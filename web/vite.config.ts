@@ -19,7 +19,10 @@ export default defineConfig({
     chunkSizeWarningLimit: 1500,
   },
   server: {
+    // 默认 host=localhost 在 macOS 上会解析到 ::1，只监听 IPv6，导致 127.0.0.1 无法访问
+    host: '0.0.0.0',
     port: 5173,
+    strictPort: true,
     // 开发态代理，规则与生产 Nginx 反代保持一致
     proxy: {
       '/auth': 'http://127.0.0.1:8000',
