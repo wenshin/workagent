@@ -27,6 +27,7 @@ export default defineConfig({
     proxy: {
       '/auth': 'http://127.0.0.1:8000',
       '/spaces': 'http://127.0.0.1:8000',
+      '/sessions': 'http://127.0.0.1:8000',
       '/healthz': 'http://127.0.0.1:8000',
     },
   },
