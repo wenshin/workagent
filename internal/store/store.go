@@ -55,15 +55,26 @@ type SpaceInput struct {
 	Depth    int
 }
 
-// Session 是聊天会话，归属于某个空间的「会话」子空间。
+// Session 是聊天会话，直接归属于某个空间。
 type Session struct {
 	ID            string
 	SpaceID       string
 	Title         string
+	TitleAuto     bool // true 表示标题可被首条消息改写
 	CreatedBy     string
 	LastMessageAt *time.Time
 	Status        string
 	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// Message 是会话中的一条消息。
+type Message struct {
+	ID        string
+	SessionID string
+	Role      string // user | assistant | system
+	Content   string
+	CreatedAt time.Time
 }
 
 // AuthSession 是登录会话（注意：与聊天会话 session 表不是一回事）。
@@ -84,7 +95,7 @@ type Store interface {
 	GetAuthSession(ctx context.Context, tokenHash string) (AuthSession, error)
 	DeleteAuthSession(ctx context.Context, tokenHash string) error
 
-	// EnsurePersonalSpace 保证用户拥有个人空间与「会话」子空间，返回二者及是否本次创建。
+	// EnsurePersonalSpace 保证用户拥有个人空间（含一个「新会话」），返回可见空间及是否本次创建。
 	EnsurePersonalSpace(ctx context.Context, userID string) ([]Space, bool, error)
 	ListSpaces(ctx context.Context, userID string) ([]Space, error)
 
@@ -98,4 +109,15 @@ type Store interface {
 
 	CreateSession(ctx context.Context, spaceID, userID, title string) (Session, error)
 	ListSessions(ctx context.Context, spaceID string) ([]Session, error)
+	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
+	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
+	GetSession(ctx context.Context, id string) (Session, error)
+	// RenameSession 修改标题；auto 为 true 表示仍允许被首条消息覆盖。
+	RenameSession(ctx context.Context, id, title string, auto bool) error
+	// TouchSession 更新最近活动时间。
+	TouchSession(ctx context.Context, id string) error
+
+	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
+	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
+	CountMessages(ctx context.Context, sessionID string) (int, error)
 }

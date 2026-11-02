@@ -1,42 +1,79 @@
 import { IconPlus } from '@douyinfe/semi-icons';
-import { Avatar, Button, Layout, Spin } from '@douyinfe/semi-ui';
-import { useEffect, useMemo, useState } from 'react';
+import { Avatar, Button, Layout, Spin, Toast } from '@douyinfe/semi-ui';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
-import { useMe, useSessions, useSpaces } from '../api/hooks';
+import { useCreateSession, useMe, useMessages, useSendMessage, useSessions, useSpaces } from '../api/hooks';
 import type { Space } from '../api/types';
-import SessionPanel from '../components/SessionPanel';
+import ChatPanel from '../components/ChatPanel';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
-import SpaceTree from '../components/SpaceTree';
+import SpacePanel from '../components/SpacePanel';
+import SpaceTree, { SESSION_KEY_PREFIX } from '../components/SpaceTree';
 
 export default function WorkspacePage() {
   const { data: me } = useMe();
   const { data: spaces = [], isLoading: spacesLoading } = useSpaces();
+  const { data: sessions = [], isLoading: sessionsLoading } = useSessions();
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
 
-  // 默认定位到个人空间的「会话」子空间
-  const defaultId = useMemo(() => {
-    const personal = spaces.find((s) => s.type === 'personal' && !s.parent_id);
-    const session = personal
-      ? spaces.find((s) => s.parent_id === personal.id && s.is_system_reserved)
-      : undefined;
-    return session?.id ?? personal?.id ?? spaces[0]?.id ?? '';
-  }, [spaces]);
+  const createSession = useCreateSession();
+  const sendMessage = useSendMessage();
 
-  const urlId = searchParams.get('space') ?? '';
-  const selectedId = spaces.some((s) => s.id === urlId) ? urlId : defaultId;
-  const selected = spaces.find((s) => s.id === selectedId);
+  const personalId = useMemo(
+    () => spaces.find((s) => s.type === 'personal' && !s.parent_id)?.id ?? '',
+    [spaces],
+  );
+
+  const urlSessionId = searchParams.get('session') ?? '';
+  const urlSpaceId = searchParams.get('space') ?? '';
+
+  const selectedSession = sessions.find((s) => s.id === urlSessionId);
+  const selectedSpaceId = selectedSession
+    ? selectedSession.space_id
+    : spaces.some((s) => s.id === urlSpaceId)
+      ? urlSpaceId
+      : personalId;
+  const selectedSpace = spaces.find((s) => s.id === selectedSpaceId);
+
+  // 进入工作台默认打开个人空间里最近使用的会话
+  const defaultSessionId = useMemo(() => {
+    const personalSessions = sessions.filter((s) => s.space_id === personalId);
+    return (personalSessions[0] ?? sessions[0])?.id ?? '';
+  }, [sessions, personalId]);
 
   useEffect(() => {
-    if (selectedId && selectedId !== urlId) {
-      setSearchParams({ space: selectedId }, { replace: true });
-    }
-  }, [selectedId, urlId, setSearchParams]);
+    if (urlSessionId || urlSpaceId || spaces.length === 0) return;
+    if (defaultSessionId) setSearchParams({ session: defaultSessionId }, { replace: true });
+  }, [urlSessionId, urlSpaceId, defaultSessionId, spaces.length, setSearchParams]);
 
-  const isSessionView = selected?.is_system_reserved ?? false;
-  const { data: sessions = [], isLoading: sessionsLoading } = useSessions(selectedId, isSessionView);
+  const { data: messages = [], isLoading: messagesLoading } = useMessages(selectedSession?.id);
+
+  const spaceSessions = useMemo(
+    () => sessions.filter((s) => s.space_id === selectedSpaceId),
+    [sessions, selectedSpaceId],
+  );
+
+  const openSession = (id: string) => setSearchParams({ session: id });
+  const openSpace = (id: string) => setSearchParams({ space: id });
+
+  const addSession = useCallback(
+    async (spaceId: string) => {
+      try {
+        const res = await createSession.mutateAsync({ spaceId });
+        setSearchParams({ session: res.session.id });
+      } catch (e) {
+        Toast.error(e instanceof Error ? e.message : '新建会话失败');
+      }
+    },
+    [createSession, setSearchParams],
+  );
+
+  const send = async (content: string) => {
+    if (!selectedSession) return;
+    await sendMessage.mutateAsync({ sessionId: selectedSession.id, content });
+  };
 
   const logout = async () => {
     try {
@@ -48,8 +85,7 @@ export default function WorkspacePage() {
 
   const user = me?.user;
   const initial = user?.name?.trim().slice(0, 1) || '?';
-
-  const selectSpace = (id: string) => setSearchParams({ space: id });
+  const treeValue = selectedSession ? SESSION_KEY_PREFIX + selectedSession.id : selectedSpaceId;
 
   return (
     <Layout className="app-shell">
@@ -88,23 +124,37 @@ export default function WorkspacePage() {
           ) : (
             <SpaceTree
               spaces={spaces}
-              value={selectedId}
-              onSelect={selectSpace}
+              sessions={sessions}
+              value={treeValue}
+              onSelectSpace={openSpace}
+              onSelectSession={openSession}
               onAddChild={(space: Space) => setDialog({ kind: 'create-child', parent: space })}
+              onAddSession={(space: Space) => void addSession(space.id)}
               onRename={(space: Space) => setDialog({ kind: 'rename', target: space })}
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
-              onAddSession={(space: Space) => setDialog({ kind: 'add-session', target: space })}
             />
           )}
         </Layout.Sider>
 
         <Layout.Content className="app-content">
-          <SessionPanel
-            space={selected}
-            sessions={sessions}
-            loading={sessionsLoading}
-            onAddSession={() => selected && setDialog({ kind: 'add-session', target: selected })}
-          />
+          {selectedSession ? (
+            <ChatPanel
+              session={selectedSession}
+              spaceName={selectedSpace?.name}
+              messages={messages}
+              loading={messagesLoading}
+              sending={sendMessage.isPending}
+              onSend={send}
+            />
+          ) : (
+            <SpacePanel
+              space={selectedSpace}
+              sessions={spaceSessions}
+              loading={sessionsLoading}
+              onOpenSession={openSession}
+              onAddSession={() => selectedSpace && void addSession(selectedSpace.id)}
+            />
+          )}
         </Layout.Content>
       </Layout>
 

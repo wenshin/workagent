@@ -30,20 +30,17 @@ returning id::text, owner_id::text, name, type, coalesce(parent_id::text, ''),
 		return store.Space{}, err
 	}
 
-	// 每个空间都预设一个「会话」子空间（系统保留，不可删改）
+	// 每个空间预置一个「新会话」，作为进入该空间后的默认对话入口
 	if _, err := tx.Exec(ctx, `
-insert into space (owner_id, name, type, parent_id, path, depth, is_system_reserved)
-values ($1::uuid, '会话', $2, $3::uuid, $4, $5, true)`,
-		in.OwnerID, in.Type, s.ID, in.Path+"/session", in.Depth+1); err != nil {
+insert into session (space_id, title, created_by)
+values ($1::uuid, '新会话', $2::uuid)`, s.ID, in.OwnerID); err != nil {
 		return store.Space{}, err
 	}
 
-	// 创建者对新空间及其「会话」子空间均为 manage
+	// 创建者对新空间为 manage
 	if _, err := tx.Exec(ctx, `
 insert into space_member (space_id, user_id, perm, source)
-select x.id, $2::uuid, 'manage', 'system'
-from space x
-where x.id = $1::uuid or x.parent_id = $1::uuid
+values ($1::uuid, $2::uuid, 'manage', 'system')
 on conflict (space_id, user_id) do nothing`, s.ID, in.OwnerID); err != nil {
 		return store.Space{}, err
 	}
