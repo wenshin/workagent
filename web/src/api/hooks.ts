@@ -113,6 +113,14 @@ export function useRenameSession() {
   });
 }
 
+export function useDeleteSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api<{ ok: boolean }>(`/sessions/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.sessions }),
+  });
+}
+
 export function useSendMessage() {
   const qc = useQueryClient();
   return useMutation({

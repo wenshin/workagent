@@ -97,6 +97,22 @@ func (s *Service) Rename(ctx context.Context, userID, sessionID, rawTitle string
 	return sess, nil
 }
 
+// Delete 删除会话，需要空间写权限；消息记录保留但不再展示。
+func (s *Service) Delete(ctx context.Context, userID, sessionID string) error {
+	sess, sp, err := s.load(ctx, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	if !canWrite(sp.Perm) {
+		return ErrForbidden
+	}
+	if err := s.store.DeleteSession(ctx, sessionID); err != nil {
+		return err
+	}
+	s.log.Info("会话已删除", "session_id", sess.ID, "space_id", sess.SpaceID, "by", userID)
+	return nil
+}
+
 // Messages 返回会话消息。
 func (s *Service) Messages(ctx context.Context, userID, sessionID string) ([]store.Message, error) {
 	if _, _, err := s.load(ctx, userID, sessionID); err != nil {

@@ -114,6 +114,8 @@ type Store interface {
 	GetSession(ctx context.Context, id string) (Session, error)
 	// RenameSession 修改标题；auto 为 true 表示仍允许被首条消息覆盖。
 	RenameSession(ctx context.Context, id, title string, auto bool) error
+	// DeleteSession 软删会话，历史消息保留。
+	DeleteSession(ctx context.Context, id string) error
 	// TouchSession 更新最近活动时间。
 	TouchSession(ctx context.Context, id string) error
 

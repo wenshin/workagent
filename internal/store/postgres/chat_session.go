@@ -109,6 +109,21 @@ where id::text = $1 and status = 'active'`, id, title, auto)
 	return nil
 }
 
+// DeleteSession 软删会话，消息记录保留以便追溯。
+func (d *DB) DeleteSession(ctx context.Context, id string) error {
+	tag, err := d.pool.Exec(ctx, `
+update session
+set status = 'deleted', updated_at = now()
+where id::text = $1 and status = 'active'`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 // TouchSession 更新最近活动时间。
 func (d *DB) TouchSession(ctx context.Context, id string) error {
 	_, err := d.pool.Exec(ctx, `

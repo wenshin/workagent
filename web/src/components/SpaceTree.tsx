@@ -28,10 +28,16 @@ interface Props {
   onAddSession: (space: Space) => void;
   onRename: (space: Space) => void;
   onDelete: (space: Space) => void;
+  onDeleteSession: (session: ChatSession) => void;
 }
 
 function canWrite(space: Space) {
   return space.perm === 'write' || space.perm === 'manage';
+}
+
+// 排序基准：优先用最近消息时间，没有消息时用创建时间
+function sessionTime(s: ChatSession) {
+  return new Date(s.last_message_at ?? s.created_at).getTime() || 0;
 }
 
 export default function SpaceTree({
@@ -44,6 +50,7 @@ export default function SpaceTree({
   onAddSession,
   onRename,
   onDelete,
+  onDeleteSession,
 }: Props) {
   const spaceById = useMemo(() => new Map(spaces.map((s) => [s.id, s])), [spaces]);
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
@@ -61,24 +68,26 @@ export default function SpaceTree({
       });
     });
 
-    // 子空间按树序挂载
+    // 会话排在目录之前，按最近活动时间从新到旧
+    [...sessions]
+      .sort((a, b) => sessionTime(b) - sessionTime(a))
+      .forEach((sess) => {
+        const parent = nodes.get(sess.space_id);
+        if (!parent) return;
+        parent.children?.push({
+          key: SESSION_KEY_PREFIX + sess.id,
+          label: sess.title,
+          kind: 'session',
+          refId: sess.id,
+          isLeaf: true,
+          icon: <IconComment />,
+        });
+      });
+
+    // 子空间挂在会话之后
     spaces.forEach((s) => {
       if (!s.parent_id) return;
       nodes.get(s.parent_id)?.children?.push(nodes.get(s.id)!);
-    });
-
-    // 会话直接挂在所属空间下，排在子空间之后
-    sessions.forEach((sess) => {
-      const parent = nodes.get(sess.space_id);
-      if (!parent) return;
-      parent.children?.push({
-        key: SESSION_KEY_PREFIX + sess.id,
-        label: sess.title,
-        kind: 'session',
-        refId: sess.id,
-        isLeaf: true,
-        icon: <IconComment />,
-      });
     });
 
     return spaces.filter((s) => !s.parent_id).map((s) => nodes.get(s.id)!);
@@ -117,9 +126,22 @@ export default function SpaceTree({
 
     if (node.kind === 'session') {
       const sess = sessionById.get(node.refId);
+      const owner = sess ? spaceById.get(sess.space_id) : undefined;
       return (
         <span className="space-row">
           <span className="space-row-name session-name">{sess?.title ?? String(node.label ?? '')}</span>
+          {sess && owner && canWrite(owner) ? (
+            <span className="space-row-actions" onClick={(e) => e.stopPropagation()}>
+              <Button
+                theme="borderless"
+                size="small"
+                type="danger"
+                icon={<IconDelete />}
+                aria-label="删除会话"
+                onClick={() => onDeleteSession(sess)}
+              />
+            </span>
+          ) : null}
         </span>
       );
     }

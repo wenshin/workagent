@@ -32,6 +32,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/sessions", h.create)
 	mux.HandleFunc("GET /sessions", h.listMine)
 	mux.HandleFunc("PATCH /sessions/{id}", h.rename)
+	mux.HandleFunc("DELETE /sessions/{id}", h.remove)
 	mux.HandleFunc("GET /sessions/{id}/messages", h.messages)
 	mux.HandleFunc("POST /sessions/{id}/messages", h.appendMessage)
 }
@@ -154,6 +155,18 @@ func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"session": toDTO(sess)})
+}
+
+func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.Delete(r.Context(), user.ID, r.PathValue("id")); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
