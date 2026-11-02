@@ -120,7 +120,7 @@ export default function WorkspacePage() {
       <Layout.Header className="app-header">
         <div className="brand">
           <span className="brand-mark" />
-          <span className="brand-name">AutoAgent</span>
+          <span className="brand-name">WorkAgent</span>
         </div>
         <div className="header-right">
           <Avatar size="small" color="violet" src={user?.avatar || undefined}>

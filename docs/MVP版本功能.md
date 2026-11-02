@@ -1,4 +1,4 @@
-# AutoAgent MVP PRD（Web Agent Client + Service）
+# WorkAgent MVP PRD（Web Agent Client + Service）
 
 > 版本：v0.2（在原始需求清单基础上查漏补缺完善）
 > 状态：待评审
@@ -307,7 +307,7 @@ autoagent/                                 # 存储根
 | 项 | 内容 |
 | --- | --- |
 | 组件模型 | 每个组件有 `manifest`：名称（slug）、版本、描述、props Schema、依赖数据源（资源 + 工具）、构建产物引用、最大高度、是否需要浮层能力 |
-| 构建 | 组件源码构建为 ESM bundle（`react`/`react-dom`/`@autoagent/ui` 全部 external），存入 `Storage`（**MVP 本地 FS**），按 `slug@版本` 不可变寻址 |
+| 构建 | 组件源码构建为 ESM bundle（`react`/`react-dom`/`@workagent/ui` 全部 external），存入 `Storage`（**MVP 本地 FS**），按 `slug@版本` 不可变寻址 |
 | **生成方式** | 组件由平台内置 Skill `ui-component-authoring` 对话式生成（追问 → 生成 TSX + manifest → 校验 → 预览 → 审核 → 发布）。**Skill 有版本、可升级、可灰度回滚**；MVP 先交付可用版本，上线后在产品内持续优化 |
 | **渲染协议** | 消息内容为**结构化内容块数组**，组件以 `ui` 块表达，**不在正文里写版本号**：<br>`{"type":"text","text":"本月销售情况如下："}`<br>`{"type":"ui","component":"sales-dashboard","version":"1.2.0","props":{"period":"month"},"fallback":"[销售看板]"}` |
 | **版本由后端注入（本期确认项）** | 模型只输出组件 slug；服务端在持久化消息前解析版本并写入 `version` 字段：优先取「会话创建时锁定的组件版本」，无锁定时取当前 published 版本。**禁止模型自行书写版本号**；模型输出中的组件引用块会被服务端覆写为解析结果 |
@@ -315,7 +315,7 @@ autoagent/                                 # 存储根
 | 前端行为 | 前端**不解析正文文本**，只渲染结构化块；不做正则扫描，避免与 `@提及`、代码块、Markdown 语法互相干扰 |
 | 文本降级 | 纯文本客户端（CLI、导出 Markdown）使用 `fallback`；需要行内引用时统一写作 `@component(slug)`（**不带版本**），块级用 `:::component{#slug}`（remark-directive），**一律不使用 `&` 分隔版本**（`&` 会被 HTML 实体与 Markdown 管道改写） |
 | 流式 | 先发 `ui.placeholder` 占位事件，props 就绪后 patch 为完整块，避免布局跳动 |
-| **来源封闭** | 只接受平台 Skill 生成 + 审核发布的组件；**不提供上传、导入或引用外部组件的能力**，统一 React + `@autoagent/ui` + Token |
+| **来源封闭** | 只接受平台 Skill 生成 + 审核发布的组件；**不提供上传、导入或引用外部组件的能力**，统一 React + `@workagent/ui` + Token |
 | **渲染容器（不用 iframe）** | Shadow DOM（`mode: closed`）+ `adoptedStyleSheets` 样式隔离；Token 通过 CSS 自定义属性穿透继承，主题/密度自动跟随；与主应用同源直挂，**无 iframe 裁剪问题、无独立文档加载** |
 | **执行隔离** | ① 构建期禁止清单（`fetch`/`document`/`window`/`localStorage`/`eval`/动态 import 等，越界即编译失败）；② 运行期受限全局（Proxy 拦截，白名单外标识符抛错）；③ 组件唯一对外通道是宿主注入的 `ctx` |
 | **数据通道** | 组件无网络能力，取数只能 `ctx.tools.call()`：宿主校验 `manifest.dataSources` 白名单 + 用户权限 → BFF/MCP Gateway（凭证服务端注入）→ 脱敏 + 配额 + 审计 |

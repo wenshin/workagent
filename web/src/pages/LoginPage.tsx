@@ -13,7 +13,7 @@ export default function LoginPage() {
     <div className="login-wrap">
       <div className="login-card">
         <div className="brand-mark" />
-        <h1 className="login-title">AutoAgent</h1>
+        <h1 className="login-title">WorkAgent</h1>
         <p className="login-sub">企业级 Agent 工作台</p>
 
         {error ? <Banner type="danger" description={error} className="login-banner" /> : null}
