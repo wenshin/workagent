@@ -190,28 +190,16 @@ func (h *Handler) clearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, h.newCookie("", -1))
 }
 
-// newCookie 按配置生成会话 Cookie，前后端跨站部署时需 SameSite=none + Secure。
+// newCookie 生成会话 Cookie。前后端同源（经反向代理），使用 Lax 即可。
 func (h *Handler) newCookie(value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name:     h.cfg.SessionCookie,
 		Value:    value,
 		Path:     "/",
-		Domain:   h.cfg.CookieDomain,
 		HttpOnly: true,
 		Secure:   h.cfg.CookieSecure,
-		SameSite: h.sameSite(),
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
-	}
-}
-
-func (h *Handler) sameSite() http.SameSite {
-	switch h.cfg.CookieSameSite {
-	case "none":
-		return http.SameSiteNoneMode
-	case "strict":
-		return http.SameSiteStrictMode
-	default:
-		return http.SameSiteLaxMode
 	}
 }
 

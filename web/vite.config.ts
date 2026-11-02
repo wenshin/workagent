@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react';
 // Semi 的 package.json exports 未暴露 dist 下的样式，这里用别名绕开深层导入限制
 const semiCss = new URL('./node_modules/@douyinfe/semi-ui/dist/css/semi.min.css', import.meta.url).pathname;
 
-// 前端独立部署（CDN），构建产物挂根路径；API 地址由 VITE_API_BASE 注入
+// 前端独立构建、部署到 CDN；对浏览器始终同源访问 API
 export default defineConfig({
   base: '/',
   plugins: [react()],
@@ -20,6 +20,7 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // 开发态代理，规则与生产 Nginx 反代保持一致
     proxy: {
       '/auth': 'http://127.0.0.1:8000',
       '/spaces': 'http://127.0.0.1:8000',

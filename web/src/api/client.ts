@@ -10,9 +10,6 @@ export class ApiError extends Error {
   }
 }
 
-// 开发态留空走 Vite 代理；生产填 API 域名，例如 https://api.example.com
-export const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '');
-
 const LOGIN_PATH = '/login';
 
 function redirectToLogin() {
@@ -34,16 +31,15 @@ interface ErrorBody {
   code?: string;
 }
 
+// 前端永远是同源调用：开发态由 Vite 代理转发，生产由 Nginx/CDN 反向代理转发到 API 服务。
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, signal } = options;
 
   let res: Response;
   try {
-    res = await fetch(API_BASE + path, {
+    res = await fetch(path, {
       method,
       signal,
-      // 前后端跨域部署时需要显式携带 Cookie
-      credentials: 'include',
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -68,9 +64,9 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
     throw new ApiError(err.message ?? `请求失败（${res.status}）`, res.status, err.code ?? 'unknown');
   }
 
-  // 前端与 API 分离部署时，若 VITE_API_BASE 配错，请求会落到静态站点并返回 HTML
+  // 反向代理未覆盖该路径时会返回静态页面的 HTML，这里显式报错而不是当成空数据
   if (!isJSON) {
-    throw new ApiError('接口返回的不是 JSON，请检查 VITE_API_BASE 是否指向 API 服务', res.status, 'bad_response');
+    throw new ApiError('接口返回的不是 JSON，请检查反向代理是否已转发该路径', res.status, 'bad_response');
   }
 
   return data as T;

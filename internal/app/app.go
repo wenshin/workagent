@@ -43,7 +43,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}, nil
 }
 
-// Handler 返回带中间件的根 handler。前端为独立部署，本服务只提供 API。
+// Handler 返回带中间件的根 handler。前端由 CDN/Nginx 托管并经同源反向代理访问本服务，无需 CORS。
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -58,7 +58,6 @@ func (a *App) Handler() http.Handler {
 	h = platform.AccessLog(a.log)(h)
 	h = platform.Recover(a.log)(h)
 	h = platform.RequestID(h)
-	h = platform.CORS(a.cfg.CORSAllowedOrigins)(h)
 	return h
 }
 

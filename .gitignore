@@ -1,7 +1,6 @@
 .env
 .env.local
 .env.*.local
-web/.env.production
 data/
 bin/
 web/node_modules/
