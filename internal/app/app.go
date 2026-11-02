@@ -4,8 +4,10 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/auth"
 	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
@@ -29,7 +31,16 @@ type App struct {
 func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logger) (*App, error) {
 	authHandler := auth.NewHandler(auth.NewService(st, cfg, log), cfg, log)
 	spaceSvc := space.NewService(st, fs, log)
-	sessionSvc := session.NewService(st, spaceSvc, log)
+
+	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout)
+	agentSvc := agent.NewService(cfg, llmClient, st, log)
+	if !cfg.LLMReady() {
+		log.Warn("模型服务未配置，对话接口将不可用", "missing", cfg.MissingLLM())
+	} else {
+		log.Info("模型服务已就绪", "base_url", cfg.LLMBaseURL, "model", cfg.LLMModel)
+	}
+
+	sessionSvc := session.NewService(st, spaceSvc, agentSvc, log)
 
 	return &App{
 		cfg:        cfg,
@@ -52,6 +63,7 @@ func (a *App) Handler() http.Handler {
 	a.sessionH.Register(mux)
 
 	mux.HandleFunc("GET /healthz", a.healthz)
+	mux.HandleFunc("GET /agent/info", a.agentInfo)
 	mux.HandleFunc("GET /{$}", a.index)
 
 	var h http.Handler = mux
@@ -59,6 +71,18 @@ func (a *App) Handler() http.Handler {
 	h = platform.Recover(a.log)(h)
 	h = platform.RequestID(h)
 	return h
+}
+
+// agentInfo 供前端展示当前模型与可用状态。
+func (a *App) agentInfo(w http.ResponseWriter, r *http.Request) {
+	if _, err := a.auth.CurrentUser(r); err != nil {
+		platform.WriteError(w, r, http.StatusUnauthorized, "unauthenticated", "未登录或登录已过期")
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"ready": a.sessionSvc.AgentReady(),
+		"model": a.sessionSvc.AgentModel(),
+	})
 }
 
 func (a *App) index(w http.ResponseWriter, r *http.Request) {

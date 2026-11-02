@@ -33,12 +33,41 @@ export interface ChatSession {
 
 export type MessageRole = 'user' | 'assistant' | 'system';
 
+/** 一次工具调用的完整状态 */
+export interface ToolCallRecord {
+  id: string;
+  name: string;
+  args: string;
+  result?: string;
+  status: 'running' | 'ok' | 'error';
+  duration_ms?: number;
+}
+
+/** 消息里的结构化执行轨迹 */
+export interface MessagePart {
+  type: 'tool';
+  id: string;
+  name: string;
+  args: string;
+  result?: string;
+  status: 'running' | 'ok' | 'error';
+  duration_ms?: number;
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;
   role: MessageRole;
   content: string;
+  /** 模型的思考过程，历史消息回放用 */
+  reasoning?: string;
+  parts?: MessagePart[];
   created_at: string;
+}
+
+export interface AgentInfo {
+  ready: boolean;
+  model: string;
 }
 
 export interface MeResponse {

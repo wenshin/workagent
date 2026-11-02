@@ -74,6 +74,10 @@ type Message struct {
 	SessionID string
 	Role      string // user | assistant | system
 	Content   string
+	// Reasoning 是模型的思考过程，仅 assistant 消息可能有值
+	Reasoning string
+	// Parts 是结构化的执行轨迹（思考、工具调用），JSON 数组；为空表示纯文本消息
+	Parts     []byte
 	CreatedAt time.Time
 }
 
@@ -120,6 +124,8 @@ type Store interface {
 	TouchSession(ctx context.Context, id string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
+	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息。
+	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte) (Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	CountMessages(ctx context.Context, sessionID string) (int, error)
 }

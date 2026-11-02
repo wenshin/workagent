@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -26,6 +27,13 @@ type Config struct {
 	CookieSecure  bool
 
 	StorageRoot string
+
+	// LLM 走 OpenAI 兼容协议，DeepSeek / 通义兼容模式 / vLLM / Ollama 均可直接接入
+	LLMBaseURL   string
+	LLMAPIKey    string
+	LLMModel     string
+	LLMTimeout   time.Duration
+	LLMMaxRounds int // 单轮对话内允许的最大工具调用轮次
 }
 
 // Load 读取 .env（存在时）并解析环境变量。
@@ -35,6 +43,18 @@ func Load() (*Config, error) {
 	ttl, err := time.ParseDuration(getenv("SESSION_TTL", "168h"))
 	if err != nil {
 		return nil, fmt.Errorf("SESSION_TTL 不是合法的时长: %w", err)
+	}
+
+	llmTimeout, err := time.ParseDuration(getenv("LLM_TIMEOUT", "120s"))
+	if err != nil {
+		return nil, fmt.Errorf("LLM_TIMEOUT 不是合法的时长: %w", err)
+	}
+
+	maxRounds := 5
+	if v := getenv("LLM_MAX_ROUNDS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxRounds); err != nil || maxRounds <= 0 {
+			return nil, fmt.Errorf("LLM_MAX_ROUNDS 必须是正整数")
+		}
 	}
 
 	c := &Config{
@@ -50,6 +70,12 @@ func Load() (*Config, error) {
 		SessionTTL:           ttl,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
+
+		LLMBaseURL:   strings.TrimRight(getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"), "/"),
+		LLMAPIKey:    getenv("LLM_API_KEY", ""),
+		LLMModel:     getenv("LLM_MODEL", "deepseek-chat"),
+		LLMTimeout:   llmTimeout,
+		LLMMaxRounds: maxRounds,
 	}
 
 	if c.DatabaseURL == "" {
@@ -73,6 +99,55 @@ func (c *Config) MissingDingTalk() []string {
 		missing = append(missing, "DINGTALK_CLIENT_SECRET")
 	}
 	return missing
+}
+
+// LLMReady 判断模型服务是否可用。
+//
+// 云端服务必须有 API Key；本地推理（Ollama / vLLM）通常不校验密钥，按主机名放行。
+func (c *Config) LLMReady() bool {
+	if c.LLMBaseURL == "" || c.LLMModel == "" {
+		return false
+	}
+	if c.LLMAPIKey != "" {
+		return true
+	}
+
+	u, err := url.Parse(c.LLMBaseURL)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal":
+		return true
+	}
+	return false
+}
+
+// MissingLLM 返回缺失的模型配置项名称，用于启动告警。
+func (c *Config) MissingLLM() []string {
+	missing := make([]string, 0, 2)
+	if c.LLMBaseURL == "" {
+		missing = append(missing, "LLM_BASE_URL")
+	}
+	if c.LLMModel == "" {
+		missing = append(missing, "LLM_MODEL")
+	}
+	if c.LLMAPIKey == "" && c.LLMReadyBaseOnly() {
+		missing = append(missing, "LLM_API_KEY")
+	}
+	return missing
+}
+
+func (c *Config) LLMReadyBaseOnly() bool {
+	u, err := url.Parse(c.LLMBaseURL)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal":
+		return false
+	}
+	return true
 }
 
 func getenv(key, def string) string {

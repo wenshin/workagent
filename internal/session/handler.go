@@ -1,11 +1,14 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -35,6 +38,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{id}", h.remove)
 	mux.HandleFunc("GET /sessions/{id}/messages", h.messages)
 	mux.HandleFunc("POST /sessions/{id}/messages", h.appendMessage)
+	// 与 Agent 对话，流式返回（SSE）
+	mux.HandleFunc("POST /sessions/{id}/chat", h.chat)
 }
 
 type sessionDTO struct {
@@ -49,11 +54,13 @@ type sessionDTO struct {
 }
 
 type messageDTO struct {
-	ID        string `json:"id"`
-	SessionID string `json:"session_id"`
-	Role      string `json:"role"`
-	Content   string `json:"content"`
-	CreatedAt string `json:"created_at"`
+	ID        string          `json:"id"`
+	SessionID string          `json:"session_id"`
+	Role      string          `json:"role"`
+	Content   string          `json:"content"`
+	Reasoning string          `json:"reasoning,omitempty"`
+	Parts     json.RawMessage `json:"parts"`
+	CreatedAt string          `json:"created_at"`
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
@@ -76,11 +83,17 @@ func toDTO(s store.Session) sessionDTO {
 }
 
 func toMessageDTO(m store.Message) messageDTO {
+	parts := json.RawMessage(m.Parts)
+	if len(parts) == 0 {
+		parts = json.RawMessage("[]")
+	}
 	return messageDTO{
 		ID:        m.ID,
 		SessionID: m.SessionID,
 		Role:      m.Role,
 		Content:   m.Content,
+		Reasoning: m.Reasoning,
+		Parts:     parts,
 		CreatedAt: m.CreatedAt.In(time.Local).Format(timeLayout),
 	}
 }
@@ -212,6 +225,93 @@ func (h *Handler) appendMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// chat 与 Agent 对话：先做常规校验（错误以 JSON 返回），再切换为 SSE 流式输出。
+func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	sessionID := r.PathValue("id")
+	if _, _, err := h.svc.ValidateChat(r.Context(), user.ID, sessionID, req.Content); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		platform.WriteError(w, r, http.StatusInternalServerError, "stream_unsupported", "当前服务不支持流式响应")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	// 关闭 Nginx 等反向代理的响应缓冲，保证首 token 及时到达
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	emit := func(ev agent.Event) error {
+		switch ev.Type {
+		case agent.EventReasoning, agent.EventText:
+			return writeSSE(w, flusher, ev.Type, map[string]string{"delta": ev.Delta})
+		case agent.EventToolStart, agent.EventToolResult:
+			return writeSSE(w, flusher, ev.Type, map[string]any{"tool": ev.Tool})
+		default:
+			return nil
+		}
+	}
+
+	msg, sess, err := h.svc.Chat(r.Context(), user.ID, sessionID, req.Content, emit)
+	if err != nil {
+		if r.Context().Err() != nil {
+			// 客户端已断开，没有接收方，直接结束
+			return
+		}
+		h.log.Warn("对话失败", "session_id", sessionID, "err", err)
+		_ = writeSSE(w, flusher, agent.EventError, map[string]string{"message": userFacingAgentError(err)})
+		return
+	}
+
+	_ = writeSSE(w, flusher, agent.EventDone, map[string]any{
+		"message": toMessageDTO(msg),
+		"session": toDTO(sess),
+	})
+}
+
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+// userFacingAgentError 把内部错误转成可读文案，避免把密钥等细节暴露给前端。
+func userFacingAgentError(err error) string {
+	switch {
+	case errors.Is(err, ErrAgentUnavailable):
+		return err.Error()
+	case errors.Is(err, ErrForbidden):
+		return "没有该空间的权限"
+	default:
+		return "生成回复失败：" + err.Error()
+	}
+}
+
 func sessionDTOs(list []store.Session) []sessionDTO {
 	out := make([]sessionDTO, 0, len(list))
 	for _, s := range list {
@@ -237,6 +337,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", "没有该空间的权限")
 	case errors.Is(err, ErrLastSession):
 		platform.WriteError(w, r, http.StatusConflict, "last_session", err.Error())
+	case errors.Is(err, ErrAgentUnavailable):
+		platform.WriteError(w, r, http.StatusServiceUnavailable, "agent_unavailable", err.Error())
 	case errors.Is(err, ErrTitleInvalid), errors.Is(err, ErrMessageEmpty), errors.Is(err, ErrMessageTooLong),
 		errors.Is(err, space.ErrNameInvalid):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())

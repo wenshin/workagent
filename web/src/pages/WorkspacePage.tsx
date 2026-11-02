@@ -1,20 +1,23 @@
 import { IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast } from '@douyinfe/semi-ui';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
 import {
+  queryKeys,
+  useAgentInfo,
   useCreateSession,
   useDeleteSession,
   useMe,
   useMessages,
-  useSendMessage,
   useSessions,
   useSpaces,
 } from '../api/hooks';
+import { streamChat } from '../api/stream';
 import type { ChatSession, Space } from '../api/types';
-import ChatPanel from '../components/ChatPanel';
+import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
 import SpaceTree, { SESSION_KEY_PREFIX } from '../components/SpaceTree';
@@ -26,10 +29,15 @@ export default function WorkspacePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
+  const [stream, setStream] = useState<StreamView | null>(null);
+  const [pendingUser, setPendingUser] = useState<string | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
+  const queryClient = useQueryClient();
 
   const createSession = useCreateSession();
   const deleteSession = useDeleteSession();
-  const sendMessage = useSendMessage();
+  const { data: agentInfo } = useAgentInfo();
 
   const personalId = useMemo(
     () => spaces.find((s) => s.type === 'personal' && !s.parent_id)?.id ?? '',
@@ -98,9 +106,53 @@ export default function WorkspacePage() {
     }
   };
 
+  // 切换会话时中断正在进行的生成
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, [selectedSession?.id]);
+
   const send = async (content: string) => {
-    if (!selectedSession) return;
-    await sendMessage.mutateAsync({ sessionId: selectedSession.id, content });
+    if (!selectedSession || abortRef.current) return;
+    const sessionId = selectedSession.id;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setPendingUser(content);
+    setStream({ reasoning: '', text: '', tools: [] });
+
+    try {
+      await streamChat(
+        sessionId,
+        content,
+        {
+          onReasoning: (delta) => setStream((s) => (s ? { ...s, reasoning: s.reasoning + delta } : s)),
+          onText: (delta) => setStream((s) => (s ? { ...s, text: s.text + delta } : s)),
+          onToolStart: (tool) => setStream((s) => (s ? { ...s, tools: [...s.tools, tool] } : s)),
+          onToolResult: (tool) =>
+            setStream((s) => (s ? { ...s, tools: s.tools.map((t) => (t.id === tool.id ? tool : t)) } : s)),
+          onError: (message) => Toast.error(message),
+        },
+        controller.signal,
+      );
+    } catch (e) {
+      // 用户主动停止不算错误
+      const aborted = e instanceof DOMException && e.name === 'AbortError';
+      if (!aborted) {
+        Toast.error(e instanceof Error ? e.message : '发送失败，请重试');
+      }
+    } finally {
+      abortRef.current = null;
+      setStream(null);
+      setPendingUser(null);
+      await queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+    }
+  };
+
+  const stopGenerating = () => {
+    abortRef.current?.abort();
   };
 
   const logout = async () => {
@@ -172,8 +224,13 @@ export default function WorkspacePage() {
               spaceName={selectedSpace?.name}
               messages={messages}
               loading={messagesLoading}
-              sending={sendMessage.isPending}
+              sending={Boolean(stream)}
+              stream={stream}
+              pendingUser={pendingUser}
+              agentReady={agentInfo?.ready ?? false}
+              model={agentInfo?.model}
               onSend={send}
+              onStop={stopGenerating}
             />
           ) : (
             <SpacePanel

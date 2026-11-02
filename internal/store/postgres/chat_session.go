@@ -132,16 +132,39 @@ where id::text = $1`, id)
 	return err
 }
 
-// CreateMessage 写入一条消息。
+const messageColumns = `id::text, session_id::text, role, content, reasoning,
+       coalesce(parts, '[]'::jsonb), created_at`
+
+// CreateMessage 写入一条消息（用户/系统消息，无执行轨迹）。
 func (d *DB) CreateMessage(ctx context.Context, sessionID, role, content string) (store.Message, error) {
 	const q = `
 insert into message (session_id, role, content)
 values ($1::uuid, $2, $3)
-returning id::text, session_id::text, role, content, created_at`
+returning ` + messageColumns
 
 	var m store.Message
 	if err := d.pool.QueryRow(ctx, q, sessionID, role, content).Scan(
-		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.CreatedAt,
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt,
+	); err != nil {
+		return store.Message{}, err
+	}
+	return m, nil
+}
+
+// CreateAssistantMessage 写入助手消息，包含思考过程与工具调用轨迹。
+func (d *DB) CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte) (store.Message, error) {
+	if len(parts) == 0 {
+		parts = []byte("[]")
+	}
+
+	const q = `
+insert into message (session_id, role, content, reasoning, parts)
+values ($1::uuid, 'assistant', $2, $3, $4::jsonb)
+returning ` + messageColumns
+
+	var m store.Message
+	if err := d.pool.QueryRow(ctx, q, sessionID, content, reasoning, parts).Scan(
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt,
 	); err != nil {
 		return store.Message{}, err
 	}
@@ -151,7 +174,7 @@ returning id::text, session_id::text, role, content, created_at`
 // ListMessages 按时间顺序返回会话消息。
 func (d *DB) ListMessages(ctx context.Context, sessionID string) ([]store.Message, error) {
 	const q = `
-select id::text, session_id::text, role, content, created_at
+select ` + messageColumns + `
 from message
 where session_id = $1::uuid
 order by created_at asc, id asc`
@@ -165,7 +188,7 @@ order by created_at asc, id asc`
 	out := make([]store.Message, 0, 16)
 	for rows.Next() {
 		var m store.Message
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

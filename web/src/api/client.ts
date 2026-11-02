@@ -12,7 +12,7 @@ export class ApiError extends Error {
 
 const LOGIN_PATH = '/login';
 
-function redirectToLogin() {
+export function redirectToLogin() {
   if (window.location.pathname === LOGIN_PATH) {
     return;
   }

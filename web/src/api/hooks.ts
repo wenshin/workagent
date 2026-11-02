@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { api } from './client';
 import type {
+  AgentInfo,
   AppendMessageResponse,
   ChatSession,
   MeResponse,
@@ -15,8 +16,19 @@ export const queryKeys = {
   me: ['me'] as const,
   spaces: ['spaces'] as const,
   sessions: ['sessions'] as const,
+  agent: ['agent'] as const,
   messages: (sessionId: string) => ['messages', sessionId] as const,
 };
+
+/** 当前模型服务是否可用，用于对话页提示 */
+export function useAgentInfo() {
+  return useQuery({
+    queryKey: queryKeys.agent,
+    queryFn: () => api<AgentInfo>('/agent/info'),
+    staleTime: 60_000,
+    retry: false,
+  });
+}
 
 export function useMe() {
   return useQuery({

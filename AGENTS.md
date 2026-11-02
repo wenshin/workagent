@@ -44,3 +44,25 @@
 1. 统一的 UI 设计规范
 2. 通过对话可以直接开发 UI Components，可以直接让 AI 基于 MCP Gateway 实现一个组件，这个组件就是一段需求说明
 3. 组件可以在 skills 中通过指令指定使用
+
+# 本地运行
+
+```bash
+make pg-up   # 起 Postgres（docker）
+make run     # 后端 :8000，启动时自动执行迁移
+make web     # 前端 :5173
+```
+
+# 模型配置
+
+Agent 走 OpenAI 兼容协议（`/chat/completions`），DeepSeek、通义兼容模式、vLLM、Ollama 均可直接接入：
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `LLM_BASE_URL` | 兼容端点（不含 `/chat/completions`） | `https://api.deepseek.com/v1` |
+| `LLM_API_KEY` | 密钥；本地 Ollama / vLLM 可留空 | `sk-xxx` |
+| `LLM_MODEL` | 模型名 | `deepseek-chat` |
+| `LLM_TIMEOUT` | 单次模型调用超时 | `120s` |
+| `LLM_MAX_ROUNDS` | 单轮对话内工具调用轮次上限 | `5` |
+
+未配置密钥时，启动日志会告警，对话接口返回 `503`，前端输入框禁用并提示。
