@@ -29,6 +29,10 @@ func main() {
 		logger.Warn("钉钉凭证未配置，登录功能不可用", "missing", cfg.MissingDingTalk())
 	}
 
+	if cfg.CookieSameSite == "none" && !cfg.CookieSecure {
+		logger.Warn("COOKIE_SAMESITE=none 需要同时设置 COOKIE_SECURE=true，否则浏览器会丢弃会话 Cookie")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -74,6 +78,8 @@ func main() {
 	go func() {
 		logger.Info("服务已启动",
 			"addr", "http://"+cfg.HTTPAddr,
+			"web", cfg.WebBaseURL,
+			"cors", cfg.CORSAllowedOrigins,
 			"redirect_uri", cfg.DingTalkRedirectURI,
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

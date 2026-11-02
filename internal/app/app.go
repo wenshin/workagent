@@ -43,7 +43,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}, nil
 }
 
-// Handler 返回带中间件的根 handler。
+// Handler 返回带中间件的根 handler。前端为独立部署，本服务只提供 API。
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -52,31 +52,22 @@ func (a *App) Handler() http.Handler {
 	a.sessionH.Register(mux)
 
 	mux.HandleFunc("GET /healthz", a.healthz)
-	mux.HandleFunc("GET /{$}", redirectToApp)
-	mux.HandleFunc("GET /app", redirectToApp)
-	mux.HandleFunc("GET /login", redirectToLoginPage)
-	mux.Handle("GET /app/", newSPAHandler())
+	mux.HandleFunc("GET /{$}", a.index)
 
 	var h http.Handler = mux
 	h = platform.AccessLog(a.log)(h)
 	h = platform.Recover(a.log)(h)
 	h = platform.RequestID(h)
+	h = platform.CORS(a.cfg.CORSAllowedOrigins)(h)
 	return h
 }
 
-func redirectToApp(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, withQuery("/app/", r), http.StatusFound)
-}
-
-func redirectToLoginPage(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, withQuery("/app/login", r), http.StatusFound)
-}
-
-func withQuery(target string, r *http.Request) string {
-	if r.URL.RawQuery == "" {
-		return target
-	}
-	return target + "?" + r.URL.RawQuery
+func (a *App) index(w http.ResponseWriter, r *http.Request) {
+	platform.WriteJSON(w, http.StatusOK, map[string]string{
+		"service": "auto-agent-api",
+		"status":  "ok",
+		"web":     a.cfg.WebBaseURL,
+	})
 }
 
 func (a *App) healthz(w http.ResponseWriter, r *http.Request) {

@@ -1,12 +1,14 @@
 import { Banner, Button } from '@douyinfe/semi-ui';
 import { useSearchParams } from 'react-router-dom';
 
+import { API_BASE } from '../api/client';
+
 export default function LoginPage() {
   const [params] = useSearchParams();
   const error = params.get('error');
 
   const login = () => {
-    window.location.href = '/auth/dingtalk/login';
+    window.location.href = `${API_BASE}/auth/dingtalk/login`;
   };
 
   return (

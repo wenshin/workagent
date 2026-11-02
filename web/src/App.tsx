@@ -18,8 +18,6 @@ const queryClient = new QueryClient({
   },
 });
 
-const basename = import.meta.env.BASE_URL.replace(/\/$/, '');
-
 function RequireAuth({ children }: { children: ReactElement }) {
   const { data, isLoading, isError } = useMe();
 
@@ -40,7 +38,7 @@ export default function App() {
   return (
     <ConfigProvider locale={zh_CN}>
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter basename={basename}>
+        <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route

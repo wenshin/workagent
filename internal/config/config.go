@@ -10,8 +10,9 @@ import (
 
 // Config 保存服务运行所需的全部配置，全部来源于环境变量（支持 .env 文件）。
 type Config struct {
-	HTTPAddr  string
-	AppBaseURL string
+	HTTPAddr   string
+	AppBaseURL string // 本服务对外地址，用于拼接回调等
+	WebBaseURL string // 前端站点地址，用于登录跳转与 CORS 默认值
 
 	DatabaseURL string
 
@@ -20,9 +21,14 @@ type Config struct {
 	DingTalkCorpID       string
 	DingTalkRedirectURI  string
 
-	SessionCookie string
-	SessionTTL    time.Duration
-	CookieSecure  bool
+	SessionCookie  string
+	SessionTTL     time.Duration
+	CookieSecure   bool
+	CookieSameSite string // lax / strict / none
+	CookieDomain   string
+
+	// CORSAllowedOrigins 是允许跨域访问 API 的前端源，前后端分离部署时必填。
+	CORSAllowedOrigins []string
 
 	StorageRoot string
 }
@@ -36,9 +42,24 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SESSION_TTL 不是合法的时长: %w", err)
 	}
 
+	webBase := strings.TrimRight(getenv("WEB_BASE_URL", "http://127.0.0.1:5173"), "/")
+
+	sameSite := strings.ToLower(getenv("COOKIE_SAMESITE", "lax"))
+	switch sameSite {
+	case "lax", "strict", "none":
+	default:
+		return nil, fmt.Errorf("COOKIE_SAMESITE 只能是 lax/strict/none，当前为 %q", sameSite)
+	}
+
+	origins := splitList(getenv("CORS_ALLOWED_ORIGINS", ""))
+	if len(origins) == 0 {
+		origins = []string{webBase}
+	}
+
 	c := &Config{
 		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8000"),
 		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8000"), "/"),
+		WebBaseURL:           webBase,
 		DatabaseURL:          getenv("DATABASE_URL", ""),
 		DingTalkClientID:     getenv("DINGTALK_CLIENT_ID", ""),
 		DingTalkClientSecret: getenv("DINGTALK_CLIENT_SECRET", ""),
@@ -47,6 +68,9 @@ func Load() (*Config, error) {
 		SessionCookie:        getenv("SESSION_COOKIE", "aa_session"),
 		SessionTTL:           ttl,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
+		CookieSameSite:       sameSite,
+		CookieDomain:         getenv("COOKIE_DOMAIN", ""),
+		CORSAllowedOrigins:   origins,
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
 	}
 
@@ -78,6 +102,18 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList 解析逗号分隔的列表，去掉空白与末尾斜杠。
+func splitList(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimRight(strings.TrimSpace(p), "/"); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // loadDotEnv 解析简单的 KEY=VALUE 文件，已存在的环境变量优先。

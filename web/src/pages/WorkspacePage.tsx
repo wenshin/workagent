@@ -42,8 +42,7 @@ export default function WorkspacePage() {
     try {
       await api('/auth/logout', { method: 'POST' });
     } finally {
-      const base = import.meta.env.BASE_URL.replace(/\/$/, '');
-      window.location.href = `${base}/login`;
+      window.location.href = '/login';
     }
   };
 

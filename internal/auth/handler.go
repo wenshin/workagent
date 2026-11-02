@@ -12,9 +12,6 @@ import (
 	"github.com/autohome/auto-agent/internal/store"
 )
 
-// webLoginPath 是前端登录页路径（SPA 挂在 /app 下）。
-const webLoginPath = "/app/login"
-
 // Handler 提供登录相关 HTTP 端点。
 type Handler struct {
 	svc *Service
@@ -26,6 +23,9 @@ type Handler struct {
 func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger) *Handler {
 	return &Handler{svc: svc, cfg: cfg, log: log}
 }
+
+// webURL 拼接前端站点地址。
+func (h *Handler) webURL(p string) string { return h.cfg.WebBaseURL + p }
 
 // Register 注册路由。
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -84,7 +84,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	u, err := h.svc.LoginURL()
 	if err != nil {
 		h.log.Warn("生成登录地址失败", "err", err)
-		http.Redirect(w, r, webLoginPath+"?error="+url.QueryEscape(err.Error()), http.StatusFound)
+		http.Redirect(w, r, h.webURL("/login")+"?error="+url.QueryEscape(err.Error()), http.StatusFound)
 		return
 	}
 	http.Redirect(w, r, u, http.StatusFound)
@@ -95,19 +95,19 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	if msg := q.Get("error"); msg != "" {
-		http.Redirect(w, r, webLoginPath+"?error="+url.QueryEscape("钉钉授权失败: "+msg), http.StatusFound)
+		http.Redirect(w, r, h.webURL("/login")+"?error="+url.QueryEscape("钉钉授权失败: "+msg), http.StatusFound)
 		return
 	}
 
 	res, err := h.svc.CompleteLogin(r.Context(), q.Get("code"), q.Get("state"))
 	if err != nil {
 		h.log.Warn("登录失败", "err", err, "request_id", platform.RequestIDFrom(r.Context()))
-		http.Redirect(w, r, webLoginPath+"?error="+url.QueryEscape(h.publicMessage(err)), http.StatusFound)
+		http.Redirect(w, r, h.webURL("/login")+"?error="+url.QueryEscape(h.publicMessage(err)), http.StatusFound)
 		return
 	}
 
 	h.setCookie(w, res.Token)
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, h.cfg.WebBaseURL+"/", http.StatusFound)
 }
 
 // CallbackAPI 以 JSON 方式完成登录（供 SPA 使用）。
@@ -163,7 +163,7 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	h.clearCookie(w)
 
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
-		http.Redirect(w, r, webLoginPath, http.StatusFound)
+		http.Redirect(w, r, h.webURL("/login"), http.StatusFound)
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -183,27 +183,36 @@ func (h *Handler) tokenFromRequest(r *http.Request) string {
 }
 
 func (h *Handler) setCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     h.cfg.SessionCookie,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   h.cfg.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(h.cfg.SessionTTL.Seconds()),
-	})
+	http.SetCookie(w, h.newCookie(token, int(h.cfg.SessionTTL.Seconds())))
 }
 
 func (h *Handler) clearCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, h.newCookie("", -1))
+}
+
+// newCookie 按配置生成会话 Cookie，前后端跨站部署时需 SameSite=none + Secure。
+func (h *Handler) newCookie(value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
 		Name:     h.cfg.SessionCookie,
-		Value:    "",
+		Value:    value,
 		Path:     "/",
+		Domain:   h.cfg.CookieDomain,
 		HttpOnly: true,
 		Secure:   h.cfg.CookieSecure,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
+		SameSite: h.sameSite(),
+		MaxAge:   maxAge,
+	}
+}
+
+func (h *Handler) sameSite() http.SameSite {
+	switch h.cfg.CookieSameSite {
+	case "none":
+		return http.SameSiteNoneMode
+	case "strict":
+		return http.SameSiteStrictMode
+	default:
+		return http.SameSiteLaxMode
+	}
 }
 
 func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {

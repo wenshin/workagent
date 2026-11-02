@@ -1,11 +1,11 @@
 .env
 .env.local
+.env.*.local
+web/.env.production
 data/
 bin/
 web/node_modules/
 web/dist/
-# 前端产物由 make web 生成，不入库
-internal/app/dist/
 *.log
 .DS_Store
 .idea/
