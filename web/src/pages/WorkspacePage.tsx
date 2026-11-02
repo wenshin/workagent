@@ -136,7 +136,7 @@ export default function WorkspacePage() {
       <Layout className="app-body">
         <Layout.Sider className="app-sider" style={{ width: 280 }}>
           <div className="sider-head">
-            <span className="sider-title">空间</span>
+            <span className="sider-title">工作空间</span>
             <Button
               theme="borderless"
               size="small"
