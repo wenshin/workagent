@@ -3,7 +3,7 @@ package space
 import (
 	"sort"
 
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // BuildTree 把扁平列表组装成树序（父节点后紧跟其子节点），个人空间排最前。

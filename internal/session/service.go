@@ -8,8 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/autohome/auto-agent/internal/space"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 var (

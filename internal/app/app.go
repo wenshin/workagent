@@ -4,13 +4,13 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/autohome/auto-agent/internal/auth"
-	"github.com/autohome/auto-agent/internal/config"
-	"github.com/autohome/auto-agent/internal/platform"
-	"github.com/autohome/auto-agent/internal/session"
-	"github.com/autohome/auto-agent/internal/space"
-	"github.com/autohome/auto-agent/internal/storage"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/auth"
+	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/session"
+	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/storage"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // App 组装路由与服务。

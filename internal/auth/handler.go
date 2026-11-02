@@ -7,9 +7,9 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/autohome/auto-agent/internal/config"
-	"github.com/autohome/auto-agent/internal/platform"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // Handler 提供登录相关 HTTP 端点。

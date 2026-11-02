@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/store"
 	"github.com/jackc/pgx/v5"
 )
 

@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/autohome/auto-agent/internal/platform"
-	"github.com/autohome/auto-agent/internal/space"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // UserResolver 从请求中解析当前登录用户。

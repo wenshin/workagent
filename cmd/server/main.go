@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/autohome/auto-agent/internal/app"
-	"github.com/autohome/auto-agent/internal/config"
-	"github.com/autohome/auto-agent/internal/storage/localfs"
-	"github.com/autohome/auto-agent/internal/store/postgres"
+	"github.com/workagent/auto-agent/internal/app"
+	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/storage/localfs"
+	"github.com/workagent/auto-agent/internal/store/postgres"
 )
 
 func main() {

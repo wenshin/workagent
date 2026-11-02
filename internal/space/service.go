@@ -7,9 +7,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/autohome/auto-agent/internal/platform"
-	"github.com/autohome/auto-agent/internal/storage"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/storage"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 var (

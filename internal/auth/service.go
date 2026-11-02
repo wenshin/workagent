@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/autohome/auto-agent/internal/config"
-	"github.com/autohome/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 var (

@@ -1,4 +1,4 @@
-module github.com/autohome/auto-agent
+module github.com/workagent/auto-agent
 
 go 1.23
 
