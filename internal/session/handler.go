@@ -235,6 +235,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusNotFound, "not_found", "会话或空间不存在")
 	case errors.Is(err, space.ErrForbidden), errors.Is(err, ErrForbidden):
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", "没有该空间的权限")
+	case errors.Is(err, ErrLastSession):
+		platform.WriteError(w, r, http.StatusConflict, "last_session", err.Error())
 	case errors.Is(err, ErrTitleInvalid), errors.Is(err, ErrMessageEmpty), errors.Is(err, ErrMessageTooLong),
 		errors.Is(err, space.ErrNameInvalid):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())

@@ -17,6 +17,7 @@ var (
 	ErrTitleInvalid   = errors.New("会话标题需为 1-64 个字符")
 	ErrMessageEmpty   = errors.New("消息内容不能为空")
 	ErrMessageTooLong = errors.New("单条消息不能超过 8000 字")
+	ErrLastSession    = errors.New("每个空间至少要保留一个会话")
 )
 
 const (
@@ -106,6 +107,14 @@ func (s *Service) Delete(ctx context.Context, userID, sessionID string) error {
 	if !canWrite(sp.Perm) {
 		return ErrForbidden
 	}
+
+	// 空间至少要保留一个会话，否则进入空间后没有对话入口
+	if list, err := s.store.ListSessions(ctx, sess.SpaceID); err != nil {
+		return err
+	} else if len(list) <= 1 {
+		return ErrLastSession
+	}
+
 	if err := s.store.DeleteSession(ctx, sessionID); err != nil {
 		return err
 	}

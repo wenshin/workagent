@@ -55,6 +55,13 @@ export default function SpaceTree({
   const spaceById = useMemo(() => new Map(spaces.map((s) => [s.id, s])), [spaces]);
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
 
+  // 每个空间的会话数：只有一个时不允许删除
+  const sessionCount = useMemo(() => {
+    const counts = new Map<string, number>();
+    sessions.forEach((s) => counts.set(s.space_id, (counts.get(s.space_id) ?? 0) + 1));
+    return counts;
+  }, [sessions]);
+
   const treeData = useMemo<TreeNodeData[]>(() => {
     const nodes = new Map<string, TreeNodeData>();
     spaces.forEach((s) => {
@@ -120,6 +127,12 @@ export default function SpaceTree({
     setExpandedKeys((keys) => (keys.includes(sess.space_id) ? keys : [...keys, sess.space_id]));
   }, [value, sessionById]);
 
+  // 增删会话/目录后补上新增的父节点，并触发树重建：已展开的节点不会自动补上新增子节点
+  const treeSignature = `${spaces.length}-${sessions.length}`;
+  useEffect(() => {
+    setExpandedKeys((keys) => Array.from(new Set([...keys, ...parentKeys])));
+  }, [treeSignature]);
+
   const renderLabel = (_label?: ReactNode, treeNode?: SemiTreeNodeData) => {
     const node = treeNode as TreeNodeData | undefined;
     if (!node) return null;
@@ -130,7 +143,7 @@ export default function SpaceTree({
       return (
         <span className="space-row">
           <span className="space-row-name session-name">{sess?.title ?? String(node.label ?? '')}</span>
-          {sess && owner && canWrite(owner) ? (
+          {sess && owner && canWrite(owner) && (sessionCount.get(sess.space_id) ?? 0) > 1 ? (
             <span className="space-row-actions" onClick={(e) => e.stopPropagation()}>
               <Button
                 theme="borderless"
@@ -203,6 +216,7 @@ export default function SpaceTree({
 
   return (
     <Tree
+      key={treeSignature}
       className="space-tree"
       treeData={treeData}
       value={value}
