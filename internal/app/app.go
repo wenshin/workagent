@@ -1,18 +1,23 @@
 package app
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/auth"
 	"github.com/workagent/auto-agent/internal/config"
-	"github.com/workagent/auto-agent/internal/llm"
+	"github.com/workagent/auto-agent/internal/ctxmgr"
+	"github.com/workagent/auto-agent/internal/identity"
+	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/tool"
 )
 
 // App 组装路由与服务。
@@ -29,18 +34,47 @@ type App struct {
 
 // New 构造应用。
 func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logger) (*App, error) {
-	authHandler := auth.NewHandler(auth.NewService(st, cfg, log), cfg, log)
+	// 身份接入（§5.1.1）：按 IDENTITY_PROVIDER 选择实现，切换 IdP 不改业务代码
+	idp := identity.New(cfg, log)
+	if !idp.Ready() {
+		log.Warn("身份接入未就绪，登录功能不可用",
+			"provider", idp.Name(), "display", idp.DisplayName(), "missing", idp.Missing())
+	} else {
+		log.Info("身份接入已就绪", "provider", idp.Name(), "display", idp.DisplayName())
+	}
+	authHandler := auth.NewHandler(auth.NewService(st, cfg, idp, log), cfg, log)
 	spaceSvc := space.NewService(st, fs, log)
 
-	llmClient := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout)
-	agentSvc := agent.NewService(cfg, llmClient, st, log)
+	router := buildRouter(cfg, log)
+
+	// Tool 三层模型：内置能力 + MCP 远端工具，统一走 ToolInvoker 策略链
+	mcpManager := mcp.NewManager(st, log)
+	if err := mcpManager.Sync(context.Background()); err != nil {
+		log.Warn("MCP 工具同步失败，本次仅提供内置工具", "err", err)
+	}
+
+	if err := tool.RegisterCapabilities(context.Background(), st); err != nil {
+		log.Warn("内置能力注册失败", "err", err)
+	}
+
+	registry := tool.NewRegistry(st, mcpManager, log)
+	invoker := tool.NewInvoker(policy.RBACEngine{}, st, log)
+	agentSvc := agent.NewService(cfg, router, registry, invoker, log)
+
 	if !cfg.LLMReady() {
 		log.Warn("模型服务未配置，对话接口将不可用", "missing", cfg.MissingLLM())
 	} else {
-		log.Info("模型服务已就绪", "base_url", cfg.LLMBaseURL, "model", cfg.LLMModel)
+		log.Info("模型服务已就绪",
+			"provider", cfg.LLMProvider,
+			"model", cfg.LLMModel,
+			"routes", router.Describe(),
+			"embedding", router.EmbeddingReady())
 	}
 
-	sessionSvc := session.NewService(st, spaceSvc, agentSvc, log)
+	// 上下文管理：摘要压缩 + 向量检索（§5.7.2 / §5.7.4）
+	memory := ctxmgr.New(st, router, log, ctxmgr.DefaultBudget())
+
+	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, log)
 
 	return &App{
 		cfg:        cfg,

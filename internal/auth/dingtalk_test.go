@@ -1,37 +1,9 @@
 package auth
 
 import (
-	"net/url"
 	"testing"
 	"time"
 )
-
-func TestAuthorizeURL(t *testing.T) {
-	c := NewDingTalkClient("ding_test_id", "secret", "http://127.0.0.1:8000/auth/dingtalk/callback")
-
-	raw := c.AuthorizeURL("state-123")
-	u, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("授权地址无法解析: %v", err)
-	}
-	if u.Scheme != "https" || u.Host != "login.dingtalk.com" || u.Path != "/oauth2/auth" {
-		t.Fatalf("授权地址前缀不符: %s", raw)
-	}
-
-	q := u.Query()
-	cases := map[string]string{
-		"client_id":     "ding_test_id",
-		"response_type": "code",
-		"scope":         "openid",
-		"state":         "state-123",
-		"redirect_uri":  "http://127.0.0.1:8000/auth/dingtalk/callback",
-	}
-	for k, want := range cases {
-		if got := q.Get(k); got != want {
-			t.Errorf("参数 %s = %q, 期望 %q", k, got, want)
-		}
-	}
-}
 
 func TestStateStoreConsumeOnce(t *testing.T) {
 	s := newStateStore(time.Minute)

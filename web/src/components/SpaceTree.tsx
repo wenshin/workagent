@@ -1,19 +1,28 @@
-import { IconComment, IconDelete, IconEdit, IconFolder, IconPlus } from '@douyinfe/semi-icons';
+import {
+  IconComment,
+  IconDelete,
+  IconFolder,
+  IconFolderStroked,
+  IconMore,
+  IconPlus,
+} from '@douyinfe/semi-icons';
 import { Button, Dropdown, Tree } from '@douyinfe/semi-ui';
 import type { TreeNodeData as SemiTreeNodeData } from '@douyinfe/semi-ui/lib/es/tree/interface';
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
-import type { ChatSession, Space } from '../api/types';
+import type { ChatSession, Space, SpaceDir } from '../api/types';
 
 export const SESSION_KEY_PREFIX = 'session:';
+// 目录不是空间，单独用一套 key 前缀，选中时不做导航
+const DIR_KEY_PREFIX = 'dir:';
 
 interface TreeNodeData {
   key: string;
   label?: ReactNode;
   isLeaf?: boolean;
   icon?: ReactNode;
-  kind: 'space' | 'session';
+  kind: 'space' | 'session' | 'dir';
   refId: string;
   children?: TreeNodeData[];
 }
@@ -21,13 +30,17 @@ interface TreeNodeData {
 interface Props {
   spaces: Space[];
   sessions: ChatSession[];
+  dirs: SpaceDir[];
   value: string;
   onSelectSpace: (id: string) => void;
   onSelectSession: (id: string) => void;
-  onAddChild: (space: Space) => void;
+  onAddSubspace: (space: Space) => void;
+  onAddDir: (space: Space) => void;
   onAddSession: (space: Space) => void;
   onRename: (space: Space) => void;
   onDelete: (space: Space) => void;
+  onRenameDir: (space: Space, dir: SpaceDir) => void;
+  onDeleteDir: (space: Space, dir: SpaceDir) => void;
   onDeleteSession: (session: ChatSession) => void;
 }
 
@@ -40,20 +53,32 @@ function sessionTime(s: ChatSession) {
   return new Date(s.last_message_at ?? s.created_at).getTime() || 0;
 }
 
+function dirKey(spaceId: string, name: string) {
+  return `${DIR_KEY_PREFIX}${spaceId}/${name}`;
+}
+
 export default function SpaceTree({
   spaces,
   sessions,
+  dirs,
   value,
   onSelectSpace,
   onSelectSession,
-  onAddChild,
+  onAddSubspace,
+  onAddDir,
   onAddSession,
   onRename,
   onDelete,
+  onRenameDir,
+  onDeleteDir,
   onDeleteSession,
 }: Props) {
   const spaceById = useMemo(() => new Map(spaces.map((s) => [s.id, s])), [spaces]);
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
+  const dirByKey = useMemo(
+    () => new Map(dirs.map((d) => [dirKey(d.space_id, d.name), d])),
+    [dirs],
+  );
 
   // 每个空间的会话数：只有一个时不允许删除
   const sessionCount = useMemo(() => {
@@ -75,7 +100,7 @@ export default function SpaceTree({
       });
     });
 
-    // 会话排在目录之前，按最近活动时间从新到旧
+    // 会话挂在所属空间下，按最近活动时间从新到旧
     [...sessions]
       .sort((a, b) => sessionTime(b) - sessionTime(a))
       .forEach((sess) => {
@@ -91,24 +116,40 @@ export default function SpaceTree({
         });
       });
 
-    // 子空间挂在会话之后
+    // 子空间排在会话之后
     spaces.forEach((s) => {
       if (!s.parent_id) return;
       nodes.get(s.parent_id)?.children?.push(nodes.get(s.id)!);
     });
 
+    // 目录排在最后：它是 fs 目录，不是空间
+    dirs.forEach((d) => {
+      const parent = nodes.get(d.space_id);
+      if (!parent) return;
+      parent.children?.push({
+        key: dirKey(d.space_id, d.name),
+        label: d.name,
+        kind: 'dir',
+        refId: `${d.space_id}/${d.name}`,
+        isLeaf: true,
+        // 空间用实心文件夹，目录用线框文件夹：一眼看出「目录不是空间」
+        icon: <IconFolderStroked className="dir-icon" />,
+      });
+    });
+
     return spaces.filter((s) => !s.parent_id).map((s) => nodes.get(s.id)!);
-  }, [spaces, sessions]);
+  }, [spaces, sessions, dirs]);
 
   const parentKeys = useMemo(() => {
     const keys: string[] = [];
     spaces.forEach((s) => {
       const hasChildSpace = spaces.some((c) => c.parent_id === s.id);
       const hasSession = sessions.some((c) => c.space_id === s.id);
-      if (hasChildSpace || hasSession) keys.push(s.id);
+      const hasDir = dirs.some((d) => d.space_id === s.id);
+      if (hasChildSpace || hasSession || hasDir) keys.push(s.id);
     });
     return keys;
-  }, [spaces, sessions]);
+  }, [spaces, sessions, dirs]);
 
   const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const initialized = useRef(false);
@@ -127,11 +168,11 @@ export default function SpaceTree({
     setExpandedKeys((keys) => (keys.includes(sess.space_id) ? keys : [...keys, sess.space_id]));
   }, [value, sessionById]);
 
-  // 增删会话/目录后补上新增的父节点，并触发树重建：已展开的节点不会自动补上新增子节点
-  const treeSignature = `${spaces.length}-${sessions.length}`;
+  // 增删会话/子空间/目录后补上新增的父节点，并触发树重建：已展开的节点不会自动补上新增子节点
+  const treeSignature = `${spaces.length}-${sessions.length}-${dirs.length}`;
   useEffect(() => {
     setExpandedKeys((keys) => Array.from(new Set([...keys, ...parentKeys])));
-  }, [treeSignature]);
+  }, [treeSignature, parentKeys]);
 
   const renderLabel = (_label?: ReactNode, treeNode?: SemiTreeNodeData) => {
     const node = treeNode as TreeNodeData | undefined;
@@ -159,6 +200,32 @@ export default function SpaceTree({
       );
     }
 
+    if (node.kind === 'dir') {
+      const dir = dirByKey.get(node.key);
+      const owner = dir ? spaceById.get(dir.space_id) : undefined;
+      return (
+        <span className="space-row">
+          <span className="space-row-name dir-name">{dir?.name ?? String(node.label ?? '')}</span>
+          {dir && owner && canWrite(owner) ? (
+            <span className="space-row-actions" onClick={(e) => e.stopPropagation()}>
+              <Dropdown
+                trigger="click"
+                position="bottomRight"
+                render={
+                  <Dropdown.Menu>
+                    <Dropdown.Item onClick={() => onRenameDir(owner, dir)}>重命名目录</Dropdown.Item>
+                    <Dropdown.Item onClick={() => onDeleteDir(owner, dir)}>删除目录</Dropdown.Item>
+                  </Dropdown.Menu>
+                }
+              >
+                <Button theme="borderless" size="small" icon={<IconMore />} aria-label="目录操作" />
+              </Dropdown>
+            </span>
+          ) : null}
+        </span>
+      );
+    }
+
     const space = spaceById.get(node.refId);
     if (!space) return <span>{String(node.label ?? '')}</span>;
 
@@ -172,7 +239,8 @@ export default function SpaceTree({
               position="bottomRight"
               render={
                 <Dropdown.Menu>
-                  <Dropdown.Item onClick={() => onAddChild(space)}>新建目录</Dropdown.Item>
+                  <Dropdown.Item onClick={() => onAddSubspace(space)}>新建子空间</Dropdown.Item>
+                  <Dropdown.Item onClick={() => onAddDir(space)}>新建目录</Dropdown.Item>
                   <Dropdown.Item onClick={() => onAddSession(space)}>新建会话</Dropdown.Item>
                 </Dropdown.Menu>
               }
@@ -181,23 +249,18 @@ export default function SpaceTree({
             </Dropdown>
           ) : null}
           {space.perm === 'manage' && !space.locked ? (
-            <Fragment>
-              <Button
-                theme="borderless"
-                size="small"
-                icon={<IconEdit />}
-                aria-label="重命名"
-                onClick={() => onRename(space)}
-              />
-              <Button
-                theme="borderless"
-                size="small"
-                type="danger"
-                icon={<IconDelete />}
-                aria-label="删除"
-                onClick={() => onDelete(space)}
-              />
-            </Fragment>
+            <Dropdown
+              trigger="click"
+              position="bottomRight"
+              render={
+                <Dropdown.Menu>
+                  <Dropdown.Item onClick={() => onRename(space)}>重命名空间</Dropdown.Item>
+                  <Dropdown.Item onClick={() => onDelete(space)}>删除空间</Dropdown.Item>
+                </Dropdown.Menu>
+              }
+            >
+              <Button theme="borderless" size="small" icon={<IconMore />} aria-label="空间操作" />
+            </Dropdown>
           ) : null}
         </span>
       </span>
@@ -211,6 +274,8 @@ export default function SpaceTree({
       onSelectSession(key.slice(SESSION_KEY_PREFIX.length));
       return;
     }
+    // 目录只是文件目录，没有可进入的页面
+    if (key.startsWith(DIR_KEY_PREFIX)) return;
     onSelectSpace(key);
   };
 

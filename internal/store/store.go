@@ -9,24 +9,41 @@ import (
 // ErrNotFound 表示记录不存在。
 var ErrNotFound = errors.New("not found")
 
-// User 是平台用户，与钉钉账号一一对应（以 union_id 为唯一键）。
+// User 是平台用户，身份唯一键是 (Provider, ProviderUID)（§5.1.1）。
 type User struct {
-	ID              string
-	DingTalkUnionID string
-	Name            string
-	Avatar          string
-	Mobile          string
-	Status          string
-	CreatedAt       time.Time
+	ID          string
+	Provider    string // dingtalk | wecom | feishu
+	ProviderUID string
+	Name        string
+	Avatar      string
+	Mobile      string
+	Email       string
+	JobNumber   string
+	CorpName    string
+	// ProfileWarning 是最近一次通讯录同步失败的用户可读原因，成功时为 NULL。
+	ProfileWarning string
+	Status         string
+	CreatedAt      time.Time
 }
 
-// DingTalkProfile 是钉钉返回的用户资料。
-type DingTalkProfile struct {
-	UnionID string
-	OpenID  string
-	Name    string
-	Avatar  string
-	Mobile  string
+// IdentityProfile 是身份接入层（internal/identity）产出的统一用户资料。
+// 同一 (Provider, ProviderUID) 对应同一个 User；通讯录字段只在有值时覆盖。
+type IdentityProfile struct {
+	Provider    string
+	ProviderUID string
+	UnionID     string
+	OpenID      string
+	EmployeeID  string
+	Name        string
+	Avatar      string
+	Mobile      string
+	Email       string
+	JobNumber   string
+	Title       string
+	CorpName    string
+	// ContactError 是通讯录同步失败原因；为空表示本次同步成功（会清空历史记录）。
+	ContactError string
+	Raw          []byte // 通讯录原始返回，落 user_identity.raw
 }
 
 // Space 是空间（个人空间 / 共享空间），parent_id 为空表示根空间。
@@ -81,6 +98,105 @@ type Message struct {
 	CreatedAt time.Time
 }
 
+// Capability 是平台能力接口（技术方案 §5.6.1），只描述语义与 IO Schema。
+type Capability struct {
+	Name        string
+	Description string
+	InputSchema []byte
+	RiskLevel   int // 1 只读无副作用 / 2 只读有成本 / 3 写 / 4 高敏感
+	Idempotent  bool
+	SideEffects string
+}
+
+// ToolRecord 是能力的实现（§5.6.1 第二层）。
+type ToolRecord struct {
+	Name        string
+	Capability  string
+	Runtime     string // builtin | mcp
+	RiskLevel   int
+	MCPServerID string
+}
+
+// ToolBinding 把工具约束在空间/用户上，并携带约束（§5.6.1 第三层）。
+type ToolBinding struct {
+	ID          string
+	ToolName    string
+	Runtime     string
+	MCPServerID string
+	SpaceID     string
+	UserID      string
+	Constraints []byte
+	RiskLevel   int
+}
+
+// MCPServer 是注册的 MCP Server（§5.3.1）。
+type MCPServer struct {
+	ID         string
+	Name       string
+	Transport  string
+	Endpoint   string
+	AuthHeader string
+	SecretRef  string
+	Visibility string
+	Health     string
+	ToolsCache []byte
+	LastSyncAt *time.Time
+}
+
+// AuditEntry 是一条审计记录（§8.2）。
+type AuditEntry struct {
+	Actor   string
+	Action  string
+	Object  string
+	Result  string
+	Detail  []byte
+	TraceID string
+}
+
+// RunStatus 是一次执行的结局（§5.7.5）。
+const (
+	RunRunning         = "running"
+	RunWaitingApproval = "waiting_approval"
+	RunSucceeded       = "succeeded"
+	RunFailed          = "failed"
+	RunCancelled       = "cancelled"
+)
+
+// Run 是一次执行（§6 run），round 内所有模型与工具调用都归属它。
+type Run struct {
+	ID        string
+	SessionID string
+	Status    string
+	Budget    []byte
+	Usage     []byte
+	Provider  string
+	Model     string
+	Error     string
+	StartedAt time.Time
+	EndedAt   *time.Time
+}
+
+// RunStep 是一条 checkpoint（§6 run_step / §5.7.5）。
+type RunStep struct {
+	ID        string
+	RunID     string
+	Seq       int
+	Type      string
+	Payload   []byte
+	CreatedAt time.Time
+}
+
+// ToolCallRecord 是一次工具调用记录（§6 tool_call）。
+type ToolCallRecord struct {
+	SessionID string
+	RunID     string
+	ToolName  string
+	Args      []byte
+	Status    string
+	LatencyMS int
+	RiskLevel int
+}
+
 // AuthSession 是登录会话（注意：与聊天会话 session 表不是一回事）。
 type AuthSession struct {
 	TokenHash string
@@ -92,7 +208,7 @@ type AuthSession struct {
 type Store interface {
 	Ping(ctx context.Context) error
 
-	UpsertUser(ctx context.Context, p DingTalkProfile) (User, error)
+	UpsertUserByIdentity(ctx context.Context, p IdentityProfile) (User, error)
 	GetUser(ctx context.Context, id string) (User, error)
 
 	CreateAuthSession(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error
@@ -128,4 +244,56 @@ type Store interface {
 	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte) (Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	CountMessages(ctx context.Context, sessionID string) (int, error)
+
+	// ---- Tool 三层模型（§5.6.1）----
+	UpsertCapability(ctx context.Context, c Capability) error
+	UpsertTool(ctx context.Context, t ToolRecord) error
+	// ListToolBindings 返回空间维度与用户维度的有效绑定。
+	ListToolBindings(ctx context.Context, spaceID, userID string) ([]ToolBinding, error)
+	UpsertToolBinding(ctx context.Context, b ToolBinding) (ToolBinding, error)
+
+	// ---- MCP（§5.3.1 / §5.4）----
+	ListMCPServers(ctx context.Context) ([]MCPServer, error)
+	UpsertMCPServer(ctx context.Context, s MCPServer) (MCPServer, error)
+	UpdateMCPToolsCache(ctx context.Context, id string, cache []byte) error
+
+	// ---- 审计与调用记录（§8.2 / §6）----
+	AppendAuditLog(ctx context.Context, e AuditEntry) error
+	RecordToolCall(ctx context.Context, r ToolCallRecord) error
+
+	// ---- Run 与 checkpoint（§5.7.5 / §6）----
+	// CreateRun 开启一次执行，初始状态为 running。
+	CreateRun(ctx context.Context, r Run) (Run, error)
+	// AppendRunStep 追加一条 checkpoint，seq 由调用方保证递增。
+	AppendRunStep(ctx context.Context, s RunStep) (RunStep, error)
+	// FinishRun 落最终状态、用量与错误信息。
+	FinishRun(ctx context.Context, r Run) error
+	// ListRunSteps 按 seq 返回一次执行的全部 checkpoint，供恢复时重放。
+	ListRunSteps(ctx context.Context, runID string) ([]RunStep, error)
+
+	// ---- 上下文与记忆（§5.7.2 / §5.7.4）----
+	GetSessionSummary(ctx context.Context, sessionID string) (SessionSummary, bool, error)
+	SaveSessionSummary(ctx context.Context, s SessionSummary) error
+	SaveMessageEmbedding(ctx context.Context, r EmbeddingRecord) error
+	ListMessageEmbeddings(ctx context.Context, sessionID string, limit int) ([]EmbeddingRecord, error)
+}
+
+// SessionSummary 是一段历史消息的滚动摘要。
+type SessionSummary struct {
+	SessionID     string
+	UptoMessageID string
+	Content       string
+	MessageCount  int
+	Model         string
+	UpdatedAt     time.Time
+}
+
+// EmbeddingRecord 是消息向量与其原文，用于按需检索。
+type EmbeddingRecord struct {
+	MessageID string
+	SessionID string
+	Model     string
+	Vector    []float32
+	Role      string
+	Content   string
 }

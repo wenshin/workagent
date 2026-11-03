@@ -33,6 +33,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /spaces/{id}", h.rename)
 	mux.HandleFunc("DELETE /spaces/{id}", h.remove)
 	mux.HandleFunc("GET /spaces/{id}/tree", h.tree)
+
+	// 目录是文件系统里的真实目录，与 space 表无关（MVP 方案 §4.2）
+	mux.HandleFunc("GET /spaces/dirs", h.listDirs)
+	mux.HandleFunc("POST /spaces/{id}/dirs", h.createDir)
+	mux.HandleFunc("PATCH /spaces/{id}/dirs/{name}", h.renameDir)
+	mux.HandleFunc("DELETE /spaces/{id}/dirs/{name}", h.deleteDir)
 }
 
 type spaceDTO struct {
@@ -193,6 +199,84 @@ func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"spaces": toDTOs(BuildTree(sub))})
 }
 
+type dirDTO struct {
+	SpaceID string `json:"space_id"`
+	Name    string `json:"name"`
+}
+
+func (h *Handler) listDirs(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	dirs, err := h.svc.ListDirs(r.Context(), user.ID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	out := make([]dirDTO, 0, len(dirs))
+	for _, d := range dirs {
+		out = append(out, dirDTO{SpaceID: d.SpaceID, Name: d.Name})
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"dirs": out})
+}
+
+func (h *Handler) createDir(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	dir, err := h.svc.CreateDir(r.Context(), user.ID, r.PathValue("id"), req.Name)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusCreated, map[string]any{"dir": dirDTO{SpaceID: dir.SpaceID, Name: dir.Name}})
+}
+
+func (h *Handler) renameDir(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	dir, err := h.svc.RenameDir(r.Context(), user.ID, r.PathValue("id"), r.PathValue("name"), req.Name)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"dir": dirDTO{SpaceID: dir.SpaceID, Name: dir.Name}})
+}
+
+func (h *Handler) deleteDir(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.DeleteDir(r.Context(), user.ID, r.PathValue("id"), r.PathValue("name")); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (h *Handler) current(w http.ResponseWriter, r *http.Request) (store.User, bool) {
 	user, err := h.resolve(r)
 	if err != nil {
@@ -210,6 +294,10 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, ErrReserved):
 		platform.WriteError(w, r, http.StatusConflict, "reserved_space", err.Error())
+	case errors.Is(err, ErrDirNotFound):
+		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, ErrDirExists):
+		platform.WriteError(w, r, http.StatusConflict, "dir_exists", err.Error())
 	case errors.Is(err, ErrNameInvalid), errors.Is(err, ErrConfirmMismatch), errors.Is(err, ErrDepthExceeded):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	default:

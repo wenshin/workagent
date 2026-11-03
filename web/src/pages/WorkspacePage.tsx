@@ -1,5 +1,5 @@
-import { IconPlus } from '@douyinfe/semi-icons';
-import { Avatar, Button, Layout, Modal, Spin, Toast } from '@douyinfe/semi-ui';
+import { IconAlertCircle, IconPlus } from '@douyinfe/semi-icons';
+import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
@@ -13,10 +13,11 @@ import {
   useMe,
   useMessages,
   useSessions,
+  useSpaceDirs,
   useSpaces,
 } from '../api/hooks';
 import { streamChat } from '../api/stream';
-import type { ChatSession, Space } from '../api/types';
+import type { ChatSession, Space, SpaceDir } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
@@ -26,6 +27,7 @@ export default function WorkspacePage() {
   const { data: me } = useMe();
   const { data: spaces = [], isLoading: spacesLoading } = useSpaces();
   const { data: sessions = [], isLoading: sessionsLoading } = useSessions();
+  const { data: dirs = [] } = useSpaceDirs();
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
@@ -165,6 +167,10 @@ export default function WorkspacePage() {
 
   const user = me?.user;
   const initial = user?.name?.trim().slice(0, 1) || '?';
+  // 工号/邮箱来自企业通讯录，权限缺失时为空
+  const userMeta = [user?.job_number ? `工号 ${user.job_number}` : '', user?.email ?? '']
+    .filter(Boolean)
+    .join(' · ');
   const treeValue = selectedSession ? SESSION_KEY_PREFIX + selectedSession.id : selectedSpaceId;
 
   return (
@@ -173,12 +179,20 @@ export default function WorkspacePage() {
         <div className="brand">
           <span className="brand-mark" />
           <span className="brand-name">WorkAgent</span>
+          {user?.corp_name ? <span className="header-corp">{user.corp_name}</span> : null}
         </div>
         <div className="header-right">
           <Avatar size="small" color="violet" src={user?.avatar || undefined}>
             {initial}
           </Avatar>
-          <span className="header-name">{user?.name}</span>
+          <span className="header-name" title={userMeta || undefined}>
+            {user?.name}
+          </span>
+          {user?.profile_warning ? (
+            <Tooltip content={user.profile_warning} position="bottomRight">
+              <IconAlertCircle className="header-warn" />
+            </Tooltip>
+          ) : null}
           <Button theme="borderless" size="small" onClick={logout}>
             退出
           </Button>
@@ -205,13 +219,17 @@ export default function WorkspacePage() {
             <SpaceTree
               spaces={spaces}
               sessions={sessions}
+              dirs={dirs}
               value={treeValue}
               onSelectSpace={openSpace}
               onSelectSession={openSession}
-              onAddChild={(space: Space) => setDialog({ kind: 'create-child', parent: space })}
+              onAddSubspace={(space: Space) => setDialog({ kind: 'create-subspace', parent: space })}
+              onAddDir={(space: Space) => setDialog({ kind: 'create-dir', parent: space })}
               onAddSession={(space: Space) => void addSession(space.id)}
               onRename={(space: Space) => setDialog({ kind: 'rename', target: space })}
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
+              onRenameDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'rename-dir', space, dir })}
+              onDeleteDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'delete-dir', space, dir })}
               onDeleteSession={setPendingDelete}
             />
           )}

@@ -2,20 +2,51 @@ import { ApiError, redirectToLogin } from './client';
 import type { ChatMessage, ChatSession, ToolCallRecord } from './types';
 
 export interface StreamHandlers {
+  onRunStarted?: (runId: string) => void;
   onReasoning?: (delta: string) => void;
   onText?: (delta: string) => void;
   onToolStart?: (tool: ToolCallRecord) => void;
   onToolResult?: (tool: ToolCallRecord) => void;
+  onApproval?: (request: { approvalId: string; callId: string; tool: string; timeoutS: number }) => void;
   onDone?: (payload: { message: ChatMessage; session: ChatSession }) => void;
   onError?: (message: string) => void;
 }
 
+/** 事件载荷字段与后端 §7.3 运行流一致 */
 interface StreamPayload {
-  delta?: string;
-  /** done 事件是消息对象，error 事件是错误文案 */
+  run_id?: string;
+  role?: string;
+  /** message.delta：正文增量 */
+  content?: string;
+  /** message.delta：思考过程增量 */
+  reasoning?: string;
+  call_id?: string;
+  tool?: string;
+  args?: string;
+  /** tool.result：结果摘要 */
+  summary?: string;
+  status?: string;
+  risk?: number;
+  duration_ms?: number;
+  approval_id?: string;
+  timeout_s?: number;
+  usage?: { in: number; out: number };
+  /** message.done 携带落库后的消息与会话 */
   message?: ChatMessage | string;
-  tool?: ToolCallRecord;
   session?: ChatSession;
+  /** run.finished 失败时的可读文案 */
+  error?: string;
+}
+
+function toToolRecord(payload: StreamPayload): ToolCallRecord {
+  return {
+    id: payload.call_id ?? '',
+    name: payload.tool ?? '',
+    args: payload.args ?? '',
+    result: payload.summary,
+    status: (payload.status as ToolCallRecord['status']) ?? 'running',
+    duration_ms: payload.duration_ms,
+  };
 }
 
 /**
@@ -79,21 +110,37 @@ export async function streamChat(
     }
 
     switch (event) {
-      case 'reasoning':
-        handlers.onReasoning?.(payload.delta ?? '');
+      case 'run.started':
+        handlers.onRunStarted?.(payload.run_id ?? '');
         break;
-      case 'text':
-        handlers.onText?.(payload.delta ?? '');
+      case 'message.delta':
+        // 思考过程与正文共用同一事件，用字段区分
+        if (payload.reasoning) handlers.onReasoning?.(payload.reasoning);
+        if (payload.content) handlers.onText?.(payload.content);
         break;
-      case 'tool_start':
-        if (payload.tool) handlers.onToolStart?.(payload.tool);
+      case 'tool.call':
+        handlers.onToolStart?.(toToolRecord(payload));
         break;
-      case 'tool_result':
-        if (payload.tool) handlers.onToolResult?.(payload.tool);
+      case 'tool.result':
+        handlers.onToolResult?.(toToolRecord(payload));
         break;
-      case 'done':
+      case 'approval.req':
+        handlers.onApproval?.({
+          approvalId: payload.approval_id ?? '',
+          callId: payload.call_id ?? '',
+          tool: payload.tool ?? '',
+          timeoutS: payload.timeout_s ?? 0,
+        });
+        break;
+      case 'message.done':
         if (typeof payload.message === 'object' && payload.message && payload.session) {
           handlers.onDone?.({ message: payload.message, session: payload.session });
+        }
+        break;
+      case 'run.finished':
+        // 失败以 run.finished 收尾，成功则由 message.done 更新界面
+        if (payload.status && payload.status !== 'succeeded') {
+          handlers.onError?.(payload.error || '生成失败，请重试');
         }
         break;
       case 'error':

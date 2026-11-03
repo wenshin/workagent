@@ -13,16 +13,19 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/config"
+	"github.com/workagent/auto-agent/internal/identity"
 	"github.com/workagent/auto-agent/internal/store"
 )
 
+// 身份相关错误直接复用 identity 包，保证 handler 能按 errors.Is 统一处理。
 var (
-	ErrNotConfigured  = errors.New("钉钉登录未配置")
-	ErrInvalidRequest = errors.New("缺少授权码或 state")
-	ErrInvalidState   = errors.New("登录 state 无效或已过期，请重新登录")
-	ErrNoIdentity     = errors.New("未能获取钉钉身份标识（unionId/openId 均为空）")
+	ErrNotConfigured   = identity.ErrNotConfigured
+	ErrNotImplemented  = identity.ErrNotImplemented
+	ErrInvalidRequest  = identity.ErrInvalidRequest
+	ErrNoIdentity      = identity.ErrNoIdentity
+	ErrInvalidState    = errors.New("登录 state 无效或已过期，请重新登录")
 	ErrUnauthenticated = errors.New("未登录或登录已过期")
-	ErrForbidden      = errors.New("账号已被禁用")
+	ErrForbidden       = errors.New("账号已被禁用")
 )
 
 // Result 是一次成功登录的结果。
@@ -36,41 +39,55 @@ type Result struct {
 
 // Service 负责登录编排：state 校验、换取 token、落库、建空间、发会话。
 type Service struct {
-	store  store.Store
-	client *DingTalkClient
-	cfg    *config.Config
-	log    *slog.Logger
-	states *stateStore
+	store    store.Store
+	provider identity.Provider
+	cfg      *config.Config
+	log      *slog.Logger
+	states   *stateStore
 }
 
-// NewService 构造登录服务。
-func NewService(st store.Store, cfg *config.Config, log *slog.Logger) *Service {
+// NewService 构造登录服务。IdP 由调用方按配置注入，切换 IdP 不改这里。
+func NewService(st store.Store, cfg *config.Config, idp identity.Provider, log *slog.Logger) *Service {
 	return &Service{
-		store:  st,
-		client: NewDingTalkClient(cfg.DingTalkClientID, cfg.DingTalkClientSecret, cfg.DingTalkRedirectURI),
-		cfg:    cfg,
-		log:    log,
-		states: newStateStore(10 * time.Minute),
+		store:    st,
+		provider: idp,
+		cfg:      cfg,
+		log:      log,
+		states:   newStateStore(10 * time.Minute),
 	}
+}
+
+// ProviderInfo 返回当前 IdP 信息，供启动日志与登录页展示。
+func (s *Service) ProviderInfo() (name, display string, ready bool, missing []string) {
+	missing = s.provider.Missing()
+	if missing == nil {
+		missing = []string{}
+	}
+	return s.provider.Name(), s.provider.DisplayName(), s.provider.Ready(), missing
+}
+
+// MissingConfig 返回当前 IdP 缺失的环境变量名。
+func (s *Service) MissingConfig() []string {
+	missing := s.provider.Missing()
+	if missing == nil {
+		return []string{}
+	}
+	return missing
 }
 
 // LoginURL 生成带 state 的授权地址。
+//
+// 未配置与未实现分别由 Provider 返回 ErrNotConfigured / ErrNotImplemented。
 func (s *Service) LoginURL() (string, error) {
-	if !s.cfg.DingTalkReady() {
-		return "", ErrNotConfigured
-	}
 	state, err := s.states.Issue()
 	if err != nil {
 		return "", err
 	}
-	return s.client.AuthorizeURL(state), nil
+	return s.provider.AuthorizeURL(state)
 }
 
 // CompleteLogin 用 code + state 完成登录。
 func (s *Service) CompleteLogin(ctx context.Context, code, state string) (*Result, error) {
-	if !s.cfg.DingTalkReady() {
-		return nil, ErrNotConfigured
-	}
 	if code == "" || state == "" {
 		return nil, ErrInvalidRequest
 	}
@@ -78,29 +95,33 @@ func (s *Service) CompleteLogin(ctx context.Context, code, state string) (*Resul
 		return nil, ErrInvalidState
 	}
 
-	tok, err := s.client.ExchangeCode(ctx, code)
+	cred, err := s.provider.Exchange(ctx, code)
 	if err != nil {
 		return nil, err
 	}
-	profile, err := s.client.UserProfile(ctx, tok.AccessToken)
+	profile, err := s.provider.Profile(ctx, cred)
 	if err != nil {
 		return nil, err
 	}
-
-	unionID := profile.UnionID
-	if unionID == "" {
-		unionID = profile.OpenID
-	}
-	if unionID == "" {
+	if profile.ProviderUID == "" {
 		return nil, ErrNoIdentity
 	}
 
-	user, err := s.store.UpsertUser(ctx, store.DingTalkProfile{
-		UnionID: unionID,
-		OpenID:  profile.OpenID,
-		Name:    profile.Nick,
-		Avatar:  profile.AvatarURL,
-		Mobile:  profile.Mobile,
+	user, err := s.store.UpsertUserByIdentity(ctx, store.IdentityProfile{
+		Provider:     profile.Provider,
+		ProviderUID:  profile.ProviderUID,
+		UnionID:      profile.UnionID,
+		OpenID:       profile.OpenID,
+		EmployeeID:   profile.EmployeeID,
+		Name:         profile.Name,
+		Avatar:       profile.Avatar,
+		Mobile:       profile.Mobile,
+		Email:        profile.Email,
+		JobNumber:    profile.JobNumber,
+		Title:        profile.Title,
+		CorpName:     profile.CorpName,
+		ContactError: profile.ContactError,
+		Raw:          profile.Raw,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("写入用户失败: %w", err)

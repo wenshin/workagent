@@ -18,6 +18,8 @@ import (
 type UserResolver func(r *http.Request) (store.User, error)
 
 // Handler 提供会话 HTTP 端点。
+// SSE 事件名统一在 agent 包定义，与方案 §7.3 一致；run 级事件由会话层补发。
+
 type Handler struct {
 	svc     *Service
 	resolve UserResolver
@@ -262,29 +264,51 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 
 	emit := func(ev agent.Event) error {
 		switch ev.Type {
-		case agent.EventReasoning, agent.EventText:
-			return writeSSE(w, flusher, ev.Type, map[string]string{"delta": ev.Delta})
-		case agent.EventToolStart, agent.EventToolResult:
-			return writeSSE(w, flusher, ev.Type, map[string]any{"tool": ev.Tool})
+		case agent.EventRunStarted:
+			return writeSSE(w, flusher, ev.Type, map[string]string{"run_id": ev.RunID})
+		case agent.EventMessageDelta:
+			// 思考过程与正文共用 message.delta，用字段区分，保持会话顺序不乱
+			if ev.Reasoning {
+				return writeSSE(w, flusher, ev.Type, map[string]string{"role": ev.Role, "reasoning": ev.Delta})
+			}
+			return writeSSE(w, flusher, ev.Type, map[string]string{"role": ev.Role, "content": ev.Delta})
+		case agent.EventToolCall, agent.EventToolResult:
+			return writeSSE(w, flusher, ev.Type, ev.Tool.Payload())
+		case agent.EventApprovalReq:
+			return writeSSE(w, flusher, ev.Type, ev.Approval)
 		default:
 			return nil
 		}
 	}
 
-	msg, sess, err := h.svc.Chat(r.Context(), user.ID, sessionID, req.Content, emit)
+	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, req.Content, emit)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// 客户端已断开，没有接收方，直接结束
 			return
 		}
-		h.log.Warn("对话失败", "session_id", sessionID, "err", err)
-		_ = writeSSE(w, flusher, agent.EventError, map[string]string{"message": userFacingAgentError(err)})
+		h.log.Warn("对话失败", "session_id", sessionID, "run_id", out.RunID, "err", err)
+		// 失败也以 run.finished 收尾，保证一次 run 的事件流始终有终点
+		payload := map[string]any{"status": "failed", "error": userFacingAgentError(err)}
+		if out.RunID != "" {
+			payload["run_id"] = out.RunID
+		}
+		_ = writeSSE(w, flusher, agent.EventRunFinished, payload)
 		return
 	}
 
-	_ = writeSSE(w, flusher, agent.EventDone, map[string]any{
-		"message": toMessageDTO(msg),
-		"session": toDTO(sess),
+	_ = writeSSE(w, flusher, agent.EventMessageDone, map[string]any{
+		"role": "assistant",
+		"usage": map[string]int{
+			"in":  out.Usage.InputTokens,
+			"out": out.Usage.OutputTokens,
+		},
+		"message": toMessageDTO(out.Message),
+		"session": toDTO(out.Session),
+	})
+	_ = writeSSE(w, flusher, agent.EventRunFinished, map[string]any{
+		"run_id": out.RunID,
+		"status": out.Status,
 	})
 }
 

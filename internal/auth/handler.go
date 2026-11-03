@@ -28,19 +28,34 @@ func NewHandler(svc *Service, cfg *config.Config, log *slog.Logger) *Handler {
 func (h *Handler) webURL(p string) string { return h.cfg.WebBaseURL + p }
 
 // Register 注册路由。
+//
+// 登录端点与 IdP 无关（§5.1.1），历史 /auth/dingtalk/* 保留为别名。
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /auth/login/url", h.AuthURL)
+	mux.HandleFunc("GET /auth/login", h.Login)
+	mux.HandleFunc("GET /auth/callback", h.CallbackRedirect)
+	mux.HandleFunc("POST /auth/callback", h.CallbackAPI)
+	mux.HandleFunc("GET /auth/provider", h.Provider)
+
 	mux.HandleFunc("GET /auth/dingtalk/url", h.AuthURL)
 	mux.HandleFunc("GET /auth/dingtalk/login", h.Login)
 	mux.HandleFunc("GET /auth/dingtalk/callback", h.CallbackRedirect)
 	mux.HandleFunc("POST /auth/dingtalk/callback", h.CallbackAPI)
+
 	mux.HandleFunc("GET /auth/me", h.Me)
 	mux.HandleFunc("POST /auth/logout", h.Logout)
 }
 
 type userDTO struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Avatar string `json:"avatar"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Avatar    string `json:"avatar"`
+	Email     string `json:"email"`
+	JobNumber string `json:"job_number"`
+	CorpName  string `json:"corp_name"`
+	// ProfileWarning 为通讯录同步失败原因，成功时为空
+	ProfileWarning string `json:"profile_warning"`
+	Provider       string `json:"provider"`
 }
 
 type spaceDTO struct {
@@ -55,7 +70,11 @@ type spaceDTO struct {
 }
 
 func toUserDTO(u store.User) userDTO {
-	return userDTO{ID: u.ID, Name: u.Name, Avatar: u.Avatar}
+	return userDTO{
+		ID: u.ID, Name: u.Name, Avatar: u.Avatar,
+		Email: u.Email, JobNumber: u.JobNumber, CorpName: u.CorpName,
+		ProfileWarning: u.ProfileWarning, Provider: u.Provider,
+	}
 }
 
 func toSpaceDTOs(list []store.Space) []spaceDTO {
@@ -79,7 +98,18 @@ func (h *Handler) AuthURL(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"url": u})
 }
 
-// Login 直接 302 到钉钉授权页。
+// Provider 返回当前 IdP 信息，登录页据此渲染按钮文案与缺失提示。
+func (h *Handler) Provider(w http.ResponseWriter, r *http.Request) {
+	name, display, ready, missing := h.svc.ProviderInfo()
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"provider":     name,
+		"display_name": display,
+		"ready":        ready,
+		"missing":      missing,
+	})
+}
+
+// Login 直接 302 到 IdP 授权页。
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	u, err := h.svc.LoginURL()
 	if err != nil {
@@ -95,7 +125,8 @@ func (h *Handler) CallbackRedirect(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	if msg := q.Get("error"); msg != "" {
-		http.Redirect(w, r, h.webURL("/login")+"?error="+url.QueryEscape("钉钉授权失败: "+msg), http.StatusFound)
+		_, display, _, _ := h.svc.ProviderInfo()
+		http.Redirect(w, r, h.webURL("/login")+"?error="+url.QueryEscape(display+"授权失败: "+msg), http.StatusFound)
 		return
 	}
 
@@ -205,10 +236,14 @@ func (h *Handler) newCookie(value string, maxAge int) *http.Cookie {
 
 func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, ErrNotImplemented):
+		_, display, _, _ := h.svc.ProviderInfo()
+		platform.WriteError(w, r, http.StatusNotImplemented, "not_implemented",
+			"身份接入方「"+display+"」尚未实现，当前仅支持 dingtalk")
 	case errors.Is(err, ErrNotConfigured):
-		missing := strings.Join(h.cfg.MissingDingTalk(), ", ")
+		missing := strings.Join(h.svc.MissingConfig(), ", ")
 		platform.WriteError(w, r, http.StatusServiceUnavailable, "not_configured",
-			"钉钉登录未配置，请设置环境变量: "+missing)
+			"登录未配置，请设置环境变量: "+missing)
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, ErrInvalidState):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, ErrNoIdentity), errors.Is(err, ErrForbidden):
@@ -221,8 +256,11 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 
 func (h *Handler) publicMessage(err error) string {
 	switch {
+	case errors.Is(err, ErrNotImplemented):
+		_, display, _, _ := h.svc.ProviderInfo()
+		return "身份接入方「" + display + "」尚未实现，请联系管理员改用已支持的登录方式"
 	case errors.Is(err, ErrNotConfigured):
-		return "钉钉登录未配置，请联系管理员补全 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET"
+		return "登录未配置，请联系管理员补全：" + strings.Join(h.svc.MissingConfig(), " / ")
 	case errors.Is(err, ErrInvalidState):
 		return "登录已超时，请重新点击「钉钉登录」"
 	case errors.Is(err, ErrNoIdentity):

@@ -46,6 +46,8 @@ function prettyJSON(raw: string) {
 function statusLabel(status: ToolCallRecord['status']) {
   if (status === 'running') return '执行中';
   if (status === 'ok') return '成功';
+  if (status === 'approval') return '待审批';
+  if (status === 'denied') return '已拒绝';
   return '失败';
 }
 

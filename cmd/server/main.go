@@ -25,9 +25,6 @@ func main() {
 		logger.Error("加载配置失败", "err", err)
 		os.Exit(1)
 	}
-	if !cfg.DingTalkReady() {
-		logger.Warn("钉钉凭证未配置，登录功能不可用", "missing", cfg.MissingDingTalk())
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

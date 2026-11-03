@@ -10,9 +10,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/agent"
+	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/tool"
 )
 
 var (
@@ -30,23 +33,21 @@ const (
 	maxMessageRunes = 8000
 	// 首条消息自动生成的标题长度（超出部分省略）
 	autoTitleRunes = 20
-
-	// 模型上下文上限：最近 20 条、合计 24000 字
-	maxHistoryMessages = 20
-	maxHistoryRunes    = 24000
 )
 
 // Service 承载聊天会话的业务规则。
 type Service struct {
-	store  store.Store
-	spaces *space.Service
-	agent  *agent.Service
-	log    *slog.Logger
+	store   store.Store
+	spaces  *space.Service
+	agent   *agent.Service
+	storage storage.Storage
+	memory  *ctxmgr.Manager
+	log     *slog.Logger
 }
 
 // NewService 构造会话服务。
-func NewService(st store.Store, spaces *space.Service, agents *agent.Service, log *slog.Logger) *Service {
-	return &Service{store: st, spaces: spaces, agent: agents, log: log}
+func NewService(st store.Store, spaces *space.Service, agents *agent.Service, fs storage.Storage, memory *ctxmgr.Manager, log *slog.Logger) *Service {
+	return &Service{store: st, spaces: spaces, agent: agents, storage: fs, memory: memory, log: log}
 }
 
 // AgentReady 返回模型服务是否可用。
@@ -160,28 +161,41 @@ func (s *Service) ValidateChat(ctx context.Context, userID, sessionID, content s
 	return sess, sp, nil
 }
 
-// Chat 执行一次完整对话：保存用户消息 → 调用 Agent（含工具循环）→ 保存助手消息。
+// ChatOutcome 是一轮对话的落库结果与运行统计，供 SSE 收尾事件使用。
+type ChatOutcome struct {
+	Message store.Message
+	Session store.Session
+	RunID   string
+	Usage   llm.Usage
+	Status  string
+}
+
+// Chat 执行一次完整对话：保存用户消息 → 建 run → 调用 Agent（含工具循环）→ 保存助手消息。
 //
-// 流式过程中产生的增量通过 emit 推给调用方；即使客户端中途断开，已生成的内容也会落库。
+// 每个执行步骤都写 run_step 做 checkpoint（§5.7.5）；流式增量通过 emit 推给调用方，
+// 即使客户端中途断开，已生成的内容与 checkpoint 也会落库。
 func (s *Service) Chat(
 	ctx context.Context,
 	userID, sessionID, content string,
 	emit func(agent.Event) error,
-) (store.Message, store.Session, error) {
-	sess, _, err := s.ValidateChat(ctx, userID, sessionID, content)
+) (ChatOutcome, error) {
+	out := ChatOutcome{}
+
+	sess, sp, err := s.ValidateChat(ctx, userID, sessionID, content)
 	if err != nil {
-		return store.Message{}, store.Session{}, err
+		return out, err
 	}
 	text := strings.TrimSpace(content)
 
 	// 先读历史，再写入本条用户消息，避免同一条消息重复进入上下文
 	history, err := s.store.ListMessages(ctx, sessionID)
 	if err != nil {
-		return store.Message{}, store.Session{}, err
+		return out, err
 	}
 
-	if _, err := s.store.CreateMessage(ctx, sessionID, "user", text); err != nil {
-		return store.Message{}, store.Session{}, err
+	userMsg, err := s.store.CreateMessage(ctx, sessionID, "user", text)
+	if err != nil {
+		return out, err
 	}
 	if err := s.store.TouchSession(ctx, sessionID); err != nil {
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
@@ -201,13 +215,75 @@ func (s *Service) Chat(
 
 	history = append(history, store.Message{Role: "user", Content: text})
 
+	// 上下文三段式组装：摘要 + 按需检索 + 滑动窗口（§5.7.2 / §5.7.4）
+	contextMessages, err := s.memory.Build(ctx, ctxmgr.Input{
+		SessionID: sessionID,
+		History:   history,
+		Query:     text,
+	})
+	if err != nil {
+		return out, err
+	}
+
+	// 一次 run 为根，预算与步骤都落库，进程重启后可据此恢复（§5.7.5）
+	budget, marshalErr := json.Marshal(s.agent.Budget())
+	if marshalErr != nil {
+		budget = []byte(`{}`)
+	}
+	run, err := s.store.CreateRun(ctx, store.Run{SessionID: sessionID, Budget: budget})
+	if err != nil {
+		return out, err
+	}
+	out.RunID = run.ID
+
+	// checkpoint 与事件推送共用一条链路，保证「推给前端的」与「落库的」一致
+	seq := 0
+	appendStep := func(typ string, payload any) {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		seq++
+		stepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		_, err = s.store.AppendRunStep(stepCtx, store.RunStep{
+			RunID: run.ID, Seq: seq, Type: typ, Payload: data,
+		})
+		cancel()
+		if err != nil {
+			s.log.Warn("写入 run checkpoint 失败", "run_id", run.ID, "seq", seq, "err", err)
+		}
+	}
+
+	// run.started 由会话层补发：此时 run 已落库，前端可以据此做断线重连与取消
+	_ = emit(agent.Event{Type: agent.EventRunStarted, RunID: run.ID})
+
+	emitEvent := func(ev agent.Event) error {
+		switch ev.Type {
+		case agent.EventToolCall, agent.EventToolResult:
+			appendStep(ev.Type, ev.Tool.Payload())
+		case agent.EventApprovalReq:
+			appendStep(ev.Type, ev.Approval)
+		}
+		return emit(ev)
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	res, runErr := s.agent.Run(runCtx, agent.RunInput{
-		Scope:   agent.Scope{UserID: userID, SpaceID: sess.SpaceID},
-		History: toLLMMessages(history),
-	}, emit)
+		Env: tool.Env{
+			UserID:    userID,
+			SpaceID:   sess.SpaceID,
+			SessionID: sessionID,
+			RunID:     run.ID,
+			SpacePerm: sp.Perm,
+			Store:     s.store,
+			Storage:   s.storage,
+			Log:       s.log,
+		},
+		History: contextMessages,
+		Query:   text,
+	}, emitEvent)
 
 	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来
 	saveCtx := ctx
@@ -215,11 +291,39 @@ func (s *Service) Chat(
 		saveCtx = context.WithoutCancel(ctx)
 	}
 
-	if res.Content == "" && len(res.Steps) == 0 {
-		if runErr != nil {
-			return store.Message{}, store.Session{}, runErr
+	status := store.RunSucceeded
+	switch {
+	case ctx.Err() != nil:
+		status = store.RunCancelled
+	case runErr != nil:
+		status = store.RunFailed
+	}
+
+	finish := func(errMsg string) {
+		usage, err := json.Marshal(map[string]int{
+			"in":  res.Usage.InputTokens,
+			"out": res.Usage.OutputTokens,
+		})
+		if err != nil {
+			usage = []byte(`{}`)
 		}
-		return store.Message{}, store.Session{}, errors.New("模型没有返回内容，请重试")
+		if err := s.store.FinishRun(saveCtx, store.Run{
+			ID: run.ID, Status: status, Usage: usage,
+			Provider: res.Provider, Model: res.Model, Error: errMsg,
+		}); err != nil {
+			s.log.Warn("更新 run 状态失败", "run_id", run.ID, "err", err)
+		}
+	}
+
+	if res.Content == "" && len(res.Steps) == 0 {
+		status = store.RunFailed
+		if runErr != nil {
+			finish(runErr.Error())
+			return out, runErr
+		}
+		err := errors.New("模型没有返回内容，请重试")
+		finish(err.Error())
+		return out, err
 	}
 
 	parts, marshalErr := json.Marshal(res.Steps)
@@ -229,8 +333,19 @@ func (s *Service) Chat(
 
 	msg, err := s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts)
 	if err != nil {
-		return store.Message{}, store.Session{}, err
+		status = store.RunFailed
+		finish(err.Error())
+		return out, err
 	}
+	appendStep("message", map[string]any{
+		"message_id":      msg.ID,
+		"chars":           utf8.RuneCountInString(res.Content),
+		"reasoning_chars": utf8.RuneCountInString(res.Reasoning),
+		"tools":           len(res.Steps),
+		"need_approval":   res.NeedApproval,
+	})
+	finish("")
+
 	if err := s.store.TouchSession(saveCtx, sessionID); err != nil {
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
 	}
@@ -240,11 +355,27 @@ func (s *Service) Chat(
 		sess = latest
 	}
 
+	// 向量索引异步执行，失败不影响本次对话
+	if s.memory.EmbeddingEnabled() {
+		go func() {
+			indexCtx, indexCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer indexCancel()
+			if err := s.memory.Index(indexCtx, sessionID, []store.Message{userMsg, msg}); err != nil {
+				s.log.Warn("写入消息向量失败", "session_id", sessionID, "err", err)
+			}
+		}()
+	}
+
 	s.log.Info("对话完成",
-		"session_id", sessionID, "space_id", sess.SpaceID, "by", userID,
+		"session_id", sessionID, "space_id", sess.SpaceID, "by", userID, "run_id", run.ID,
+		"status", status, "provider", res.Provider, "model", res.Model,
 		"chars", utf8.RuneCountInString(res.Content), "tools", len(res.Steps))
 
-	return msg, sess, runErr
+	out.Message = msg
+	out.Session = sess
+	out.Usage = res.Usage
+	out.Status = status
+	return out, runErr
 }
 
 // Messages 返回会话消息。
@@ -326,38 +457,6 @@ func normalizeMessage(raw string) (string, error) {
 		return "", ErrMessageTooLong
 	}
 	return text, nil
-}
-
-// toLLMMessages 把历史消息裁剪成模型上下文：只保留最近若干条，并限制总字数。
-func toLLMMessages(msgs []store.Message) []llm.Message {
-	if len(msgs) > maxHistoryMessages {
-		msgs = msgs[len(msgs)-maxHistoryMessages:]
-	}
-
-	// 从最近的消息往前累计，超过预算就丢弃更早的
-	picked := make([]llm.Message, 0, len(msgs))
-	total := 0
-	for i := len(msgs) - 1; i >= 0; i-- {
-		m := msgs[i]
-		if m.Role != "user" && m.Role != "assistant" {
-			continue
-		}
-		if strings.TrimSpace(m.Content) == "" {
-			continue
-		}
-		size := utf8.RuneCountInString(m.Content)
-		if total+size > maxHistoryRunes {
-			break
-		}
-		total += size
-		picked = append(picked, llm.Message{Role: m.Role, Content: m.Content})
-	}
-
-	// 反转回时间顺序
-	for i, j := 0, len(picked)-1; i < j; i, j = i+1, j-1 {
-		picked[i], picked[j] = picked[j], picked[i]
-	}
-	return picked
 }
 
 func normalizeTitle(raw string) (string, error) {

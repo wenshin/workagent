@@ -126,6 +126,25 @@ body[theme-mode='dark'] {
   color: var(--semi-color-text-1);
 }
 
+/* 企业名称：弱化显示在品牌名后 */
+.header-corp {
+  margin-left: 10px;
+  padding-left: 10px;
+  border-left: 1px solid var(--semi-color-border);
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 通讯录同步失败提示 */
+.header-warn {
+  color: var(--semi-color-warning);
+  cursor: help;
+}
+
 .app-body {
   height: calc(100% - 56px);
 }
@@ -265,6 +284,16 @@ body[theme-mode='dark'] {
 .session-name {
   font-size: 13px;
   color: var(--semi-color-text-1);
+}
+
+/* 目录是 fs 真实目录：线框图标 + 弱化文字，与实心文件夹的空间区分 */
+.dir-name {
+  font-size: 13px;
+  color: var(--semi-color-text-2);
+}
+
+.dir-icon {
+  color: var(--semi-color-text-2);
 }
 
 /* ---- 聊天框 ---- */

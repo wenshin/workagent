@@ -5,20 +5,35 @@ import type {
   AgentInfo,
   AppendMessageResponse,
   ChatSession,
+  DirsResponse,
   MeResponse,
   MessagesResponse,
+  ProviderResponse,
   SessionsResponse,
   Space,
+  SpaceDir,
   SpacesResponse,
 } from './types';
 
 export const queryKeys = {
   me: ['me'] as const,
+  provider: ['provider'] as const,
   spaces: ['spaces'] as const,
   sessions: ['sessions'] as const,
+  dirs: ['dirs'] as const,
   agent: ['agent'] as const,
   messages: (sessionId: string) => ['messages', sessionId] as const,
 };
+
+/** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
+export function useProviderInfo() {
+  return useQuery({
+    queryKey: queryKeys.provider,
+    queryFn: () => api<ProviderResponse>('/auth/provider'),
+    retry: false,
+    staleTime: 5 * 60_000,
+  });
+}
 
 /** 当前模型服务是否可用，用于对话页提示 */
 export function useAgentInfo() {
@@ -98,6 +113,50 @@ export function useDeleteSpace() {
       qc.invalidateQueries({ queryKey: queryKeys.spaces });
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
     },
+  });
+}
+
+/** 用户可见空间下的全部真实目录（左侧树一次取全） */
+export function useSpaceDirs() {
+  return useQuery({
+    queryKey: queryKeys.dirs,
+    queryFn: () => api<DirsResponse>('/spaces/dirs').then((r) => r.dirs),
+    staleTime: 15_000,
+  });
+}
+
+export function useCreateDir() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; name: string }) =>
+      api<{ dir: SpaceDir }>(`/spaces/${input.spaceId}/dirs`, {
+        method: 'POST',
+        body: { name: input.name },
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.dirs }),
+  });
+}
+
+export function useRenameDir() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; name: string; nextName: string }) =>
+      api<{ dir: SpaceDir }>(`/spaces/${input.spaceId}/dirs/${encodeURIComponent(input.name)}`, {
+        method: 'PATCH',
+        body: { name: input.nextName },
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.dirs }),
+  });
+}
+
+export function useDeleteDir() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; name: string }) =>
+      api<{ ok: boolean }>(`/spaces/${input.spaceId}/dirs/${encodeURIComponent(input.name)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.dirs }),
   });
 }
 

@@ -17,9 +17,13 @@ type Config struct {
 
 	DatabaseURL string
 
+	// 身份接入（§5.1.1 IdentityProvider）：dingtalk | wecom | feishu
+	IdentityProvider string
+
 	DingTalkClientID     string
 	DingTalkClientSecret string
 	DingTalkCorpID       string
+	DingTalkCorpName     string
 	DingTalkRedirectURI  string
 
 	SessionCookie string
@@ -28,12 +32,31 @@ type Config struct {
 
 	StorageRoot string
 
-	// LLM 走 OpenAI 兼容协议，DeepSeek / 通义兼容模式 / vLLM / Ollama 均可直接接入
+	// LLM 走 Provider 适配层（§5.7.1）：openai 兼容协议覆盖 vLLM / 国产模型，anthropic 走原生协议。
+	LLMProvider  string // openai | anthropic
 	LLMBaseURL   string
 	LLMAPIKey    string
 	LLMModel     string
 	LLMTimeout   time.Duration
+	LLMMaxTokens int
 	LLMMaxRounds int // 单轮对话内允许的最大工具调用轮次
+
+	// 失败降级（§5.7.3）：主模型 5xx / 超时后切备模型，协议族不同则不降级
+	LLMFallbackProvider string
+	LLMFallbackBaseURL  string
+	LLMFallbackAPIKey   string
+	LLMFallbackModel    string
+
+	// 上下文压缩与记忆（§5.7.2 / §5.7.4）
+	LLMSummaryModel string // 摘要用小模型，为空则复用主模型
+	LLMEmbedBaseURL string
+	LLMEmbedAPIKey  string
+	LLMEmbedModel   string
+
+	// 预算控制（§5.7.2 关键约束）
+	LLMMaxToolCalls int
+	LLMMaxParallel  int
+	LLMMaxWallClock time.Duration
 }
 
 // Load 读取 .env（存在时）并解析环境变量。
@@ -57,48 +80,75 @@ func Load() (*Config, error) {
 		}
 	}
 
+	maxToolCalls := 20
+	if v := getenv("LLM_MAX_TOOL_CALLS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxToolCalls); err != nil || maxToolCalls <= 0 {
+			return nil, fmt.Errorf("LLM_MAX_TOOL_CALLS 必须是正整数")
+		}
+	}
+
+	maxParallel := 4
+	if v := getenv("LLM_MAX_PARALLEL", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxParallel); err != nil || maxParallel <= 0 {
+			return nil, fmt.Errorf("LLM_MAX_PARALLEL 必须是正整数")
+		}
+	}
+
+	maxTokens := 4096
+	if v := getenv("LLM_MAX_TOKENS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxTokens); err != nil || maxTokens <= 0 {
+			return nil, fmt.Errorf("LLM_MAX_TOKENS 必须是正整数")
+		}
+	}
+
+	wallClock, err := time.ParseDuration(getenv("LLM_MAX_WALL_CLOCK", "10m"))
+	if err != nil {
+		return nil, fmt.Errorf("LLM_MAX_WALL_CLOCK 不是合法的时长: %w", err)
+	}
+
 	c := &Config{
 		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8000"),
 		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8000"), "/"),
 		WebBaseURL:           strings.TrimRight(getenv("WEB_BASE_URL", "http://127.0.0.1:5173"), "/"),
 		DatabaseURL:          getenv("DATABASE_URL", ""),
+		IdentityProvider:     getenv("IDENTITY_PROVIDER", "dingtalk"),
 		DingTalkClientID:     getenv("DINGTALK_CLIENT_ID", ""),
 		DingTalkClientSecret: getenv("DINGTALK_CLIENT_SECRET", ""),
 		DingTalkCorpID:       getenv("DINGTALK_CORP_ID", ""),
+		DingTalkCorpName:     getenv("DINGTALK_CORP_NAME", ""),
 		DingTalkRedirectURI:  getenv("DINGTALK_REDIRECT_URI", "http://127.0.0.1:8000/auth/dingtalk/callback"),
 		SessionCookie:        getenv("SESSION_COOKIE", "aa_session"),
 		SessionTTL:           ttl,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
 
+		LLMProvider:  getenv("LLM_PROVIDER", "openai"),
 		LLMBaseURL:   strings.TrimRight(getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"), "/"),
 		LLMAPIKey:    getenv("LLM_API_KEY", ""),
 		LLMModel:     getenv("LLM_MODEL", "deepseek-chat"),
 		LLMTimeout:   llmTimeout,
+		LLMMaxTokens: maxTokens,
 		LLMMaxRounds: maxRounds,
+
+		LLMFallbackProvider: getenv("LLM_FALLBACK_PROVIDER", ""),
+		LLMFallbackBaseURL:  strings.TrimRight(getenv("LLM_FALLBACK_BASE_URL", ""), "/"),
+		LLMFallbackAPIKey:   getenv("LLM_FALLBACK_API_KEY", ""),
+		LLMFallbackModel:    getenv("LLM_FALLBACK_MODEL", ""),
+
+		LLMSummaryModel: getenv("LLM_SUMMARY_MODEL", ""),
+		LLMEmbedBaseURL: strings.TrimRight(getenv("LLM_EMBED_BASE_URL", ""), "/"),
+		LLMEmbedAPIKey:  getenv("LLM_EMBED_API_KEY", ""),
+		LLMEmbedModel:   getenv("LLM_EMBED_MODEL", ""),
+
+		LLMMaxToolCalls: maxToolCalls,
+		LLMMaxParallel:  maxParallel,
+		LLMMaxWallClock: wallClock,
 	}
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL 未配置")
 	}
 	return c, nil
-}
-
-// DingTalkReady 判断钉钉凭证是否已配置齐全。
-func (c *Config) DingTalkReady() bool {
-	return c.DingTalkClientID != "" && c.DingTalkClientSecret != ""
-}
-
-// MissingDingTalk 返回缺失的钉钉配置项名称，用于启动告警与页面提示。
-func (c *Config) MissingDingTalk() []string {
-	var missing []string
-	if c.DingTalkClientID == "" {
-		missing = append(missing, "DINGTALK_CLIENT_ID")
-	}
-	if c.DingTalkClientSecret == "" {
-		missing = append(missing, "DINGTALK_CLIENT_SECRET")
-	}
-	return missing
 }
 
 // LLMReady 判断模型服务是否可用。

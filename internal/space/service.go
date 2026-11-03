@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -13,14 +15,21 @@ import (
 )
 
 var (
-	ErrNameInvalid     = errors.New("空间名称需为 1-64 个字符，且不能包含 / 或 \\")
+	ErrNameInvalid     = errors.New("名称需为 1-64 个字符，且不能包含 / 或 \\")
 	ErrForbidden       = errors.New("没有该空间的权限")
 	ErrReserved        = errors.New("系统预置空间不支持修改或删除")
-	ErrConfirmMismatch = errors.New("输入的空间名与当前空间不一致")
-	ErrDepthExceeded   = errors.New("空间最多支持 8 层")
+	ErrConfirmMismatch = errors.New("输入的名称与当前对象不一致")
+	ErrDepthExceeded   = errors.New("空间最多支持 3 层")
+	ErrDirExists       = errors.New("同名目录已存在")
+	ErrDirNotFound     = errors.New("目录不存在")
 )
 
-const maxDepth = 8
+const (
+	// maxDepth 与 MVP 方案 §4.1 一致：空间树最多 3 层
+	maxDepth = 3
+	// dirsRoot 是空间内用户文件区的目录名（§4.3 存储布局）
+	dirsRoot = "files"
+)
 
 // Service 承载空间业务规则：命名、层级、权限、存储目录。
 type Service struct {
@@ -100,7 +109,8 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (st
 		return store.Space{}, err
 	}
 
-	if err := s.storage.EnsureDir(ctx, s.storage.SpaceKey(sp.ID)); err != nil {
+	// 空间物理目录用 ID；用户目录建在 files/ 下（§4.3）
+	if err := s.storage.EnsureDir(ctx, s.filesKey(sp.ID)); err != nil {
 		// 目录可懒创建，不阻塞建空间
 		s.log.Warn("初始化空间目录失败", "space_id", sp.ID, "err", err)
 	}
@@ -180,6 +190,146 @@ func (s *Service) Delete(ctx context.Context, userID, spaceID, confirmName strin
 	return nil
 }
 
+// Dir 是空间内的一个真实文件目录（§4.2）：只存在于文件系统，不落 space 表，
+// 没有默认会话、不能单独分享，权限完全沿用所属空间。
+type Dir struct {
+	SpaceID string
+	Name    string
+}
+
+// filesKey 返回空间内用户文件区的 key，目录都建在它下面。
+func (s *Service) filesKey(spaceID string) string {
+	return path.Join(s.storage.SpaceKey(spaceID), dirsRoot)
+}
+
+// ListDirs 返回用户可见空间下的全部目录，一次取全供左侧树使用。
+func (s *Service) ListDirs(ctx context.Context, userID string) ([]Dir, error) {
+	spaces, err := s.store.ListSpaces(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Dir, 0, 8)
+	for _, sp := range spaces {
+		entries, err := s.storage.List(ctx, s.filesKey(sp.ID))
+		if err != nil {
+			// 空间还没建过目录时 files/ 不存在，属于正常空态
+			if errors.Is(err, storage.ErrNotFound) {
+				continue
+			}
+			s.log.Warn("读取空间目录失败", "space_id", sp.ID, "err", err)
+			continue
+		}
+
+		dirs := make([]Dir, 0, len(entries))
+		for _, e := range entries {
+			if !e.IsDir {
+				continue
+			}
+			dirs = append(dirs, Dir{SpaceID: sp.ID, Name: path.Base(e.Key)})
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name < dirs[j].Name })
+		out = append(out, dirs...)
+	}
+	return out, nil
+}
+
+// CreateDir 在空间的文件区建一个真实目录，名称即物理目录名（不是 hash）。
+func (s *Service) CreateDir(ctx context.Context, userID, spaceID, rawName string) (Dir, error) {
+	name, err := normalizeDirName(rawName)
+	if err != nil {
+		return Dir{}, err
+	}
+
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return Dir{}, err
+	}
+	if !canWrite(sp.Perm) {
+		return Dir{}, ErrForbidden
+	}
+
+	key := path.Join(s.filesKey(sp.ID), name)
+	if _, err := s.storage.Stat(ctx, key); err == nil {
+		return Dir{}, ErrDirExists
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return Dir{}, err
+	}
+
+	if err := s.storage.EnsureDir(ctx, key); err != nil {
+		return Dir{}, err
+	}
+	return Dir{SpaceID: sp.ID, Name: name}, nil
+}
+
+// RenameDir 重命名目录：目录名就是真实路径，所以这里是一次 fs 的 rename。
+func (s *Service) RenameDir(ctx context.Context, userID, spaceID, rawOld, rawNew string) (Dir, error) {
+	oldName, err := normalizeDirName(rawOld)
+	if err != nil {
+		return Dir{}, err
+	}
+	newName, err := normalizeDirName(rawNew)
+	if err != nil {
+		return Dir{}, err
+	}
+
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return Dir{}, err
+	}
+	if !canWrite(sp.Perm) {
+		return Dir{}, ErrForbidden
+	}
+	if oldName == newName {
+		return Dir{SpaceID: sp.ID, Name: newName}, nil
+	}
+
+	from := path.Join(s.filesKey(sp.ID), oldName)
+	if _, err := s.storage.Stat(ctx, from); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return Dir{}, ErrDirNotFound
+		}
+		return Dir{}, err
+	}
+
+	to := path.Join(s.filesKey(sp.ID), newName)
+	if _, err := s.storage.Stat(ctx, to); err == nil {
+		return Dir{}, ErrDirExists
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return Dir{}, err
+	}
+
+	if err := s.storage.Rename(ctx, from, to); err != nil {
+		return Dir{}, err
+	}
+	return Dir{SpaceID: sp.ID, Name: newName}, nil
+}
+
+// DeleteDir 删除目录及其内容；目录不进回收站（§4.2）。
+func (s *Service) DeleteDir(ctx context.Context, userID, spaceID, rawName string) error {
+	name, err := normalizeDirName(rawName)
+	if err != nil {
+		return err
+	}
+
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return err
+	}
+	if !canWrite(sp.Perm) {
+		return ErrForbidden
+	}
+
+	key := path.Join(s.filesKey(sp.ID), name)
+	if _, err := s.storage.Stat(ctx, key); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrDirNotFound
+		}
+		return err
+	}
+	return s.storage.Delete(ctx, key)
+}
+
 func normalizeName(raw string) (string, error) {
 	name := strings.TrimSpace(raw)
 	if name == "" {
@@ -194,11 +344,23 @@ func normalizeName(raw string) (string, error) {
 	return name, nil
 }
 
+// normalizeDirName 校验目录名：目录名即物理路径，额外禁止 . 与 ..。
+func normalizeDirName(raw string) (string, error) {
+	name, err := normalizeName(raw)
+	if err != nil {
+		return "", err
+	}
+	if name == "." || name == ".." {
+		return "", ErrNameInvalid
+	}
+	return name, nil
+}
+
 func canWrite(perm string) bool {
 	return perm == "write" || perm == "manage"
 }
 
-// isLocked 判断是否为系统预置空间（个人空间根、「会话」子空间）。
+// isLocked 判断是否为系统预置空间（个人空间根）。
 func isLocked(sp store.Space) bool {
 	return sp.IsSystemReserved || (sp.Type == "personal" && sp.ParentID == "")
 }

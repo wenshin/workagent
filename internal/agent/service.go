@@ -2,39 +2,55 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/llm"
-	"github.com/workagent/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/tool"
 )
 
-// 流式事件类型，与前端 SSE 事件名保持一致。
+// 流式事件类型，与方案 §7.3 的运行流示例逐字对齐。
 const (
-	EventReasoning    = "reasoning"
-	EventText         = "text"
-	EventToolStart    = "tool_start"
-	EventToolResult   = "tool_result"
-	EventDone         = "done"
-	EventError        = "error"
+	EventRunStarted   = "run.started"
+	EventMessageDelta = "message.delta"
+	EventToolCall     = "tool.call"
+	EventToolResult   = "tool.result"
+	EventApprovalReq  = "approval.req"
+	EventMessageDone  = "message.done"
+	EventRunFinished  = "run.finished"
 )
 
 // 单轮对话内的容量上限，避免模型输出把上下文撑爆。
 const (
-	maxToolArgBytes    = 8 * 1024
-	maxToolResultBytes = 8 * 1024
-	maxToolFeedBytes   = 4 * 1024
+	maxToolArgBytes  = 8 * 1024
+	maxToolFeedBytes = 4 * 1024
 )
 
-// Event 是 Agent 运行过程中推送给前端的增量。
+// Event 是 Agent 运行过程中推送给前端的增量（§7.3）。
 type Event struct {
-	Type  string
-	Delta string
-	Tool  *ToolState
+	Type string
+	// RunID 由会话层在 run.started 中填充
+	RunID string
+	// Role 是 message.delta 的角色，固定为 assistant
+	Role string
+	// Delta 是 message.delta 的文本；Reasoning 为 true 时表示思考过程
+	Delta     string
+	Reasoning bool
+	Tool      *ToolState
+	Approval  *ApprovalState
+}
+
+// ApprovalState 是一条审批请求（§5.7.5 / §7.3 approval.req）。
+type ApprovalState struct {
+	ID       string `json:"approval_id"`
+	CallID   string `json:"call_id"`
+	Tool     string `json:"tool"`
+	Reason   string `json:"reason,omitempty"`
+	TimeoutS int    `json:"timeout_s"`
 }
 
 // ToolState 是一次工具调用的完整状态。
@@ -44,7 +60,29 @@ type ToolState struct {
 	Args       string `json:"args"`
 	Result     string `json:"result,omitempty"`
 	Status     string `json:"status"`
+	Risk       int    `json:"risk,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
+}
+
+// Payload 返回 §7.3 的字段名，SSE 与 checkpoint 共用，避免两处命名漂移。
+func (t *ToolState) Payload() map[string]any {
+	if t == nil {
+		return map[string]any{}
+	}
+	payload := map[string]any{
+		"call_id": t.ID,
+		"tool":    t.Name,
+		"args":    t.Args,
+		"status":  t.Status,
+		"risk":    t.Risk,
+	}
+	if t.Result != "" {
+		payload["summary"] = t.Result
+	}
+	if t.DurationMS > 0 {
+		payload["duration_ms"] = t.DurationMS
+	}
+	return payload
 }
 
 // Step 是落库的一条执行轨迹，用于历史消息还原。
@@ -56,13 +94,20 @@ type Step struct {
 	Args       string `json:"args,omitempty"`
 	Result     string `json:"result,omitempty"`
 	Status     string `json:"status,omitempty"`
+	Risk       int    `json:"risk,omitempty"`
 	DurationMS int64  `json:"duration_ms,omitempty"`
 }
 
 // RunInput 是一次 Agent 运行的输入。
 type RunInput struct {
-	Scope   Scope
+	// Env 决定工具能看到的资源范围与权限
+	Env tool.Env
+	// History 是已组装好的上下文（含 system prompt 之外的历史消息）
 	History []llm.Message
+	// Query 是用户本轮输入，用于工具相关性裁剪
+	Query string
+	// Tools 非空时直接使用（测试用）；为空则按注册表加载
+	Tools []tool.Tool
 }
 
 // Result 是一次 Agent 运行的产出。
@@ -70,38 +115,63 @@ type Result struct {
 	Content   string
 	Reasoning string
 	Steps     []Step
+	// NeedApproval 表示本次执行中至少有一次工具调用被策略要求审批
+	NeedApproval bool
+	Provider     string
+	Model        string
+	Usage        llm.Usage
 }
 
-// Service 编排「模型 → 工具 → 模型」的循环。
+// Service 编排「模型 → 工具 → 模型」的循环（§5.7.2 主循环、§5.7.7 ToolInvoker）。
 type Service struct {
-	cfg   *config.Config
-	llm   *llm.Client
-	store store.Store
-	log   *slog.Logger
+	cfg      *config.Config
+	llm      *llm.Router
+	registry *tool.Registry
+	invoker  *tool.Invoker
+	log      *slog.Logger
 }
 
 // NewService 构造 Agent 服务。
-func NewService(cfg *config.Config, client *llm.Client, st store.Store, log *slog.Logger) *Service {
-	return &Service{cfg: cfg, llm: client, store: st, log: log}
+func NewService(cfg *config.Config, router *llm.Router, registry *tool.Registry, invoker *tool.Invoker, log *slog.Logger) *Service {
+	return &Service{cfg: cfg, llm: router, registry: registry, invoker: invoker, log: log}
 }
 
-// Ready 判断模型是否可用。
-func (s *Service) Ready() bool { return s.cfg.LLMReady() }
+// Ready 判断模型路由是否可用。
+func (s *Service) Ready() bool { return s.llm != nil && s.llm.Ready() }
 
-// Model 返回当前模型名，用于前端提示。
-func (s *Service) Model() string { return s.cfg.LLMModel }
+// Budget 返回本次执行的预算上限，写入 run.budget（§5.7.2 Token 预算、§6 run）。
+func (s *Service) Budget() map[string]any {
+	return map[string]any{
+		"max_rounds":       s.cfg.LLMMaxRounds,
+		"max_tool_calls":   s.cfg.LLMMaxToolCalls,
+		"max_wall_clock_s": int(s.cfg.LLMMaxWallClock.Seconds()),
+		"max_tokens":       s.cfg.LLMMaxTokens,
+	}
+}
+
+// Model 返回当前路由命中的模型名。
+func (s *Service) Model() string {
+	if s.llm == nil {
+		return ""
+	}
+	return s.llm.Model(llm.RouteChat)
+}
 
 // Run 执行一次带工具调用的对话，过程中通过 emit 推送增量事件。
 func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) (Result, error) {
 	if !s.Ready() {
-		return Result{}, fmt.Errorf("模型服务未配置：请在 .env 中设置 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL")
+		return Result{}, fmt.Errorf("模型服务未配置：请设置 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL")
 	}
 
-	tools := s.buildTools()
-	defs := make([]llm.Tool, 0, len(tools))
-	for _, t := range tools {
-		defs = append(defs, t.Definition())
+	tools := in.Tools
+	if len(tools) == 0 && s.registry != nil {
+		loaded, err := s.registry.Load(ctx, in.Env, in.Query)
+		if err != nil {
+			return Result{}, fmt.Errorf("加载工具失败：%w", err)
+		}
+		tools = loaded
 	}
+	defs := tool.Definitions(tools)
 
 	messages := make([]llm.Message, 0, len(in.History)+2)
 	messages = append(messages, systemMessage())
@@ -110,30 +180,45 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 	var res Result
 	var reasoning strings.Builder
 
+	deadline := time.Now().Add(s.cfg.LLMMaxWallClock)
+	toolCalls := 0
+
 	for round := 0; round < s.cfg.LLMMaxRounds; round++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
+		if time.Now().After(deadline) {
+			return res, fmt.Errorf("本轮对话超过时间预算（%s）", s.cfg.LLMMaxWallClock)
+		}
 
-		out, err := s.llm.Chat(ctx, llm.ChatRequest{Messages: messages, Tools: defs}, func(d llm.Delta) error {
+		out, provider, chatErr := s.llm.Chat(ctx, llm.RouteChat, llm.ChatRequest{Messages: messages, Tools: defs}, func(d llm.Delta) error {
 			if d.Reasoning != "" {
 				reasoning.WriteString(d.Reasoning)
-				return emit(Event{Type: EventReasoning, Delta: d.Reasoning})
+				return emit(Event{Type: EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Reasoning, Reasoning: true})
 			}
 			if d.Content != "" {
 				res.Content += d.Content
-				return emit(Event{Type: EventText, Delta: d.Content})
+				return emit(Event{Type: EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Content})
 			}
 			return nil
 		})
-		if err != nil {
-			return res, err
+		if chatErr != nil {
+			return res, chatErr
 		}
+		res.Provider = provider
+		res.Model = out.Model
+		res.Usage.InputTokens += out.Usage.InputTokens
+		res.Usage.OutputTokens += out.Usage.OutputTokens
 
 		if len(out.ToolCalls) == 0 {
 			res.Reasoning = reasoning.String()
 			return res, nil
 		}
+
+		if toolCalls+len(out.ToolCalls) > s.cfg.LLMMaxToolCalls {
+			return res, fmt.Errorf("工具调用次数超过上限（%d）", s.cfg.LLMMaxToolCalls)
+		}
+		toolCalls += len(out.ToolCalls)
 
 		messages = append(messages, llm.Message{
 			Role:      llm.RoleAssistant,
@@ -148,22 +233,62 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 				Args:   truncate(call.Function.Arguments, maxToolArgBytes),
 				Status: "running",
 			}
-			if err := emit(Event{Type: EventToolStart, Tool: state}); err != nil {
+			if t, ok := tool.Find(tools, call.Function.Name); ok {
+				state.Risk = t.Risk
+			}
+			if err := emit(Event{Type: EventToolCall, Tool: state}); err != nil {
 				return res, err
 			}
+		}
 
-			start := time.Now()
-			result, runErr := s.execTool(ctx, tools, call, in.Scope)
-			state.DurationMS = time.Since(start).Milliseconds()
-			state.Status = "ok"
-			if runErr != nil {
-				state.Status = "error"
-				result = runErr.Error()
+		// 同一轮的多个调用并行执行，但事件与消息拼接保持确定顺序
+		results := make([]tool.InvokeResult, len(out.ToolCalls))
+		sem := make(chan struct{}, maxParallel(s.cfg.LLMMaxParallel))
+		var wg sync.WaitGroup
+		for i, call := range out.ToolCalls {
+			wg.Add(1)
+			go func(i int, call llm.ToolCall) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				t, ok := tool.Find(tools, call.Function.Name)
+				if !ok {
+					results[i] = tool.InvokeResult{ToolName: call.Function.Name, Status: tool.StatusError,
+						Content: fmt.Sprintf("未知工具：%s", call.Function.Name)}
+					return
+				}
+				results[i] = s.invoker.Invoke(ctx, t, call, in.Env)
+			}(i, call)
+		}
+		wg.Wait()
+
+		for i, call := range out.ToolCalls {
+			r := results[i]
+			state := &ToolState{
+				ID:         call.ID,
+				Name:       call.Function.Name,
+				Args:       truncate(call.Function.Arguments, maxToolArgBytes),
+				Result:     truncate(r.Content, 8*1024),
+				Status:     r.Status,
+				Risk:       r.Risk,
+				DurationMS: r.LatencyMS,
 			}
-			state.Result = truncate(result, maxToolResultBytes)
-
 			if err := emit(Event{Type: EventToolResult, Tool: state}); err != nil {
 				return res, err
+			}
+			// 策略判定需要审批时额外推一条审批请求（§5.7.5），前端据此挂起并提示
+			if state.Status == tool.StatusApproval {
+				res.NeedApproval = true
+				if err := emit(Event{Type: EventApprovalReq, Approval: &ApprovalState{
+					ID:       approvalID(call.ID),
+					CallID:   call.ID,
+					Tool:     state.Name,
+					Reason:   r.Content,
+					TimeoutS: approvalTimeoutS,
+				}}); err != nil {
+					return res, err
+				}
 			}
 
 			res.Steps = append(res.Steps, Step{
@@ -173,42 +298,20 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 				Args:       state.Args,
 				Result:     state.Result,
 				Status:     state.Status,
+				Risk:       state.Risk,
 				DurationMS: state.DurationMS,
 			})
 
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				ToolCallID: call.ID,
-				Content:    truncate(result, maxToolFeedBytes),
+				Content:    truncate(r.Content, maxToolFeedBytes),
 			})
 		}
 	}
 
-	// 轮次用尽：把已有的正文与轨迹返回，前端会提示模型未收敛
 	res.Reasoning = reasoning.String()
 	return res, nil
-}
-
-func (s *Service) execTool(ctx context.Context, tools []Tool, call llm.ToolCall, scope Scope) (string, error) {
-	tool, ok := findTool(tools, call.Function.Name)
-	if !ok {
-		return "", fmt.Errorf("未知工具：%s", call.Function.Name)
-	}
-
-	args := json.RawMessage(call.Function.Arguments)
-	if len(args) == 0 {
-		args = json.RawMessage(`{}`)
-	}
-	if len(args) > maxToolArgBytes {
-		return "", fmt.Errorf("工具参数过大")
-	}
-
-	out, err := tool.Run(ctx, args, scope)
-	if err != nil {
-		s.log.Warn("工具执行失败", "tool", tool.Name, "err", err)
-		return "", err
-	}
-	return out, nil
 }
 
 func systemMessage() llm.Message {
@@ -216,10 +319,11 @@ func systemMessage() llm.Message {
 
 要求：
 - 用中文回答，简洁直接，先给结论再展开。
-- 可以使用工具查询当前时间、用户的空间列表和当前空间的会话列表；需要事实依据时先调用工具，不要凭空编造数据。
+- 需要事实依据时先调用工具（时间、空间列表、文件列表等），不要凭空编造。
+- 工具返回「需要审批」或「策略拒绝」时，如实告知用户原因，不要重试同一工具。
 - 不清楚的信息要明确说明，而不是猜测。
 - 代码用 Markdown 代码块输出，并标注语言。
-- 不执行任何写操作：当前版本的工具都是只读的。`
+- 当前版本工具均为只读，不要尝试写操作。`
 
 	return llm.Message{Role: llm.RoleSystem, Content: prompt}
 }
@@ -228,5 +332,22 @@ func truncate(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
-	return s[:limit] + "…（已截断）"
+	return strings.ToValidUTF8(s[:limit], "") + "…（已截断）"
+}
+
+func maxParallel(configured int) int {
+	if configured <= 0 {
+		return 4
+	}
+	return configured
+}
+
+// approvalTimeoutS 是审批请求的默认超时（§7.3 approval.req）。
+const approvalTimeoutS = 300
+
+func approvalID(callID string) string {
+	if callID == "" {
+		return "ap_unknown"
+	}
+	return "ap_" + callID
 }
