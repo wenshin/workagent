@@ -29,7 +29,7 @@ export default defineConfig({
     proxy: Object.fromEntries(
       ['/auth', '/spaces', '/sessions', '/healthz', '/agent'].map((prefix) => [
         prefix,
-        'http://127.0.0.1:8000',
+        'http://127.0.0.1:8321',
       ]),
     ),
   },

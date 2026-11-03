@@ -69,14 +69,15 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	}
 
 	decision, err := i.engine.Check(ctx, policy.Request{
-		Actor:     env.UserID,
-		Action:    "tool:invoke",
-		Tool:      t.Name,
-		Risk:      t.Risk,
-		SpaceID:   env.SpaceID,
-		SpacePerm: env.SpacePerm,
-		HasBind:   t.HasBinding,
-		Binding:   t.Constraints,
+		Actor:       env.UserID,
+		Action:      "tool:invoke",
+		Tool:        t.Name,
+		Risk:        t.Risk,
+		SpaceID:     env.SpaceID,
+		SpacePerm:   env.SpacePerm,
+		SideEffects: t.SideEffects,
+		HasBind:     t.HasBinding,
+		Binding:     t.Constraints,
 	})
 	if err != nil {
 		var denied *policy.ErrDenied

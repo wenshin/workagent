@@ -4,16 +4,20 @@ import (
 	"context"
 	"errors"
 
-	"github.com/workagent/auto-agent/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
-const sessionColumns = `id::text, space_id::text, title, title_auto, created_by::text,
-       last_message_at, status, created_at, updated_at`
+const sessionColumns = `id::text, space_id::text, coalesce(dir, ''), title, title_auto, coalesce(skill_path, ''),
+       created_by::text, last_message_at, status, created_at, updated_at`
+
+// sessionColumnsWithAlias 是带表别名的版本，列顺序必须与 scanSession 一致。
+const sessionColumnsWithAlias = `s.id::text, s.space_id::text, coalesce(s.dir, ''), s.title, s.title_auto, coalesce(s.skill_path, ''),
+       s.created_by::text, s.last_message_at, s.status, s.created_at, s.updated_at`
 
 func scanSession(row pgx.Row) (store.Session, error) {
 	var s store.Session
-	if err := row.Scan(&s.ID, &s.SpaceID, &s.Title, &s.TitleAuto, &s.CreatedBy,
+	if err := row.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
 		&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Session{}, store.ErrNotFound
@@ -23,14 +27,14 @@ func scanSession(row pgx.Row) (store.Session, error) {
 	return s, nil
 }
 
-// CreateSession 在指定空间下创建聊天会话。
-func (d *DB) CreateSession(ctx context.Context, spaceID, userID, title string) (store.Session, error) {
+// CreateSession 在指定空间（或空间内某个目录）下创建聊天会话。
+func (d *DB) CreateSession(ctx context.Context, spaceID, userID, title, dir string) (store.Session, error) {
 	const q = `
-insert into session (space_id, title, created_by)
-values ($1::uuid, $2, $3::uuid)
+insert into session (space_id, dir, title, created_by)
+values ($1::uuid, nullif($2, ''), $3, $4::uuid)
 returning ` + sessionColumns
 
-	return scanSession(d.pool.QueryRow(ctx, q, spaceID, title, userID))
+	return scanSession(d.pool.QueryRow(ctx, q, spaceID, dir, title, userID))
 }
 
 // ListSessions 返回空间下的会话，最近活动的在前。
@@ -53,8 +57,7 @@ order by coalesce(last_message_at, created_at) desc`
 // ListUserSessions 返回用户在可见空间下的全部会话。
 func (d *DB) ListUserSessions(ctx context.Context, userID string) ([]store.Session, error) {
 	const q = `
-select ` + "s.id::text, s.space_id::text, s.title, s.title_auto, s.created_by::text, " +
-		`s.last_message_at, s.status, s.created_at, s.updated_at` + `
+select ` + sessionColumnsWithAlias + `
 from session s
 join space sp on sp.id = s.space_id and sp.deleted_at is null
 join space_member m on m.space_id = sp.id and m.user_id = $1::uuid
@@ -74,7 +77,7 @@ func collectSessions(rows pgx.Rows) ([]store.Session, error) {
 	out := make([]store.Session, 0, 16)
 	for rows.Next() {
 		var s store.Session
-		if err := rows.Scan(&s.ID, &s.SpaceID, &s.Title, &s.TitleAuto, &s.CreatedBy,
+		if err := rows.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
 			&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -129,6 +132,38 @@ func (d *DB) TouchSession(ctx context.Context, id string) error {
 	_, err := d.pool.Exec(ctx, `
 update session set last_message_at = now(), updated_at = now()
 where id::text = $1`, id)
+	return err
+}
+
+// ClearSessionsDir 把目录（含子目录）下的会话移回空间根：目录被删后会话不跟着消失。
+func (d *DB) ClearSessionsDir(ctx context.Context, spaceID, dir string) error {
+	_, err := d.pool.Exec(ctx, `
+update session
+set dir = null, updated_at = now()
+where space_id = $1::uuid
+  and status = 'active'
+  and (dir = $2 or dir like $2 || '/%')`, spaceID, dir)
+	return err
+}
+
+// MoveSessionsDir 目录改名后同步会话的 dir 前缀。
+func (d *DB) MoveSessionsDir(ctx context.Context, spaceID, from, to string) error {
+	if from == to {
+		return nil
+	}
+	_, err := d.pool.Exec(ctx, `
+update session
+set dir = $3 || substr(dir, length($2) + 1), updated_at = now()
+where space_id = $1::uuid
+  and status = 'active'
+  and (dir = $2 or dir like $2 || '/%')`, spaceID, from, to)
+	return err
+}
+
+// UpdateSessionSkill 绑定会话技能；空串表示清除绑定。
+func (d *DB) UpdateSessionSkill(ctx context.Context, id, path string) error {
+	_, err := d.pool.Exec(ctx,
+		`update session set skill_path = $2, updated_at = now() where id = $1::uuid`, id, path)
 	return err
 }
 

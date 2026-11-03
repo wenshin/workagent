@@ -81,32 +81,63 @@ body[theme-mode='dark'] {
   color: var(--semi-color-text-2);
 }
 
-/* ---- 工作台骨架 ---- */
+/* ---- 工作台骨架：左右布局（左侧栏 + 右侧内容） ---- */
 .app-shell {
+  display: flex;
+  /* Semi 的 Layout 默认纵向排列，这里显式改为左右，否则侧边栏会跑到上方 */
+  flex-direction: row;
   height: 100%;
 }
 
-.app-header {
+.app-sider {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 56px;
-  padding: 0 20px;
+  flex-direction: column;
+  flex: 0 0 280px;
+  width: 280px;
+  padding: 0;
+  overflow: hidden;
   background: var(--semi-color-bg-1);
-  border-bottom: 1px solid var(--semi-color-border);
+  border-right: 1px solid var(--semi-color-border);
 }
 
-.brand {
+/* Semi 会在 Sider 内再包一层 children；它必须是 flex 容器，
+   否则内容溢出时整栏一起滚动，顶部 Logo 与底部用户区会被滚走 */
+.app-sider.semi-layout-sider {
+  height: 100%;
+  overflow: hidden;
+}
+
+.app-sider .semi-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 侧边栏顶部：Logo 与组织 */
+.sider-brand {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex: 0 0 56px;
+  height: 56px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--semi-color-border);
 }
 
-.app-header .brand-mark {
-  width: 22px;
-  height: 22px;
+.sider-brand .brand-mark {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
   margin: 0;
   border-radius: 7px;
+}
+
+.sider-brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .brand-name {
@@ -115,25 +146,10 @@ body[theme-mode='dark'] {
   letter-spacing: 0.2px;
 }
 
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.header-name {
-  font-size: 13px;
-  color: var(--semi-color-text-1);
-}
-
-/* 企业名称：弱化显示在品牌名后 */
-.header-corp {
-  margin-left: 10px;
-  padding-left: 10px;
-  border-left: 1px solid var(--semi-color-border);
+/* 企业名称：弱化显示在品牌名下方 */
+.sider-corp {
   font-size: 12px;
   color: var(--semi-color-text-2);
-  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -145,15 +161,45 @@ body[theme-mode='dark'] {
   cursor: help;
 }
 
-.app-body {
-  height: calc(100% - 56px);
+/* 侧边栏中部：树区域独立滚动 */
+.sider-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 8px;
 }
 
-.app-sider {
-  padding: 10px 8px;
-  overflow: auto;
-  background: var(--semi-color-bg-1);
-  border-right: 1px solid var(--semi-color-border);
+/* 侧边栏底部：用户与退出 */
+.sider-user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 10px 12px;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+.sider-user-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sider-user-name {
+  font-size: 13px;
+  color: var(--semi-color-text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sider-user-meta {
+  font-size: 11px;
+  color: var(--semi-color-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sider-head {
@@ -177,7 +223,9 @@ body[theme-mode='dark'] {
 }
 
 .app-content {
-  padding: 18px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
   overflow: auto;
   background: var(--semi-color-bg-0);
 }
@@ -218,14 +266,29 @@ body[theme-mode='dark'] {
   opacity: 1;
 }
 
+/* 目录与技能：技能只靠图标区分（不改文字颜色），内置目录用实心文件夹图标 */
+.space-tree .dir-icon {
+  color: var(--semi-color-text-2);
+}
+
+.space-tree .skill-icon {
+  color: var(--semi-color-success);
+}
+
+.space-tree .skill-name {
+  font-weight: 500;
+}
+
+.space-tree .dir-name {
+  color: var(--semi-color-text-1);
+}
+
 /* ---- 会话面板 ---- */
 .session-panel {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 56px - 36px);
+  height: 100%;
   background: var(--semi-color-bg-1);
-  border: 1px solid var(--semi-color-border);
-  border-radius: 12px;
   overflow: hidden;
 }
 
@@ -300,16 +363,124 @@ body[theme-mode='dark'] {
 .chat-panel {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 56px - 36px);
+  height: 100%;
   background: var(--semi-color-bg-1);
-  border: 1px solid var(--semi-color-border);
-  border-radius: 12px;
   overflow: hidden;
 }
 
 .chat-head {
   padding: 14px 20px;
   border-bottom: 1px solid var(--semi-color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chat-skill-btn.semi-button {
+  color: var(--semi-color-text-1);
+  border: 1px solid var(--semi-color-border);
+  border-radius: 999px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.chat-skill-btn.is-active.semi-button {
+  color: var(--semi-color-primary);
+  border-color: var(--semi-color-primary-light-active);
+  background: var(--semi-color-primary-light-default);
+}
+
+/* 技能选择浮层 */
+.skill-picker {
+  width: 280px;
+  max-height: 320px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.skill-picker-head {
+  padding: 4px 8px 6px;
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+}
+
+.skill-picker-empty {
+  padding: 12px 8px;
+  font-size: 12px;
+  color: var(--semi-color-text-3);
+}
+
+.skill-picker-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skill-picker-item:hover {
+  background: var(--semi-color-fill-0);
+}
+
+.skill-picker-item.is-active {
+  background: var(--semi-color-primary-light-default);
+}
+
+.skill-picker-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--semi-color-text-0);
+}
+
+.skill-picker-desc {
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-source {
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.skill-source-current {
+  color: var(--semi-color-success);
+  background: var(--semi-color-success-light-default);
+}
+
+.skill-source-system {
+  color: var(--semi-color-text-2);
+  background: var(--semi-color-fill-1);
+}
+
+.skill-picker-clear {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: none;
+  border-top: 1px solid var(--semi-color-border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--semi-color-text-2);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.skill-picker-clear:hover {
+  color: var(--semi-color-danger);
 }
 
 .chat-body {
@@ -513,9 +684,207 @@ body[theme-mode='dark'] {
   word-break: break-all;
 }
 
+/* 新建技能时的描述输入 */
+.dialog-desc-input {
+  margin-top: 10px;
+}
+
 .dialog-error {
   min-height: 18px;
   margin-top: 6px;
   font-size: 12px;
   color: var(--semi-color-danger);
+}
+
+/* ---- 树里的文件节点 ---- */
+.space-tree .file-icon {
+  color: var(--semi-color-text-2);
+}
+
+.space-tree .file-icon-md {
+  color: var(--semi-color-success);
+}
+
+.space-tree .file-icon-json {
+  color: var(--semi-color-warning);
+}
+
+.space-tree .file-name {
+  color: var(--semi-color-text-2);
+}
+
+/* ---- 文件内容面板 ---- */
+.file-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--semi-color-bg-1);
+}
+
+.file-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 0 0 auto;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--semi-color-border);
+}
+
+.file-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.file-panel-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.file-panel-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+}
+
+.file-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 24px;
+}
+
+.file-pre {
+  margin: 0;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--semi-color-text-1);
+}
+
+/* ---- 轻量 Markdown 渲染 ---- */
+.md-body {
+  font-size: 14px;
+  line-height: 1.75;
+  color: var(--semi-color-text-1);
+}
+
+.md-body h2,
+.md-body h3,
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  margin: 20px 0 10px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.md-body h2 {
+  font-size: 20px;
+}
+
+.md-body h3 {
+  font-size: 17px;
+}
+
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  font-size: 15px;
+}
+
+.md-body p {
+  margin: 0 0 12px;
+}
+
+.md-body ul,
+.md-body ol {
+  margin: 0 0 12px;
+  padding-left: 22px;
+}
+
+.md-body li {
+  margin: 4px 0;
+}
+
+.md-body a {
+  color: var(--semi-color-primary);
+}
+
+.md-body code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--semi-color-fill-0);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.md-body .md-code {
+  position: relative;
+  margin: 0 0 14px;
+  padding: 14px 16px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--semi-color-fill-0);
+}
+
+.md-body .md-code code {
+  padding: 0;
+  background: none;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.md-code-lang {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+.md-body blockquote {
+  margin: 0 0 12px;
+  padding: 8px 14px;
+  border-left: 3px solid var(--semi-color-primary);
+  border-radius: 0 6px 6px 0;
+  background: var(--semi-color-fill-0);
+  color: var(--semi-color-text-2);
+}
+
+.md-body hr {
+  margin: 18px 0;
+  border: none;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+.md-table-wrap {
+  margin: 0 0 14px;
+  overflow: auto;
+}
+
+.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.md-table th,
+.md-table td {
+  padding: 6px 10px;
+  border: 1px solid var(--semi-color-border);
+  text-align: left;
+}
+
+.md-table th {
+  background: var(--semi-color-fill-0);
+  font-weight: 600;
 }

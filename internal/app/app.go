@@ -42,8 +42,11 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	} else {
 		log.Info("身份接入已就绪", "provider", idp.Name(), "display", idp.DisplayName())
 	}
-	authHandler := auth.NewHandler(auth.NewService(st, cfg, idp, log), cfg, log)
-	spaceSvc := space.NewService(st, fs, log)
+	spaceSvc := space.NewService(st, fs, log, cfg.AdminJobs)
+	// 管理员可能尚未登录过：启动时按配置工号尽量把系统空间准备好
+	spaceSvc.BootstrapSystemSpace(context.Background())
+
+	authHandler := auth.NewHandler(auth.NewService(st, cfg, idp, spaceSvc, log), cfg, log)
 
 	router := buildRouter(cfg, log)
 

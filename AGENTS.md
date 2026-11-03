@@ -14,7 +14,7 @@
 
 1. 开发新功能前，先读技术方案中对应章节，按其中的分层、领域模型与接口约定实现。
 2. 需要偏离技术方案时，**先改文档并说明原因，再改代码**，不允许代码先行、文档长期滞后。
-3. 阶段性简化（如首版工具只读、单 Agent 不做编排）要在提交信息里注明与方案的差距及后续补齐计划。
+3. 阶段性简化（如首版只支持内置工具、单 Agent 不做编排）要在提交信息里注明与方案的差距及后续补齐计划。
 
 # 架构
 1. Agent Frontend Clients
@@ -64,9 +64,36 @@
 
 ```bash
 make pg-up   # 起 Postgres（docker）
-make run     # 后端 :8000，启动时自动执行迁移
+make run     # 后端 :8321，启动时自动执行迁移
 make web     # 前端 :5173
 ```
+
+# 系统空间（system）
+
+平台内置一个全局唯一的「系统空间」，**只有系统管理员可见、可编辑**：
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `ADMIN_JOB_NUMBERS` | 系统管理员工号，逗号分隔；MVP 用配置指定，后续接组织架构改角色表 | `16390,16391` |
+
+- 服务启动时按工号查 `app_user` 初始化（管理员未登录过则跳过，首次登录时创建），重复执行幂等。
+- 系统空间是 `space` 表中的一条 `type='system'` 记录（`is_system_reserved=true`），不可改名、不可删除，成员固定 `manage`。
+- 固定内容：一个默认会话 + 三个**内置目录**，目录本身不可改名/删除，内容可编辑：
+  - `files/skills`：全局技能，每个技能含 `.meta.json` + `SKILL.md`
+  - `files/tools`：内置工具定义，与 `tool.BuiltinManifests()` 同步，一个工具一个 JSON
+  - `files/mcps`：MCP 服务快照，`README.md` + 每个已注册服务一个 JSON
+- 这三个目录是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `global_source_list` 列条目、`global_source_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
+- `skills/` 与 `tools/` 是平台托管内容，随代码版本覆盖（否则升级后文档与运行时工具对不上）；`mcps/` 只在缺失时写入。要定制请复制成自定义技能。
+
+# 能力索引与会话技能
+
+- 每个空间文件根下有一个隐藏索引 `files/.meta.json`，汇总该空间的 skills / tools / mcps（名称、描述、相对路径）。写操作（建/改/删技能目录、写文件、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
+- Agent 的能力源 = **当前空间 + 系统空间**，同名（Name）以当前空间为准；系统空间未初始化时自动降级为只用当前空间。
+- 三处消费：
+  1. `global_source_list` / `global_source_read`：按需检索与读取，读取时先当前空间、再系统空间。
+  2. 系统提示词：每轮注入技能索引（名称 + 描述 + 路径，最多 30 条），正文由模型按需 `global_source_read`。
+  3. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。
+- 技能路径统一为相对 `files/` 的 `SKILL.md` 路径：普通空间是 `<技能名>/SKILL.md`，系统空间是 `skills/<技能名>/SKILL.md`。
 
 # 身份接入（登录）
 
@@ -78,7 +105,7 @@ make web     # 前端 :5173
 | `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` | 应用 appKey / appSecret；扫码登录与通讯录接口共用 | `dingxxx` |
 | `DINGTALK_CORP_ID` | 企业 CorpID | `dingxxxx` |
 | `DINGTALK_CORP_NAME` | 企业名称兜底（可选），未开通 `Contact.Org.Read` 时顶栏显示 | `某公司` |
-| `DINGTALK_REDIRECT_URI` | 回调地址 | `http://127.0.0.1:8000/auth/callback` |
+| `DINGTALK_REDIRECT_URI` | 回调地址 | `http://127.0.0.1:8321/auth/callback` |
 
 - 端点与 IdP 无关：`GET /auth/login/url`、`GET /auth/login`、`GET|POST /auth/callback`、`GET /auth/provider`；历史 `/auth/dingtalk/*` 保留为别名。
 - 钉钉资料链路：用户令牌 `GET /v1.0/contact/users/me` → 企业令牌 `POST /v1.0/oauth2/accessToken` → `POST /topapi/user/getbyunionid` → `POST /topapi/v2/user/get`，后者提供**工号 `job_number` 与 `email`**；企业名称取 `GET /v1.0/contact/organizations/authInfos?targetCorpId=` 的 `orgName`。

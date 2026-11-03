@@ -100,6 +100,26 @@ func (d *DB) GetUser(ctx context.Context, id string) (store.User, error) {
 	return d.getUserByID(ctx, id)
 }
 
+// FindUserByJobNumber 按工号查用户：系统管理员名单来自配置，需要用工号反查用户。
+func (d *DB) FindUserByJobNumber(ctx context.Context, jobNumber string) (store.User, error) {
+	const q = `
+select id::text
+from app_user
+where job_number = $1 and status = 'active'
+order by created_at
+limit 1`
+
+	var id string
+	err := d.pool.QueryRow(ctx, q, jobNumber).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.User{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.User{}, err
+	}
+	return d.getUserByID(ctx, id)
+}
+
 func (d *DB) getUserByID(ctx context.Context, id string) (store.User, error) {
 	const q = `
 select u.id::text, coalesce(i.provider, ''), coalesce(i.provider_uid, ''),

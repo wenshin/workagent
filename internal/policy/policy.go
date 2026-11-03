@@ -19,6 +19,17 @@ const (
 	RiskSensitive = 4
 )
 
+// SideEffects 描述一次调用的影响范围，决定写操作能否走「空间工作区」放行。
+const (
+	// SideEffectsReadOnly 无副作用。
+	SideEffectsReadOnly = "read-only"
+	// SideEffectsWorkspace 只改当前空间 workdir 内的数据（如 fs.write），
+	// 范围由工具自身约束，授权只看空间成员权限。
+	SideEffectsWorkspace = "write-workspace"
+	// SideEffectsExternal 会改动空间外的资源（外部系统、凭证等），一律走审批。
+	SideEffectsExternal = "write-external"
+)
+
 // Constraints 是绑定上的执行约束。
 type Constraints struct {
 	MaxRows          int  `json:"max_rows,omitempty"`
@@ -45,8 +56,10 @@ type Request struct {
 	Risk      int
 	SpaceID   string
 	SpacePerm string // 调用方在该空间的权限，空表示不是成员
-	HasBind   bool
-	Binding   Constraints
+	// SideEffects 来自工具声明，写操作据此区分「空间工作区」与「外部资源」
+	SideEffects string
+	HasBind     bool
+	Binding     Constraints
 }
 
 // Decision 是判定结果。
@@ -105,6 +118,14 @@ func (RBACEngine) Check(_ context.Context, req Request) (Decision, error) {
 	case req.Risk >= RiskSensitive:
 		return Decision{NeedApproval: true, Reason: "高敏工具需审批", Constraints: constraints}, nil
 	case req.Risk >= RiskWrite:
+		// 空间工作区内的写入（如 fs.write）：范围已由工具限制在当前空间文件根下，
+		// 因此由空间权限直接决定，不再逐次要求绑定与人工审批。
+		if req.SideEffects == SideEffectsWorkspace {
+			if req.SpacePerm == "write" || req.SpacePerm == "manage" {
+				return Decision{Allow: true, Reason: "空间工作区写入", Constraints: constraints}, nil
+			}
+			return deny(fmt.Sprintf("你在该空间没有写权限，无法执行 %s", req.Tool))
+		}
 		if !req.HasBind || !constraints.AllowWrite {
 			return Decision{NeedApproval: true, Reason: "写操作未授权", Constraints: constraints}, nil
 		}

@@ -108,6 +108,17 @@ type RunInput struct {
 	Query string
 	// Tools 非空时直接使用（测试用）；为空则按注册表加载
 	Tools []tool.Tool
+	// Skills 是当前空间 + 系统空间合并后的技能索引，注入系统提示词的「可用技能」段
+	Skills []tool.SourceEntry
+	// ActiveSkill 是会话绑定的技能，正文直接进系统提示词
+	ActiveSkill *ActiveSkill
+}
+
+// ActiveSkill 是会话选中的技能。
+type ActiveSkill struct {
+	Name string
+	Path string
+	Doc  string
 }
 
 // Result 是一次 Agent 运行的产出。
@@ -174,7 +185,7 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 	defs := tool.Definitions(tools)
 
 	messages := make([]llm.Message, 0, len(in.History)+2)
-	messages = append(messages, systemMessage())
+	messages = append(messages, systemMessage(in))
 	messages = append(messages, in.History...)
 
 	var res Result
@@ -314,19 +325,53 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 	return res, nil
 }
 
-func systemMessage() llm.Message {
+func systemMessage(in RunInput) llm.Message {
 	const prompt = `你是 WorkAgent 工作台里的智能助手，帮助用户在「空间」中完成工作。
 
 要求：
 - 用中文回答，简洁直接，先给结论再展开。
 - 需要事实依据时先调用工具（时间、空间列表、文件列表等），不要凭空编造。
+- 能力源（skills / tools / mcps）来自「当前空间 + 系统空间」，同名时当前空间优先：需要了解平台有哪些能力时先调用 global_source_list，再用 global_source_read 读取具体文件（如 SKILL.md、工具定义 JSON）。
+- 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
+- 用户要「做一个技能」时，先用 skill_create 建技能（生成 .meta.json 与 SKILL.md），再用 file_write 完善技能正文；只写 SKILL.md 不建目录不会生成技能。
 - 工具返回「需要审批」或「策略拒绝」时，如实告知用户原因，不要重试同一工具。
 - 不清楚的信息要明确说明，而不是猜测。
-- 代码用 Markdown 代码块输出，并标注语言。
-- 当前版本工具均为只读，不要尝试写操作。`
+- 代码用 Markdown 代码块输出，并标注语言。`
 
-	return llm.Message{Role: llm.RoleSystem, Content: prompt}
+	var b strings.Builder
+	b.WriteString(prompt)
+
+	// 方案一：技能索引常驻（名称 + 描述 + 路径），正文按需读取，避免一次性塞满上下文
+	if len(in.Skills) > 0 {
+		b.WriteString("\n\n## 可用技能\n")
+		b.WriteString("以下是当前空间与系统空间的技能索引（同名时当前空间优先）。任务与某个技能相关时，先用 global_source_read 读取它的 SKILL.md 再按步骤执行；不要凭名称猜测内容。\n")
+		for i, s := range in.Skills {
+			if i >= maxSkillIndexItems {
+				b.WriteString("- 其余技能可用 global_source_list 查看\n")
+				break
+			}
+			where := "当前空间"
+			if s.Source == "system" {
+				where = "系统空间"
+			}
+			b.WriteString("- " + s.Name + "（" + where + "）：" + truncate(s.Description, 80) + " → " + s.Path + "\n")
+		}
+	}
+
+	// 方案二：会话选中的技能，正文直接注入本轮
+	if in.ActiveSkill != nil && strings.TrimSpace(in.ActiveSkill.Doc) != "" {
+		b.WriteString("\n\n## 本轮选中的技能：")
+		b.WriteString(in.ActiveSkill.Name)
+		b.WriteString("\n用户已为本会话选择该技能，优先按下面的步骤执行；如果与当前任务无关，说明原因后按常规处理。\n\n")
+		b.WriteString(in.ActiveSkill.Doc)
+		b.WriteString("\n")
+	}
+
+	return llm.Message{Role: llm.RoleSystem, Content: b.String()}
 }
+
+// maxSkillIndexItems 限制注入的技能条数，避免索引过长挤占上下文。
+const maxSkillIndexItems = 30
 
 func truncate(s string, limit int) string {
 	if len(s) <= limit {

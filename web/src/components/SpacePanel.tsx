@@ -24,7 +24,7 @@ export default function SpacePanel({ space, sessions, loading, onOpenSession, on
   if (!space) {
     return (
       <div className="panel-empty">
-        <Empty title="还没有空间" description="点击左上角 + 创建一个空间" />
+        <Empty title="还没有空间" description="点击左侧「工作空间」旁的 + 创建一个空间" />
       </div>
     );
   }
@@ -37,7 +37,11 @@ export default function SpacePanel({ space, sessions, loading, onOpenSession, on
         <div className="panel-heading">
           <h2 className="panel-title">{space.name}</h2>
           <Text type="tertiary" size="small">
-            {space.type === 'personal' ? '个人空间 · ' : '共享空间 · '}
+            {space.type === 'personal'
+              ? '个人空间 · '
+              : space.type === 'system'
+                ? '系统空间 · '
+                : '共享空间 · '}
             选择下面的会话开始对话，或新建一个
           </Text>
         </div>

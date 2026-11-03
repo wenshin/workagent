@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -19,11 +20,11 @@ import (
 )
 
 var (
-	ErrForbidden      = errors.New("没有该空间的权限")
-	ErrTitleInvalid   = errors.New("会话标题需为 1-64 个字符")
-	ErrMessageEmpty   = errors.New("消息内容不能为空")
-	ErrMessageTooLong = errors.New("单条消息不能超过 8000 字")
-	ErrLastSession    = errors.New("每个空间至少要保留一个会话")
+	ErrForbidden        = errors.New("没有该空间的权限")
+	ErrTitleInvalid     = errors.New("会话标题需为 1-64 个字符")
+	ErrMessageEmpty     = errors.New("消息内容不能为空")
+	ErrMessageTooLong   = errors.New("单条消息不能超过 8000 字")
+	ErrLastSession      = errors.New("每个空间至少要保留一个会话")
 	ErrAgentUnavailable = errors.New("模型服务未配置，请联系管理员配置 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL")
 )
 
@@ -74,8 +75,8 @@ func (s *Service) ListMine(ctx context.Context, userID string) ([]store.Session,
 	return s.store.ListUserSessions(ctx, userID)
 }
 
-// Create 在空间下新建会话，标题默认为「新会话」。
-func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle string) (store.Session, error) {
+// Create 在空间（或空间内某个目录）下新建会话，标题默认为「新会话」。
+func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir string) (store.Session, error) {
 	sp, err := s.spaces.Get(ctx, userID, spaceID)
 	if err != nil {
 		return store.Session{}, err
@@ -89,12 +90,33 @@ func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle string) 
 		return store.Session{}, err
 	}
 
-	sess, err := s.store.CreateSession(ctx, spaceID, userID, title)
+	// 会话可以挂在目录下：目录必须真实存在，避免树里出现悬空节点
+	dir, err := normalizeDirPath(rawDir)
 	if err != nil {
 		return store.Session{}, err
 	}
-	s.log.Info("会话已创建", "session_id", sess.ID, "space_id", spaceID, "by", userID)
+	if err := s.spaces.CheckDir(ctx, spaceID, dir); err != nil {
+		return store.Session{}, err
+	}
+
+	sess, err := s.store.CreateSession(ctx, spaceID, userID, title, dir)
+	if err != nil {
+		return store.Session{}, err
+	}
+	s.log.Info("会话已创建", "session_id", sess.ID, "space_id", spaceID, "dir", dir, "by", userID)
 	return sess, nil
+}
+
+// normalizeDirPath 统一目录路径格式：去掉首尾斜杠与空白，空串表示空间根。
+func normalizeDirPath(raw string) (string, error) {
+	dir := strings.Trim(strings.TrimSpace(raw), "/")
+	if dir == "" {
+		return "", nil
+	}
+	if strings.Contains(dir, "..") || strings.Contains(dir, "\\") {
+		return "", space.ErrNameInvalid
+	}
+	return dir, nil
 }
 
 // Rename 手动重命名会话；命名后不再被首条消息自动改写。
@@ -267,6 +289,18 @@ func (s *Service) Chat(
 		return emit(ev)
 	}
 
+	// 技能：索引常驻提示词，会话绑定的技能正文直接注入
+	skills := s.skillIndex(ctx, sess.SpaceID)
+	var activeSkill *agent.ActiveSkill
+	if sess.SkillPath != "" {
+		skill, err := s.loadSkill(ctx, sess.SpaceID, sess.SkillPath)
+		if err != nil {
+			s.log.Warn("技能正文加载失败", "session_id", sessionID, "path", sess.SkillPath, "err", err)
+		} else {
+			activeSkill = skill
+		}
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -280,9 +314,25 @@ func (s *Service) Chat(
 			Store:     s.store,
 			Storage:   s.storage,
 			Log:       s.log,
+			// 能力源：当前空间 + 系统空间，同名当前空间优先
+			Sources: sourceLoader{spaces: s.spaces, spaceID: sess.SpaceID},
+			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
+			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
+			CreateSkill: func(ctx context.Context, name, description string) (string, error) {
+				dir, err := s.spaces.CreateSkill(ctx, userID, sess.SpaceID, name, description)
+				if err != nil {
+					if errors.Is(err, space.ErrDirExists) {
+						return "", fmt.Errorf("同名目录已存在：%s；如需修改现有技能，请用 file_write 编辑 %s/SKILL.md", name, name)
+					}
+					return "", err
+				}
+				return dir.Path, nil
+			},
 		},
-		History: contextMessages,
-		Query:   text,
+		History:     contextMessages,
+		Query:       text,
+		Skills:      skills,
+		ActiveSkill: activeSkill,
 	}, emitEvent)
 
 	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来

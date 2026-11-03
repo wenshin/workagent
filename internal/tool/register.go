@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/store"
 )
 
@@ -13,13 +14,18 @@ import (
 // 这样绑定、审计、计量都有稳定的外键可引用。
 func RegisterCapabilities(ctx context.Context, st store.Store) error {
 	for _, t := range builtinTools() {
+		effects := t.SideEffects
+		if effects == "" {
+			effects = policy.SideEffectsReadOnly
+		}
 		if err := st.UpsertCapability(ctx, store.Capability{
 			Name:        t.Capability,
 			Description: t.Description,
 			InputSchema: t.Parameters,
 			RiskLevel:   t.Risk,
-			Idempotent:  true,
-			SideEffects: "read-only",
+			// 写操作（尤其 append）不保证幂等
+			Idempotent:  t.Risk < policy.RiskWrite,
+			SideEffects: effects,
 		}); err != nil {
 			return fmt.Errorf("注册能力 %s 失败: %w", t.Capability, err)
 		}

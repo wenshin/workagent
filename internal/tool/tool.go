@@ -34,6 +34,13 @@ type Env struct {
 	Store   store.Store
 	Storage storage.Storage
 	Log     *slog.Logger
+
+	// CreateSkill 由会话层注入「在当前空间创建技能目录」的实现（space.Service.CreateSkill），
+	// 工具包不依赖 space 包，避免循环依赖；为 nil 时 skill_create 不可用。
+	CreateSkill func(ctx context.Context, name, description string) (dir string, err error)
+
+	// Sources 是「当前空间 + 系统空间」合并后的能力源视图，为 nil 时相关工具不可用。
+	Sources SourceLoader
 }
 
 // Tool 是一个可被模型调用的工具。
@@ -45,6 +52,9 @@ type Tool struct {
 	Description string
 	Parameters  json.RawMessage
 	Risk        int
+	// SideEffects 声明影响范围：read-only（默认）/ write-workspace（仅当前空间工作区）。
+	// 策略层据此区分「空间内写」与「外部写」，后者必须绑定 + 审批。
+	SideEffects string
 	Runtime     string // builtin | mcp
 	ServerID    string
 	ServerName  string

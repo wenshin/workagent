@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/workagent/auto-agent/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // CreateSpace 创建空间，并把创建者写成 manage 成员。
@@ -17,14 +17,14 @@ func (d *DB) CreateSpace(ctx context.Context, in store.SpaceInput) (store.Space,
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	const insert = `
-insert into space (id, owner_id, name, type, parent_id, path, depth)
-values ($1::uuid, $2::uuid, $3, $4, nullif($5, '')::uuid, $6, $7)
+insert into space (id, owner_id, name, type, parent_id, path, depth, is_system_reserved)
+values ($1::uuid, $2::uuid, $3, $4, nullif($5, '')::uuid, $6, $7, $8)
 returning id::text, owner_id::text, name, type, coalesce(parent_id::text, ''),
           path, depth, is_system_reserved, status, created_at`
 
 	var s store.Space
 	if err := tx.QueryRow(ctx, insert,
-		in.ID, in.OwnerID, in.Name, in.Type, in.ParentID, in.Path, in.Depth,
+		in.ID, in.OwnerID, in.Name, in.Type, in.ParentID, in.Path, in.Depth, in.IsSystemReserved,
 	).Scan(&s.ID, &s.OwnerID, &s.Name, &s.Type, &s.ParentID,
 		&s.Path, &s.Depth, &s.IsSystemReserved, &s.Status, &s.CreatedAt); err != nil {
 		return store.Space{}, err
@@ -70,6 +70,37 @@ where id::text = $1 and deleted_at is null`
 		return store.Space{}, err
 	}
 	return s, nil
+}
+
+// GetSpaceByType 按类型取第一个未删除空间；系统空间全局唯一。
+func (d *DB) GetSpaceByType(ctx context.Context, spaceType string) (store.Space, error) {
+	const q = `
+select id::text, owner_id::text, name, type, coalesce(parent_id::text, ''),
+       path, depth, is_system_reserved, status, created_at
+from space
+where type = $1 and deleted_at is null and status = 'active'
+order by created_at
+limit 1`
+
+	var s store.Space
+	err := d.pool.QueryRow(ctx, q, spaceType).Scan(&s.ID, &s.OwnerID, &s.Name, &s.Type, &s.ParentID,
+		&s.Path, &s.Depth, &s.IsSystemReserved, &s.Status, &s.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Space{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.Space{}, err
+	}
+	return s, nil
+}
+
+// EnsureSpaceMember 幂等添加成员；已存在时不降级已有权限。
+func (d *DB) EnsureSpaceMember(ctx context.Context, spaceID, userID, perm string) error {
+	_, err := d.pool.Exec(ctx, `
+insert into space_member (space_id, user_id, perm, source)
+values ($1::uuid, $2::uuid, $3, 'system')
+on conflict (space_id, user_id) do nothing`, spaceID, userID, perm)
+	return err
 }
 
 // SpacePerm 返回用户在该空间的权限，无权限返回空字符串。

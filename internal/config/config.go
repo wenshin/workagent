@@ -32,6 +32,10 @@ type Config struct {
 
 	StorageRoot string
 
+	// 系统管理员工号（逗号分隔）：只有这些用户能看到并编辑「系统空间」。
+	// MVP 用配置文件指定，后续接入组织架构后改为角色表。
+	AdminJobs []string
+
 	// LLM 走 Provider 适配层（§5.7.1）：openai 兼容协议覆盖 vLLM / 国产模型，anthropic 走原生协议。
 	LLMProvider  string // openai | anthropic
 	LLMBaseURL   string
@@ -107,8 +111,8 @@ func Load() (*Config, error) {
 	}
 
 	c := &Config{
-		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8000"),
-		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8000"), "/"),
+		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8321"),
+		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8321"), "/"),
 		WebBaseURL:           strings.TrimRight(getenv("WEB_BASE_URL", "http://127.0.0.1:5173"), "/"),
 		DatabaseURL:          getenv("DATABASE_URL", ""),
 		IdentityProvider:     getenv("IDENTITY_PROVIDER", "dingtalk"),
@@ -116,11 +120,12 @@ func Load() (*Config, error) {
 		DingTalkClientSecret: getenv("DINGTALK_CLIENT_SECRET", ""),
 		DingTalkCorpID:       getenv("DINGTALK_CORP_ID", ""),
 		DingTalkCorpName:     getenv("DINGTALK_CORP_NAME", ""),
-		DingTalkRedirectURI:  getenv("DINGTALK_REDIRECT_URI", "http://127.0.0.1:8000/auth/dingtalk/callback"),
+		DingTalkRedirectURI:  getenv("DINGTALK_REDIRECT_URI", "http://127.0.0.1:8321/auth/dingtalk/callback"),
 		SessionCookie:        getenv("SESSION_COOKIE", "aa_session"),
 		SessionTTL:           ttl,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
+		AdminJobs:            splitList(getenv("ADMIN_JOB_NUMBERS", "")),
 
 		LLMProvider:  getenv("LLM_PROVIDER", "openai"),
 		LLMBaseURL:   strings.TrimRight(getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"), "/"),
@@ -198,6 +203,32 @@ func (c *Config) LLMReadyBaseOnly() bool {
 		return false
 	}
 	return true
+}
+
+// IsAdminJob 判断工号是否在系统管理员名单中；空工号永远不是管理员。
+func (c *Config) IsAdminJob(jobNumber string) bool {
+	job := strings.TrimSpace(jobNumber)
+	if job == "" {
+		return false
+	}
+	for _, item := range c.AdminJobs {
+		if item == job {
+			return true
+		}
+	}
+	return false
+}
+
+// splitList 把逗号分隔的配置切成去空白的列表，保持配置顺序。
+func splitList(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func getenv(key, def string) string {

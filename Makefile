@@ -9,7 +9,7 @@ help:
 	@echo "tidy      拉齐依赖并生成 go.sum（首次必须执行）"
 	@echo "pg-up     启动本地 PostgreSQL"
 	@echo "pg-down   停止本地 PostgreSQL"
-	@echo "run       本地启动 API（127.0.0.1:8000）"
+	@echo "run       本地启动 API（127.0.0.1:8321）"
 	@echo "web       构建前端到 web/dist（上传 CDN）"
 	@echo "build     编译 API 到 bin/server"
 	@echo "test      运行单元测试"

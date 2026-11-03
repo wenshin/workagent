@@ -37,21 +37,30 @@ type Result struct {
 	NewSpace  bool
 }
 
+// SystemSpaceEnsurer 保证系统管理员的「系统空间」就绪。
+//
+// 定义为接口而不是直接依赖 space 包，避免 auth 与 space 相互引用。
+type SystemSpaceEnsurer interface {
+	EnsureSystemSpace(ctx context.Context, user store.User) error
+}
+
 // Service 负责登录编排：state 校验、换取 token、落库、建空间、发会话。
 type Service struct {
 	store    store.Store
 	provider identity.Provider
 	cfg      *config.Config
+	spaces   SystemSpaceEnsurer
 	log      *slog.Logger
 	states   *stateStore
 }
 
 // NewService 构造登录服务。IdP 由调用方按配置注入，切换 IdP 不改这里。
-func NewService(st store.Store, cfg *config.Config, idp identity.Provider, log *slog.Logger) *Service {
+func NewService(st store.Store, cfg *config.Config, idp identity.Provider, spaces SystemSpaceEnsurer, log *slog.Logger) *Service {
 	return &Service{
 		store:    st,
 		provider: idp,
 		cfg:      cfg,
+		spaces:   spaces,
 		log:      log,
 		states:   newStateStore(10 * time.Minute),
 	}
@@ -128,6 +137,14 @@ func (s *Service) CompleteLogin(ctx context.Context, code, state string) (*Resul
 	}
 	if user.Status != "active" {
 		return nil, ErrForbidden
+	}
+
+	// 系统管理员：确保系统空间存在并加入成员。必须早于个人空间初始化，
+	// 因为 EnsurePersonalSpace 末尾会重新列出可见空间。
+	if s.spaces != nil {
+		if err := s.spaces.EnsureSystemSpace(ctx, user); err != nil {
+			s.log.Warn("初始化系统空间失败", "user_id", user.ID, "err", err)
+		}
 	}
 
 	spaces, created, err := s.store.EnsurePersonalSpace(ctx, user.ID)

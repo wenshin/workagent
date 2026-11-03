@@ -28,7 +28,8 @@ export interface Space {
   id: string;
   parent_id?: string;
   name: string;
-  type: 'personal' | 'shared';
+  /** system：平台内置的「系统空间」，仅系统管理员可见 */
+  type: 'personal' | 'shared' | 'system';
   path: string;
   depth: number;
   perm: Perm;
@@ -39,19 +40,39 @@ export interface Space {
 
 /**
  * 空间内的真实文件目录：只存在于文件系统，不落 space 表。
- * 没有默认会话、不能单独分享，权限沿用所属空间。
+ * 目录可多级（path 为相对空间 files/ 的路径），权限沿用所属空间。
  */
 export interface SpaceDir {
   space_id: string;
+  /** 相对空间 files/ 的路径，如 "设计/原型" */
+  path: string;
+  /** 展示名：skill 取自 .meta.json 的 name，其余等于末级目录名 */
   name: string;
+  /** true 表示该目录是 skill（目录下有隐藏的 .meta.json） */
+  is_skill: boolean;
+  /** true 表示系统空间的内置目录（skills / tools / mcps），不可改名删除 */
+  builtin: boolean;
+  description?: string;
+}
+
+/** skill 的 .meta.json 内容（前端只读展示，创建时由后端写入） */
+export interface SkillMeta {
+  name: string;
+  description?: string;
+  type: 'skill';
+  created_at?: string;
 }
 
 export interface ChatSession {
   id: string;
   space_id: string;
+  /** 会话所属目录路径，为空表示直接挂在空间根 */
+  dir?: string;
   title: string;
   /** true 表示标题还允许被首条消息改写 */
   title_auto: boolean;
+  /** 会话绑定的技能（SKILL.md 路径），空表示未绑定 */
+  skill_path?: string;
   status: string;
   last_message_at?: string | null;
   created_at: string;
@@ -113,12 +134,52 @@ export interface DirsResponse {
   dirs: SpaceDir[];
 }
 
+/** 空间目录下的可预览文件：md / json 等文本类型，展示在左侧树与右侧面板 */
+export interface SpaceFile {
+  space_id: string;
+  /** 相对空间 files/ 的路径，如 skills/空间管理/SKILL.md */
+  path: string;
+  /** 所属目录路径，空串表示直接在空间根 */
+  dir: string;
+  name: string;
+  size: number;
+  mod_time?: string;
+}
+
+export interface FilesResponse {
+  files: SpaceFile[];
+}
+
+/** 文件正文：超出后端上限时 truncated=true，content 为截断后的内容 */
+export interface FileContent extends SpaceFile {
+  content: string;
+  truncated: boolean;
+}
+
+export interface FileContentResponse {
+  file: FileContent;
+}
+
 export interface SessionsResponse {
   sessions: ChatSession[];
 }
 
 export interface MessagesResponse {
   messages: ChatMessage[];
+}
+
+/** 技能选择器里的一条：来自当前空间或系统空间 */
+export interface SpaceSkill {
+  name: string;
+  description?: string;
+  /** SKILL.md 相对空间 files/ 的路径 */
+  path: string;
+  /** current 当前空间 / system 系统空间 */
+  source: 'current' | 'system';
+}
+
+export interface SkillsResponse {
+  skills: SpaceSkill[];
 }
 
 export interface AppendMessageResponse {

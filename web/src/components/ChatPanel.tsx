@@ -1,8 +1,8 @@
-import { IconClose, IconSend } from '@douyinfe/semi-icons';
-import { Button, Empty, Spin, TextArea, Typography } from '@douyinfe/semi-ui';
+import { IconBook, IconClose, IconSend } from '@douyinfe/semi-icons';
+import { Button, Empty, Popover, Spin, TextArea, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useRef, useState } from 'react';
 
-import type { ChatMessage, ChatSession, MessagePart, ToolCallRecord } from '../api/types';
+import type { ChatMessage, ChatSession, MessagePart, SpaceSkill, ToolCallRecord } from '../api/types';
 
 const { Text } = Typography;
 
@@ -23,6 +23,10 @@ interface Props {
   pendingUser: string | null;
   agentReady: boolean;
   model?: string;
+  /** 当前空间 + 系统空间合并后的技能 */
+  skills: SpaceSkill[];
+  /** 选择会话技能，空串表示清除 */
+  onSelectSkill: (path: string) => void;
   onSend: (content: string) => Promise<void>;
   onStop: () => void;
 }
@@ -128,11 +132,14 @@ export default function ChatPanel({
   pendingUser,
   agentReady,
   model,
+  skills,
+  onSelectSkill,
   onSend,
   onStop,
 }: Props) {
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -158,6 +165,12 @@ export default function ChatPanel({
 
   const busy = sending || Boolean(stream);
   const showEmpty = !loading && messages.length === 0 && !stream && !pendingUser;
+  const activeSkill = skills.find((s) => s.path === session.skill_path);
+
+  const pickSkill = (path: string) => {
+    onSelectSkill(path);
+    setSkillPickerOpen(false);
+  };
 
   return (
     <div className="chat-panel">
@@ -169,6 +182,52 @@ export default function ChatPanel({
             {agentReady ? `模型 ${model || '已就绪'}` : '模型未配置，无法对话'}
           </Text>
         </div>
+
+        <Popover
+          trigger="click"
+          position="bottomRight"
+          visible={skillPickerOpen}
+          onVisibleChange={setSkillPickerOpen}
+          content={
+            <div className="skill-picker">
+              <div className="skill-picker-head">技能（当前空间与系统空间）</div>
+              {skills.length === 0 ? (
+                <div className="skill-picker-empty">还没有技能，可让 Agent 帮你创建一个</div>
+              ) : (
+                skills.map((s) => (
+                  <button
+                    key={s.path}
+                    type="button"
+                    className={`skill-picker-item${s.path === session.skill_path ? ' is-active' : ''}`}
+                    onClick={() => pickSkill(s.path)}
+                  >
+                    <span className="skill-picker-name">
+                      {s.name}
+                      <span className={`skill-source skill-source-${s.source}`}>
+                        {s.source === 'system' ? '系统' : '当前空间'}
+                      </span>
+                    </span>
+                    {s.description ? <span className="skill-picker-desc">{s.description}</span> : null}
+                  </button>
+                ))
+              )}
+              {session.skill_path ? (
+                <button type="button" className="skill-picker-clear" onClick={() => pickSkill('')}>
+                  不使用技能
+                </button>
+              ) : null}
+            </div>
+          }
+        >
+          <Button
+            size="small"
+            theme="borderless"
+            icon={<IconBook />}
+            className={`chat-skill-btn${activeSkill ? ' is-active' : ''}`}
+          >
+            {activeSkill ? activeSkill.name : '选择技能'}
+          </Button>
+        </Popover>
       </div>
 
       <div className="chat-body">

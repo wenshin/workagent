@@ -42,13 +42,19 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{id}/messages", h.appendMessage)
 	// 与 Agent 对话，流式返回（SSE）
 	mux.HandleFunc("POST /sessions/{id}/chat", h.chat)
+	// 绑定/清除会话技能：空的 path 表示清除
+	mux.HandleFunc("PUT /sessions/{id}/skill", h.setSkill)
 }
 
 type sessionDTO struct {
-	ID            string  `json:"id"`
-	SpaceID       string  `json:"space_id"`
-	Title         string  `json:"title"`
-	TitleAuto     bool    `json:"title_auto"`
+	ID      string `json:"id"`
+	SpaceID string `json:"space_id"`
+	// Dir 是会话所属目录（相对空间 files/），为空表示直接挂在空间根
+	Dir       string `json:"dir,omitempty"`
+	Title     string `json:"title"`
+	TitleAuto bool   `json:"title_auto"`
+	// SkillPath 是会话绑定的技能（SKILL.md 路径），空表示未绑定
+	SkillPath     string  `json:"skill_path,omitempty"`
 	Status        string  `json:"status"`
 	LastMessageAt *string `json:"last_message_at"`
 	CreatedAt     string  `json:"created_at"`
@@ -71,8 +77,10 @@ func toDTO(s store.Session) sessionDTO {
 	dto := sessionDTO{
 		ID:        s.ID,
 		SpaceID:   s.SpaceID,
+		Dir:       s.Dir,
 		Title:     s.Title,
 		TitleAuto: s.TitleAuto,
+		SkillPath: s.SkillPath,
 		Status:    s.Status,
 		CreatedAt: s.CreatedAt.Format(timeLayout),
 		UpdatedAt: s.UpdatedAt.Format(timeLayout),
@@ -134,6 +142,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Title string `json:"title"`
+		// Dir 是空间内目录路径（相对 files/），为空表示挂在空间根
+		Dir string `json:"dir"`
 	}
 	if r.ContentLength != 0 {
 		if err := platform.DecodeJSON(r, &req); err != nil {
@@ -142,7 +152,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sess, err := h.svc.Create(r.Context(), user.ID, r.PathValue("id"), req.Title)
+	sess, err := h.svc.Create(r.Context(), user.ID, r.PathValue("id"), req.Title, req.Dir)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -165,6 +175,29 @@ func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess, err := h.svc.Rename(r.Context(), user.ID, r.PathValue("id"), req.Title)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"session": toDTO(sess)})
+}
+
+// setSkill 绑定会话技能；path 为空表示清除。
+func (h *Handler) setSkill(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	sess, err := h.svc.SetSkill(r.Context(), user.ID, r.PathValue("id"), req.Path)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -363,8 +396,10 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusConflict, "last_session", err.Error())
 	case errors.Is(err, ErrAgentUnavailable):
 		platform.WriteError(w, r, http.StatusServiceUnavailable, "agent_unavailable", err.Error())
+	case errors.Is(err, space.ErrDirNotFound):
+		platform.WriteError(w, r, http.StatusNotFound, "dir_not_found", "目录不存在，可能已被删除")
 	case errors.Is(err, ErrTitleInvalid), errors.Is(err, ErrMessageEmpty), errors.Is(err, ErrMessageTooLong),
-		errors.Is(err, space.ErrNameInvalid):
+		errors.Is(err, space.ErrNameInvalid), errors.Is(err, space.ErrDirTooDeep):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
 		h.log.Error("会话接口失败", "err", err, "request_id", platform.RequestIDFrom(r.Context()))

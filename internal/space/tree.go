@@ -6,47 +6,33 @@ import (
 	"github.com/workagent/auto-agent/internal/store"
 )
 
-// BuildTree 把扁平列表组装成树序（父节点后紧跟其子节点），个人空间排最前。
-// 父节点不可见（无权限）的子空间会被提升为根，避免数据静默消失。
+// BuildTree 对扁平空间列表排序：个人空间置顶，其余按创建时间。
+//
+// 空间只有一级（子空间概念已取消），第二层起都是普通目录，因此这里不再组装父子关系。
 func BuildTree(list []store.Space) []store.Space {
-	exists := make(map[string]bool, len(list))
-	for _, s := range list {
-		exists[s.ID] = true
-	}
-
-	children := make(map[string][]store.Space, len(list))
-	var roots []store.Space
-	for _, s := range list {
-		if s.ParentID == "" || !exists[s.ParentID] {
-			roots = append(roots, s)
-			continue
-		}
-		children[s.ParentID] = append(children[s.ParentID], s)
-	}
-
-	sortSiblings(roots)
-	for k := range children {
-		sortSiblings(children[k])
-	}
-
-	out := make([]store.Space, 0, len(list))
-	var walk func(items []store.Space, depth int)
-	walk = func(items []store.Space, depth int) {
-		for _, s := range items {
-			s.Depth = depth
-			out = append(out, s)
-			walk(children[s.ID], depth+1)
-		}
-	}
-	walk(roots, 0)
+	out := make([]store.Space, len(list))
+	copy(out, list)
+	sortSiblings(out)
 	return out
+}
+
+// spacePriority 决定左侧树的空间顺序：个人空间 → 系统空间 → 共享空间。
+func spacePriority(spaceType string) int {
+	switch spaceType {
+	case "personal":
+		return 0
+	case "system":
+		return 1
+	default:
+		return 2
+	}
 }
 
 func sortSiblings(items []store.Space) {
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
-		if a.Type != b.Type {
-			return a.Type == "personal"
+		if pa, pb := spacePriority(a.Type), spacePriority(b.Type); pa != pb {
+			return pa < pb
 		}
 		return a.CreatedAt.Before(b.CreatedAt)
 	})

@@ -34,11 +34,26 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /spaces/{id}", h.remove)
 	mux.HandleFunc("GET /spaces/{id}/tree", h.tree)
 
-	// 目录是文件系统里的真实目录，与 space 表无关（MVP 方案 §4.2）
+	// 目录是文件系统里的真实目录，与 space 表无关（MVP 方案 §4.2）；
+	// 支持多级路径，因此读写都用 body/query 里的 path，而不是路径参数。
 	mux.HandleFunc("GET /spaces/dirs", h.listDirs)
 	mux.HandleFunc("POST /spaces/{id}/dirs", h.createDir)
-	mux.HandleFunc("PATCH /spaces/{id}/dirs/{name}", h.renameDir)
-	mux.HandleFunc("DELETE /spaces/{id}/dirs/{name}", h.deleteDir)
+	mux.HandleFunc("PATCH /spaces/{id}/dirs", h.renameDir)
+	mux.HandleFunc("DELETE /spaces/{id}/dirs", h.deleteDir)
+
+	// 兼容旧客户端的一级目录路由
+	mux.HandleFunc("PATCH /spaces/{id}/dirs/{name}", h.renameDirLegacy)
+	mux.HandleFunc("DELETE /spaces/{id}/dirs/{name}", h.deleteDirLegacy)
+
+	// skill 本质是带 .meta.json 的特殊目录
+	mux.HandleFunc("POST /spaces/{id}/skills", h.createSkill)
+	// 当前空间 + 系统空间合并后的技能列表，供会话技能选择器使用
+	mux.HandleFunc("GET /spaces/{id}/skills", h.listSkills)
+
+	// 树里的文件节点：/spaces/files 一次取全，/spaces/{id}/file 读正文。
+	// 这两个端点只读，且只暴露 md/json 等文本类型。
+	mux.HandleFunc("GET /spaces/files", h.listFiles)
+	mux.HandleFunc("GET /spaces/{id}/file", h.readFile)
 }
 
 type spaceDTO struct {
@@ -96,16 +111,16 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 空间只有一级：parent_id 字段已废弃，传了也不生效
 	var req struct {
-		Name     string `json:"name"`
-		ParentID string `json:"parent_id"`
+		Name string `json:"name"`
 	}
 	if err := platform.DecodeJSON(r, &req); err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
 		return
 	}
 
-	sp, err := h.svc.Create(r.Context(), user.ID, CreateInput{Name: req.Name, ParentID: req.ParentID})
+	sp, err := h.svc.Create(r.Context(), user.ID, CreateInput{Name: req.Name})
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -171,37 +186,69 @@ func (h *Handler) remove(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// tree 仅返回该空间自身：空间不再有子空间，保留端点是为了兼容旧前端。
 func (h *Handler) tree(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.current(w, r)
 	if !ok {
 		return
 	}
-
-	rootID := r.PathValue("id")
-	root, err := h.svc.Get(r.Context(), user.ID, rootID)
+	root, err := h.svc.Get(r.Context(), user.ID, r.PathValue("id"))
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-
-	all, err := h.svc.List(r.Context(), user.ID)
-	if err != nil {
-		h.writeErr(w, r, err)
-		return
-	}
-
-	var sub []store.Space
-	for _, s := range all {
-		if s.ID == root.ID || strings.HasPrefix(s.Path, root.Path+"/") {
-			sub = append(sub, s)
-		}
-	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"spaces": toDTOs(BuildTree(sub))})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"spaces": toDTOs([]store.Space{root})})
 }
 
 type dirDTO struct {
 	SpaceID string `json:"space_id"`
+	Path    string `json:"path"`
 	Name    string `json:"name"`
+	IsSkill bool   `json:"is_skill"`
+	// Builtin 表示系统空间的内置目录（skills / tools / mcps），不可改名删除
+	Builtin     bool   `json:"builtin"`
+	Description string `json:"description,omitempty"`
+}
+
+func toDirDTO(d Dir) dirDTO {
+	return dirDTO{
+		SpaceID:     d.SpaceID,
+		Path:        d.Path,
+		Name:        d.Name,
+		IsSkill:     d.IsSkill,
+		Builtin:     d.Builtin,
+		Description: d.Description,
+	}
+}
+
+// skillDTO 是技能选择器里的一条：source 为 current（当前空间）或 system（系统空间）。
+type skillDTO struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Path        string `json:"path"`
+	Source      string `json:"source"`
+}
+
+func (h *Handler) listSkills(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	entries, err := h.svc.Skills(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	out := make([]skillDTO, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, skillDTO{
+			Name:        e.Name,
+			Description: e.Description,
+			Path:        e.Path,
+			Source:      e.Source,
+		})
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"skills": out})
 }
 
 func (h *Handler) listDirs(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +263,7 @@ func (h *Handler) listDirs(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]dirDTO, 0, len(dirs))
 	for _, d := range dirs {
-		out = append(out, dirDTO{SpaceID: d.SpaceID, Name: d.Name})
+		out = append(out, toDirDTO(d))
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"dirs": out})
 }
@@ -229,21 +276,46 @@ func (h *Handler) createDir(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Name string `json:"name"`
+		// Parent 是父目录路径，为空表示建在空间根
+		Parent string `json:"parent"`
 	}
 	if err := platform.DecodeJSON(r, &req); err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
 		return
 	}
 
-	dir, err := h.svc.CreateDir(r.Context(), user.ID, r.PathValue("id"), req.Name)
+	dir, err := h.svc.CreateDir(r.Context(), user.ID, r.PathValue("id"), req.Parent, req.Name)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
-	platform.WriteJSON(w, http.StatusCreated, map[string]any{"dir": dirDTO{SpaceID: dir.SpaceID, Name: dir.Name}})
+	platform.WriteJSON(w, http.StatusCreated, map[string]any{"dir": toDirDTO(dir)})
 }
 
 func (h *Handler) renameDir(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	dir, err := h.svc.RenameDir(r.Context(), user.ID, r.PathValue("id"), req.Path, req.Name)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"dir": toDirDTO(dir)})
+}
+
+func (h *Handler) renameDirLegacy(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.current(w, r)
 	if !ok {
 		return
@@ -262,10 +334,23 @@ func (h *Handler) renameDir(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"dir": dirDTO{SpaceID: dir.SpaceID, Name: dir.Name}})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"dir": toDirDTO(dir)})
 }
 
 func (h *Handler) deleteDir(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	dir := strings.TrimSpace(r.URL.Query().Get("path"))
+	if err := h.svc.DeleteDir(r.Context(), user.ID, r.PathValue("id"), dir); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) deleteDirLegacy(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.current(w, r)
 	if !ok {
 		return
@@ -275,6 +360,96 @@ func (h *Handler) deleteDir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	dir, err := h.svc.CreateSkill(r.Context(), user.ID, r.PathValue("id"), req.Name, req.Description)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusCreated, map[string]any{"dir": toDirDTO(dir)})
+}
+
+type fileDTO struct {
+	SpaceID string `json:"space_id"`
+	Path    string `json:"path"`
+	Dir     string `json:"dir"`
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	ModTime string `json:"mod_time,omitempty"`
+}
+
+// fileContentDTO 在文件元信息上追加正文，Truncated 表示超过读取上限被截断。
+type fileContentDTO struct {
+	fileDTO
+	Content   string `json:"content"`
+	Truncated bool   `json:"truncated"`
+}
+
+func toFileDTO(f File) fileDTO {
+	dto := fileDTO{
+		SpaceID: f.SpaceID,
+		Path:    f.Path,
+		Dir:     f.Dir,
+		Name:    f.Name,
+		Size:    f.Size,
+	}
+	if !f.ModTime.IsZero() {
+		dto.ModTime = f.ModTime.Format("2006-01-02T15:04:05Z07:00")
+	}
+	return dto
+}
+
+func (h *Handler) listFiles(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	files, err := h.svc.ListFiles(r.Context(), user.ID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	out := make([]fileDTO, 0, len(files))
+	for _, f := range files {
+		out = append(out, toFileDTO(f))
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"files": out})
+}
+
+func (h *Handler) readFile(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	fc, err := h.svc.ReadFile(r.Context(), user.ID, r.PathValue("id"), rel)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"file": fileContentDTO{
+			fileDTO:   toFileDTO(fc.File),
+			Content:   fc.Content,
+			Truncated: fc.Truncated,
+		},
+	})
 }
 
 func (h *Handler) current(w http.ResponseWriter, r *http.Request) (store.User, bool) {
@@ -294,11 +469,14 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, ErrReserved):
 		platform.WriteError(w, r, http.StatusConflict, "reserved_space", err.Error())
-	case errors.Is(err, ErrDirNotFound):
+	case errors.Is(err, ErrDirNotFound), errors.Is(err, ErrFileNotFound):
 		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, ErrFileUnsupported):
+		platform.WriteError(w, r, http.StatusBadRequest, "unsupported_file", err.Error())
 	case errors.Is(err, ErrDirExists):
 		platform.WriteError(w, r, http.StatusConflict, "dir_exists", err.Error())
-	case errors.Is(err, ErrNameInvalid), errors.Is(err, ErrConfirmMismatch), errors.Is(err, ErrDepthExceeded):
+	case errors.Is(err, ErrNameInvalid), errors.Is(err, ErrConfirmMismatch),
+		errors.Is(err, ErrDirTooDeep):
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
 		h.log.Error("空间接口失败", "err", err, "request_id", platform.RequestIDFrom(r.Context()))

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/workagent/auto-agent/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // EnsurePersonalSpace 幂等地保证用户拥有个人空间，并在空间下预置一个「新会话」。
@@ -77,7 +77,7 @@ join space_member m on m.space_id = s.id and m.user_id = $1::uuid
 where s.deleted_at is null
   and s.status = 'active'
   and (m.expire_at is null or m.expire_at > now())
-order by (s.type = 'personal') desc, s.depth asc, s.created_at asc`
+order by case s.type when 'personal' then 0 when 'system' then 1 else 2 end, s.depth asc, s.created_at asc`
 
 	rows, err := d.pool.Query(ctx, q, userID)
 	if err != nil {

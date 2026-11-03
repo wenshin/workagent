@@ -46,12 +46,12 @@ type IdentityProfile struct {
 	Raw          []byte // 通讯录原始返回，落 user_identity.raw
 }
 
-// Space 是空间（个人空间 / 共享空间），parent_id 为空表示根空间。
+// Space 是空间（个人空间 / 共享空间 / 系统空间），parent_id 为空表示根空间。
 type Space struct {
 	ID               string
 	OwnerID          string
 	Name             string
-	Type             string // personal | shared
+	Type             string // personal | shared | system
 	ParentID         string
 	Path             string
 	Depth            int
@@ -70,14 +70,20 @@ type SpaceInput struct {
 	ParentID string
 	Path     string
 	Depth    int
+	// IsSystemReserved 为 true 表示系统内置空间：不允许重命名、删除。
+	IsSystemReserved bool
 }
 
 // Session 是聊天会话，直接归属于某个空间。
 type Session struct {
-	ID            string
-	SpaceID       string
-	Title         string
-	TitleAuto     bool // true 表示标题可被首条消息改写
+	ID      string
+	SpaceID string
+	// Dir 是会话所属目录（相对 space/files/ 的路径），为空表示直接挂在空间根
+	Dir       string
+	Title     string
+	TitleAuto bool // true 表示标题可被首条消息改写
+	// SkillPath 是会话绑定的技能（相对空间 files/ 的 SKILL.md 路径），空表示未绑定
+	SkillPath     string
 	CreatedBy     string
 	LastMessageAt *time.Time
 	Status        string
@@ -210,6 +216,8 @@ type Store interface {
 
 	UpsertUserByIdentity(ctx context.Context, p IdentityProfile) (User, error)
 	GetUser(ctx context.Context, id string) (User, error)
+	// FindUserByJobNumber 按工号查用户，用于按配置识别系统管理员。
+	FindUserByJobNumber(ctx context.Context, jobNumber string) (User, error)
 
 	CreateAuthSession(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error
 	GetAuthSession(ctx context.Context, tokenHash string) (AuthSession, error)
@@ -221,13 +229,17 @@ type Store interface {
 
 	CreateSpace(ctx context.Context, in SpaceInput) (Space, error)
 	GetSpace(ctx context.Context, id string) (Space, error)
+	// GetSpaceByType 按类型取第一个未删除空间（系统空间全局唯一）。
+	GetSpaceByType(ctx context.Context, spaceType string) (Space, error)
+	// EnsureSpaceMember 幂等地把用户加入空间，已有记录不覆盖（权限升级走专门流程）。
+	EnsureSpaceMember(ctx context.Context, spaceID, userID, perm string) error
 	// SpacePerm 返回用户在某空间的权限，无权限返回空字符串。
 	SpacePerm(ctx context.Context, spaceID, userID string) (string, error)
 	RenameSpace(ctx context.Context, id, name string) error
 	// DeleteSpaceTree 软删整棵子树，返回被删除的空间列表（业务层据此移入回收站）。
 	DeleteSpaceTree(ctx context.Context, id string) ([]Space, error)
 
-	CreateSession(ctx context.Context, spaceID, userID, title string) (Session, error)
+	CreateSession(ctx context.Context, spaceID, userID, title, dir string) (Session, error)
 	ListSessions(ctx context.Context, spaceID string) ([]Session, error)
 	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
 	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
@@ -238,6 +250,12 @@ type Store interface {
 	DeleteSession(ctx context.Context, id string) error
 	// TouchSession 更新最近活动时间。
 	TouchSession(ctx context.Context, id string) error
+	// ClearSessionsDir 把该目录（含子目录）下的会话移回空间根，用于删除目录。
+	ClearSessionsDir(ctx context.Context, spaceID, dir string) error
+	// MoveSessionsDir 目录改名后同步会话的 dir 前缀。
+	MoveSessionsDir(ctx context.Context, spaceID, from, to string) error
+	// UpdateSessionSkill 绑定/清除会话技能（相对空间 files/ 的 SKILL.md 路径，空串清除）。
+	UpdateSessionSkill(ctx context.Context, id, path string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
 	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息。
