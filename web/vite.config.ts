@@ -23,12 +23,14 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
-    // 开发态代理，规则与生产 Nginx 反代保持一致
-    proxy: {
-      '/auth': 'http://127.0.0.1:8000',
-      '/spaces': 'http://127.0.0.1:8000',
-      '/sessions': 'http://127.0.0.1:8000',
-      '/healthz': 'http://127.0.0.1:8000',
-    },
+    // 开发态代理，规则与生产 Nginx 反代保持一致。
+    // 必须覆盖后端全部路由前缀：漏掉的前缀会被 Vite 当成 SPA 路由返回 index.html，
+    // 前端 api() 收到 HTML 会抛 bad_response，表现为「接口没数据」而不是明确的 404。
+    proxy: Object.fromEntries(
+      ['/auth', '/spaces', '/sessions', '/healthz', '/agent'].map((prefix) => [
+        prefix,
+        'http://127.0.0.1:8000',
+      ]),
+    ),
   },
 });
