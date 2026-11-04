@@ -45,6 +45,8 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
   const items = data?.items ?? [];
   const enabled = data?.secrets_enabled ?? false;
   const scope = refs[0]?.scope ?? 'search';
+  // 环境变量提供的引用不在界面上管理：那里没有可录入的条目
+  const envRefs = refs.filter((r) => r.source === 'env');
 
   useEffect(() => {
     if (!visible) {
@@ -56,8 +58,9 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
   }, [visible]);
 
   const openAdd = () => {
-    // 平台引用的那条还没配过时，直接带上名称，省掉手工输入
-    const referenced = refs[0]?.name ?? '';
+    // 平台引用的那条还没配过时，直接带上名称，省掉手工输入。
+    // 环境变量引用（${...}）不是合法凭证名，不能预填。
+    const referenced = refs[0] && refs[0].source !== 'env' ? refs[0].name : '';
     const exists = items.some((it) => it.name === referenced);
     setName(!referenced || exists ? '' : referenced);
     setValue('');
@@ -136,7 +139,22 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
             密钥加密保存在服务端存储目录，不进入空间文件树，也不进备份快照；接口只返回指纹。
           </Text>
 
-          {!enabled ? (
+          {envRefs.length > 0 ? (
+            <div>
+              <Text size="small">
+                平台当前从后端环境变量读取密钥（不落盘，也不需要在这里录入）：
+              </Text>
+              <Text code style={{ display: 'block', marginTop: 6 }}>
+                {envRefs.map((r) => r.name).join(', ')}
+              </Text>
+              <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 6 }}>
+                要改成界面录入，把系统空间 <Text code>files/config.json</Text> 的{' '}
+                <Text code>search.secret</Text> 改成凭证名（如 <Text code>default</Text>）后重启后端。
+              </Text>
+            </div>
+          ) : null}
+
+          {!enabled && envRefs.length === 0 ? (
             <div>
               <Text type="warning" size="small">
                 凭证存储未启用：后端进程没读到环境变量 SECRET_KEK，密钥没法加密落盘。
@@ -151,7 +169,9 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                 这个值要长期留存：换掉它，之前存过的密钥就解不开了，需要重新录入。
               </Text>
             </div>
-          ) : (
+          ) : null}
+
+          {enabled ? (
             <>
               <section>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -249,7 +269,7 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                 </section>
               ) : null}
             </>
-          )}
+          ) : null}
         </div>
       )}
     </Modal>

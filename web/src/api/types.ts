@@ -235,6 +235,8 @@ export interface SecretRef {
   scope: string;
   name: string;
   label: string;
+  /** store = 凭证存储（界面可管理）；env = 环境变量（由部署平台注入） */
+  source: 'store' | 'env';
 }
 
 /** 已保存凭证的元信息：只有指纹，没有明文 */

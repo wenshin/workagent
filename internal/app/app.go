@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -126,16 +127,20 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 	searchProvider := firstNonEmpty(platCfg.Search.Provider, cfg.SearchProvider)
 	searchEndpoint := firstNonEmpty(platCfg.Search.Endpoint, cfg.SearchEndpoint)
-	// 凭证名统一成 default：同一时刻只有一个搜索源在用，一把密钥就够。
-	// 名字不再跟 provider 绑定，换源不用改密钥名，环境变量也始终是 SEARCH_API_KEY。
+	// 凭证引用有两种写法：
+	//   "default"            → 凭证存储里的槽位名（界面「密钥配置」里录入）
+	//   "${SEARCH_API_KEY}"  → 直接读环境变量，不落盘、不进凭证存储
+	// 环境变量写法适合密钥由部署平台（k8s Secret / systemd / 容器 env）注入的场景。
 	searchSecret := firstNonEmpty(platCfg.Search.Secret, search.DefaultSecretName)
+	searchKeyEnv := envRefName(searchSecret)
 	allow := netAllow.Domains
 	if len(allow) == 0 {
 		allow = cfg.SearchAllow
 	}
 
-	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准
-	if secretStore.Enabled() && cfg.SearchAPIKey != "" {
+	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准。
+	// 写的是 ${ENV} 时环境变量本身就是源，不需要也不应该再往存储里抄一份。
+	if searchKeyEnv == "" && secretStore.Enabled() && cfg.SearchAPIKey != "" {
 		seedCtx := context.Background()
 		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, searchSecret); getErr != nil {
 			if putErr := secretStore.Put(seedCtx, search.SecretScope, searchSecret, cfg.SearchAPIKey); putErr != nil {
@@ -148,7 +153,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 旧部署的凭证名曾是 provider 名（bocha），统一成 default 后搬一次，
 	// 否则升级完 web_search 会突然说「密钥不可用」。
-	if secretStore.Enabled() && searchSecret != searchProvider {
+	if searchKeyEnv == "" && secretStore.Enabled() && searchSecret != searchProvider {
 		migCtx := context.Background()
 		if _, getErr := secretStore.Get(migCtx, search.SecretScope, searchSecret); errors.Is(getErr, secret.ErrNotFound) {
 			if v, legacyErr := secretStore.Get(migCtx, search.SecretScope, searchProvider); legacyErr == nil && v != "" {
@@ -176,6 +181,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 搜索（§5.6.1）：出网统一走 Guard。
 	searchReg := search.NewRegistry(searchProvider)
 	keyFunc := func(ctx context.Context) (string, error) {
+		if searchKeyEnv != "" {
+			v := strings.TrimSpace(os.Getenv(searchKeyEnv))
+			if v == "" {
+				return "", fmt.Errorf("环境变量 %s 未设置或为空", searchKeyEnv)
+			}
+			return v, nil
+		}
 		return secretStore.Get(ctx, search.SecretScope, searchSecret)
 	}
 	guard := search.NewGuard(allow)
@@ -197,13 +209,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
 		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
-		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled())
+		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled() || searchKeyEnv != "")
 
 	// 启动时就把「引用的密钥在不在」说清楚。
-	// 改了 config.json 的 search.secret 却没录入同名凭证，是最容易出现的错配：
+	// 引用的名字写错（凭证没录入 / 环境变量没导出）是最容易出现的错配：
 	// 配置看着没问题、服务也能起，直到第一次搜索才报错。这里提前告警并给出名字。
-	if secretStore.Enabled() {
-		if _, getErr := secretStore.Get(context.Background(), search.SecretScope, searchSecret); getErr != nil {
+	if secretStore.Enabled() || searchKeyEnv != "" {
+		if _, getErr := keyFunc(context.Background()); getErr != nil {
 			log.Warn("搜索密钥不可用，web_search 会报错", "secret", searchSecret, "err", getErr)
 		}
 	}
@@ -227,9 +239,10 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
 		// refs 告诉管理页「哪一条密钥真正被引用」，避免改了 A 却仍跑在 B 上。
 		adminH: admin.NewHandler(spaceSvc, secretStore, []admin.SecretRef{{
-			Scope: search.SecretScope,
-			Name:  searchSecret,
-			Label: fmt.Sprintf("web_search（%s）", searchProvider),
+			Scope:  search.SecretScope,
+			Name:   searchSecret,
+			Label:  searchRefLabel(searchProvider, searchKeyEnv),
+			Source: searchRefSource(searchKeyEnv),
 		}}, authHandler.CurrentUser, log),
 	}, nil
 }
@@ -293,4 +306,33 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// envRefName 解析 "${NAME}" 形式的环境变量引用；不是这个形式时返回空串，
+// 表示按普通凭证名去凭证存储里找。
+//
+// 为什么要一个显式写法：让「密钥从哪来」在配置文件里一眼可见，
+// 而不是靠“环境变量有没有值”猜——猜的结果是两种来源互相覆盖，很难排查。
+func envRefName(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) < 4 || !strings.HasPrefix(ref, "${") || !strings.HasSuffix(ref, "}") {
+		return ""
+	}
+	return strings.TrimSpace(ref[2 : len(ref)-1])
+}
+
+// searchRefLabel 是「密钥配置」弹窗里那句“平台当前使用”的文案。
+func searchRefLabel(provider, envName string) string {
+	if envName != "" {
+		return fmt.Sprintf("web_search（环境变量 %s）", envName)
+	}
+	return fmt.Sprintf("web_search（%s）", provider)
+}
+
+// searchRefSource 告诉管理页这条引用能不能在界面上管理。
+func searchRefSource(envName string) string {
+	if envName != "" {
+		return admin.SourceEnv
+	}
+	return admin.SourceStore
 }

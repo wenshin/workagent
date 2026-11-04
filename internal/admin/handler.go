@@ -29,7 +29,16 @@ type SecretRef struct {
 	Scope string `json:"scope"`
 	Name  string `json:"name"`
 	Label string `json:"label"`
+	// Source 说明密钥从哪来：store（凭证存储，界面可管理）或 env（环境变量，
+	// 由部署平台注入，这里只管显示，不需要也不能在界面上录入）。
+	Source string `json:"source"`
 }
+
+// 凭证来源。
+const (
+	SourceStore = "store"
+	SourceEnv   = "env"
+)
 
 // SecretItem 是一条已存凭证的元信息，不含明文。
 type SecretItem struct {
