@@ -29,6 +29,7 @@ func builtinTools() []Tool {
 		skillCreate(),
 		resourceSearch(),
 		resourceRead(),
+		webSearch(),
 	}
 }
 

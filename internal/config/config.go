@@ -65,6 +65,18 @@ type Config struct {
 	LLMMaxToolCalls int
 	LLMMaxParallel  int
 	LLMMaxWallClock time.Duration
+
+	// 凭证加密（§5.5.2 的 MVP 形态）：KEK 只从环境变量读，不进仓库。
+	// 为空时凭证存储不可用，搜索等需要密钥的能力自动降级为「未配置」。
+	SecretKEK string
+
+	// 搜索（§5.6.1 search.query）：endpoint 与白名单是平台属性，skill / 模型都无法指定。
+	SearchProvider string
+	SearchEndpoint string
+	// SearchAllow 是出网白名单（逗号分隔的域名）。空表示不允许任何外部搜索。
+	SearchAllow []string
+	// SearchAPIKey 只用于首次播种到凭证存储，之后以凭证存储为准。
+	SearchAPIKey string
 }
 
 // Load 读取 .env（存在时）并解析环境变量。
@@ -156,6 +168,13 @@ func Load() (*Config, error) {
 		LLMMaxToolCalls: maxToolCalls,
 		LLMMaxParallel:  maxParallel,
 		LLMMaxWallClock: wallClock,
+
+		SecretKEK: getenv("SECRET_KEK", ""),
+
+		SearchProvider: getenv("SEARCH_PROVIDER", "bocha"),
+		SearchEndpoint: getenv("SEARCH_ENDPOINT", "https://api.bochaai.com/v1/web-search"),
+		SearchAllow:    splitList(getenv("SEARCH_ALLOW", "api.bochaai.com")),
+		SearchAPIKey:   getenv("SEARCH_API_KEY", ""),
 	}
 
 	if c.DatabaseURL == "" {

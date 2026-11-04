@@ -17,6 +17,7 @@ import (
 
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -41,6 +42,10 @@ type Env struct {
 
 	// Sources 是「当前空间 + 系统空间」合并后的能力源视图，为 nil 时相关工具不可用。
 	Sources SourceLoader
+
+	// Search 是搜索 provider 注册表（internal/search），为 nil 时 web_search 不可用。
+	// 密钥与出网策略都在实现内部，不经由工具参数传递。
+	Search *search.Registry
 }
 
 // Tool 是一个可被模型调用的工具。

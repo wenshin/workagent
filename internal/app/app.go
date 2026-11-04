@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
@@ -17,6 +19,8 @@ import (
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/resource"
+	"github.com/workagent/auto-agent/internal/search"
+	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
@@ -99,7 +103,40 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 资源发布：把空间草稿按版本快照发布到独立目录，供 Agent 按需检索
 	resourceSvc := resource.NewService(st, fs, spaceSvc, log)
 
-	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, cfg.LLMMaxWallClock, log)
+	// 凭证存储（§5.5.2 的 MVP 形态）：信封加密落盘，明文只在用到的那一刻取出
+	secretStore, err := secret.NewFileStore(filepath.Join(cfg.StorageRoot, "secrets"), cfg.SecretKEK)
+	if err != nil {
+		return nil, fmt.Errorf("初始化凭证存储失败: %w", err)
+	}
+	if !secretStore.Enabled() {
+		log.Warn("凭证存储未启用（未配置 SECRET_KEK），需要密钥的能力不可用")
+	}
+	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准
+	if secretStore.Enabled() && cfg.SearchAPIKey != "" {
+		seedCtx := context.Background()
+		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, cfg.SearchProvider); getErr != nil {
+			if putErr := secretStore.Put(seedCtx, search.SecretScope, cfg.SearchProvider, cfg.SearchAPIKey); putErr != nil {
+				log.Warn("搜索密钥播种失败", "err", putErr)
+			} else {
+				log.Info("搜索密钥已写入凭证存储", "provider", cfg.SearchProvider)
+			}
+		}
+	}
+
+	// 搜索（§5.6.1）：出网统一走 Guard，provider 只认识平台配置的 endpoint
+	searchReg := search.NewRegistry(cfg.SearchProvider)
+	switch cfg.SearchProvider {
+	case "bocha":
+		searchReg.Register(search.NewBocha(cfg.SearchEndpoint, func(ctx context.Context) (string, error) {
+			return secretStore.Get(ctx, search.SecretScope, "bocha")
+		}, search.NewGuard(cfg.SearchAllow)))
+	default:
+		log.Warn("未知的搜索 provider，web_search 将不可用", "provider", cfg.SearchProvider)
+	}
+	log.Info("搜索能力已装配", "provider", cfg.SearchProvider,
+		"available", searchReg.Names(), "allow", cfg.SearchAllow, "secret_ready", secretStore.Enabled())
+
+	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, searchReg, cfg.LLMMaxWallClock, log)
 
 	return &App{
 		cfg:         cfg,
