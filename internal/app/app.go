@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -124,7 +126,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 	searchProvider := firstNonEmpty(platCfg.Search.Provider, cfg.SearchProvider)
 	searchEndpoint := firstNonEmpty(platCfg.Search.Endpoint, cfg.SearchEndpoint)
-	searchSecret := firstNonEmpty(platCfg.Search.Secret, searchProvider)
+	// 凭证名统一成 default：同一时刻只有一个搜索源在用，一把密钥就够。
+	// 名字不再跟 provider 绑定，换源不用改密钥名，环境变量也始终是 SEARCH_API_KEY。
+	searchSecret := firstNonEmpty(platCfg.Search.Secret, search.DefaultSecretName)
 	allow := netAllow.Domains
 	if len(allow) == 0 {
 		allow = cfg.SearchAllow
@@ -142,22 +146,58 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		}
 	}
 
-	// 搜索（§5.6.1）：出网统一走 Guard，provider 只认识平台配置的 endpoint。
-	// 装配层不认识任何具体 provider：名字 → 构造函数由 internal/search 的工厂表解析，
-	// 新增搜索源只改 provider 自己的文件，这里一行都不用动。
+	// 旧部署的凭证名曾是 provider 名（bocha），统一成 default 后搬一次，
+	// 否则升级完 web_search 会突然说「密钥不可用」。
+	if secretStore.Enabled() && searchSecret != searchProvider {
+		migCtx := context.Background()
+		if _, getErr := secretStore.Get(migCtx, search.SecretScope, searchSecret); errors.Is(getErr, secret.ErrNotFound) {
+			if v, legacyErr := secretStore.Get(migCtx, search.SecretScope, searchProvider); legacyErr == nil && v != "" {
+				if putErr := secretStore.Put(migCtx, search.SecretScope, searchSecret, v); putErr != nil {
+					log.Warn("搜索密钥迁移失败", "err", putErr)
+				} else {
+					_ = secretStore.Delete(migCtx, search.SecretScope, searchProvider)
+					log.Info("搜索密钥已迁移到统一凭证名", "from", searchProvider, "to", searchSecret)
+				}
+			}
+		}
+	}
+
+	// 声明式搜索源：config.json 里给了 search.spec 就按配置拼请求 / 取结果，
+	// 接一个新的 REST 搜索 API 不用写 Go、不用发版。
+	var searchSpec *search.Spec
+	if len(platCfg.Search.Spec) > 0 {
+		var s search.Spec
+		if err := json.Unmarshal(platCfg.Search.Spec, &s); err != nil {
+			return nil, fmt.Errorf("config.json 的 search.spec 解析失败: %w", err)
+		}
+		searchSpec = &s
+	}
+
+	// 搜索（§5.6.1）：出网统一走 Guard。
 	searchReg := search.NewRegistry(searchProvider)
 	keyFunc := func(ctx context.Context) (string, error) {
 		return secretStore.Get(ctx, search.SecretScope, searchSecret)
 	}
-	if provider, ok := search.Build(searchProvider, searchEndpoint, keyFunc, search.NewGuard(allow)); ok {
+	guard := search.NewGuard(allow)
+	switch {
+	case searchSpec != nil:
+		provider, buildErr := search.NewHTTPJSON(searchProvider, searchEndpoint, *searchSpec, keyFunc, guard)
+		if buildErr != nil {
+			return nil, fmt.Errorf("config.json 的 search.spec 不可用: %w", buildErr)
+		}
 		searchReg.Register(provider)
-	} else {
-		log.Warn("未知的搜索 provider，web_search 将不可用",
-			"provider", searchProvider, "known", search.ProviderNames())
+	default:
+		// 没有 spec 时回落到内置 provider：名字 → 构造函数由工厂表解析。
+		if provider, ok := search.Build(searchProvider, searchEndpoint, keyFunc, guard); ok {
+			searchReg.Register(provider)
+		} else {
+			log.Warn("未知的搜索 provider，web_search 将不可用",
+				"provider", searchProvider, "known", search.ProviderNames())
+		}
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
 		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
-		"secret_ready", secretStore.Enabled())
+		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled())
 
 	// 启动时就把「引用的密钥在不在」说清楚。
 	// 改了 config.json 的 search.secret 却没录入同名凭证，是最容易出现的错配：

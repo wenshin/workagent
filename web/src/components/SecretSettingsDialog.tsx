@@ -227,7 +227,7 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                       value={name}
                       onChange={setName}
                       disabled={editing !== null}
-                      placeholder="名称，如 bocha"
+                      placeholder="名称，如 default"
                       style={{ width: 200 }}
                     />
                     <Input
@@ -243,8 +243,8 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                     <Button onClick={closeForm}>取消</Button>
                   </div>
                   <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 8 }}>
-                    只有名称与系统空间 <Text code>files/config.json</Text> 的引用一致（搜索是{' '}
-                    <Text code>search.secret</Text>）才会生效；名称保存后不可改，换个名字等于新增一条。
+                    搜索密钥统一用名称 <Text code>default</Text>
+                    ，只有与平台引用一致的那条才会生效；名称保存后不可改，换个名字等于新增一条。
                   </Text>
                 </section>
               ) : null}

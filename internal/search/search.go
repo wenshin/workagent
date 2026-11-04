@@ -31,6 +31,12 @@ type Result struct {
 	Source      string `json:"source,omitempty"`
 }
 
+// DefaultSecretName 是平台凭证的统一名字。
+//
+// 凭证名不跟 provider 绑定：同一时刻只有一个搜索源在用，一把密钥就够。
+// 换源只改 provider / endpoint，密钥名与环境变量（SEARCH_API_KEY）都不用动。
+const DefaultSecretName = "default"
+
 // Provider 是一个可插拔的搜索实现。
 //
 // 约束：实现内部只能通过 Guard 出网，密钥通过 KeyFunc 从凭证存储取，

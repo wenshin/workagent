@@ -30,8 +30,12 @@ const (
 type Search struct {
 	Provider string `json:"provider"`
 	Endpoint string `json:"endpoint"`
-	// Secret 是凭证存储（{STORAGE_ROOT}/secrets/search/）里的名字
-	Secret string `json:"secret"`
+	// Secret 是凭证存储里的名字，已废弃：留空即使用统一名 default。
+	// 保留字段只为兼容老配置（DisallowUnknownFields 会让删掉字段的老配置启动失败）。
+	Secret string `json:"secret,omitempty"`
+	// Spec 是声明式搜索源定义（请求模板 + 响应字段映射），由 internal/search 解析。
+	// 给了 spec 就不需要内置 provider 实现，接新搜索 API 只改这里。
+	Spec json.RawMessage `json:"spec,omitempty"`
 }
 
 // Config 是 config.json 的结构。

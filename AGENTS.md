@@ -112,7 +112,29 @@ make web     # 前端 :5173
 
 # 通用搜索与凭证
 
-- `web_search`（能力 `search.query`）：参数只有 `query` / `limit`。provider、endpoint 与密钥都是平台属性，**schema 里不暴露 provider**——模型没有选源的时机，多源选择属于配置（`config.json` 的 `search.provider`），不属于对话。
+- `web_search`（能力 `search.query`）：参数只有 `query` / `limit`。provider、endpoint 与密钥都是平台属性，**schema 里不暴露 provider**——模型没有选源的时机，换源属于配置（`config.json` 的 `search.provider`），不属于对话。
+- REST 搜索 API 没有行业标准（Bocha `data.webPages.value[]`、Tavily `results[]`、Serper `organic[]`，字段名各不相同），但差异都能归结为「请求参数名 + 响应字段路径」。所以提供**声明式搜索源**：`config.json` 写 `search.spec`，由 `internal/search.HTTPJSON` 解释，接新 API 不用写 Go、不用发版。
+
+  ```json
+  "search": {
+    "provider": "tavily",
+    "endpoint": "https://api.tavily.com/search",
+    "spec": {
+      "request": {
+        "method": "POST",
+        "auth": { "in": "header", "name": "Authorization", "prefix": "Bearer " },
+        "body": { "query": "{{query}}", "max_results": "{{limit}}" }
+      },
+      "response": {
+        "items": "results", "title": "title", "url": "url", "snippet": "content"
+      }
+    }
+  }
+  ```
+
+  占位符：`{{query}}` `{{limit}}` `{{freshness}}` `{{secret}}`（正好是占位符时保留类型，`{{limit}}` 仍是数字）。路径支持 `a.b[0].c`。`auth.in` ∈ `header|query|body`。`error_code` + `error_ok` 用于把业务错误码（如 `code != 0`）判成失败，而不是当成 0 条结果。
+- 声明式覆盖不到的情况（游标分页、非 JSON 响应、请求签名）走代码：实现 `search.Provider` 并在同文件 `init()` 里 `RegisterFactory`，装配层不加 case 分支。两条路并存，`search.spec` 优先。
+- 凭证名统一为 `default`（`search.DefaultSecretName`）：同一时刻只有一个搜索源在用，一把密钥就够，换源不用改密钥名。环境变量始终是 `SEARCH_API_KEY`，只用于首次播种；老部署里 provider 同名的旧凭证启动时自动迁移到 `default`。`search.secret` 字段已废弃，留空即可。
 - 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
 - 配置优先级：系统空间 `config.json` / `net_whitelist.json` → 环境变量 `SEARCH_*`。启动时读一次，改完需重启；配置写错**启动失败**而不是静默用默认值。
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。

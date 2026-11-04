@@ -19,7 +19,24 @@ var builtinConfigFiles = []struct {
   "search": {
     "provider": "bocha",
     "endpoint": "https://api.bochaai.com/v1/web-search",
-    "secret": "bocha"
+    "spec": {
+      "request": {
+        "method": "POST",
+        "headers": { "Content-Type": "application/json" },
+        "auth": { "in": "header", "name": "Authorization", "prefix": "Bearer " },
+        "body": { "query": "{{query}}", "count": "{{limit}}", "summary": true }
+      },
+      "response": {
+        "items": "data.webPages.value",
+        "title": "name",
+        "url": "url",
+        "snippet": "summary",
+        "published_at": "datePublished",
+        "error_code": "code",
+        "error_ok": [0, 200],
+        "error_message": "msg"
+      }
+    }
   }
 }
 `,
