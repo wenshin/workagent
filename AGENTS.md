@@ -112,11 +112,12 @@ make web     # 前端 :5173
 
 # 通用搜索与凭证
 
-- `web_search`（能力 `search.query`）：provider 由平台配置决定，skill 与模型都无法指定 endpoint；参数只有 `query` / `provider` / `limit`，没有密钥字段。
+- `web_search`（能力 `search.query`）：参数只有 `query` / `limit`。provider、endpoint 与密钥都是平台属性，**schema 里不暴露 provider**——模型没有选源的时机，多源选择属于配置（`config.json` 的 `search.provider`），不属于对话。
 - 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
 - 配置优先级：系统空间 `config.json` / `net_whitelist.json` → 环境变量 `SEARCH_*`。启动时读一次，改完需重启；配置写错**启动失败**而不是静默用默认值。
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
-- **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（配置回显 + 指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用；界面入口是系统空间页的「平台配置」。`config.json` 里存的只是凭证引用名，不是密钥。
+- **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（引用列表 + 指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。`config.json` 里存的只是凭证引用名，不是密钥。
+- 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间，并标出 `使用中 / 未引用`——只有与 `config.json` 引用一致的那条才会生效，避免改了 A 却仍跑在 B 上。
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
 - 新增 provider：实现 `search.Provider` 并在 `internal/app` 注册，工具与提示词都不用改。
 

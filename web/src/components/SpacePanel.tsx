@@ -1,4 +1,4 @@
-import { IconPlus, IconSetting } from '@douyinfe/semi-icons';
+import { IconKey, IconPlus } from '@douyinfe/semi-icons';
 import { Button, Card, Empty, Spin, Typography } from '@douyinfe/semi-ui';
 
 import type { ChatSession, Space } from '../api/types';
@@ -11,7 +11,7 @@ interface Props {
   loading: boolean;
   onOpenSession: (id: string) => void;
   onAddSession: () => void;
-  /** 系统空间才有平台配置入口：凭证、搜索接入等 */
+  /** 系统空间才有密钥配置入口（只影响平台能力，不涉及空间内容） */
   onOpenPlatform?: () => void;
 }
 
@@ -56,8 +56,8 @@ export default function SpacePanel({
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {space.type === 'system' && onOpenPlatform ? (
-            <Button icon={<IconSetting />} onClick={onOpenPlatform}>
-              平台配置
+            <Button icon={<IconKey />} onClick={onOpenPlatform}>
+              密钥配置
             </Button>
           ) : null}
           {writable ? (

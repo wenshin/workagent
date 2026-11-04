@@ -171,13 +171,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		resourceH:   resource.NewHandler(resourceSvc, authHandler.CurrentUser, log),
 		sessionSvc:  sessionSvc,
 		sessionH:    session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
-		// 平台管理：凭证写入 + 配置回显。密钥只进不出，接口只回指纹。
-		adminH: admin.NewHandler(spaceSvc, secretStore, admin.SearchSettings{
-			Provider:   searchProvider,
-			Endpoint:   searchEndpoint,
-			Allow:      allow,
-			SecretName: searchSecret,
-		}, authHandler.CurrentUser, log),
+		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
+		// refs 告诉管理页「哪一条密钥真正被引用」，避免改了 A 却仍跑在 B 上。
+		adminH: admin.NewHandler(spaceSvc, secretStore, []admin.SecretRef{{
+			Scope: search.SecretScope,
+			Name:  searchSecret,
+			Label: fmt.Sprintf("web_search（%s）", searchProvider),
+		}}, authHandler.CurrentUser, log),
 	}, nil
 }
 

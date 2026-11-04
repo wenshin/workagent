@@ -230,16 +230,25 @@ export interface ResourceDetailResponse {
   versions: ResourceVersionInfo[];
 }
 
-/** 平台配置与凭证状态（仅系统管理员可见）：只有指纹，没有密钥明文 */
+/** 平台引用的某条凭证：scope + name 用于寻址，label 是给管理员看的用途 */
+export interface SecretRef {
+  scope: string;
+  name: string;
+  label: string;
+}
+
+/** 已保存凭证的元信息：只有指纹，没有明文 */
+export interface SecretItem {
+  scope: string;
+  name: string;
+  fingerprint: string;
+  updated_at: string;
+  /** 是否被平台当前引用（未被引用的条目改了也不会生效） */
+  in_use: boolean;
+}
+
 export interface AdminSettings {
   secrets_enabled: boolean;
-  search: {
-    provider: string;
-    endpoint: string;
-    allow: string[];
-    secret_name: string;
-    secret_present: boolean;
-    fingerprint?: string;
-    updated_at?: string;
-  };
+  refs: SecretRef[];
+  items: SecretItem[];
 }

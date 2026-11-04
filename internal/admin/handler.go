@@ -1,4 +1,4 @@
-// Package admin 是平台级管理接口，目前只包含凭证维护与平台配置回显。
+// Package admin 是平台级管理接口，目前只包含凭证维护。
 //
 // 为什么密钥不放在系统空间的文件树里：系统空间对管理员来说是「可下载的文件」，
 // 明文密钥一旦进树，就同时进了备份、发布快照，以及任何拿到 read 权限的会话。
@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/platform"
-	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -22,31 +21,38 @@ import (
 // maxSecretBytes 是口令 / 密钥的长度上限；搜索 key 一般 40 多字节，留足余量。
 const maxSecretBytes = 4096
 
-// SearchSettings 是搜索相关配置的只读快照（不含密钥）。
-type SearchSettings struct {
-	Provider string   `json:"provider"`
-	Endpoint string   `json:"endpoint"`
-	Allow    []string `json:"allow"`
-	// SecretName 是 config.json 里 search.secret 指向的凭证名
-	SecretName    string     `json:"secret_name"`
-	SecretPresent bool       `json:"secret_present"`
-	Fingerprint   string     `json:"fingerprint,omitempty"`
-	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+// SecretRef 描述平台某个能力引用的凭证：scope + name 用于寻址，label 是给管理员看的用途。
+//
+// 只有被 ref 引用的那条凭证会被平台真正使用，其余同 scope 下的条目只是历史遗留，
+// 界面上用 in_use 标出来，避免管理员改了 A 却仍跑在 B 上。
+type SecretRef struct {
+	Scope string `json:"scope"`
+	Name  string `json:"name"`
+	Label string `json:"label"`
+}
+
+// SecretItem 是一条已存凭证的元信息，不含明文。
+type SecretItem struct {
+	Scope       string    `json:"scope"`
+	Name        string    `json:"name"`
+	Fingerprint string    `json:"fingerprint"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	InUse       bool      `json:"in_use"`
 }
 
 // Handler 提供 /admin 下的接口。
 type Handler struct {
 	spaces  *space.Service
 	secrets secret.Store
-	search  SearchSettings
+	refs    []SecretRef
 	resolve func(*http.Request) (store.User, error)
 	log     *slog.Logger
 }
 
 // NewHandler 构造管理接口；secrets 允许为 nil（未配置 SECRET_KEK）。
-func NewHandler(spaces *space.Service, secrets secret.Store, searchCfg SearchSettings,
+func NewHandler(spaces *space.Service, secrets secret.Store, refs []SecretRef,
 	resolve func(*http.Request) (store.User, error), log *slog.Logger) *Handler {
-	return &Handler{spaces: spaces, secrets: secrets, search: searchCfg, resolve: resolve, log: log}
+	return &Handler{spaces: spaces, secrets: secrets, refs: refs, resolve: resolve, log: log}
 }
 
 // Register 注册路由。全部要求系统管理员（按工号白名单）。
@@ -56,38 +62,58 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/secrets/{scope}/{name}", h.deleteSecret)
 }
 
-// settings 返回平台配置与凭证指纹，供管理页展示「配没配、是什么指纹」。
+// settings 返回「平台引用了哪些凭证」以及每条凭证的指纹。
 func (h *Handler) settings(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.requireAdmin(w, r); !ok {
 		return
 	}
 
-	enabled := h.secrets != nil && h.secrets.Enabled()
-	searchCfg := h.search
-	if searchCfg.Allow == nil {
-		searchCfg.Allow = []string{}
+	refs := h.refs
+	if refs == nil {
+		refs = []SecretRef{}
 	}
+	enabled := h.secrets != nil && h.secrets.Enabled()
+	items := make([]SecretItem, 0, len(refs))
 	if enabled {
-		items, err := h.secrets.Status(r.Context(), search.SecretScope)
-		if err != nil {
-			h.log.Warn("读取凭证状态失败", "scope", search.SecretScope, "err", err)
-		}
-		for _, it := range items {
-			if it.Name != searchCfg.SecretName {
+		seen := make(map[string]bool, len(refs))
+		for _, ref := range refs {
+			if seen[ref.Scope] {
 				continue
 			}
-			searchCfg.SecretPresent = true
-			searchCfg.Fingerprint = it.Fingerprint
-			updated := it.UpdatedAt
-			searchCfg.UpdatedAt = &updated
+			seen[ref.Scope] = true
+			list, err := h.secrets.Status(r.Context(), ref.Scope)
+			if err != nil {
+				h.log.Warn("读取凭证状态失败", "scope", ref.Scope, "err", err)
+				continue
+			}
+			for _, it := range list {
+				items = append(items, SecretItem{
+					Scope:       ref.Scope,
+					Name:        it.Name,
+					Fingerprint: it.Fingerprint,
+					UpdatedAt:   it.UpdatedAt,
+					InUse:       h.inUse(ref.Scope, it.Name),
+				})
+			}
 		}
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
-	platform.WriteJSON(w, http.StatusOK, struct {
-		SecretsEnabled bool           `json:"secrets_enabled"`
-		Search         SearchSettings `json:"search"`
-	}{SecretsEnabled: enabled, Search: searchCfg})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"secrets_enabled": enabled,
+		"refs":            refs,
+		"items":           items,
+	})
+}
+
+// inUse 判断某个 scope/name 是否被平台引用。
+func (h *Handler) inUse(scope, name string) bool {
+	for _, ref := range h.refs {
+		if ref.Scope == scope && ref.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // putSecret 写入或覆盖凭证，只回显指纹。
@@ -168,7 +194,7 @@ func (h *Handler) requireAdmin(w http.ResponseWriter, r *http.Request) (store.Us
 		return store.User{}, false
 	}
 	if !h.spaces.IsAdmin(user) {
-		platform.WriteError(w, r, http.StatusForbidden, "forbidden", "只有系统管理员可以修改平台配置")
+		platform.WriteError(w, r, http.StatusForbidden, "forbidden", "只有系统管理员可以管理密钥")
 		return store.User{}, false
 	}
 	return user, true

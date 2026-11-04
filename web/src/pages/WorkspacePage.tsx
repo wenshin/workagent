@@ -23,8 +23,8 @@ import { streamChat } from '../api/stream';
 import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
-import PlatformSettingsDialog from '../components/PlatformSettingsDialog';
 import ResourcePanel from '../components/ResourcePanel';
+import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
 import SpaceTree, { FILE_KEY_PREFIX, SESSION_KEY_PREFIX } from '../components/SpaceTree';
@@ -371,7 +371,7 @@ export default function WorkspacePage() {
       </Layout.Content>
 
       <SpaceDialog state={dialog} onClose={() => setDialog({ kind: 'none' })} />
-      <PlatformSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
+      <SecretSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
 
       <Modal
         title="删除会话"

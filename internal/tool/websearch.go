@@ -27,7 +27,6 @@ func webSearch() Tool {
   "type": "object",
   "properties": {
     "query": {"type": "string", "description": "检索词：用用户原话里的关键实体与限定词，不要整句疑问句"},
-    "provider": {"type": "string", "description": "搜索源，省略用平台默认值；填错时返回提示会列出可用源"},
     "limit": {"type": "integer", "description": "返回条数，默认 8，最大 20"}
   },
   "required": ["query"],
@@ -50,9 +49,8 @@ func invokeWebSearch(ctx context.Context, args json.RawMessage, env Env) (string
 	}
 
 	var in struct {
-		Query    string `json:"query"`
-		Provider string `json:"provider"`
-		Limit    int    `json:"limit"`
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
@@ -62,7 +60,8 @@ func invokeWebSearch(ctx context.Context, args json.RawMessage, env Env) (string
 		return "", fmt.Errorf("query 不能为空")
 	}
 
-	results, err := env.Search.Search(ctx, in.Provider, search.Request{
+	// 搜索源是平台配置，不是模型的选择：传空名表示用注册表默认源。
+	results, err := env.Search.Search(ctx, "", search.Request{
 		Query: in.Query,
 		Limit: in.Limit,
 	})
