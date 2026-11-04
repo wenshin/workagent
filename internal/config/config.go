@@ -51,6 +51,10 @@ type Config struct {
 	LLMFallbackAPIKey   string
 	LLMFallbackModel    string
 
+	// AgentImpl 选择 Agent 编排实现（§5.7.7）：builtin（内置 ReAct）/ direct（无工具直答）。
+	// 未注册的名字在启动时告警并回退 builtin，不影响服务可用。
+	AgentImpl string
+
 	// 上下文压缩与记忆（§5.7.2 / §5.7.4）
 	LLMSummaryModel string // 摘要用小模型，为空则复用主模型
 	LLMEmbedBaseURL string
@@ -72,7 +76,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SESSION_TTL 不是合法的时长: %w", err)
 	}
 
-	llmTimeout, err := time.ParseDuration(getenv("LLM_TIMEOUT", "120s"))
+	// 流式对话是「一个请求一条长连接」：这个值是整请求超时，必须 ≥ LLM_MAX_WALL_CLOCK，
+	// 否则普通长回答会先被上游超时打断（默认取主流 SDK 的 600s）
+	llmTimeout, err := time.ParseDuration(getenv("LLM_TIMEOUT", "10m"))
 	if err != nil {
 		return nil, fmt.Errorf("LLM_TIMEOUT 不是合法的时长: %w", err)
 	}
@@ -139,6 +145,8 @@ func Load() (*Config, error) {
 		LLMFallbackBaseURL:  strings.TrimRight(getenv("LLM_FALLBACK_BASE_URL", ""), "/"),
 		LLMFallbackAPIKey:   getenv("LLM_FALLBACK_API_KEY", ""),
 		LLMFallbackModel:    getenv("LLM_FALLBACK_MODEL", ""),
+
+		AgentImpl: getenv("AGENT_IMPL", "builtin"),
 
 		LLMSummaryModel: getenv("LLM_SUMMARY_MODEL", ""),
 		LLMEmbedBaseURL: strings.TrimRight(getenv("LLM_EMBED_BASE_URL", ""), "/"),

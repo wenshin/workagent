@@ -1,9 +1,9 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -68,7 +68,11 @@ type messageDTO struct {
 	Content   string          `json:"content"`
 	Reasoning string          `json:"reasoning,omitempty"`
 	Parts     json.RawMessage `json:"parts"`
-	CreatedAt string          `json:"created_at"`
+	// 产生这条助手消息的那一轮的 token 消耗与总耗时；用户消息为 0
+	InTokens   int    `json:"in_tokens"`
+	OutTokens  int    `json:"out_tokens"`
+	DurationMS int    `json:"duration_ms"`
+	CreatedAt  string `json:"created_at"`
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
@@ -98,13 +102,16 @@ func toMessageDTO(m store.Message) messageDTO {
 		parts = json.RawMessage("[]")
 	}
 	return messageDTO{
-		ID:        m.ID,
-		SessionID: m.SessionID,
-		Role:      m.Role,
-		Content:   m.Content,
-		Reasoning: m.Reasoning,
-		Parts:     parts,
-		CreatedAt: m.CreatedAt.In(time.Local).Format(timeLayout),
+		ID:         m.ID,
+		SessionID:  m.SessionID,
+		Role:       m.Role,
+		Content:    m.Content,
+		Reasoning:  m.Reasoning,
+		Parts:      parts,
+		InTokens:   m.Stats.InTokens,
+		OutTokens:  m.Stats.OutTokens,
+		DurationMS: m.Stats.DurationMS,
+		CreatedAt:  m.CreatedAt.In(time.Local).Format(timeLayout),
 	}
 }
 
@@ -281,34 +288,36 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	// 不支持 flush 的 ResponseWriter 做不了 SSE，在写响应头之前返回统一错误
+	if _, ok := w.(http.Flusher); !ok {
 		platform.WriteError(w, r, http.StatusInternalServerError, "stream_unsupported", "当前服务不支持流式响应")
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
-	// 关闭 Nginx 等反向代理的响应缓冲，保证首 token 及时到达
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	// 响应头、首字节、心跳与写截止时间都交给推送器（§7.3 时限约定）
+	stream := platform.NewStream(w)
+	if err := stream.Start(); err != nil {
+		// 响应头已发出，状态码无法回改，只能记录后结束
+		h.log.Warn("SSE 初始化失败",
+			"session_id", sessionID, "request_id", platform.RequestIDFrom(r.Context()), "err", err)
+		return
+	}
+	defer stream.Close()
 
 	emit := func(ev agent.Event) error {
 		switch ev.Type {
 		case agent.EventRunStarted:
-			return writeSSE(w, flusher, ev.Type, map[string]string{"run_id": ev.RunID})
+			return stream.Send(ev.Type, map[string]string{"run_id": ev.RunID})
 		case agent.EventMessageDelta:
 			// 思考过程与正文共用 message.delta，用字段区分，保持会话顺序不乱
 			if ev.Reasoning {
-				return writeSSE(w, flusher, ev.Type, map[string]string{"role": ev.Role, "reasoning": ev.Delta})
+				return stream.Send(ev.Type, map[string]string{"role": ev.Role, "reasoning": ev.Delta})
 			}
-			return writeSSE(w, flusher, ev.Type, map[string]string{"role": ev.Role, "content": ev.Delta})
+			return stream.Send(ev.Type, map[string]string{"role": ev.Role, "content": ev.Delta})
 		case agent.EventToolCall, agent.EventToolResult:
-			return writeSSE(w, flusher, ev.Type, ev.Tool.Payload())
+			return stream.Send(ev.Type, ev.Tool.Payload())
 		case agent.EventApprovalReq:
-			return writeSSE(w, flusher, ev.Type, ev.Approval)
+			return stream.Send(ev.Type, ev.Approval)
 		default:
 			return nil
 		}
@@ -316,21 +325,31 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 
 	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, req.Content, emit)
 	if err != nil {
-		if r.Context().Err() != nil {
-			// 客户端已断开，没有接收方，直接结束
+		switch {
+		case r.Context().Err() != nil:
+			// 客户端已断开（用户点了停止或关掉页面）：没有接收方，事件写不出去；
+			// 已生成的部分已落库，中断原因由会话层记录
+			return
+		case out.Status == store.RunCancelled:
+			// 连接仍然可用（到点或预算用尽，而不是用户断开）：补一个可解释的收尾
+			_ = stream.Send(agent.EventRunFinished, map[string]any{
+				"run_id": out.RunID, "status": out.Status, "reason": out.Reason,
+				"error": userFacingCancelError(err),
+			})
 			return
 		}
+
 		h.log.Warn("对话失败", "session_id", sessionID, "run_id", out.RunID, "err", err)
 		// 失败也以 run.finished 收尾，保证一次 run 的事件流始终有终点
 		payload := map[string]any{"status": "failed", "error": userFacingAgentError(err)}
 		if out.RunID != "" {
 			payload["run_id"] = out.RunID
 		}
-		_ = writeSSE(w, flusher, agent.EventRunFinished, payload)
+		_ = stream.Send(agent.EventRunFinished, payload)
 		return
 	}
 
-	_ = writeSSE(w, flusher, agent.EventMessageDone, map[string]any{
+	_ = stream.Send(agent.EventMessageDone, map[string]any{
 		"role": "assistant",
 		"usage": map[string]int{
 			"in":  out.Usage.InputTokens,
@@ -339,27 +358,31 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		"message": toMessageDTO(out.Message),
 		"session": toDTO(out.Session),
 	})
-	_ = writeSSE(w, flusher, agent.EventRunFinished, map[string]any{
-		"run_id": out.RunID,
-		"status": out.Status,
-	})
+	finished := map[string]any{"run_id": out.RunID, "status": out.Status}
+	if out.Reason != "" {
+		finished["reason"] = out.Reason
+	}
+	_ = stream.Send(agent.EventRunFinished, finished)
 }
 
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, payload any) error {
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
+// userFacingCancelError 说明一次中断的原因，避免前端把它当成「失败，请重试」。
+// 预算用尽由实现给出具体说明（如「本轮对话超过时间预算（10m0s）」），其余给通用文案。
+func userFacingCancelError(err error) string {
+	if errors.Is(err, agent.ErrBudgetExceeded) {
+		return err.Error()
 	}
-	if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
-		return err
-	}
-	flusher.Flush()
-	return nil
+	return RunBudgetExceededMessage
 }
+
+// timeoutError 识别上游超时：http.Client 的 Timeout 会包成实现了 Timeout() 的错误。
+type timeoutError interface{ Timeout() bool }
 
 // userFacingAgentError 把内部错误转成可读文案，避免把密钥等细节暴露给前端。
 func userFacingAgentError(err error) string {
+	var timeout timeoutError
 	switch {
+	case errors.As(err, &timeout) && timeout.Timeout(), errors.Is(err, context.DeadlineExceeded):
+		return "模型响应超时，可调大 LLM_TIMEOUT 或把问题拆小后重试"
 	case errors.Is(err, ErrAgentUnavailable):
 		return err.Error()
 	case errors.Is(err, ErrForbidden):

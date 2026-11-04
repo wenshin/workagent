@@ -21,7 +21,7 @@ func TestSystemMessageSkillIndexIsBudgeted(t *testing.T) {
 		})
 	}
 
-	msg := systemMessage(RunInput{Skills: skills})
+	msg := BuildSystemMessage(RunInput{Skills: skills})
 	if got := llm.EstimateTokens(msg.Content); got > skillIndexTokenBudget+300 {
 		t.Fatalf("技能索引超预算：%d tokens", got)
 	}
@@ -32,7 +32,7 @@ func TestSystemMessageSkillIndexIsBudgeted(t *testing.T) {
 
 func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 	doc := strings.Repeat("这是技能正文里的一步操作说明。\n", 2000)
-	msg := systemMessage(RunInput{ActiveSkill: &ActiveSkill{
+	msg := BuildSystemMessage(RunInput{ActiveSkill: &ActiveSkill{
 		Name: "长技能",
 		Path: "长技能/SKILL.md",
 		Doc:  doc,

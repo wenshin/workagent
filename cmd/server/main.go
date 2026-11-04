@@ -63,8 +63,11 @@ func main() {
 		Handler:           application.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// 不设 WriteTimeout：Go 的这个值是「整条响应」的绝对写截止时间，且无法按路由豁免，
+		// 会把 SSE 长连接按秒掐断（表现为「回答到一半停住、无任何报错」）。
+		// 流式写入的时限由 platform.Stream 每次写前刷新 + 15s 心跳维持（技术方案 §7.3）。
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)

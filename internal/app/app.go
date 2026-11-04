@@ -6,6 +6,9 @@ import (
 	"net/http"
 
 	"github.com/workagent/auto-agent/internal/agent"
+	"github.com/workagent/auto-agent/internal/agent/builtin"
+	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
+	_ "github.com/workagent/auto-agent/internal/agent/direct"
 	"github.com/workagent/auto-agent/internal/auth"
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
@@ -13,6 +16,7 @@ import (
 	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
@@ -22,14 +26,16 @@ import (
 
 // App 组装路由与服务。
 type App struct {
-	cfg        *config.Config
-	log        *slog.Logger
-	store      store.Store
-	auth       *auth.Handler
-	spaceSvc   *space.Service
-	spaceH     *space.Handler
-	sessionSvc *session.Service
-	sessionH   *session.Handler
+	cfg         *config.Config
+	log         *slog.Logger
+	store       store.Store
+	auth        *auth.Handler
+	spaceSvc    *space.Service
+	spaceH      *space.Handler
+	resourceSvc *resource.Service
+	resourceH   *resource.Handler
+	sessionSvc  *session.Service
+	sessionH    *session.Handler
 }
 
 // New 构造应用。
@@ -62,7 +68,20 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	registry := tool.NewRegistry(st, mcpManager, log)
 	invoker := tool.NewInvoker(policy.RBACEngine{}, st, log)
-	agentSvc := agent.NewService(cfg, router, registry, invoker, log)
+
+	// Agent 运行时（§5.7.7）：编排实现按 AGENT_IMPL 选择；框架依赖只允许出现在实现子包内，
+	// 本层只依赖 agent.Agent 契约。配置写错时回退内置实现，避免整个服务起不来。
+	agentDeps := agent.Deps{Config: cfg, LLM: router, Registry: registry, Invoker: invoker, Log: log}
+	agentSvc, err := agent.New(cfg.AgentImpl, agentDeps)
+	if err != nil {
+		log.Warn("Agent 实现不可用，回退内置实现",
+			"impl", cfg.AgentImpl, "fallback", builtin.Name, "err", err, "available", agent.Available())
+		if agentSvc, err = agent.New(builtin.Name, agentDeps); err != nil {
+			return nil, err
+		}
+	}
+	log.Info("Agent 运行时已就绪",
+		"impl", agentSvc.Name(), "capabilities", agentSvc.Capabilities(), "available", agent.Available())
 
 	if !cfg.LLMReady() {
 		log.Warn("模型服务未配置，对话接口将不可用", "missing", cfg.MissingLLM())
@@ -77,17 +96,22 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 上下文管理：摘要压缩 + 向量检索（§5.7.2 / §5.7.4）
 	memory := ctxmgr.New(st, router, log, ctxmgr.DefaultBudget())
 
-	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, log)
+	// 资源发布：把空间草稿按版本快照发布到独立目录，供 Agent 按需检索
+	resourceSvc := resource.NewService(st, fs, spaceSvc, log)
+
+	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, cfg.LLMMaxWallClock, log)
 
 	return &App{
-		cfg:        cfg,
-		log:        log,
-		store:      st,
-		auth:       authHandler,
-		spaceSvc:   spaceSvc,
-		spaceH:     space.NewHandler(spaceSvc, authHandler.CurrentUser, log),
-		sessionSvc: sessionSvc,
-		sessionH:   session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
+		cfg:         cfg,
+		log:         log,
+		store:       st,
+		auth:        authHandler,
+		spaceSvc:    spaceSvc,
+		spaceH:      space.NewHandler(spaceSvc, authHandler.CurrentUser, log),
+		resourceSvc: resourceSvc,
+		resourceH:   resource.NewHandler(resourceSvc, authHandler.CurrentUser, log),
+		sessionSvc:  sessionSvc,
+		sessionH:    session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
 	}, nil
 }
 
@@ -97,6 +121,7 @@ func (a *App) Handler() http.Handler {
 
 	a.auth.Register(mux)
 	a.spaceH.Register(mux)
+	a.resourceH.Register(mux)
 	a.sessionH.Register(mux)
 
 	mux.HandleFunc("GET /healthz", a.healthz)
@@ -117,8 +142,10 @@ func (a *App) agentInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{
-		"ready": a.sessionSvc.AgentReady(),
-		"model": a.sessionSvc.AgentModel(),
+		"ready":        a.sessionSvc.AgentReady(),
+		"model":        a.sessionSvc.AgentModel(),
+		"impl":         a.sessionSvc.AgentImpl(),
+		"capabilities": a.sessionSvc.AgentCapabilities(),
 	})
 }
 

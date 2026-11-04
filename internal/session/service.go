@@ -13,6 +13,7 @@ import (
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
+	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
@@ -34,21 +35,61 @@ const (
 	maxMessageRunes = 8000
 	// 首条消息自动生成的标题长度（超出部分省略）
 	autoTitleRunes = 20
+
+	// defaultRunBudget 与配置项 LLM_MAX_WALL_CLOCK 的缺省值保持一致
+	defaultRunBudget = 10 * time.Minute
+	// runBudgetBackstopMargin 是 ctx 兜底比实现内部预算多留的余量：
+	// 让实现先按自己的预算收尾，ctx 只兜住不自己计时的实现（如直答 direct）
+	runBudgetBackstopMargin = 30 * time.Second
 )
+
+// 中断原因（§7.3 run.finished.reason）：一次被掐断的流要能区分「用户停止」与「服务端到点」。
+const (
+	// ReasonClientDisconnected 客户端断开或服务端关闭，事件已经写不出去
+	ReasonClientDisconnected = "client_disconnected"
+	// ReasonWallClockExceeded 本服务的墙钟上限到点，连接仍可用，会补发 run.finished
+	ReasonWallClockExceeded = "wall_clock_exceeded"
+	// ReasonBudgetExceeded 实现自己的预算（墙钟 / 工具次数 / 轮次）用尽
+	ReasonBudgetExceeded = "budget_exceeded"
+)
+
+// RunBudgetExceededMessage 是墙钟上限到点时的用户可见文案。
+const RunBudgetExceededMessage = "本次回答已达时长上限，已保留已生成的内容"
+
+// cancelDetail 生成 run.error：预算是实现给出的具体说明（如「超过时间预算（10m0s）」），其余用原因常量。
+func cancelDetail(reason string, runErr error) string {
+	if reason == "" {
+		return ""
+	}
+	if errors.Is(runErr, agent.ErrBudgetExceeded) {
+		return runErr.Error()
+	}
+	return reason
+}
 
 // Service 承载聊天会话的业务规则。
 type Service struct {
-	store   store.Store
-	spaces  *space.Service
-	agent   *agent.Service
-	storage storage.Storage
-	memory  *ctxmgr.Manager
-	log     *slog.Logger
+	store     store.Store
+	spaces    *space.Service
+	resources *resource.Service
+	agent     agent.Agent
+	storage   storage.Storage
+	memory    *ctxmgr.Manager
+	// runBudget 是单次回答的墙钟上限（ctx 兜底），由 LLM_MAX_WALL_CLOCK 加余量得到
+	runBudget time.Duration
+	log       *slog.Logger
 }
 
-// NewService 构造会话服务。
-func NewService(st store.Store, spaces *space.Service, agents *agent.Service, fs storage.Storage, memory *ctxmgr.Manager, log *slog.Logger) *Service {
-	return &Service{store: st, spaces: spaces, agent: agents, storage: fs, memory: memory, log: log}
+// NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
+// wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
+func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, wallClock time.Duration, log *slog.Logger) *Service {
+	if wallClock <= 0 {
+		wallClock = defaultRunBudget
+	}
+	return &Service{
+		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
+		memory: memory, runBudget: wallClock + runBudgetBackstopMargin, log: log,
+	}
 }
 
 // AgentReady 返回模型服务是否可用。
@@ -60,6 +101,22 @@ func (s *Service) AgentModel() string {
 		return ""
 	}
 	return s.agent.Model()
+}
+
+// AgentImpl 返回当前生效的 Agent 实现名（§5.7.7 实现切换）。
+func (s *Service) AgentImpl() string {
+	if s.agent == nil {
+		return ""
+	}
+	return s.agent.Name()
+}
+
+// AgentCapabilities 返回当前实现的能力声明，供接口层向客户端说明。
+func (s *Service) AgentCapabilities() agent.Capabilities {
+	if s.agent == nil {
+		return agent.Capabilities{}
+	}
+	return s.agent.Capabilities()
 }
 
 // List 返回空间下的会话。
@@ -190,6 +247,8 @@ type ChatOutcome struct {
 	RunID   string
 	Usage   llm.Usage
 	Status  string
+	// Reason 是中断原因（仅 cancelled 有值），供 run.finished 说明发生了什么
+	Reason string
 }
 
 // Chat 执行一次完整对话：保存用户消息 → 建 run → 调用 Agent（含工具循环）→ 保存助手消息。
@@ -248,7 +307,13 @@ func (s *Service) Chat(
 	}
 
 	// 一次 run 为根，预算与步骤都落库，进程重启后可据此恢复（§5.7.5）
-	budget, marshalErr := json.Marshal(s.agent.Budget())
+	budgetMap := s.agent.Budget()
+	if budgetMap == nil {
+		budgetMap = map[string]any{}
+	}
+	// 记录实际生效的实现，便于按实现定位问题（AGENT_IMPL 可切换）
+	budgetMap["impl"] = s.agent.Name()
+	budget, marshalErr := json.Marshal(budgetMap)
 	if marshalErr != nil {
 		budget = []byte(`{}`)
 	}
@@ -301,8 +366,14 @@ func (s *Service) Chat(
 		}
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	// 流的生命周期上限由应用自己定，不依赖任何中间件超时；
+	// 实现内部还有自己的墙钟预算（builtin 会自己计时），这里多留余量做兜底
+	runCtx, cancel := context.WithTimeout(ctx, s.runBudget)
 	defer cancel()
+
+	// 整轮墙钟：从进入实现到回答落库，含所有工具轮次与思考时间。
+	// 用应用侧时钟而不是 run.started_at，避免与应用、数据库的时钟差导致耗时失真。
+	startedAt := time.Now()
 
 	res, runErr := s.agent.Run(runCtx, agent.RunInput{
 		Env: tool.Env{
@@ -314,8 +385,13 @@ func (s *Service) Chat(
 			Store:     s.store,
 			Storage:   s.storage,
 			Log:       s.log,
-			// 能力源：当前空间 + 系统空间，同名当前空间优先
-			Sources: sourceLoader{spaces: s.spaces, spaceID: sess.SpaceID},
+			// 能力源：当前空间 + 系统空间 + 已发布资源（发布件按需检索，不做同名覆盖）
+			Sources: sourceLoader{
+				spaces:    s.spaces,
+				published: s.resources,
+				spaceID:   sess.SpaceID,
+				userID:    userID,
+			},
 			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
 			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
 			CreateSkill: func(ctx context.Context, name, description string) (string, error) {
@@ -341,13 +417,32 @@ func (s *Service) Chat(
 		saveCtx = context.WithoutCancel(ctx)
 	}
 
-	status := store.RunSucceeded
+	// 中断原因：请求 ctx 结束 = 客户端断开或服务端关闭；runCtx 结束 = 本服务的墙钟上限到点。
+	// 少了这一步，被自己掐断的 run 会被记成 succeeded，事后完全看不出是截断的。
+	reason := ""
 	switch {
 	case ctx.Err() != nil:
+		reason = ReasonClientDisconnected
+	case errors.Is(runErr, agent.ErrBudgetExceeded):
+		// 实现自己声明的预算用尽（builtin 的墙钟与工具次数上限）
+		reason = ReasonBudgetExceeded
+	case runCtx.Err() != nil:
+		reason = ReasonWallClockExceeded
+	}
+
+	status := store.RunSucceeded
+	switch {
+	case reason != "":
 		status = store.RunCancelled
 	case runErr != nil:
 		status = store.RunFailed
 	}
+	if reason != "" {
+		s.log.Warn("对话被中断",
+			"session_id", sessionID, "run_id", run.ID, "reason", reason,
+			"chars", utf8.RuneCountInString(res.Content), "tools", len(res.Steps))
+	}
+	out.Reason = reason
 
 	finish := func(errMsg string) {
 		usage, err := json.Marshal(map[string]int{
@@ -366,22 +461,40 @@ func (s *Service) Chat(
 	}
 
 	if res.Content == "" && len(res.Steps) == 0 {
-		status = store.RunFailed
-		if runErr != nil {
-			finish(runErr.Error())
-			return out, runErr
+		// 没有内容可存：取消不改判为失败，原因如实写进 run.error
+		if reason == "" {
+			status = store.RunFailed
 		}
-		err := errors.New("模型没有返回内容，请重试")
-		finish(err.Error())
+		err := runErr
+		if err == nil {
+			err = errors.New("模型没有返回内容，请重试")
+		}
+		if reason != "" {
+			finish(cancelDetail(reason, runErr))
+		} else {
+			finish(err.Error())
+		}
 		return out, err
 	}
 
-	parts, marshalErr := json.Marshal(res.Steps)
-	if marshalErr != nil {
-		parts = []byte("[]")
+	// res.Steps 为空时 json.Marshal 会给出 null，而 parts 的契约是数组，这里显式落 []
+	parts := []byte("[]")
+	if len(res.Steps) > 0 {
+		data, marshalErr := json.Marshal(res.Steps)
+		if marshalErr != nil {
+			s.log.Warn("序列化执行轨迹失败", "session_id", sessionID, "err", marshalErr)
+		} else {
+			parts = data
+		}
 	}
 
-	msg, err := s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts)
+	// 这一轮的用量与耗时随消息落库：前端刷新后仍能看到 token 与总耗时
+	stats := store.MessageStats{
+		InTokens:   res.Usage.InputTokens,
+		OutTokens:  res.Usage.OutputTokens,
+		DurationMS: int(time.Since(startedAt).Milliseconds()),
+	}
+	msg, err := s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts, stats)
 	if err != nil {
 		status = store.RunFailed
 		finish(err.Error())
@@ -394,7 +507,8 @@ func (s *Service) Chat(
 		"tools":           len(res.Steps),
 		"need_approval":   res.NeedApproval,
 	})
-	finish("")
+	// cancelled 也写原因，便于事后区分「用户停止」与「服务端到点」
+	finish(cancelDetail(reason, runErr))
 
 	if err := s.store.TouchSession(saveCtx, sessionID); err != nil {
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)

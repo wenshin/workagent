@@ -168,7 +168,7 @@ func (d *DB) UpdateSessionSkill(ctx context.Context, id, path string) error {
 }
 
 const messageColumns = `id::text, session_id::text, role, content, reasoning,
-       coalesce(parts, '[]'::jsonb), created_at`
+       coalesce(parts, '[]'::jsonb), in_tokens, out_tokens, duration_ms, created_at`
 
 // CreateMessage 写入一条消息（用户/系统消息，无执行轨迹）。
 func (d *DB) CreateMessage(ctx context.Context, sessionID, role, content string) (store.Message, error) {
@@ -179,27 +179,30 @@ returning ` + messageColumns
 
 	var m store.Message
 	if err := d.pool.QueryRow(ctx, q, sessionID, role, content).Scan(
-		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt,
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt,
 	); err != nil {
 		return store.Message{}, err
 	}
 	return m, nil
 }
 
-// CreateAssistantMessage 写入助手消息，包含思考过程与工具调用轨迹。
-func (d *DB) CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte) (store.Message, error) {
+// CreateAssistantMessage 写入助手消息，包含思考过程、工具调用轨迹与这一轮的用量耗时。
+func (d *DB) CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte, stats store.MessageStats) (store.Message, error) {
 	if len(parts) == 0 {
 		parts = []byte("[]")
 	}
 
 	const q = `
-insert into message (session_id, role, content, reasoning, parts)
-values ($1::uuid, 'assistant', $2, $3, $4::jsonb)
+insert into message (session_id, role, content, reasoning, parts, in_tokens, out_tokens, duration_ms)
+values ($1::uuid, 'assistant', $2, $3, $4::jsonb, $5, $6, $7)
 returning ` + messageColumns
 
 	var m store.Message
-	if err := d.pool.QueryRow(ctx, q, sessionID, content, reasoning, parts).Scan(
-		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt,
+	if err := d.pool.QueryRow(ctx, q, sessionID, content, reasoning, parts,
+		stats.InTokens, stats.OutTokens, stats.DurationMS).Scan(
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt,
 	); err != nil {
 		return store.Message{}, err
 	}
@@ -223,7 +226,8 @@ order by created_at asc, id asc`
 	out := make([]store.Message, 0, 16)
 	for rows.Next() {
 		var m store.Message
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+			&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

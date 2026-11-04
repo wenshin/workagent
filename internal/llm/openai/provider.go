@@ -44,7 +44,8 @@ var _ llm.Provider = (*Provider)(nil)
 // New 构造 Provider；apiKey 允许为空（本地 Ollama / vLLM）。
 func New(cfg Config) *Provider {
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 120 * time.Second
+		// 流式请求是整请求超时，缺省与主流 SDK 的 600s 对齐
+		cfg.Timeout = 10 * time.Minute
 	}
 	if cfg.Name == "" {
 		cfg.Name = "openai"

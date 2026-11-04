@@ -100,8 +100,18 @@ type Message struct {
 	// Reasoning 是模型的思考过程，仅 assistant 消息可能有值
 	Reasoning string
 	// Parts 是结构化的执行轨迹（思考、工具调用），JSON 数组；为空表示纯文本消息
-	Parts     []byte
+	Parts []byte
+	// Stats 是这条助手消息的用量与耗时，仅 assistant 消息有值（历史消息为 0）
+	Stats     MessageStats
 	CreatedAt time.Time
+}
+
+// MessageStats 是产生一条助手消息的那一轮 run 的 token 消耗与总墙钟耗时（含工具轮次）。
+// 只做展示与成本归因，不参与上下文预算计算。
+type MessageStats struct {
+	InTokens   int
+	OutTokens  int
+	DurationMS int
 }
 
 // Capability 是平台能力接口（技术方案 §5.6.1），只描述语义与 IO Schema。
@@ -258,8 +268,8 @@ type Store interface {
 	UpdateSessionSkill(ctx context.Context, id, path string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
-	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息。
-	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte) (Message, error)
+	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息，并记录这一轮的用量与耗时。
+	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte, stats MessageStats) (Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	CountMessages(ctx context.Context, sessionID string) (int, error)
 
@@ -294,7 +304,68 @@ type Store interface {
 	SaveSessionSummary(ctx context.Context, s SessionSummary) error
 	SaveMessageEmbedding(ctx context.Context, r EmbeddingRecord) error
 	ListMessageEmbeddings(ctx context.Context, sessionID string, limit int) ([]EmbeddingRecord, error)
+
+	// ---- 资源发布（§5.6 资源管理）----
+	// CreateResource 在同一事务里写入资源与首个版本。
+	CreateResource(ctx context.Context, r Resource, v ResourceVersion) (Resource, error)
+	// FindResourceByName 按「发布者 + kind + name」查资源，用于判断是新增版本还是首次发布。
+	FindResourceByName(ctx context.Context, ownerID, kind, name string) (Resource, error)
+	GetResource(ctx context.Context, id string) (Resource, error)
+	// ListResources 返回对该用户可见的资源：全部 public + 自己的 private。
+	ListResources(ctx context.Context, userID string) ([]Resource, error)
+	// AddResourceVersion 追加一个不可变版本，并把 latest_version 指向最高版本。
+	AddResourceVersion(ctx context.Context, resourceID string, v ResourceVersion, latest string) error
+	ListResourceVersions(ctx context.Context, resourceID string) ([]ResourceVersion, error)
+	// GetResourceVersion 取指定版本；version 为空时取 latest_version。
+	GetResourceVersion(ctx context.Context, resourceID, version string) (ResourceVersion, error)
+	SetResourceStatus(ctx context.Context, id, status string) error
+	// UpdateResourceMeta 在再次发布时同步描述与可见性（版本快照本身不可变）。
+	UpdateResourceMeta(ctx context.Context, id, description, visibility string) error
+	DeleteResource(ctx context.Context, id string) error
+	// DeleteResourceVersion 删除一个版本；version 为空时删除 latest_version。
+	DeleteResourceVersion(ctx context.Context, resourceID, version string) error
 }
+
+// Resource 是发布后的资源：独立于工作空间存储，只保留名称、版本、描述等最小信息。
+//
+// 原始定义（MCP 配置、tool 文件、DB 连接串）不在接口里暴露，避免发布后泄露密钥。
+type Resource struct {
+	ID          string
+	Kind        string // skill | tool | mcp | component | db
+	Name        string
+	Description string
+	Visibility  string // public | private
+	Status      string // enabled | disabled
+	OwnerID     string
+	OwnerName   string
+	// SourceSpaceID 是发布来源空间（草稿所在空间），用于追溯
+	SourceSpaceID string
+	// SourceSpaceName 是来源空间名，仅列表查询时填充
+	SourceSpaceName string
+	LatestVersion   string
+	VersionCount    int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// ResourceVersion 是一个不可变的资源版本快照。
+type ResourceVersion struct {
+	Version     string
+	Notes       string
+	StoragePath string
+	FileCount   int
+	TotalBytes  int64
+	CreatedBy   string
+	CreatedAt   time.Time
+}
+
+// 资源可见性与状态取值。
+const (
+	ResourceVisibilityPublic  = "public"
+	ResourceVisibilityPrivate = "private"
+	ResourceStatusEnabled     = "enabled"
+	ResourceStatusDisabled    = "disabled"
+)
 
 // SessionSummary 是一段历史消息的滚动摘要。
 type SessionSummary struct {
