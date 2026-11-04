@@ -106,9 +106,20 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
           </Text>
 
           {!enabled ? (
-            <Text type="warning" size="small">
-              凭证存储未启用：需要在前端环境里配置 SECRET_KEK（至少 16 个字符）并重启后端。
-            </Text>
+            <div>
+              <Text type="warning" size="small">
+                凭证存储未启用：后端进程没读到环境变量 SECRET_KEK，密钥没法加密落盘。
+              </Text>
+              <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 6 }}>
+                在启动后端的那个终端 / 容器里设置一次（至少 16 个字符），然后重启后端：
+              </Text>
+              <Text code style={{ display: 'block', marginTop: 6 }}>
+                SECRET_KEK=$(openssl rand -base64 32) make run
+              </Text>
+              <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 6 }}>
+                这个值要长期留存：换掉它，之前存过的密钥就解不开了，需要重新录入。
+              </Text>
+            </div>
           ) : (
             <>
               <section>
