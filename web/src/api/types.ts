@@ -113,6 +113,10 @@ export interface ChatMessage {
   /** 模型的思考过程，历史消息回放用 */
   reasoning?: string;
   parts?: MessagePart[];
+  /** 产生这条助手消息的那一轮的 token 消耗与总耗时；用户消息为 0 */
+  in_tokens?: number;
+  out_tokens?: number;
+  duration_ms?: number;
   created_at: string;
 }
 
@@ -185,4 +189,43 @@ export interface SkillsResponse {
 export interface AppendMessageResponse {
   message: ChatMessage;
   session: ChatSession;
+}
+
+/** 已发布资源：资源管理板块只展示名称、版本与描述，不提供原始 MCP / tool / DB 配置 */
+export interface PublishedResource {
+  id: string;
+  kind: 'skill' | 'tool' | 'mcp' | 'component' | 'db';
+  name: string;
+  description: string;
+  /** public 全部可见 / private 仅自己可见 */
+  visibility: 'public' | 'private';
+  /** enabled 可被 Agent 检索使用 / disabled 已停用 */
+  status: 'enabled' | 'disabled';
+  owner_id: string;
+  owner_name: string;
+  source_space_id?: string;
+  source_space_name?: string;
+  latest_version: string;
+  version_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 一个不可变的发布版本；改内容必须发新版本 */
+export interface ResourceVersionInfo {
+  version: string;
+  notes: string;
+  file_count: number;
+  total_bytes: number;
+  created_by: string;
+  created_at: string;
+}
+
+export interface ResourcesResponse {
+  resources: PublishedResource[];
+}
+
+export interface ResourceDetailResponse {
+  resource: PublishedResource;
+  versions: ResourceVersionInfo[];
 }

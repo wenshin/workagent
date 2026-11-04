@@ -34,8 +34,10 @@ interface StreamPayload {
   /** message.done 携带落库后的消息与会话 */
   message?: ChatMessage | string;
   session?: ChatSession;
-  /** run.finished 失败时的可读文案 */
+  /** run.finished 失败或中断时的可读文案 */
   error?: string;
+  /** run.finished：中断原因（client_disconnected / wall_clock_exceeded） */
+  reason?: string;
 }
 
 function toToolRecord(payload: StreamPayload): ToolCallRecord {
@@ -138,9 +140,11 @@ export async function streamChat(
         }
         break;
       case 'run.finished':
-        // 失败以 run.finished 收尾，成功则由 message.done 更新界面
+        // 失败与中断都以 run.finished 收尾（成功时由 message.done 更新界面）
         if (payload.status && payload.status !== 'succeeded') {
-          handlers.onError?.(payload.error || '生成失败，请重试');
+          const fallback =
+            payload.status === 'cancelled' ? '回答已中断，已保留已生成的内容' : '生成失败，请重试';
+          handlers.onError?.(payload.error || fallback);
         }
         break;
       case 'error':

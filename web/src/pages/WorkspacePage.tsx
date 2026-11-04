@@ -2,7 +2,7 @@ import { IconAlertCircle, IconExit, IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
 import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
 import {
@@ -23,11 +23,16 @@ import { streamChat } from '../api/stream';
 import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
+import ResourcePanel from '../components/ResourcePanel';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
 import SpaceTree, { FILE_KEY_PREFIX, SESSION_KEY_PREFIX } from '../components/SpaceTree';
 
 export default function WorkspacePage() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  // 「工作空间」与「资源管理」同级：同一套外壳，用路由区分内容
+  const isResources = location.pathname.startsWith('/resources');
   const { data: me } = useMe();
   const { data: spaces = [], isLoading: spacesLoading } = useSpaces();
   const { data: sessions = [], isLoading: sessionsLoading } = useSessions();
@@ -229,8 +234,26 @@ export default function WorkspacePage() {
           </div>
         </div>
 
-        {/* 中部：工作空间树 */}
-        <div className="sider-main">
+        {/* 一级菜单：工作空间 / 资源管理 */}
+        <nav className="sider-nav">
+          <button
+            type="button"
+            className={`sider-nav-item${isResources ? '' : ' active'}`}
+            onClick={() => navigate('/')}
+          >
+            工作空间
+          </button>
+          <button
+            type="button"
+            className={`sider-nav-item${isResources ? ' active' : ''}`}
+            onClick={() => navigate('/resources')}
+          >
+            资源管理
+          </button>
+        </nav>
+
+        {/* 中部：工作空间树（资源管理下不展示树） */}
+        <div className="sider-main" hidden={isResources}>
           <div className="sider-head">
             <span className="sider-title">工作空间</span>
             <Button
@@ -269,6 +292,12 @@ export default function WorkspacePage() {
           )}
         </div>
 
+        {isResources ? (
+          <div className="sider-main sider-note">
+            资源管理展示已发布资源：版本快照不可修改，停用后 Agent 不会再检索到。发布前请先在空间里写好技能正文。
+          </div>
+        ) : null}
+
         {/* 底部：用户与退出 */}
         <div className="sider-user">
           <Avatar size="small" color="violet" src={user?.avatar || undefined}>
@@ -302,7 +331,9 @@ export default function WorkspacePage() {
       </Layout.Sider>
 
       <Layout.Content className="app-content">
-        {selectedFile ? (
+        {isResources ? (
+          <ResourcePanel />
+        ) : selectedFile ? (
           <FilePanel space={selectedSpace} file={selectedFile} />
         ) : selectedSession ? (
           <ChatPanel

@@ -49,6 +49,15 @@ export default function App() {
                 </RequireAuth>
               }
             />
+            {/* 资源管理与工作空间同级：同一套外壳，用路由区分内容 */}
+            <Route
+              path="/resources"
+              element={
+                <RequireAuth>
+                  <WorkspacePage />
+                </RequireAuth>
+              }
+            />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 
 /**
  * 轻量 Markdown 渲染：只覆盖文档类文件常用的语法（标题、列表、代码块、引用、表格、链接），
@@ -57,7 +57,7 @@ function splitRow(line: string): string[] {
     .map((cell) => cell.trim());
 }
 
-export default function MarkdownView({ content }: Props) {
+function MarkdownView({ content }: Props) {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let i = 0;
@@ -206,3 +206,6 @@ export default function MarkdownView({ content }: Props) {
 
   return <div className="md-body">{blocks}</div>;
 }
+
+// 内容没变就不重解析：对话流式输出时每帧都会重渲染父组件，历史消息要 memo 掉
+export default memo(MarkdownView);

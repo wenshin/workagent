@@ -518,6 +518,16 @@ body[theme-mode='dark'] {
   color: var(--semi-color-text-2);
 }
 
+/* 助手消息的 token 消耗与总耗时，靠右显示 */
+.chat-msg-stats {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--semi-color-fill-0);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .chat-msg-content {
   padding: 10px 14px;
   border-radius: 10px;
@@ -532,6 +542,17 @@ body[theme-mode='dark'] {
 .chat-msg-user .chat-msg-content {
   background: rgba(108, 92, 231, 0.14);
   border-color: rgba(108, 92, 231, 0.4);
+}
+
+/* ---- Markdown 正文（助手回答） ---- */
+/* 用户消息是纯文本、按原样换行；助手回答按块排版，不能保留源码里的换行 */
+.chat-msg-content.chat-msg-markdown {
+  white-space: normal;
+}
+
+/* 气泡内最后一个块的外边距不要叠加在气泡内边距上（.md-* 样式见文件预览一节） */
+.chat-msg-markdown .md-body > :last-child {
+  margin-bottom: 0;
 }
 
 .chat-hint {
@@ -660,15 +681,115 @@ body[theme-mode='dark'] {
 .chat-input {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   padding: 12px 16px;
   border-top: 1px solid var(--semi-color-border);
+}
+
+/* 输入框与发送按钮同一行：边框画在外层，按钮嵌在右侧内部 */
+.chat-composer {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 14px;
+  background: var(--semi-color-bg-2);
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s;
+}
+
+/* 拖拽手柄浮在上边框上：往上拖变高，双击恢复自动高度。
+   它改的是最小高度，内容变多时 autosize 仍会自动增高 */
+.chat-composer-resize {
+  position: absolute;
+  top: -5px;
+  left: 0;
+  right: 0;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+}
+
+.chat-composer-resize-bar {
+  width: 40px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--semi-color-border);
+  transition: background-color 0.2s;
+}
+
+.chat-composer-resize:hover .chat-composer-resize-bar {
+  background: var(--semi-color-primary);
+}
+
+.chat-composer:focus-within {
+  border-color: var(--semi-color-primary);
+  box-shadow: 0 0 0 2px rgba(108, 92, 231, 0.12);
+}
+
+.chat-composer-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Semi 的 TextArea 自带边框、内边距与 hover 底色，放进 composer 后要让它彻底融进外层边框
+   （hover / focus 态也要覆盖，否则鼠标移上去会出现一个内层色块） */
+.chat-composer .semi-input-textarea-wrapper,
+.chat-composer .semi-input-textarea-wrapper:hover,
+.chat-composer .semi-input-textarea-wrapper:focus-within,
+.chat-composer .semi-input-textarea {
+  border: none;
+  background-color: transparent;
+}
+
+.chat-composer .semi-input-textarea {
+  padding: 6px 2px;
+  font-size: 14px;
+  /* 与 ChatPanel 的 INPUT_MAX_HEIGHT 一致：超出改为框内滚动 */
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* 按钮列撑满输入框高度并垂直居中：这样按钮上下间距始终一致 */
+.chat-composer-actions {
+  display: flex;
+  flex: none;
+  align-self: stretch;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-send-btn.semi-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.chat-stop-btn.semi-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
 }
 
 .chat-input-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-height: 18px;
+  padding: 0 4px;
+}
+
+.chat-input-hint {
+  font-size: 12px;
+  color: var(--semi-color-text-2);
 }
 
 .chat-error {
@@ -887,4 +1008,178 @@ body[theme-mode='dark'] {
 .md-table th {
   background: var(--semi-color-fill-0);
   font-weight: 600;
+}
+
+/* ---- 一级菜单：工作空间 / 资源管理 ---- */
+.sider-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border-bottom: 1px solid var(--semi-color-border);
+}
+
+.sider-nav-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--semi-color-text-1);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sider-nav-item:hover {
+  background: var(--semi-color-fill-0);
+}
+
+.sider-nav-item.active {
+  background: var(--semi-color-primary-light-default);
+  color: var(--semi-color-primary);
+  font-weight: 600;
+}
+
+/* 资源管理下侧栏不展示空间树，只留一段说明 */
+.sider-note {
+  flex: 0 0 auto;
+  padding: 12px;
+  color: var(--semi-color-text-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* ---- 资源管理 ---- */
+.resource-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--semi-color-bg-1);
+  overflow: hidden;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.resource-filters {
+  display: flex;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--semi-color-border);
+}
+
+.resource-grid {
+  flex: 1;
+  overflow: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 12px;
+  padding: 16px 20px;
+  align-content: start;
+}
+
+.resource-card {
+  border: 1px solid var(--semi-color-border);
+}
+
+.resource-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.resource-card-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.resource-card-desc {
+  margin-top: 8px;
+  color: var(--semi-color-text-1);
+  font-size: 13px;
+  line-height: 1.6;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.resource-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 10px;
+  color: var(--semi-color-text-2);
+  font-size: 12px;
+}
+
+.resource-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+/* ---- 版本记录 ---- */
+.resource-versions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.resource-version-item {
+  padding: 10px 12px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 6px;
+}
+
+.resource-version-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.resource-version-no {
+  font-weight: 600;
+}
+
+.resource-version-time {
+  margin-left: auto;
+  color: var(--semi-color-text-2);
+  font-size: 12px;
+}
+
+.resource-version-desc {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.resource-version-meta {
+  margin-top: 4px;
+  color: var(--semi-color-text-2);
+  font-size: 12px;
+}
+
+/* ---- 发布表单 ---- */
+.publish-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.publish-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }

@@ -11,6 +11,9 @@ import type {
   MeResponse,
   MessagesResponse,
   ProviderResponse,
+  PublishedResource,
+  ResourceDetailResponse,
+  ResourcesResponse,
   SessionsResponse,
   SkillsResponse,
   Space,
@@ -29,6 +32,8 @@ export const queryKeys = {
   agent: ['agent'] as const,
   messages: (sessionId: string) => ['messages', sessionId] as const,
   file: (spaceId: string, path: string) => ['file', spaceId, path] as const,
+  resources: ['resources'] as const,
+  resource: (id: string) => ['resource', id] as const,
 };
 
 /** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
@@ -276,6 +281,83 @@ export function useSendMessage() {
       qc.invalidateQueries({ queryKey: queryKeys.messages(vars.sessionId) });
       // 首条消息会改写标题，需要刷新树
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
+    },
+  });
+}
+
+/* ---- 资源管理：发布件与工作空间分离存储，只有用户范围（public / private） ---- */
+
+export function useResources() {
+  return useQuery({
+    queryKey: queryKeys.resources,
+    queryFn: () => api<ResourcesResponse>('/resources').then((r) => r.resources),
+    staleTime: 10_000,
+  });
+}
+
+/** 版本明细按需加载：列表不返回历史版本 */
+export function useResourceDetail(id?: string) {
+  return useQuery({
+    queryKey: queryKeys.resource(id ?? ''),
+    queryFn: () => api<ResourceDetailResponse>(`/resources/${id}`),
+    enabled: Boolean(id),
+  });
+}
+
+export function usePublishResource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      spaceId: string;
+      path: string;
+      version: string;
+      notes?: string;
+      visibility: 'public' | 'private';
+    }) =>
+      api<{ resource: PublishedResource }>('/resources', {
+        method: 'POST',
+        body: {
+          space_id: input.spaceId,
+          path: input.path,
+          version: input.version,
+          notes: input.notes ?? '',
+          visibility: input.visibility,
+        },
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.resources }),
+  });
+}
+
+export function useSetResourceStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; status: 'enabled' | 'disabled' }) =>
+      api<{ ok: boolean }>(`/resources/${input.id}`, { method: 'PATCH', body: { status: input.status } }),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.resources });
+      qc.invalidateQueries({ queryKey: queryKeys.resource(vars.id) });
+    },
+  });
+}
+
+export function useDeleteResource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api<{ ok: boolean }>(`/resources/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.resources }),
+  });
+}
+
+export function useDeleteResourceVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; version: string }) =>
+      api<{ ok: boolean }>(`/resources/${input.id}/versions/${encodeURIComponent(input.version)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.resources });
+      qc.invalidateQueries({ queryKey: queryKeys.resource(vars.id) });
     },
   });
 }

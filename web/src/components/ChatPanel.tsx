@@ -1,10 +1,16 @@
 import { IconBook, IconClose, IconSend } from '@douyinfe/semi-icons';
-import { Button, Empty, Popover, Spin, TextArea, Typography } from '@douyinfe/semi-ui';
+import { Button, Empty, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useRef, useState } from 'react';
 
 import type { ChatMessage, ChatSession, MessagePart, SpaceSkill, ToolCallRecord } from '../api/types';
+import MarkdownView from './Markdown';
 
 const { Text } = Typography;
+
+// 输入框高度：单行（行高 21 + 上下内边距 12）≈ 33px，上限约 8 行。
+// 拖拽改的是「最小高度」，内容变多时仍由 autosize 自动增高，超过上限改为框内滚动。
+const INPUT_MIN_HEIGHT = 33;
+const INPUT_MAX_HEIGHT = 200;
 
 /** 流式过程中的临时视图 */
 export interface StreamView {
@@ -36,6 +42,48 @@ function formatTime(iso: string) {
   if (Number.isNaN(date.getTime())) return '';
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** token 数：340 / 1.5k / 26k */
+function formatTokens(n: number) {
+  if (!n) return '0';
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return `${k >= 100 ? Math.round(k) : k.toFixed(1)}k`;
+}
+
+/** 耗时：820ms / 12.3s / 1m05s */
+function formatDuration(ms: number) {
+  if (!ms) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds - minutes * 60);
+  return rest > 0 ? `${minutes}m${String(rest).padStart(2, '0')}s` : `${minutes}m`;
+}
+
+/** 助手消息的用量：token 消耗（输入 ↑ / 输出 ↓）与整轮总耗时 */
+function MessageStats({
+  inTokens,
+  outTokens,
+  durationMs,
+}: {
+  inTokens?: number;
+  outTokens?: number;
+  durationMs?: number;
+}) {
+  const tokens =
+    inTokens || outTokens ? `↑${formatTokens(inTokens ?? 0)} ↓${formatTokens(outTokens ?? 0)}` : '';
+  const duration = formatDuration(durationMs ?? 0);
+  if (!tokens && !duration) return null;
+  return (
+    <span className="chat-msg-stats" title="本轮 token 消耗（输入 ↑ / 输出 ↓）与总耗时">
+      {tokens}
+      {tokens && duration ? ' · ' : ''}
+      {duration}
+    </span>
+  );
 }
 
 function prettyJSON(raw: string) {
@@ -117,7 +165,11 @@ function AssistantBody({
       {tools.map((tool) => (
         <ToolCard key={tool.id} tool={tool} />
       ))}
-      {content ? <div className="chat-msg-content">{content}</div> : null}
+      {content ? (
+        <div className="chat-msg-content chat-msg-markdown">
+          <MarkdownView content={content} />
+        </div>
+      ) : null}
     </>
   );
 }
@@ -140,7 +192,15 @@ export default function ChatPanel({
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  // 流式期间的本地计时，用于「生成中 · 12.3s」；落库后的总耗时以后端 duration_ms 为准
+  const [elapsedMs, setElapsedMs] = useState(0);
+  // 拖拽设定的输入框最小高度；0 表示不干预，交给 autosize 按内容决定
+  const [inputMinHeight, setInputMinHeight] = useState(0);
+  const startedAtRef = useRef<number | null>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  const busy = sending || Boolean(stream);
 
   useEffect(() => {
     setValue('');
@@ -150,6 +210,19 @@ export default function ChatPanel({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages.length, session.id, stream?.text, stream?.tools.length, pendingUser]);
+
+  useEffect(() => {
+    if (!busy) {
+      startedAtRef.current = null;
+      setElapsedMs(0);
+      return;
+    }
+    if (startedAtRef.current === null) startedAtRef.current = Date.now();
+    const tick = () => setElapsedMs(Date.now() - (startedAtRef.current ?? Date.now()));
+    tick();
+    const timer = window.setInterval(tick, 200);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   const send = async () => {
     const text = value.trim();
@@ -163,7 +236,30 @@ export default function ChatPanel({
     }
   };
 
-  const busy = sending || Boolean(stream);
+  // 手柄在输入框上边框上：往上拖 = 变高，往下拖 = 变矮（最矮一行，双击恢复自动高度）
+  const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const box = composerRef.current?.querySelector('textarea');
+    const startHeight = box?.offsetHeight || INPUT_MIN_HEIGHT;
+    const startY = e.clientY;
+    const clamp = (px: number) => Math.min(Math.max(px, INPUT_MIN_HEIGHT), INPUT_MAX_HEIGHT);
+
+    const onMove = (ev: MouseEvent) => setInputMinHeight(clamp(Math.round(startHeight + (startY - ev.clientY))));
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = '';
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    // 拖拽期间别把页面文字选中
+    document.body.style.userSelect = 'none';
+    setInputMinHeight(clamp(startHeight));
+  };
+
+  const resetInputHeight = () => setInputMinHeight(0);
+
   const showEmpty = !loading && messages.length === 0 && !stream && !pendingUser;
   const activeSkill = skills.find((s) => s.path === session.skill_path);
 
@@ -248,6 +344,13 @@ export default function ChatPanel({
               <div className="chat-msg-meta">
                 <span>{m.role === 'user' ? '我' : m.role === 'assistant' ? 'Agent' : '系统'}</span>
                 <span className="chat-msg-time">{formatTime(m.created_at)}</span>
+                {m.role === 'assistant' ? (
+                  <MessageStats
+                    inTokens={m.in_tokens}
+                    outTokens={m.out_tokens}
+                    durationMs={m.duration_ms}
+                  />
+                ) : null}
               </div>
               {m.role === 'assistant' ? (
                 <AssistantBody content={m.content} reasoning={m.reasoning} tools={toRecords(m.parts)} />
@@ -271,7 +374,11 @@ export default function ChatPanel({
           <div className="chat-msg chat-msg-assistant">
             <div className="chat-msg-meta">
               <span>Agent</span>
-              {busy ? <span className="chat-msg-time">生成中…</span> : null}
+              {busy ? (
+                <span className="chat-msg-time">
+                  {elapsedMs >= 1000 ? `生成中 · ${formatDuration(elapsedMs)}` : '生成中…'}
+                </span>
+              ) : null}
             </div>
             {!stream.reasoning && !stream.text && stream.tools.length === 0 ? (
               <div className="chat-msg-content chat-msg-pending">正在思考…</div>
@@ -285,39 +392,65 @@ export default function ChatPanel({
       </div>
 
       <div className="chat-input">
-        <TextArea
-          value={value}
-          onChange={setValue}
-          placeholder={
-            agentReady ? '描述你的任务，Enter 发送，Shift + Enter 换行' : '模型服务未配置，暂时无法发送消息'
-          }
-          autosize={{ minRows: 2, maxRows: 8 }}
-          disabled={busy || !agentReady}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-        />
+        {/* 输入框与操作按钮同一行：按钮嵌在输入框内部右侧 */}
+        <div className="chat-composer" ref={composerRef}>
+          <div
+            className="chat-composer-resize"
+            role="separator"
+            aria-label="拖拽调整输入框高度"
+            title="拖拽调整输入框高度，双击恢复自动高度"
+            onMouseDown={startResize}
+            onDoubleClick={resetInputHeight}
+          >
+            <span className="chat-composer-resize-bar" />
+          </div>
+          <TextArea
+            className="chat-composer-input"
+            value={value}
+            onChange={setValue}
+            placeholder={agentReady ? '描述你的任务…' : '模型服务未配置，暂时无法发送消息'}
+            autosize={{ minRows: 1 }}
+            textareaStyle={inputMinHeight ? { minHeight: inputMinHeight } : undefined}
+            borderless
+            disabled={busy || !agentReady}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+          />
+          <div className="chat-composer-actions">
+            {busy ? (
+              <Tooltip content="停止生成" position="topRight">
+                <Button
+                  className="chat-stop-btn"
+                  theme="borderless"
+                  type="danger"
+                  icon={<IconClose />}
+                  onClick={onStop}
+                  aria-label="停止生成"
+                />
+              </Tooltip>
+            ) : (
+              <Button
+                className="chat-send-btn"
+                theme="solid"
+                type="primary"
+                icon={<IconSend />}
+                loading={sending}
+                disabled={!value.trim() || !agentReady}
+                onClick={send}
+                aria-label="发送"
+              />
+            )}
+          </div>
+        </div>
         <div className="chat-input-foot">
           <span className="chat-error">{error}</span>
-          {busy ? (
-            <Button theme="borderless" type="danger" icon={<IconClose />} onClick={onStop}>
-              停止生成
-            </Button>
-          ) : (
-            <Button
-              theme="solid"
-              type="primary"
-              icon={<IconSend />}
-              loading={sending}
-              disabled={!value.trim() || !agentReady}
-              onClick={send}
-            >
-              发送
-            </Button>
-          )}
+          <span className="chat-input-hint">
+            {busy ? `已用时 ${formatDuration(elapsedMs) || '0.0s'}` : 'Enter 发送，Shift + Enter 换行'}
+          </span>
         </div>
       </div>
     </div>
