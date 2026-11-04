@@ -121,7 +121,7 @@ func (s *Service) Skills(ctx context.Context, userID, spaceID string) ([]IndexEn
 
 // ReadSourceFile 读取资源文件：先当前空间，再系统空间。
 //
-// 这是 global_source_read 与技能正文加载的统一入口，因此路径只做安全校验，
+// 这是 resource_read 与技能正文加载的统一入口，因此路径只做安全校验，
 // 不限定在 skills / tools / mcps 目录下——普通空间的技能就在 files 根下。
 func (s *Service) ReadSourceFile(ctx context.Context, spaceID, rawPath string, limit int64) (string, error) {
 	rel, err := normalizeSourcePath(rawPath)

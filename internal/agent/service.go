@@ -26,9 +26,19 @@ const (
 
 // 单轮对话内的容量上限，避免模型输出把上下文撑爆。
 const (
-	maxToolArgBytes  = 8 * 1024
+	maxToolArgBytes = 8 * 1024
+	// maxToolFeedBytes 是工具结果回填给模型的默认上限；
+	// 读类工具通过 Tool.MaxResultBytes 申请更高额度（见 file_read / resource_read）。
 	maxToolFeedBytes = 4 * 1024
 )
+
+// resultBudget 返回单次工具结果回填给模型的字节上限。
+func resultBudget(tools []tool.Tool, name string) int {
+	if t, ok := tool.Find(tools, name); ok && t.MaxResultBytes > 0 {
+		return t.MaxResultBytes
+	}
+	return maxToolFeedBytes
+}
 
 // Event 是 Agent 运行过程中推送给前端的增量（§7.3）。
 type Event struct {
@@ -316,7 +326,7 @@ func (s *Service) Run(ctx context.Context, in RunInput, emit func(Event) error) 
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				ToolCallID: call.ID,
-				Content:    truncate(r.Content, maxToolFeedBytes),
+				Content:    truncate(r.Content, resultBudget(tools, call.Function.Name)),
 			})
 		}
 	}
@@ -331,9 +341,9 @@ func systemMessage(in RunInput) llm.Message {
 要求：
 - 用中文回答，简洁直接，先给结论再展开。
 - 需要事实依据时先调用工具（时间、空间列表、文件列表等），不要凭空编造。
-- 能力源（skills / tools / mcps）来自「当前空间 + 系统空间」，同名时当前空间优先：需要了解平台有哪些能力时先调用 global_source_list，再用 global_source_read 读取具体文件（如 SKILL.md、工具定义 JSON）。
+- 资源（skills / tools / mcps）来自「当前空间 + 系统空间」，总量没有上限，不要试图列举全部：需要某类能力时用 resource_search 按关键词检索，再用 resource_read 读取 SKILL.md 或定义文件。命中多个同名资源时，先把候选给用户选，不要自行假设。
 - 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
-- 用户要「做一个技能」时，先用 skill_create 建技能（生成 .meta.json 与 SKILL.md），再用 file_write 完善技能正文；只写 SKILL.md 不建目录不会生成技能。
+- 用户要「做一个技能」时，先用 skill_create 建技能（生成 .meta.json 与符合规范的 SKILL.md 骨架），再用 file_write 完善正文。正文只写入口流程与判断规则，参考资料放子文件（最多一层引用），单个 SKILL.md 建议不超过 300 行。
 - 工具返回「需要审批」或「策略拒绝」时，如实告知用户原因，不要重试同一工具。
 - 不清楚的信息要明确说明，而不是猜测。
 - 代码用 Markdown 代码块输出，并标注语言。`
@@ -341,37 +351,58 @@ func systemMessage(in RunInput) llm.Message {
 	var b strings.Builder
 	b.WriteString(prompt)
 
-	// 方案一：技能索引常驻（名称 + 描述 + 路径），正文按需读取，避免一次性塞满上下文
+	// L1：技能索引常驻（名称 + 描述 + 路径），正文按需读取
 	if len(in.Skills) > 0 {
-		b.WriteString("\n\n## 可用技能\n")
-		b.WriteString("以下是当前空间与系统空间的技能索引（同名时当前空间优先）。任务与某个技能相关时，先用 global_source_read 读取它的 SKILL.md 再按步骤执行；不要凭名称猜测内容。\n")
+		b.WriteString("\n\n## 可用技能（索引，正文按需读取）\n")
+		b.WriteString("下面是当前空间与系统空间的技能索引，只有名称、来源、描述与路径。任务与某个技能相关时，先用 resource_read 读取它的 SKILL.md 再照做，不要凭名称猜测内容。索引没有列出全部技能，找不到时用 resource_search 检索。\n")
+
+		used := 0
 		for i, s := range in.Skills {
 			if i >= maxSkillIndexItems {
-				b.WriteString("- 其余技能可用 global_source_list 查看\n")
+				b.WriteString("- （索引已达条数上限，其余技能请用 resource_search 检索）\n")
 				break
 			}
 			where := "当前空间"
 			if s.Source == "system" {
 				where = "系统空间"
 			}
-			b.WriteString("- " + s.Name + "（" + where + "）：" + truncate(s.Description, 80) + " → " + s.Path + "\n")
+			line := "- " + s.Name + "（" + where + "）：" + truncate(s.Description, 80) + " → " + s.Path + "\n"
+			cost := llm.EstimateTokens(line)
+			if used+cost > skillIndexTokenBudget {
+				b.WriteString("- （索引已按 token 预算截断，其余技能请用 resource_search 检索）\n")
+				break
+			}
+			used += cost
+			b.WriteString(line)
 		}
 	}
 
-	// 方案二：会话选中的技能，正文直接注入本轮
+	// L2：会话选中的技能，正文按 token 预算注入本轮
 	if in.ActiveSkill != nil && strings.TrimSpace(in.ActiveSkill.Doc) != "" {
+		doc, truncated := llm.TruncateByTokens(in.ActiveSkill.Doc, skillDocTokenBudget)
 		b.WriteString("\n\n## 本轮选中的技能：")
 		b.WriteString(in.ActiveSkill.Name)
 		b.WriteString("\n用户已为本会话选择该技能，优先按下面的步骤执行；如果与当前任务无关，说明原因后按常规处理。\n\n")
-		b.WriteString(in.ActiveSkill.Doc)
+		b.WriteString(doc)
 		b.WriteString("\n")
+		if truncated {
+			b.WriteString(fmt.Sprintf("\n（正文超过 %d tokens 预算已截断，需要剩余内容时用 resource_read 继续读取 %s）\n",
+				skillDocTokenBudget, in.ActiveSkill.Path))
+		}
 	}
 
 	return llm.Message{Role: llm.RoleSystem, Content: b.String()}
 }
 
-// maxSkillIndexItems 限制注入的技能条数，避免索引过长挤占上下文。
-const maxSkillIndexItems = 30
+// 技能注入的 token 预算：按业界做法分层披露并封顶，避免技能挤占对话空间。
+const (
+	// skillIndexTokenBudget 是常驻技能索引（L1 元数据）的预算
+	skillIndexTokenBudget = 2000
+	// skillDocTokenBudget 是会话选中技能正文（L2）的预算
+	skillDocTokenBudget = 4000
+	// maxSkillIndexItems 是索引条数上限，与 token 预算互为双保险
+	maxSkillIndexItems = 30
+)
 
 func truncate(s string, limit int) string {
 	if len(s) <= limit {

@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	// sourceReadLimit 是读取能力源文件（SKILL.md / 工具 JSON）的上限
-	sourceReadLimit = 16 << 10
-	// maxSkillDocBytes 是注入系统提示词的技能正文上限，超出部分截断
-	maxSkillDocBytes = 16 << 10
+	// sourceReadLimit 是 resource_read 单次读取能力源文件的上限，与工具侧 24KB 上限一致
+	sourceReadLimit = 24 << 10
+	// maxSkillDocBytes 是读取技能正文的上限；真正的注入预算按 token 控制（见 agent.systemMessage），
+	// 这里只防止把超大文件整体读进内存
+	maxSkillDocBytes = 64 << 10
 )
 
 // sourceLoader 把「当前空间 + 系统空间」的能力源适配成工具层接口。

@@ -61,6 +61,9 @@ type Tool struct {
 
 	HasBinding  bool
 	Constraints policy.Constraints
+	// MaxResultBytes 是回填给模型的单次结果上限（默认 4KB）。
+	// 读类工具（file_read / resource_read）可申请更高额度，避免长文档被无谓截断。
+	MaxResultBytes int
 
 	Invoke func(ctx context.Context, args json.RawMessage, env Env) (string, error)
 }

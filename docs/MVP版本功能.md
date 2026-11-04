@@ -201,7 +201,7 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 | `files/tools` | 内置工具定义（与运行时 `BuiltinManifests()` 同步，一个工具一个 JSON） | 同上 |
 | `files/mcps` | MCP 服务快照：`README.md` + 每个已注册服务一个 JSON | 同上 |
 
-- `skills` / `tools` / `mcps` 三个目录是 **Agent 默认全局可见的能力搜索源**：所有用户（不限空间）都可读取，Agent 通过工具 `global_source_list` 列出条目、`global_source_read` 读取具体文件。
+- `skills` / `tools` / `mcps` 三个目录是 **Agent 默认全局可见的能力搜索源**：所有用户（不限空间）都可读取，Agent 通过 `resource_search` 检索、`resource_read` 读取具体文件（资源总量不设上限，不提供全量列举）。
 - 内置内容只在文件缺失时写入，不覆盖管理员后续的修改。
 - 内置内容初始包含：空间管理、文件与目录操作、会话管理三个技能说明，以及全部内置工具（时间、资源列表、会话列表、文件列表、文件读写、全局能力源）的定义快照。`tools/` 属于平台托管内容，每次启动按运行时清单覆盖写入，保证与 `BuiltinManifests()` 一致。
 
@@ -383,7 +383,7 @@ autoagent/                                 # 存储根
 | 项 | 内容 |
 | --- | --- |
 | 能力 | 多轮对话、工具调用、流式输出、思考过程输出、上下文管理（超长会话压缩）、错误重试 |
-| 内置工具 | `time_now`、`resource_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`system.source.list` / `system.source.read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再补写 SKILL.md 骨架或指定正文，上限 64KB |
+| 内置工具 | `time_now`、`resource_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`resource_search` / `resource_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`resource_search` 按关键词检索能力源（资源无上限，不提供全量列举），`resource_read` 读取正文并支持分页 |
 | Skill | MVP 内置 4 个：`创建数据库资源`、`创建 MCP 服务资源`、`find/创建工具资源`、`创建 UI 组件资源`；每个 Skill 定义询问参数清单与校验规则 |
 | **Skill 作为一等资产** | Skill 有独立版本，复用 Agent 的版本/发布/灰度/回滚机制；生成规则（组件白名单、禁止 API、追问话术、模板库）写在 Skill 里而非硬编码；**MVP 先交付可用版本，上线后直接在产品内迭代优化**，每轮优化产出新版本并对比“生成一次通过率” |
 | 搜索 | 空间内文件名搜索 + 会话标题搜索（MVP 不含全文检索） |

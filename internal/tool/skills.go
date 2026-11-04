@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/policy"
 )
@@ -15,6 +16,12 @@ import (
 // 技能文档最终会被读进模型上下文，过大既浪费 token 也说明这个技能该拆，
 // 所以比普通文件写（256KB）收紧到 64KB。
 const maxSkillDocBytes = 64 * 1024
+
+// 技能元数据限制，与 Agent Skills 规范对齐：name 最长 64 字符，description 最长 1024 字符。
+const (
+	maxSkillNameRunes = 64
+	maxSkillDescRunes = 1024
+)
 
 // skillCreate 在当前空间创建一个技能目录（含 .meta.json），并写入 SKILL.md。
 //
@@ -59,17 +66,34 @@ func skillCreate() Tool {
 			if name == "" {
 				return "", fmt.Errorf("name 不能为空")
 			}
+			// 规范：技能名同时是目录名，限制长度并禁止路径分隔符与隐藏目录
+			if utf8.RuneCountInString(name) > maxSkillNameRunes {
+				return "", fmt.Errorf("name 过长（%d 字符），上限 %d 字符", utf8.RuneCountInString(name), maxSkillNameRunes)
+			}
+			if strings.ContainsAny(name, `/\`) || strings.HasPrefix(name, ".") {
+				return "", fmt.Errorf("name 不能包含 / 或 \\，也不能以 . 开头")
+			}
+
 			desc := strings.TrimSpace(in.Description)
 			if desc == "" {
 				return "", fmt.Errorf("description 不能为空：用一句话说明这个技能解决什么问题")
+			}
+			// 规范：description 要同时写清「做什么」和「何时使用」，上限 1024 字符
+			if utf8.RuneCountInString(desc) > maxSkillDescRunes {
+				return "", fmt.Errorf("description 过长（%d 字符），上限 %d 字符；写清「做什么 + 何时使用」即可",
+					utf8.RuneCountInString(desc), maxSkillDescRunes)
 			}
 
 			doc := in.Content
 			if strings.TrimSpace(doc) == "" {
 				doc = defaultSkillDoc(name, desc)
+			} else if !strings.HasPrefix(strings.TrimSpace(doc), "---") {
+				// 补齐规范要求的 YAML frontmatter，便于按元数据做检索与展示
+				doc = skillFrontMatter(name, desc) + "\n" + doc
 			}
 			if len(doc) > maxSkillDocBytes {
-				return "", fmt.Errorf("SKILL.md 过大（%d 字节），上限 %d 字节；建议拆成多个技能", len(doc), maxSkillDocBytes)
+				return "", fmt.Errorf("SKILL.md 过大（%d 字节），上限 %d 字节；建议把参考资料拆到子文件并用相对路径引用",
+					len(doc), maxSkillDocBytes)
 			}
 
 			dir, err := env.CreateSkill(ctx, name, desc)
@@ -86,34 +110,48 @@ func skillCreate() Tool {
 				return "", fmt.Errorf("技能目录已创建（%s），但 SKILL.md 写入失败：%w；请用 file_write 写入 %s/SKILL.md", dir, err, dir)
 			}
 
-			return fmt.Sprintf("已创建技能 %s（%s）；SKILL.md 已写入 %d 字节，可继续用 file_write 完善 %s/SKILL.md",
-				dir, desc, len(doc), dir), nil
+			hint := ""
+			if len(doc) > 16*1024 {
+				hint = "；正文偏长，建议把模板/样例拆到子文件并在 SKILL.md 中相对路径引用"
+			}
+			return fmt.Sprintf("已创建技能 %s（%s）；SKILL.md 已写入 %d 字节，可继续用 file_write 完善 %s/SKILL.md%s",
+				dir, desc, len(doc), dir, hint), nil
 		},
 	}
 }
 
-// defaultSkillDoc 是新建技能的骨架，结构与内置技能保持一致。
+// defaultSkillDoc 是新建技能的骨架，遵循 Agent Skills 规范：
+// YAML frontmatter 提供元数据，正文只写「何时用 / 输入 / 步骤 / 验收」，
+// 长内容拆到同目录子文件（最多一层引用），避免单个 SKILL.md 过长。
 func defaultSkillDoc(name, desc string) string {
-	return fmt.Sprintf(`# %s
+	return skillFrontMatter(name, desc) + fmt.Sprintf(`
+# %s
 
-%s
+## 何时使用
 
-## 适用场景
+- 待补充：用户说什么话、处在什么场景时触发这个技能。
 
-- 待补充：用户在什么场景、说什么话时触发这个技能。
-
-## 输入参数
+## 输入
 
 | 参数 | 说明 | 必填 |
 | --- | --- | --- |
 | 待补充 |  |  |
 
-## 执行步骤
+## 步骤
 
-1. 待补充：先确认哪些参数，再按顺序调用哪些工具。
+1. 待补充：先确认哪些信息，再按顺序调用哪些工具。
 
 ## 输出与验收
 
 - 待补充：产出什么结果，如何判断任务完成。
-`, name, desc)
+
+## 参考文件（可选，最多一层）
+
+- 模板、样例、接口说明放同目录子文件，用相对路径引用，例如 `+"`templates.md`"+`。
+`, name)
+}
+
+// skillFrontMatter 生成规范要求的 YAML frontmatter。
+func skillFrontMatter(name, desc string) string {
+	return fmt.Sprintf("---\nname: %q\ndescription: %q\n---\n", name, desc)
 }

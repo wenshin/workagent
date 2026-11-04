@@ -146,13 +146,34 @@ func (s *Service) seedSkills(ctx context.Context, spaceID string) error {
 // 否则新增内置工具后系统空间里查不到，全局搜索源就失真了。
 func (s *Service) seedTools(ctx context.Context, spaceID string) error {
 	root := path.Join(s.filesKey(spaceID), systemToolsDir)
+	keep := make(map[string]bool, len(tool.BuiltinManifests()))
 	for _, m := range tool.BuiltinManifests() {
 		body, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {
 			return err
 		}
-		if _, err := s.storage.Put(ctx, path.Join(root, m.Name+".json"), strings.NewReader(string(body)), int64(len(body))); err != nil {
+		name := m.Name + ".json"
+		keep[name] = true
+		if _, err := s.storage.Put(ctx, path.Join(root, name), strings.NewReader(string(body)), int64(len(body))); err != nil {
 			return err
+		}
+	}
+
+	// 清理已下线的工具清单，否则检索会返回运行时根本不存在的工具
+	entries, err := s.storage.List(ctx, root)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		name := path.Base(e.Key)
+		if e.IsDir || keep[name] || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		if err := s.storage.Delete(ctx, e.Key); err != nil {
+			s.log.Warn("清理过期工具清单失败", "space_id", spaceID, "file", name, "err", err)
 		}
 	}
 	return nil
@@ -250,7 +271,7 @@ var builtinSkills = []builtinSkill{
 			"- 空间类型：`personal`（个人空间，登录时自动创建）、`shared`、`system`（平台内置，仅管理员可见）。",
 			"- 成员权限：`view` < `read` < `write` < `manage`；目录不单独授权，随所属空间。",
 			"- 只有 `write` / `manage` 才能写文件或建技能；权限不足时如实告知，不要换路径重试。",
-			"- 系统空间是平台默认能力源，任何用户都可通过 `global_source_list` / `global_source_read` 只读访问。",
+			"- 系统空间是平台默认能力源，任何用户都可以用 `resource_search` 检索、`resource_read` 只读访问。",
 			"",
 			"## 工具",
 			"- `resource_list`：列出当前用户可见的空间（名称、类型、权限、路径）。",

@@ -82,17 +82,20 @@ make web     # 前端 :5173
   - `files/skills`：全局技能，每个技能含 `.meta.json` + `SKILL.md`
   - `files/tools`：内置工具定义，与 `tool.BuiltinManifests()` 同步，一个工具一个 JSON
   - `files/mcps`：MCP 服务快照，`README.md` + 每个已注册服务一个 JSON
-- 这三个目录是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `global_source_list` 列条目、`global_source_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
+- 这三个目录是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `resource_search` 检索、`resource_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
 - `skills/` 与 `tools/` 是平台托管内容，随代码版本覆盖（否则升级后文档与运行时工具对不上）；`mcps/` 只在缺失时写入。要定制请复制成自定义技能。
 
 # 能力索引与会话技能
 
 - 每个空间文件根下有一个隐藏索引 `files/.meta.json`，汇总该空间的 skills / tools / mcps（名称、描述、相对路径）。写操作（建/改/删技能目录、写文件、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
 - Agent 的能力源 = **当前空间 + 系统空间**，同名（Name）以当前空间为准；系统空间未初始化时自动降级为只用当前空间。
-- 三处消费：
-  1. `global_source_list` / `global_source_read`：按需检索与读取，读取时先当前空间、再系统空间。
-  2. 系统提示词：每轮注入技能索引（名称 + 描述 + 路径，最多 30 条），正文由模型按需 `global_source_read`。
+- 资源总量不设上限，**不提供全量列举**，一律按需检索：
+  1. `resource_search` 按关键词检索（名称优先、其次描述，支持中文 bigram；默认 8 条、最多 20 条），`resource_read` 读取正文（先当前空间、再系统空间，支持 `offset` / `limit`）。
+  2. 系统提示词：每轮注入技能索引（L1：名称 + 描述 + 路径），正文（L2）由模型按需 `resource_read`。
   3. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。
+- 命中同名多来源资源时，必须让用户在候选中选择，不得自行假设。
+- 上下文按 token 控制（不按字节）：技能索引 2000 tokens、单技能正文 4000 tokens，超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
+- 技能遵循 Agent Skills 规范：SKILL.md 带 YAML frontmatter（`name` ≤ 64 字符、`description` ≤ 1024 字符，写清“做什么 + 何时使用”），正文只写入口流程，长内容拆子文件且保持一层引用。
 - 技能路径统一为相对 `files/` 的 `SKILL.md` 路径：普通空间是 `<技能名>/SKILL.md`，系统空间是 `skills/<技能名>/SKILL.md`。
 
 # 身份接入（登录）

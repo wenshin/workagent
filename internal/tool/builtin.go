@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,8 +27,8 @@ func builtinTools() []Tool {
 		fileRead(),
 		fileWrite(),
 		skillCreate(),
-		globalSourceList(),
-		globalSourceRead(),
+		resourceSearch(),
+		resourceRead(),
 	}
 }
 
@@ -60,8 +61,6 @@ func BuiltinManifests() []Manifest {
 
 // 系统空间的固定目录名；与 space 包保持一致，这里用字面量避免包间循环依赖。
 const systemSpaceType = "system"
-
-var globalSourceDirs = []string{"skills", "tools", "mcps"}
 
 func timeNow() Tool {
 	return Tool{
@@ -158,21 +157,25 @@ func sessionList() Tool {
 	}
 }
 
-// globalSourceList 列出「当前空间 + 系统空间」合并后的 skills / tools / mcps。
+// resourceSearch 按关键词检索「当前空间 + 系统空间」的资源。
 //
-// 同名资源以当前空间为准：用户在自己的空间里定制了同名技能或工具时，
-// 平台默认版本不会覆盖它，Agent 只会看到一份。
-func globalSourceList() Tool {
+// 资源总量没有上限，因此不提供「列出全部」的工具：模型按关键词检索，
+// 命中同名多来源时必须在回答前让用户确认（约束写在系统提示词里）。
+func resourceSearch() Tool {
 	return Tool{
-		Name:       "global_source_list",
-		Capability: "system.source.list",
-		Description: "列出当前空间与系统空间可用的 skills / tools / mcps（名称、描述、路径、来源）。" +
-			"需要找可复用技能、工具定义或 MCP 服务时先调用；同名资源以当前空间为准。",
+		Name:       "resource_search",
+		Capability: "system.source.search",
+		Description: "按关键词检索可用的技能（skills）、工具（tools）与 MCP 服务（mcps），返回最相关的若干条及读取路径。" +
+			"资源总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
+			"命中多个同名资源时先让用户选择，不要自行假设。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "kind": {"type": "string", "enum": ["skills", "tools", "mcps"], "description": "只看某一类，省略则全部"}
+    "query": {"type": "string", "description": "检索关键词，用能力名或任务关键词，如 周报、pdf、数据库"},
+    "kind": {"type": "string", "enum": ["skills", "tools", "mcps"], "description": "只检索某一类，省略则全部"},
+    "limit": {"type": "integer", "description": "返回条数，默认 8，最大 20"}
   },
+  "required": ["query"],
   "additionalProperties": false
 }`),
 		Risk:        policy.RiskReadOnly,
@@ -183,32 +186,64 @@ func globalSourceList() Tool {
 				return "", fmt.Errorf("能力源不可用")
 			}
 			var in struct {
-				Kind string `json:"kind"`
+				Query string `json:"query"`
+				Kind  string `json:"kind"`
+				Limit int    `json:"limit"`
 			}
-			if len(args) > 0 {
-				if err := json.Unmarshal(args, &in); err != nil {
-					return "", fmt.Errorf("参数解析失败：%w", err)
-				}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
 			}
-			if in.Kind != "" && in.Kind != "skills" && in.Kind != "tools" && in.Kind != "mcps" {
+			query := strings.TrimSpace(in.Query)
+			if query == "" {
+				return "", fmt.Errorf("query 不能为空：用要查找的能力关键词检索")
+			}
+			kind := normalizeSourceKind(in.Kind)
+			if in.Kind != "" && kind == "" {
 				return "", fmt.Errorf("kind 只能是 skills / tools / mcps")
+			}
+			if in.Limit <= 0 {
+				in.Limit = 8
+			}
+			if in.Limit > 20 {
+				in.Limit = 20
 			}
 
 			entries, err := env.Sources.Sources(ctx)
 			if err != nil {
 				return "", err
 			}
-			out := make([]SourceEntry, 0, len(entries))
+			hits := make([]scoredSource, 0, len(entries))
 			for _, e := range entries {
-				if in.Kind != "" && e.Kind != in.Kind {
+				if kind != "" && e.Kind != kind {
 					continue
 				}
-				out = append(out, e)
+				if score := scoreSource(query, e); score > 0 {
+					hits = append(hits, scoredSource{SourceEntry: e, Score: score})
+				}
 			}
-			if len(out) == 0 {
-				return "当前空间与系统空间暂未提供相关资源。", nil
+			sort.SliceStable(hits, func(i, j int) bool {
+				if hits[i].Score != hits[j].Score {
+					return hits[i].Score > hits[j].Score
+				}
+				if hits[i].Kind != hits[j].Kind {
+					return hits[i].Kind < hits[j].Kind
+				}
+				return hits[i].Name < hits[j].Name
+			})
+
+			res := sourceSearchResult{Query: query, Matched: len(hits), Items: []scoredSource{}}
+			if len(hits) > in.Limit {
+				hits = hits[:in.Limit]
+				res.Truncated = true
 			}
-			body, err := json.MarshalIndent(out, "", "  ")
+			res.Items = append(res.Items, hits...)
+			switch {
+			case res.Matched == 0:
+				res.Hint = "没有匹配的资源，可换关键词重试；当前空间的文件用 file_list 查看"
+			case looksAmbiguous(res.Items):
+				res.Hint = "存在同名资源（来源不同），使用前请让用户确认用哪一个"
+			}
+			body, err := json.MarshalIndent(res, "", "  ")
 			if err != nil {
 				return "", err
 			}
@@ -217,20 +252,22 @@ func globalSourceList() Tool {
 	}
 }
 
-// globalSourceRead 读取能力源文件：当前空间优先，找不到再到系统空间找。
+// resourceRead 读取资源文件：当前空间优先，找不到再到系统空间找。
 //
-// 因此普通空间根下的技能（<技能名>/SKILL.md）与系统空间的 skills/<技能名>/SKILL.md
+// 普通空间根下的技能（<技能名>/SKILL.md）与系统空间的 skills/<技能名>/SKILL.md
 // 用同一个工具读取，模型不需要关心资源在哪一侧。
-func globalSourceRead() Tool {
+func resourceRead() Tool {
 	return Tool{
-		Name:       "global_source_read",
+		Name:       "resource_read",
 		Capability: "system.source.read",
-		Description: "读取能力源文件正文（SKILL.md、工具定义或 MCP 快照 JSON）。" +
-			"路径取自 global_source_list；当前空间存在同名文件时优先，否则读系统空间。",
+		Description: "读取资源文件正文（技能的 SKILL.md、工具定义或 MCP 快照 JSON）。" +
+			"路径取自 resource_search；当前空间存在同名文件时优先，否则读系统空间；长文档可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "相对空间 files 的路径，如 周报生成/SKILL.md 或 skills/空间管理/SKILL.md"}
+    "path": {"type": "string", "description": "相对空间 files 的路径，如 周报生成/SKILL.md 或 skills/空间管理/SKILL.md"},
+    "offset": {"type": "integer", "description": "起始字节偏移，默认 0"},
+    "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 24576"}
   },
   "required": ["path"],
   "additionalProperties": false
@@ -238,12 +275,16 @@ func globalSourceRead() Tool {
 		Risk:        policy.RiskReadOnly,
 		SideEffects: policy.SideEffectsReadOnly,
 		Runtime:     "builtin",
+		// 读正文是明确的信息获取动作，允许比默认额度更大，减少分段次数
+		MaxResultBytes: 24 * 1024,
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
 			if env.Sources == nil {
 				return "", fmt.Errorf("能力源不可用")
 			}
 			var in struct {
-				Path string `json:"path"`
+				Path   string `json:"path"`
+				Offset int    `json:"offset"`
+				Limit  int    `json:"limit"`
 			}
 			if err := json.Unmarshal(args, &in); err != nil {
 				return "", fmt.Errorf("参数解析失败：%w", err)
@@ -252,9 +293,112 @@ func globalSourceRead() Tool {
 			if err != nil {
 				return "", err
 			}
-			return text, nil
+			return sliceBytes(text, in.Offset, in.Limit, 16*1024, 24*1024), nil
 		},
 	}
+}
+
+// scoredSource 是带匹配分数的检索结果；Score 只在内部排序用，不返回给模型。
+type scoredSource struct {
+	SourceEntry
+	Score int `json:"-"`
+}
+
+type sourceSearchResult struct {
+	Query     string         `json:"query"`
+	Matched   int            `json:"matched"`
+	Truncated bool           `json:"truncated,omitempty"`
+	Items     []scoredSource `json:"items"`
+	Hint      string         `json:"hint,omitempty"`
+}
+
+// normalizeSourceKind 兼容单复数写法，返回索引里使用的复数形式。
+func normalizeSourceKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "":
+		return ""
+	case "skill", "skills":
+		return "skills"
+	case "tool", "tools":
+		return "tools"
+	case "mcp", "mcps":
+		return "mcps"
+	default:
+		return ""
+	}
+}
+
+// scoreSource 计算资源与关键词的相关度：名称命中权重最高，其次描述。
+//
+// 中文查询通常不带空格，因此除整词匹配外，再按相邻两字（bigram）命中计分。
+func scoreSource(query string, e SourceEntry) int {
+	name := strings.ToLower(e.Name)
+	desc := strings.ToLower(e.Description)
+	score := 0
+	for _, term := range strings.Fields(strings.ToLower(query)) {
+		switch {
+		case strings.Contains(name, term):
+			score += 40
+		case strings.Contains(desc, term):
+			score += 15
+		default:
+			score += bigramScore(term, name)*2 + bigramScore(term, desc)
+		}
+	}
+	return score
+}
+
+func bigramScore(term, haystack string) int {
+	runes := []rune(term)
+	if len(runes) < 2 {
+		return 0
+	}
+	score := 0
+	for i := 0; i+1 < len(runes); i++ {
+		if strings.Contains(haystack, string(runes[i:i+2])) {
+			score += 6
+		}
+	}
+	return score
+}
+
+// looksAmbiguous 判断结果里是否存在同名不同来源的资源。
+func looksAmbiguous(items []scoredSource) bool {
+	seen := make(map[string]string, len(items))
+	for _, it := range items {
+		key := it.Kind + "/" + it.Name
+		if prev, ok := seen[key]; ok && prev != it.Source {
+			return true
+		}
+		seen[key] = it.Source
+	}
+	return false
+}
+
+// sliceBytes 按字节区间截取文本，供分页读取使用。
+func sliceBytes(s string, offset, limit, defLimit, maxLimit int) string {
+	if limit <= 0 {
+		limit = defLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(s) {
+		return ""
+	}
+	end := offset + limit
+	truncated := end < len(s)
+	if !truncated {
+		end = len(s)
+	}
+	out := strings.ToValidUTF8(s[offset:end], "")
+	if truncated {
+		out += "…（已截断，可用 offset 继续读取）"
+	}
+	return out
 }
 
 func fileList() Tool {

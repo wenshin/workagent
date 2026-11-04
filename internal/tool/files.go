@@ -99,7 +99,7 @@ func fileRead() Tool {
   "properties": {
     "path": {"type": "string", "description": "相对空间文件根目录的路径，如 tools/xxx.json"},
     "offset": {"type": "integer", "description": "起始字节偏移，默认 0"},
-    "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 32768"}
+    "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 24576"}
   },
   "required": ["path"],
   "additionalProperties": false
@@ -107,6 +107,8 @@ func fileRead() Tool {
 		Risk:        policy.RiskReadOnly,
 		SideEffects: policy.SideEffectsReadOnly,
 		Runtime:     "builtin",
+		// 读类工具允许更大的回填额度，避免长文档被 4KB 默认值截断
+		MaxResultBytes: maxReadBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
 			if env.Storage == nil || env.SpaceID == "" {
 				return "", fmt.Errorf("文件存储不可用")
