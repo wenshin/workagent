@@ -153,7 +153,17 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		log.Warn("未知的搜索 provider，web_search 将不可用", "provider", searchProvider)
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
-		"available", searchReg.Names(), "allow", allow, "secret_ready", secretStore.Enabled())
+		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
+		"secret_ready", secretStore.Enabled())
+
+	// 启动时就把「引用的密钥在不在」说清楚。
+	// 改了 config.json 的 search.secret 却没录入同名凭证，是最容易出现的错配：
+	// 配置看着没问题、服务也能起，直到第一次搜索才报错。这里提前告警并给出名字。
+	if secretStore.Enabled() {
+		if _, getErr := secretStore.Get(context.Background(), search.SecretScope, searchSecret); getErr != nil {
+			log.Warn("搜索密钥不可用，web_search 会报错", "secret", searchSecret, "err", getErr)
+		}
+	}
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 	agentLoader := agentspec.NewLoader(spaceSvc)
