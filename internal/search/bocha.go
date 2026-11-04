@@ -31,6 +31,12 @@ type Bocha struct {
 	guard    *Guard
 }
 
+func init() {
+	RegisterFactory("bocha", func(endpoint string, key KeyFunc, guard *Guard) Provider {
+		return NewBocha(endpoint, key, guard)
+	})
+}
+
 // NewBocha 构造博查 provider。endpoint 必须已被 Guard 的白名单覆盖。
 func NewBocha(endpoint string, key KeyFunc, guard *Guard) *Bocha {
 	return &Bocha{

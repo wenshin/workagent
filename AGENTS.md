@@ -119,7 +119,7 @@ make web     # 前端 :5173
 - **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（引用列表 + 指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。`config.json` 里存的只是凭证引用名，不是密钥。
 - 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间，并标出 `使用中 / 未引用`——只有与 `config.json` 引用一致的那条才会生效，避免改了 A 却仍跑在 B 上。
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
-- 新增 provider：实现 `search.Provider` 并在 `internal/app` 注册，工具与提示词都不用改。
+- 新增 provider：在 `internal/search` 下新建文件实现 `search.Provider`，并用 `init()` 调 `RegisterFactory("名字", ...)`；装配层（`internal/app`）按名字从工厂表解析，**不加 case 分支**，工具与提示词也不用改。provider 面板/路由只认 `config.json` 的 `search.provider`。
 
 # 资源发布与「资源管理」
 

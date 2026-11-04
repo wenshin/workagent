@@ -142,15 +142,18 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		}
 	}
 
-	// 搜索（§5.6.1）：出网统一走 Guard，provider 只认识平台配置的 endpoint
+	// 搜索（§5.6.1）：出网统一走 Guard，provider 只认识平台配置的 endpoint。
+	// 装配层不认识任何具体 provider：名字 → 构造函数由 internal/search 的工厂表解析，
+	// 新增搜索源只改 provider 自己的文件，这里一行都不用动。
 	searchReg := search.NewRegistry(searchProvider)
-	switch searchProvider {
-	case "bocha":
-		searchReg.Register(search.NewBocha(searchEndpoint, func(ctx context.Context) (string, error) {
-			return secretStore.Get(ctx, search.SecretScope, searchSecret)
-		}, search.NewGuard(allow)))
-	default:
-		log.Warn("未知的搜索 provider，web_search 将不可用", "provider", searchProvider)
+	keyFunc := func(ctx context.Context) (string, error) {
+		return secretStore.Get(ctx, search.SecretScope, searchSecret)
+	}
+	if provider, ok := search.Build(searchProvider, searchEndpoint, keyFunc, search.NewGuard(allow)); ok {
+		searchReg.Register(provider)
+	} else {
+		log.Warn("未知的搜索 provider，web_search 将不可用",
+			"provider", searchProvider, "known", search.ProviderNames())
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
 		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
