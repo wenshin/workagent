@@ -78,25 +78,45 @@ make web     # 前端 :5173
 
 - 服务启动时按工号查 `app_user` 初始化（管理员未登录过则跳过，首次登录时创建），重复执行幂等。
 - 系统空间是 `space` 表中的一条 `type='system'` 记录（`is_system_reserved=true`），不可改名、不可删除，成员固定 `manage`。
-- 固定内容：一个默认会话 + 三个**内置目录**，目录本身不可改名/删除，内容可编辑：
+- 固定内容：一个默认会话、四个**内置目录**与两个平台配置文件，目录本身不可改名/删除，内容可编辑：
   - `files/skills`：全局技能，每个技能含 `.meta.json` + `SKILL.md`
   - `files/tools`：内置工具定义，与 `tool.BuiltinManifests()` 同步，一个工具一个 JSON
   - `files/mcps`：MCP 服务快照，`README.md` + 每个已注册服务一个 JSON
-- 这三个目录是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `resource_search` 检索、`resource_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
-- `skills/` 与 `tools/` 是平台托管内容，随代码版本覆盖（否则升级后文档与运行时工具对不上）；`mcps/` 只在缺失时写入。要定制请复制成自定义技能。
+  - `files/agents`：智能体设定，`index.json` + 每个智能体 `agent.json` + `prompt.md`
+  - `files/config.json`：平台配置（搜索 provider / endpoint / 凭证引用名），**不含密钥**
+  - `files/net_whitelist.json`：出网白名单（域名列表）
+- `skills/` `tools/` 是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `resource_search` 检索、`resource_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
+- `skills/` 与 `tools/` 是平台托管内容，随代码版本覆盖（否则升级后文档与运行时工具对不上）；`mcps/` 与 `agents/` 只在缺失时写入，管理员改过就不覆盖。
+- `agents/` `config.json` `net_whitelist.json` **不参与跨空间回落**：`ReadSourceFile` 只允许回落到 `skills/` `tools/` `mcps/`，否则普通空间可以用同名路径读到白名单与平台配置。平台自身读取时必须显式传系统空间 ID（`space.Service.SystemSpaceID`）。
 
 # 能力索引与会话技能
 
 - 每个空间文件根下有一个隐藏索引 `files/.meta.json`，汇总该空间的 skills / tools / mcps（名称、描述、相对路径）。写操作（建/改/删技能目录、写文件、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
 - Agent 的能力源 = **当前空间 + 系统空间**，同名（Name）以当前空间为准；系统空间未初始化时自动降级为只用当前空间。
-- 资源总量不设上限，**不提供全量列举**，一律按需检索：
-  1. `resource_search` 按关键词检索（名称优先、其次描述，支持中文 bigram；默认 8 条、最多 20 条），`resource_read` 读取正文（先当前空间、再系统空间，支持 `offset` / `limit`）。
-  2. 系统提示词：每轮注入技能索引（L1：名称 + 描述 + 路径），正文（L2）由模型按需 `resource_read`。
+- 资源总量不设上限，**不提供全量列举，也不常驻技能索引**：
+  1. 系统提示词只写「何时必须检索」的硬规则：闲聊 / 翻译 / 改写 / 计算 / 总结已有材料直接做；提到「我们的规范 / 流程 / 模板 / 制度」、产出正式文档、执行明确业务动作必须先检索；检索不到要明说，不得用常识冒充公司规定。
+  2. `resource_search`：`query` 可选，只给 `kind` 时按名称列出该类资源（按需拉目录）；默认 8 条、最多 20 条。`resource_read` 读取正文（先当前空间、再系统空间，支持 `offset` / `limit`）。
   3. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。
 - 命中同名多来源资源时，必须让用户在候选中选择，不得自行假设。
-- 上下文按 token 控制（不按字节）：技能索引 2000 tokens、单技能正文 4000 tokens，超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
+- 上下文按 token 控制（不按字节）：单技能正文 4000 tokens（技能索引预算已删除），超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
 - 技能遵循 Agent Skills 规范：SKILL.md 带 YAML frontmatter（`name` ≤ 64 字符、`description` ≤ 1024 字符，写清“做什么 + 何时使用”），正文只写入口流程，长内容拆子文件且保持一层引用。
 - 技能路径统一为相对 `files/` 的 `SKILL.md` 路径：普通空间是 `<技能名>/SKILL.md`，系统空间是 `skills/<技能名>/SKILL.md`。
+
+# 智能体设定（agents）
+
+- 一个智能体 = 系统空间 `agents/<id>/` 下的 `agent.json` + `prompt.md`；`index.json` 是选择器清单（不进模型上下文）。
+- `agent.json`：`id` / `name` / `version`（x.y.z）/ `description` / `extends` / `prompt` / `enabled`。`extends` 只允许空或 `base`，**禁止链式继承**；未知字段直接加载失败，不静默忽略。
+- **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
+- 智能体是行为设定，**不是权限**：可见工具仍由 `tool_binding` + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
+- 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改配置不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
+
+# 通用搜索与凭证
+
+- `web_search`（能力 `search.query`）：provider 由平台配置决定，skill 与模型都无法指定 endpoint；参数只有 `query` / `provider` / `limit`，没有密钥字段。
+- 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
+- 配置优先级：系统空间 `config.json` / `net_whitelist.json` → 环境变量 `SEARCH_*`。启动时读一次，改完需重启；配置写错**启动失败**而不是静默用默认值。
+- 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
+- 新增 provider：实现 `search.Provider` 并在 `internal/app` 注册，工具与提示词都不用改。
 
 # 资源发布与「资源管理」
 
