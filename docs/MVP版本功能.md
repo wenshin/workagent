@@ -345,6 +345,16 @@ autoagent/                                 # 存储根
 | 文件 | 空间内支持新建文件夹、上传、下载、重命名、移动、删除、在线预览（文本/图片）；单文件上限 100MB |
 | 验收 | ① 创建资源后自动出现在所在空间列表并可在会话中被 Agent 使用；② 连接测试失败时给出可读的失败原因（DNS/认证/超时区分）；③ 回滚后使用者拿到的是旧版本配置且历史版本仍可查；④ 被引用资源的删除被正确拦截 |
 
+**当前实现（阶段简化，2026-11）**
+
+| 项 | 已实现 | 未实现 |
+| --- | --- | --- |
+| 发布 | 从空间草稿发布技能：指定版本号（`x.y.z`）、发布说明、**用户范围**（`public` 全部可见 / `private` 仅自己可见）；发布件存 `published/{kind}/{resource_id}/{version}/`，与工作空间独立 | 连接测试、回滚、发布审核、按空间定向发布 |
+| 资源管理板块 | 与「工作空间」同级的独立菜单：列表、类型/范围/状态筛选、版本记录、启用/停用、删除资源、删除单个版本 | 被引用拦截、diff、授权成员、引用位置 |
+| 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述与文件数/体积 | 版本级启停 |
+| 权限 | 发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除/启停仅发布者本人或系统管理员 | 资源管理角色表 |
+| Agent 侧 | 发布件作为独立一层进入 `resource_search`（`source=published`），`resource_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
+
 ### FR-6 公共资源
 
 | 项 | 内容 |
@@ -383,6 +393,10 @@ autoagent/                                 # 存储根
 | 项 | 内容 |
 | --- | --- |
 | 能力 | 多轮对话、工具调用、流式输出、思考过程输出、上下文管理（超长会话压缩）、错误重试 |
+| 对话页用量可见（2026-11） | 输入框与发送按钮合并为一行（按钮嵌在输入框右侧），流式期间实时显示本轮已用时；助手消息卡片展示这一轮的 token 消耗（输入 ↑ / 输出 ↓）与总耗时，随消息落库（`message.in_tokens` / `out_tokens` / `duration_ms`），刷新后仍可见 |
+| 对话正文与输入区（2026-11） | 助手回答按 **Markdown** 渲染成有样式的正文，复用仓库既有的轻量渲染器（`web/src/components/Markdown.tsx`，与文件预览同一套 `md-*` 样式）：标题、有序/无序列表、表格、代码块（带语言标签）、引用、分割线、粗体、行内代码、外链；**不引入第三方解析器、不用 `dangerouslySetInnerHTML`**（原始 HTML 按纯文本输出，没有脚本注入面），外链新窗口打开。用户消息保持纯文本、按原样换行。输入框默认一行、上下间距与发送按钮一致，**拖拽上边框**可调整高度（双击恢复自动高度），内容变多仍自动增高，到上限后改为框内滚动 |
+| └ 已知差距 | 该渲染器不支持嵌套列表（平铺成同级列表）、任务列表、斜体、图片与自动链接；需要完整 CommonMark 时按组件注释替换为 marked/markdown-it |
+| 编排实现可切换（2026-11） | 契约在 `internal/agent`（`Agent` 接口 + §7.3 事件协议），实现：`internal/agent/builtin`（ReAct，默认）、`internal/agent/direct`（无工具直答）；`AGENT_IMPL` 切换，未知实现回退 builtin，`GET /agent/info` 返回当前实现与能力，`run.budget.impl` 留痕。平台侧（审批判定、checkpoint、压缩、预算、SSE 契约）不因实现而变。差距：断点续跑（`Capabilities.Resume`）只声明未实现；审批只推 `approval.req`，没有审批记录与恢复入口；模型 failover 由 ModelRouter 提供，尚未按实现区分 |
 | 内置工具 | `time_now`、`resource_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`resource_search` / `resource_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`resource_search` 按关键词检索能力源（资源无上限，不提供全量列举），`resource_read` 读取正文并支持分页 |
 | Skill | MVP 内置 4 个：`创建数据库资源`、`创建 MCP 服务资源`、`find/创建工具资源`、`创建 UI 组件资源`；每个 Skill 定义询问参数清单与校验规则 |
 | **Skill 作为一等资产** | Skill 有独立版本，复用 Agent 的版本/发布/灰度/回滚机制；生成规则（组件白名单、禁止 API、追问话术、模板库）写在 Skill 里而非硬编码；**MVP 先交付可用版本，上线后直接在产品内迭代优化**，每轮优化产出新版本并对比“生成一次通过率” |
@@ -462,7 +476,7 @@ autoagent/                                 # 存储根
 | 空间 | `GET/POST /spaces`、`GET/PATCH/DELETE /spaces/{id}`、`GET /spaces/{id}/tree`、`POST /spaces/{id}/members`、`PATCH/DELETE /spaces/{id}/members/{userId}` |
 | 权限申请 | `POST /permission-requests`、`GET /permission-requests?role=applicant\|approver`、`POST /permission-requests/{id}/decision` |
 | 文件 | `GET /spaces/{id}/files?parent=`、`POST /files/upload`、`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
-| 资源 | `GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`POST /resources/{id}/test`、`GET /resources/{id}/versions`、`POST /resources/{id}/versions/{v}/rollback`、`POST /resources/{id}/publish` |
+| 资源 | 已实现：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；待实现：`POST /resources/{id}/test`、`POST /resources/{id}/versions/{v}/rollback`、`POST /resources/{id}/publish`（从草稿发布即 `POST /resources`） |
 | 公共资源 | `GET /public-resources`、`POST /publish-requests`、`POST /publish-requests/{id}/decision` |
 | 组件 | `GET /components`、`GET /components/{name}/versions/{version}/bundle`、`POST /components`、`POST /components/{id}/build` |
 | 会话 | `GET/POST /sessions`、`PATCH/DELETE /sessions/{id}`、`GET /sessions/{id}/messages` |

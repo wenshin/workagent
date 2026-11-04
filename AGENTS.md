@@ -98,6 +98,17 @@ make web     # 前端 :5173
 - 技能遵循 Agent Skills 规范：SKILL.md 带 YAML frontmatter（`name` ≤ 64 字符、`description` ≤ 1024 字符，写清“做什么 + 何时使用”），正文只写入口流程，长内容拆子文件且保持一层引用。
 - 技能路径统一为相对 `files/` 的 `SKILL.md` 路径：普通空间是 `<技能名>/SKILL.md`，系统空间是 `skills/<技能名>/SKILL.md`。
 
+# 资源发布与「资源管理」
+
+- 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 资源管理板块（按需检索）**。发布范围只有用户范围：`public` 全部可见 / `private` 仅自己可见；没有「必须加载 / 可选加载」。
+- 存储与工作空间分离：`{STORAGE_ROOT}/published/{kind}/{resource_id}/{version}/`，含快照文件与 `.meta.json`（kind / name / version / visibility / resource_id / source_space_id / published_at）。目录用 `resource_id` 是因为名称只在「发布者 + kind」内唯一。
+- 数据表：`resource`（kind / name / description / visibility / status / owner_id / source_space_id / latest_version）+ `resource_version`（version / notes / storage_path / file_count / total_bytes），见 `0016_resource_publish.sql`。
+- 接口：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；实现在 `internal/resource`，装配在 `internal/app/app.go`。
+- 权限：发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除资源 / 删除版本 / 启停仅发布者本人或系统管理员。资源接口只返回名称、版本、描述与文件数/体积，**不返回发布目录与原始 MCP / tool / DB 配置**。
+- 约束：版本号 `x.y.z`；同版本重复发布 409；只剩一个版本时禁止删版本；快照 ≤ 200 文件 / 5MB；发布技能必须有 SKILL.md 正文。
+- Agent 侧：发布件是独立一层能力源（`source=published`），不做同名覆盖，命中同名多来源时 `resource_search` 返回 hint 要求先问用户；停用资源不进入检索；`resource_read` 支持 `published/{kind}/{id}/{version}/...` 路径并校验可见性。
+- 前端：`web/src/components/ResourcePanel.tsx` + `PublishResourceDialog.tsx`，菜单与「工作空间」同级，路由 `/resources` 复用 `WorkspacePage` 外壳（用路径区分内容，不复制侧栏）。
+
 # 身份接入（登录）
 
 登录与用户资料统一走 `internal/identity.Provider` 抽象（技术方案 §5.1.1），切换 IdP 只改配置：
@@ -126,7 +137,7 @@ make web     # 前端 :5173
 | `LLM_BASE_URL` | 端点（不含 `/chat/completions`） | `https://api.deepseek.com/v1` |
 | `LLM_API_KEY` | 密钥；本地 Ollama / vLLM 可留空 | `sk-xxx` |
 | `LLM_MODEL` | 模型名 | `deepseek-chat` |
-| `LLM_TIMEOUT` | 单次模型调用超时 | `120s` |
+| `LLM_TIMEOUT` | 单次模型调用超时（整请求，含流式读取），**必须 ≥ `LLM_MAX_WALL_CLOCK`** | `10m` |
 | `LLM_MAX_TOKENS` | 单次响应 token 上限，0 表示不传 | `4096` |
 | `LLM_MAX_ROUNDS` | 单轮对话内工具调用轮次上限 | `5` |
 | `LLM_MAX_TOOL_CALLS` | 一次 run 内工具调用总次数上限 | `20` |
@@ -143,8 +154,36 @@ make web     # 前端 :5173
 
 未配置密钥时，启动日志会告警，对话接口返回 `503`，前端输入框禁用并提示。
 
+# Agent 运行时与实现切换
+
+Agent 的「编排与循环」是唯一可替换的一层，按技术方案 §5.7.7 / §5.7.8 隔离：
+
+- 契约 `internal/agent`：`Agent` 接口（`Name` / `Capabilities` / `Ready` / `Model` / `Budget` / `Run`）、§7.3 事件协议、`RunInput` / `Result`、系统提示词组装 `BuildSystemMessage`。**不出现任何框架类型**。
+- 实现：`internal/agent/builtin`（内置 ReAct，默认）、`internal/agent/direct`（无工具单轮直答）。实现包在 `init()` 里 `agent.Register(Name, New)`；接入 Eino 时新增 `internal/agent/eino`，**只有实现子包可以 import 框架**。
+- 切换：`AGENT_IMPL`（`builtin` / `direct`），装配在 `internal/app/app.go`；未注册的名字启动告警并回退 `builtin`。当前实现与能力见 `GET /agent/info`，每次运行写入 `run.budget.impl`。
+- 平台侧不因实现而变，实现里不要重做：审批判定与挂起（`internal/tool/invoker` + `internal/policy`）、checkpoint（`run` / `run_step`，会话层按事件落库）、上下文压缩（`internal/ctxmgr`）、预算上限（实现用 `Budget()` 声明，循环外层兜底）、SSE 事件契约。
+- 实现只负责：每轮上下文如何拼（可复用 `BuildSystemMessage`）、循环与轮次控制、工具选择与并行调度、把工具执行结果翻译成 §7.3 事件。
+- 已知差距：`Capabilities.Resume` 只声明未实现（§5.7.5 断点续跑未落地）；审批目前只推 `approval.req`，没有审批记录与恢复入口。
+
 # 运行流与 checkpoint
 
 - SSE 事件名与载荷按技术方案 §7.3：`run.started` → `message.delta` → `tool.call` / `tool.result` / `approval.req` → `message.done` → `run.finished`。
 - 一次对话对应一条 `run`，每一步写一条 `run_step`（`tool.call` / `tool.result` / `approval.req` / `message`），用于恢复与审计；`tool_call.run_id` 与 `run` 关联。
 - 修改事件名或载荷字段时必须同步改 `web/src/api/stream.ts`，两侧以本文档与技术方案为准。
+- 助手消息落库时同时记录这一轮的用量与耗时（`message.in_tokens` / `out_tokens` / `duration_ms`，见迁移 `0017_message_stats.sql`），`/sessions/{id}/messages` 随之返回，前端在消息卡片上展示「token 消耗 + 总耗时」。用户消息这三列为 0；未产生回答的被中断轮次不落消息。
+
+## SSE 时限（业内取值，别自己发明）
+
+| 项 | 取值 | 说明 |
+| --- | --- | --- |
+| 服务端 `WriteTimeout` | **0** | Go 的这个值是整条响应的绝对写截止，且无法按路由豁免；设了就会把流按秒掐断 |
+| 单次写阻塞容忍 | 30s | `platform.Stream` 每次写前 `ResponseController.SetWriteDeadline` 刷新，超时熔断 |
+| 心跳注释行 | 15s | 必须小于链路上最短空闲超时（nginx / 云 LB 默认 60s），取 1/4 ~ 1/3 |
+| 首字节 | 开流立刻发 `: open` | 穿越 CDN 的首字节超时（Cloudflare 约 100s 报 524） |
+| 流的生命周期上限 | `LLM_MAX_WALL_CLOCK`（缺省 10m）+ 30s ctx 兜底 | 由应用自己定，不依赖中间件超时；到点以 `cancelled` 收尾 |
+
+- 实现位置：`internal/platform/sse.go`（推送器，唯一允许写 SSE 的地方）、`cmd/server/main.go`（不设 `WriteTimeout`）。
+- 中断可观测：`run.finished` 带 `reason`（`client_disconnected` / `wall_clock_exceeded` / `budget_exceeded`），同时写 `run.error` 与会话层 Warn 日志；客户端已断开时事件写不出去，只能靠日志。
+- 预算用尽由实现返回 `agent.ErrBudgetExceeded`，外层据此判定为 `cancelled` 而不是 `failed`——「重试就好」对预算用尽是误导。
+- 心跳只能打败「空闲超时」；「整响应总超时」类计时器只能改配置（GCP 外部 ALB 默认 30s、Envoy route 默认 15s、API Gateway REST 集成超时 29s）。
+- nginx 部署时：流式 location 配 `proxy_read_timeout 3600s; proxy_buffering off; gzip off;`（代码已发 `X-Accel-Buffering: no`），且只对流式路由放宽，别全局调大。
