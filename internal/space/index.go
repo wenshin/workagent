@@ -111,6 +111,18 @@ func (s *Service) MergedSources(ctx context.Context, spaceID string) IndexBundle
 	return out
 }
 
+// SystemSpaceID 返回系统空间 ID；系统空间尚未初始化时返回 store.ErrNotFound。
+//
+// 平台配置（agents / config / net_whitelist）必须显式用这个 ID 读取，
+// 不能走 ReadSourceFile 的回落逻辑，否则用户空间里的同名文件会顶替平台配置。
+func (s *Service) SystemSpaceID(ctx context.Context) (string, error) {
+	sp, err := s.store.GetSpaceByType(ctx, SpaceTypeSystem)
+	if err != nil {
+		return "", err
+	}
+	return sp.ID, nil
+}
+
 // Skills 返回当前空间 + 系统空间合并后的技能（同名当前空间优先），供会话技能选择器使用。
 func (s *Service) Skills(ctx context.Context, userID, spaceID string) ([]IndexEntry, error) {
 	if _, err := s.Get(ctx, userID, spaceID); err != nil {

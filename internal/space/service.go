@@ -43,15 +43,16 @@ const (
 	SpaceTypeSystem = "system"
 	// SystemSpaceName 是系统空间的固定名称。
 	SystemSpaceName = "系统空间"
-	// 系统空间下的三个内置目录：Agent 默认全局可见的 skills / tools / mcps 搜索源。
-	// 这三个目录不可重命名、不可删除。
+	// 系统空间下的内置目录：Agent 默认全局可见的 skills / tools / mcps 搜索源，
+	// 以及 agents（智能体设定）。这些目录不可重命名、不可删除。
 	systemSkillsDir = "skills"
 	systemToolsDir  = "tools"
 	systemMCPsDir   = "mcps"
+	systemAgentsDir = "agents"
 )
 
 // systemBuiltinDirs 是系统空间根下受保护的内置目录。
-var systemBuiltinDirs = []string{systemSkillsDir, systemToolsDir, systemMCPsDir}
+var systemBuiltinDirs = []string{systemSkillsDir, systemToolsDir, systemMCPsDir, systemAgentsDir}
 
 // SkillMeta 是 skill 目录下 .meta.json 的内容。
 type SkillMeta struct {

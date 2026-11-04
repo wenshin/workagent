@@ -104,6 +104,9 @@ func (s *Service) seedSystemSpace(ctx context.Context, spaceID string) error {
 	if err := s.seedMCPs(ctx, spaceID); err != nil {
 		return err
 	}
+	if err := s.seedAgents(ctx, spaceID); err != nil {
+		return err
+	}
 	// 内置内容变了，索引要跟着重建（files/.meta.json）
 	s.refreshIndex(ctx, spaceID)
 	return nil

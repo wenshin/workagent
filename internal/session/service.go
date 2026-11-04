@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/agent"
+	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/resource"
@@ -78,6 +79,8 @@ type Service struct {
 	memory    *ctxmgr.Manager
 	// runBudget 是单次回答的墙钟上限（ctx 兜底），由 LLM_MAX_WALL_CLOCK 加余量得到
 	runBudget time.Duration
+	// agents 是智能体设定加载器，为 nil 时会话不注入追加提示词
+	agents *agentspec.Loader
 	// search 是搜索 provider 注册表，为 nil 时 web_search 返回「能力未配置」
 	search *search.Registry
 	log    *slog.Logger
@@ -85,13 +88,14 @@ type Service struct {
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
 // wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
-func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, wallClock time.Duration, log *slog.Logger) *Service {
+func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, agentLoader *agentspec.Loader, searcher *search.Registry, wallClock time.Duration, log *slog.Logger) *Service {
 	if wallClock <= 0 {
 		wallClock = defaultRunBudget
 	}
 	return &Service{
 		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
-		memory: memory, search: searcher, runBudget: wallClock + runBudgetBackstopMargin, log: log,
+		memory: memory, agents: agentLoader, search: searcher,
+		runBudget: wallClock + runBudgetBackstopMargin, log: log,
 	}
 }
 
@@ -136,7 +140,10 @@ func (s *Service) ListMine(ctx context.Context, userID string) ([]store.Session,
 }
 
 // Create 在空间（或空间内某个目录）下新建会话，标题默认为「新会话」。
-func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir string) (store.Session, error) {
+//
+// agentID 是 agents/ 目录里的智能体 id，空表示用默认的 base；
+// 智能体只影响追加提示词，不影响权限。
+func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir, agentID string) (store.Session, error) {
 	sp, err := s.spaces.Get(ctx, userID, spaceID)
 	if err != nil {
 		return store.Session{}, err
@@ -159,12 +166,52 @@ func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir 
 		return store.Session{}, err
 	}
 
-	sess, err := s.store.CreateSession(ctx, spaceID, userID, title, dir)
+	agent, err := s.resolveAgent(ctx, agentID)
 	if err != nil {
 		return store.Session{}, err
 	}
-	s.log.Info("会话已创建", "session_id", sess.ID, "space_id", spaceID, "dir", dir, "by", userID)
+
+	sess, err := s.store.CreateSession(ctx, spaceID, userID, title, dir, agent.ID, agent.Version, agent.Prompt)
+	if err != nil {
+		return store.Session{}, err
+	}
+	s.log.Info("会话已创建", "session_id", sess.ID, "space_id", spaceID, "dir", dir, "agent_id", agent.ID, "by", userID)
 	return sess, nil
+}
+
+// resolveAgent 取会话要绑定的智能体。
+//
+// 请求为空时用默认的 base；系统空间尚未种子化（全新部署）时退化为「无追加设定」，
+// 不阻塞会话创建。显式指定了不存在的智能体则报错，避免用户以为选上了。
+func (s *Service) resolveAgent(ctx context.Context, rawID string) (agentspec.Resolved, error) {
+	id := strings.TrimSpace(rawID)
+	useDefault := id == ""
+	if useDefault {
+		id = agentspec.BaseID
+	}
+	if s.agents == nil {
+		return agentspec.Resolved{ID: id}, nil
+	}
+
+	r, err := s.agents.Get(ctx, id)
+	if err != nil {
+		if useDefault && errors.Is(err, agentspec.ErrNotFound) {
+			return agentspec.Resolved{}, nil
+		}
+		return agentspec.Resolved{}, err
+	}
+	return r, nil
+}
+
+// Agents 返回可选的智能体清单，供会话创建时的选择器使用。
+func (s *Service) Agents(ctx context.Context, userID, spaceID string) ([]agentspec.Summary, error) {
+	if _, err := s.spaces.Get(ctx, userID, spaceID); err != nil {
+		return nil, err
+	}
+	if s.agents == nil {
+		return nil, nil
+	}
+	return s.agents.List(ctx)
 }
 
 // normalizeDirPath 统一目录路径格式：去掉首尾斜杠与空白，空串表示空间根。
@@ -369,6 +416,17 @@ func (s *Service) Chat(
 		}
 	}
 
+	// 智能体：优先用建会话时固化的提示词，管理员事后改 agents/ 不影响已开会话。
+	// 老会话（迁移前创建）没有快照，这里按当前配置补一次。
+	agentPrompt := sess.AgentPrompt
+	if agentPrompt == "" && sess.AgentID != "" && s.agents != nil {
+		if r, err := s.agents.Get(ctx, sess.AgentID); err == nil {
+			agentPrompt = r.Prompt
+		} else {
+			s.log.Warn("智能体设定加载失败", "session_id", sessionID, "agent_id", sess.AgentID, "err", err)
+		}
+	}
+
 	// 流的生命周期上限由应用自己定，不依赖任何中间件超时；
 	// 实现内部还有自己的墙钟预算（builtin 会自己计时），这里多留余量做兜底
 	runCtx, cancel := context.WithTimeout(ctx, s.runBudget)
@@ -414,6 +472,7 @@ func (s *Service) Chat(
 		Query:       text,
 		Skills:      skills,
 		ActiveSkill: activeSkill,
+		AgentPrompt: agentPrompt,
 	}, emitEvent)
 
 	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来

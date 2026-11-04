@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/workagent/auto-agent/internal/store"
 	"github.com/jackc/pgx/v5"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // CreateAuthSession 写入登录会话，同一 token 覆盖写入。

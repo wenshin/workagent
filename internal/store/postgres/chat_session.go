@@ -9,16 +9,19 @@ import (
 )
 
 const sessionColumns = `id::text, space_id::text, coalesce(dir, ''), title, title_auto, coalesce(skill_path, ''),
-       created_by::text, last_message_at, status, created_at, updated_at`
+       created_by::text, last_message_at, status, created_at, updated_at,
+       coalesce(agent_id, ''), agent_version, agent_prompt`
 
 // sessionColumnsWithAlias 是带表别名的版本，列顺序必须与 scanSession 一致。
 const sessionColumnsWithAlias = `s.id::text, s.space_id::text, coalesce(s.dir, ''), s.title, s.title_auto, coalesce(s.skill_path, ''),
-       s.created_by::text, s.last_message_at, s.status, s.created_at, s.updated_at`
+       s.created_by::text, s.last_message_at, s.status, s.created_at, s.updated_at,
+       coalesce(s.agent_id, ''), s.agent_version, s.agent_prompt`
 
 func scanSession(row pgx.Row) (store.Session, error) {
 	var s store.Session
 	if err := row.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
-		&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt,
+		&s.AgentID, &s.AgentVersion, &s.AgentPrompt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Session{}, store.ErrNotFound
 		}
@@ -28,13 +31,30 @@ func scanSession(row pgx.Row) (store.Session, error) {
 }
 
 // CreateSession 在指定空间（或空间内某个目录）下创建聊天会话。
-func (d *DB) CreateSession(ctx context.Context, spaceID, userID, title, dir string) (store.Session, error) {
+func (d *DB) CreateSession(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string) (store.Session, error) {
 	const q = `
-insert into session (space_id, dir, title, created_by)
-values ($1::uuid, nullif($2, ''), $3, $4::uuid)
+insert into session (space_id, dir, title, created_by, agent_id, agent_version, agent_prompt)
+values ($1::uuid, nullif($2, ''), $3, $4::uuid, nullif($5, ''), $6, $7)
 returning ` + sessionColumns
 
-	return scanSession(d.pool.QueryRow(ctx, q, spaceID, dir, title, userID))
+	return scanSession(d.pool.QueryRow(ctx, q, spaceID, dir, title, userID, agentID, agentVersion, agentPrompt))
+}
+
+// UpdateSessionAgent 重新绑定智能体，并把当时的提示词一起固化。
+func (d *DB) UpdateSessionAgent(ctx context.Context, id, agentID, agentVersion, agentPrompt string) error {
+	const q = `
+update session
+set agent_id = nullif($2, ''), agent_version = $3, agent_prompt = $4, updated_at = now()
+where id::text = $1 and status = 'active'`
+
+	tag, err := d.pool.Exec(ctx, q, id, agentID, agentVersion, agentPrompt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
 }
 
 // ListSessions 返回空间下的会话，最近活动的在前。
@@ -78,7 +98,8 @@ func collectSessions(rows pgx.Rows) ([]store.Session, error) {
 	for rows.Next() {
 		var s store.Session
 		if err := rows.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
-			&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt,
+			&s.AgentID, &s.AgentVersion, &s.AgentPrompt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

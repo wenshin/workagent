@@ -9,6 +9,7 @@ import (
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
+	"github.com/workagent/auto-agent/internal/agentspec"
 	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
 	_ "github.com/workagent/auto-agent/internal/agent/direct"
 	"github.com/workagent/auto-agent/internal/auth"
@@ -136,7 +137,10 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	log.Info("搜索能力已装配", "provider", cfg.SearchProvider,
 		"available", searchReg.Names(), "allow", cfg.SearchAllow, "secret_ready", secretStore.Enabled())
 
-	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, searchReg, cfg.LLMMaxWallClock, log)
+	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
+	agentLoader := agentspec.NewLoader(spaceSvc)
+
+	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, agentLoader, searchReg, cfg.LLMMaxWallClock, log)
 
 	return &App{
 		cfg:         cfg,

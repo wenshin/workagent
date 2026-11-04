@@ -110,6 +110,8 @@ type RunInput struct {
 	Skills []tool.SourceEntry
 	// ActiveSkill 是会话绑定的技能，正文直接进系统提示词
 	ActiveSkill *ActiveSkill
+	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后
+	AgentPrompt string
 }
 
 // ActiveSkill 是会话选中的技能。

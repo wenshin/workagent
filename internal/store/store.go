@@ -83,7 +83,13 @@ type Session struct {
 	Title     string
 	TitleAuto bool // true 表示标题可被首条消息改写
 	// SkillPath 是会话绑定的技能（相对空间 files/ 的 SKILL.md 路径），空表示未绑定
-	SkillPath     string
+	SkillPath string
+	// AgentID 是会话绑定的智能体（agents/ 目录下的 id），空表示未绑定
+	AgentID string
+	// AgentVersion 是创建时绑定的版本，用于发现配置漂移
+	AgentVersion string
+	// AgentPrompt 是创建时固化的追加提示词，管理员事后改配置不影响已开会话
+	AgentPrompt   string
 	CreatedBy     string
 	LastMessageAt *time.Time
 	Status        string
@@ -249,7 +255,8 @@ type Store interface {
 	// DeleteSpaceTree 软删整棵子树，返回被删除的空间列表（业务层据此移入回收站）。
 	DeleteSpaceTree(ctx context.Context, id string) ([]Space, error)
 
-	CreateSession(ctx context.Context, spaceID, userID, title, dir string) (Session, error)
+	// CreateSession 创建会话；agent 参数是创建时固化的智能体绑定（id / 版本 / 追加提示词）。
+	CreateSession(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string) (Session, error)
 	ListSessions(ctx context.Context, spaceID string) ([]Session, error)
 	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
 	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
@@ -266,6 +273,8 @@ type Store interface {
 	MoveSessionsDir(ctx context.Context, spaceID, from, to string) error
 	// UpdateSessionSkill 绑定/清除会话技能（相对空间 files/ 的 SKILL.md 路径，空串清除）。
 	UpdateSessionSkill(ctx context.Context, id, path string) error
+	// UpdateSessionAgent 重新绑定会话的智能体，按当前配置重新固化提示词。
+	UpdateSessionAgent(ctx context.Context, id, agentID, agentVersion, agentPrompt string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
 	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息，并记录这一轮的用量与耗时。

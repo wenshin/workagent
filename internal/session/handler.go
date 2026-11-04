@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/agent"
+	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -35,6 +36,8 @@ func NewHandler(svc *Service, resolve UserResolver, log *slog.Logger) *Handler {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /spaces/{id}/sessions", h.listBySpace)
 	mux.HandleFunc("POST /spaces/{id}/sessions", h.create)
+	// 会话创建时的智能体选择器：只返回清单，不含提示词正文
+	mux.HandleFunc("GET /spaces/{id}/agents", h.listAgents)
 	mux.HandleFunc("GET /sessions", h.listMine)
 	mux.HandleFunc("PATCH /sessions/{id}", h.rename)
 	mux.HandleFunc("DELETE /sessions/{id}", h.remove)
@@ -54,7 +57,11 @@ type sessionDTO struct {
 	Title     string `json:"title"`
 	TitleAuto bool   `json:"title_auto"`
 	// SkillPath 是会话绑定的技能（SKILL.md 路径），空表示未绑定
-	SkillPath     string  `json:"skill_path,omitempty"`
+	SkillPath string `json:"skill_path,omitempty"`
+	// AgentID 是会话绑定的智能体，空表示未绑定
+	AgentID string `json:"agent_id,omitempty"`
+	// AgentVersion 是创建时绑定的版本
+	AgentVersion  string  `json:"agent_version,omitempty"`
 	Status        string  `json:"status"`
 	LastMessageAt *string `json:"last_message_at"`
 	CreatedAt     string  `json:"created_at"`
@@ -79,15 +86,17 @@ const timeLayout = "2006-01-02T15:04:05Z07:00"
 
 func toDTO(s store.Session) sessionDTO {
 	dto := sessionDTO{
-		ID:        s.ID,
-		SpaceID:   s.SpaceID,
-		Dir:       s.Dir,
-		Title:     s.Title,
-		TitleAuto: s.TitleAuto,
-		SkillPath: s.SkillPath,
-		Status:    s.Status,
-		CreatedAt: s.CreatedAt.Format(timeLayout),
-		UpdatedAt: s.UpdatedAt.Format(timeLayout),
+		ID:           s.ID,
+		SpaceID:      s.SpaceID,
+		Dir:          s.Dir,
+		Title:        s.Title,
+		TitleAuto:    s.TitleAuto,
+		SkillPath:    s.SkillPath,
+		AgentID:      s.AgentID,
+		AgentVersion: s.AgentVersion,
+		Status:       s.Status,
+		CreatedAt:    s.CreatedAt.Format(timeLayout),
+		UpdatedAt:    s.UpdatedAt.Format(timeLayout),
 	}
 	if s.LastMessageAt != nil {
 		v := s.LastMessageAt.Format(timeLayout)
@@ -151,6 +160,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		Title string `json:"title"`
 		// Dir 是空间内目录路径（相对 files/），为空表示挂在空间根
 		Dir string `json:"dir"`
+		// AgentID 是 agents/ 里的智能体 id，空表示用默认 base
+		AgentID string `json:"agent_id"`
 	}
 	if r.ContentLength != 0 {
 		if err := platform.DecodeJSON(r, &req); err != nil {
@@ -159,12 +170,29 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sess, err := h.svc.Create(r.Context(), user.ID, r.PathValue("id"), req.Title, req.Dir)
+	sess, err := h.svc.Create(r.Context(), user.ID, r.PathValue("id"), req.Title, req.Dir, req.AgentID)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
 	platform.WriteJSON(w, http.StatusCreated, map[string]any{"session": toDTO(sess)})
+}
+
+// listAgents 返回当前空间可用的智能体清单（只含元信息，不含提示词）。
+func (h *Handler) listAgents(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	list, err := h.svc.Agents(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if list == nil {
+		list = []agentspec.Summary{}
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"agents": list})
 }
 
 func (h *Handler) rename(w http.ResponseWriter, r *http.Request) {
