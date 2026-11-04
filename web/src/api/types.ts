@@ -229,3 +229,17 @@ export interface ResourceDetailResponse {
   resource: PublishedResource;
   versions: ResourceVersionInfo[];
 }
+
+/** 平台配置与凭证状态（仅系统管理员可见）：只有指纹，没有密钥明文 */
+export interface AdminSettings {
+  secrets_enabled: boolean;
+  search: {
+    provider: string;
+    endpoint: string;
+    allow: string[];
+    secret_name: string;
+    secret_present: boolean;
+    fingerprint?: string;
+    updated_at?: string;
+  };
+}

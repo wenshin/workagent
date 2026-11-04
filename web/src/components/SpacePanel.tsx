@@ -1,4 +1,4 @@
-import { IconPlus } from '@douyinfe/semi-icons';
+import { IconPlus, IconSetting } from '@douyinfe/semi-icons';
 import { Button, Card, Empty, Spin, Typography } from '@douyinfe/semi-ui';
 
 import type { ChatSession, Space } from '../api/types';
@@ -11,6 +11,8 @@ interface Props {
   loading: boolean;
   onOpenSession: (id: string) => void;
   onAddSession: () => void;
+  /** 系统空间才有平台配置入口：凭证、搜索接入等 */
+  onOpenPlatform?: () => void;
 }
 
 function formatTime(iso: string) {
@@ -20,7 +22,14 @@ function formatTime(iso: string) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-export default function SpacePanel({ space, sessions, loading, onOpenSession, onAddSession }: Props) {
+export default function SpacePanel({
+  space,
+  sessions,
+  loading,
+  onOpenSession,
+  onAddSession,
+  onOpenPlatform,
+}: Props) {
   if (!space) {
     return (
       <div className="panel-empty">
@@ -45,11 +54,18 @@ export default function SpacePanel({ space, sessions, loading, onOpenSession, on
             选择下面的会话开始对话，或新建一个
           </Text>
         </div>
-        {writable ? (
-          <Button theme="solid" type="primary" icon={<IconPlus />} onClick={onAddSession}>
-            新建会话
-          </Button>
-        ) : null}
+        <div style={{ display: 'flex', gap: 8 }}>
+          {space.type === 'system' && onOpenPlatform ? (
+            <Button icon={<IconSetting />} onClick={onOpenPlatform}>
+              平台配置
+            </Button>
+          ) : null}
+          {writable ? (
+            <Button theme="solid" type="primary" icon={<IconPlus />} onClick={onAddSession}>
+              新建会话
+            </Button>
+          ) : null}
+        </div>
       </div>
 
       {loading ? (

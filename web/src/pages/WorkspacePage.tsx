@@ -23,6 +23,7 @@ import { streamChat } from '../api/stream';
 import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
+import PlatformSettingsDialog from '../components/PlatformSettingsDialog';
 import ResourcePanel from '../components/ResourcePanel';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
@@ -43,6 +44,7 @@ export default function WorkspacePage() {
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
   const [stream, setStream] = useState<StreamView | null>(null);
   const [pendingUser, setPendingUser] = useState<string | null>(null);
+  const [platformOpen, setPlatformOpen] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   // 本轮对话里 Agent 是否写过空间文件，决定结束后要不要刷新树与预览
@@ -363,11 +365,13 @@ export default function WorkspacePage() {
             loading={sessionsLoading}
             onOpenSession={openSession}
             onAddSession={() => selectedSpace && void addSession(selectedSpace.id)}
+            onOpenPlatform={() => setPlatformOpen(true)}
           />
         )}
       </Layout.Content>
 
       <SpaceDialog state={dialog} onClose={() => setDialog({ kind: 'none' })} />
+      <PlatformSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
 
       <Modal
         title="删除会话"

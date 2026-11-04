@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/workagent/auto-agent/internal/admin"
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
 	"github.com/workagent/auto-agent/internal/agentspec"
@@ -43,6 +44,7 @@ type App struct {
 	resourceH   *resource.Handler
 	sessionSvc  *session.Service
 	sessionH    *session.Handler
+	adminH      *admin.Handler
 }
 
 // New 构造应用。
@@ -169,6 +171,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		resourceH:   resource.NewHandler(resourceSvc, authHandler.CurrentUser, log),
 		sessionSvc:  sessionSvc,
 		sessionH:    session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
+		// 平台管理：凭证写入 + 配置回显。密钥只进不出，接口只回指纹。
+		adminH: admin.NewHandler(spaceSvc, secretStore, admin.SearchSettings{
+			Provider:   searchProvider,
+			Endpoint:   searchEndpoint,
+			Allow:      allow,
+			SecretName: searchSecret,
+		}, authHandler.CurrentUser, log),
 	}, nil
 }
 
@@ -180,6 +189,7 @@ func (a *App) Handler() http.Handler {
 	a.spaceH.Register(mux)
 	a.resourceH.Register(mux)
 	a.sessionH.Register(mux)
+	a.adminH.Register(mux)
 
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /agent/info", a.agentInfo)

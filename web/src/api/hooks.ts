@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { api } from './client';
 import type {
+  AdminSettings,
   AgentInfo,
   AppendMessageResponse,
   ChatSession,
@@ -34,6 +35,7 @@ export const queryKeys = {
   file: (spaceId: string, path: string) => ['file', spaceId, path] as const,
   resources: ['resources'] as const,
   resource: (id: string) => ['resource', id] as const,
+  adminSettings: ['admin', 'settings'] as const,
 };
 
 /** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
@@ -359,5 +361,41 @@ export function useDeleteResourceVersion() {
       qc.invalidateQueries({ queryKey: queryKeys.resources });
       qc.invalidateQueries({ queryKey: queryKeys.resource(vars.id) });
     },
+  });
+}
+
+/** 平台配置：只有管理员能拿到；非管理员会 403，用 enabled 控制是否发起请求 */
+export function useAdminSettings(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.adminSettings,
+    queryFn: () => api<AdminSettings>('/admin/settings'),
+    enabled,
+    // 指纹变化只在保存后发生，避免反复拉取
+    staleTime: 30_000,
+  });
+}
+
+/** 写入凭证：只提交明文，服务端只回指纹 */
+export function useSetSecret() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { scope: string; name: string; value: string }) =>
+      api<{ scope: string; name: string; fingerprint: string }>(
+        `/admin/secrets/${encodeURIComponent(input.scope)}/${encodeURIComponent(input.name)}`,
+        { method: 'PUT', body: { value: input.value } },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.adminSettings }),
+  });
+}
+
+export function useDeleteSecret() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { scope: string; name: string }) =>
+      api<{ ok: boolean }>(
+        `/admin/secrets/${encodeURIComponent(input.scope)}/${encodeURIComponent(input.name)}`,
+        { method: 'DELETE' },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.adminSettings }),
   });
 }
