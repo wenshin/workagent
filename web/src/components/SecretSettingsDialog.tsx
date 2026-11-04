@@ -1,3 +1,4 @@
+import { IconPlus } from '@douyinfe/semi-icons';
 import { Button, Input, Modal, Popconfirm, Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useState } from 'react';
 
@@ -26,12 +27,17 @@ function formatTime(iso?: string) {
  * 密钥配置（仅系统管理员）。
  *
  * 密钥只写不读：列表里只有名称、指纹与更新时间，明文永远不会从后端返回。
- * 名称对应平台配置里的引用（如 config.json 的 search.secret），值改完立即生效。
+ * 名称对应平台配置里的引用（如 config.json 的 search.secret），值改完立即生效；
+ * 新增其他名称只是「待用条目」，只有被引用的那一条会真正生效。
  */
 export default function SecretSettingsDialog({ visible, onClose }: Props) {
   const { data, isLoading, error } = useAdminSettings(visible);
   const setSecret = useSetSecret();
   const deleteSecret = useDeleteSecret();
+
+  // 表单：editing 为正在更新的名称，null 表示新增
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [value, setValue] = useState('');
 
@@ -42,18 +48,41 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
 
   useEffect(() => {
     if (!visible) {
+      setFormOpen(false);
+      setEditing(null);
       setName('');
       setValue('');
-      return;
     }
-    // 默认填平台正在引用的那一条，省得管理员猜名字
-    setName((prev) => prev || refs[0]?.name || '');
-  }, [visible, refs]);
+  }, [visible]);
+
+  const openAdd = () => {
+    // 平台引用的那条还没配过时，直接带上名称，省掉手工输入
+    const referenced = refs[0]?.name ?? '';
+    const exists = items.some((it) => it.name === referenced);
+    setName(!referenced || exists ? '' : referenced);
+    setValue('');
+    setEditing(null);
+    setFormOpen(true);
+  };
+
+  const openEdit = (item: SecretItem) => {
+    setName(item.name);
+    setValue('');
+    setEditing(item.name);
+    setFormOpen(true);
+  };
+
+  const closeForm = () => {
+    setFormOpen(false);
+    setEditing(null);
+    setName('');
+    setValue('');
+  };
 
   const save = async () => {
-    const trimmedName = name.trim();
+    const target = editing ?? name.trim();
     const trimmedValue = value.trim();
-    if (!NAME_RE.test(trimmedName)) {
+    if (!NAME_RE.test(target)) {
       Toast.warning('名称只允许字母、数字、下划线、短横线，且不超过 64 字符');
       return;
     }
@@ -62,12 +91,14 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
       return;
     }
     try {
-      await setSecret.mutateAsync({ scope, name: trimmedName, value: trimmedValue });
-      setValue('');
-      const referenced = refs.some((r) => r.name === trimmedName);
-      Toast.success(
-        referenced ? '密钥已保存，下一次调用立即生效' : '已保存，但该名称未被平台引用，不会生效',
-      );
+      await setSecret.mutateAsync({ scope, name: target, value: trimmedValue });
+      const referenced = refs.some((r) => r.name === target);
+      if (!referenced) {
+        Toast.warning('已保存，但该名称未被平台引用，不会生效');
+      } else {
+        Toast.success(editing ? '密钥已更新，下一次调用立即生效' : '密钥已添加，下一次调用立即生效');
+      }
+      closeForm();
     } catch (err) {
       Toast.error(err instanceof Error ? err.message : '保存失败');
     }
@@ -92,7 +123,7 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
           <Button onClick={onClose}>关闭</Button>
         </div>
       }
-      width={600}
+      width={620}
       bodyStyle={{ paddingTop: 8 }}
     >
       {error ? (
@@ -123,16 +154,24 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
           ) : (
             <>
               <section>
-                <Text strong>已保存的密钥</Text>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text strong>已保存的密钥</Text>
+                  {!formOpen ? (
+                    <Button size="small" icon={<IconPlus />} onClick={openAdd}>
+                      新增
+                    </Button>
+                  ) : null}
+                </div>
                 {refs.length > 0 ? (
                   <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 4 }}>
-                    当前被平台使用：{refs.map((r) => r.label).join('、')}
+                    平台当前使用：{refs.map((r) => `${r.label} → ${r.name}`).join('、')}
+                    ；其余条目只是备用，不会生效。
                   </Text>
                 ) : null}
                 <div style={{ marginTop: 8 }}>
                   {items.length === 0 ? (
                     <Text type="tertiary" size="small">
-                      还没有保存过密钥
+                      还没有保存过密钥，点右上角「新增」录入。
                     </Text>
                   ) : (
                     items.map((item) => (
@@ -157,6 +196,14 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                             指纹 {item.fingerprint} · {formatTime(item.updated_at)}
                           </Text>
                         </div>
+                        <Button
+                          theme="borderless"
+                          size="small"
+                          disabled={formOpen && editing === item.name}
+                          onClick={() => openEdit(item)}
+                        >
+                          更新
+                        </Button>
                         <Popconfirm
                           title="删除这条密钥？"
                           content={item.in_use ? '删除后引用它的能力会立即不可用' : undefined}
@@ -172,31 +219,35 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                 </div>
               </section>
 
-              <section>
-                <Text strong>新增 / 更新</Text>
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                  <Input
-                    value={name}
-                    onChange={setName}
-                    placeholder="名称，如 bocha"
-                    style={{ width: 180 }}
-                  />
-                  <Input
-                    mode="password"
-                    value={value}
-                    onChange={setValue}
-                    placeholder="密钥值"
-                    style={{ flex: 1 }}
-                  />
-                  <Button theme="solid" type="primary" loading={setSecret.isPending} onClick={save}>
-                    保存
-                  </Button>
-                </div>
-                <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 8 }}>
-                  名称需与系统空间 <Text code>files/config.json</Text> 里的引用一致（搜索是{' '}
-                  <Text code>search.secret</Text>）才会被使用；只改密钥值立即生效，改名称还要同步配置并重启。
-                </Text>
-              </section>
+              {formOpen ? (
+                <section>
+                  <Text strong>{editing ? `更新 ${editing}` : '新增密钥'}</Text>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <Input
+                      value={name}
+                      onChange={setName}
+                      disabled={editing !== null}
+                      placeholder="名称，如 bocha"
+                      style={{ width: 200 }}
+                    />
+                    <Input
+                      mode="password"
+                      value={value}
+                      onChange={setValue}
+                      placeholder="密钥值"
+                      style={{ flex: 1 }}
+                    />
+                    <Button theme="solid" type="primary" loading={setSecret.isPending} onClick={save}>
+                      保存
+                    </Button>
+                    <Button onClick={closeForm}>取消</Button>
+                  </div>
+                  <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 8 }}>
+                    只有名称与系统空间 <Text code>files/config.json</Text> 的引用一致（搜索是{' '}
+                    <Text code>search.secret</Text>）才会生效；名称保存后不可改，换个名字等于新增一条。
+                  </Text>
+                </section>
+              ) : null}
             </>
           )}
         </div>
