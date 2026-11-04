@@ -58,9 +58,9 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
   }, [visible]);
 
   const openAdd = () => {
-    // 平台引用的那条还没配过时，直接带上名称，省掉手工输入。
-    // 环境变量引用（${...}）不是合法凭证名，不能预填。
-    const referenced = refs[0] && refs[0].source !== 'env' ? refs[0].name : '';
+    // 平台引用的那条还没配过时直接带上名称（含 ${} 引用里的名字），
+    // 这样即便当前靠环境变量在跑，新增一条同名凭证就能接管。
+    const referenced = refs[0]?.name ?? '';
     const exists = items.some((it) => it.name === referenced);
     setName(!referenced || exists ? '' : referenced);
     setValue('');
@@ -142,14 +142,13 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
           {envRefs.length > 0 ? (
             <div>
               <Text size="small">
-                平台当前从后端环境变量读取密钥（不落盘，也不需要在这里录入）：
+                平台当前用的是后端环境变量（凭证存储里没有同名条目）：
               </Text>
               <Text code style={{ display: 'block', marginTop: 6 }}>
                 {envRefs.map((r) => r.name).join(', ')}
               </Text>
               <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 6 }}>
-                要改成界面录入，把系统空间 <Text code>files/config.json</Text> 的{' '}
-                <Text code>search.secret</Text> 改成凭证名（如 <Text code>default</Text>）后重启后端。
+                在这里新增一条同名密钥就会覆盖环境变量，且改完立即生效，不用重启。
               </Text>
             </div>
           ) : null}

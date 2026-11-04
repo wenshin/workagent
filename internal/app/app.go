@@ -128,19 +128,22 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	searchProvider := firstNonEmpty(platCfg.Search.Provider, cfg.SearchProvider)
 	searchEndpoint := firstNonEmpty(platCfg.Search.Endpoint, cfg.SearchEndpoint)
 	// 凭证引用有两种写法：
-	//   "default"            → 凭证存储里的槽位名（界面「密钥配置」里录入）
-	//   "${SEARCH_API_KEY}"  → 直接读环境变量，不落盘、不进凭证存储
-	// 环境变量写法适合密钥由部署平台（k8s Secret / systemd / 容器 env）注入的场景。
+	//   "default"            → 只看凭证存储里的槽位名（界面「密钥配置」里录入）
+	//   "${SEARCH_API_KEY}"  → 先查凭证存储同名条目，没有再读环境变量
+	//
+	// ${} 的作用只是让「密钥从哪来」在配置里显式可见，不是二选一的开关：
+	// 界面录入的那条同样能被 ${} 命中（且优先），这样既能在后台轮换，
+	// 也能在没配 SECRET_KEK 的机器上直接用环境变量跑起来。
 	searchSecret := firstNonEmpty(platCfg.Search.Secret, search.DefaultSecretName)
-	searchKeyEnv := envRefName(searchSecret)
+	searchName, searchExplicit := parseSecretRef(searchSecret)
 	allow := netAllow.Domains
 	if len(allow) == 0 {
 		allow = cfg.SearchAllow
 	}
 
 	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准。
-	// 写的是 ${ENV} 时环境变量本身就是源，不需要也不应该再往存储里抄一份。
-	if searchKeyEnv == "" && secretStore.Enabled() && cfg.SearchAPIKey != "" {
+	// 写的是 ${NAME} 时由引用自身决定来源，不需要再把环境变量抄一份进存储。
+	if !searchExplicit && secretStore.Enabled() && cfg.SearchAPIKey != "" {
 		seedCtx := context.Background()
 		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, searchSecret); getErr != nil {
 			if putErr := secretStore.Put(seedCtx, search.SecretScope, searchSecret, cfg.SearchAPIKey); putErr != nil {
@@ -153,7 +156,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 旧部署的凭证名曾是 provider 名（bocha），统一成 default 后搬一次，
 	// 否则升级完 web_search 会突然说「密钥不可用」。
-	if searchKeyEnv == "" && secretStore.Enabled() && searchSecret != searchProvider {
+	if !searchExplicit && secretStore.Enabled() && searchSecret != searchProvider {
 		migCtx := context.Background()
 		if _, getErr := secretStore.Get(migCtx, search.SecretScope, searchSecret); errors.Is(getErr, secret.ErrNotFound) {
 			if v, legacyErr := secretStore.Get(migCtx, search.SecretScope, searchProvider); legacyErr == nil && v != "" {
@@ -181,14 +184,18 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 搜索（§5.6.1）：出网统一走 Guard。
 	searchReg := search.NewRegistry(searchProvider)
 	keyFunc := func(ctx context.Context) (string, error) {
-		if searchKeyEnv != "" {
-			v := strings.TrimSpace(os.Getenv(searchKeyEnv))
-			if v == "" {
-				return "", fmt.Errorf("环境变量 %s 未设置或为空", searchKeyEnv)
-			}
+		if !searchExplicit {
+			return secretStore.Get(ctx, search.SecretScope, searchName)
+		}
+		// 存储优先：加密落盘、可在界面轮换、有指纹可审计。
+		if v, err := secretStore.Get(ctx, search.SecretScope, searchName); err == nil && v != "" {
 			return v, nil
 		}
-		return secretStore.Get(ctx, search.SecretScope, searchSecret)
+		// 没有同名凭证时退回环境变量，适合部署平台（k8s Secret / systemd）注入。
+		if v := strings.TrimSpace(os.Getenv(searchName)); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("密钥 %s 不可用：凭证存储里没有该条目，环境变量也未设置", searchName)
 	}
 	guard := search.NewGuard(allow)
 	switch {
@@ -209,12 +216,12 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
 		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
-		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled() || searchKeyEnv != "")
+		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled() || searchExplicit)
 
 	// 启动时就把「引用的密钥在不在」说清楚。
 	// 引用的名字写错（凭证没录入 / 环境变量没导出）是最容易出现的错配：
 	// 配置看着没问题、服务也能起，直到第一次搜索才报错。这里提前告警并给出名字。
-	if secretStore.Enabled() || searchKeyEnv != "" {
+	if secretStore.Enabled() || searchExplicit {
 		if _, getErr := keyFunc(context.Background()); getErr != nil {
 			log.Warn("搜索密钥不可用，web_search 会报错", "secret", searchSecret, "err", getErr)
 		}
@@ -240,9 +247,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		// refs 告诉管理页「哪一条密钥真正被引用」，避免改了 A 却仍跑在 B 上。
 		adminH: admin.NewHandler(spaceSvc, secretStore, []admin.SecretRef{{
 			Scope:  search.SecretScope,
-			Name:   searchSecret,
-			Label:  searchRefLabel(searchProvider, searchKeyEnv),
-			Source: searchRefSource(searchKeyEnv),
+			Name:   searchName,
+			Label:  searchRefLabel(searchProvider, searchName, searchExplicit),
+			Source: searchRefSource(secretStore, search.SecretScope, searchName, searchExplicit),
 		}}, authHandler.CurrentUser, log),
 	}, nil
 }
@@ -308,31 +315,36 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// envRefName 解析 "${NAME}" 形式的环境变量引用；不是这个形式时返回空串，
-// 表示按普通凭证名去凭证存储里找。
+// parseSecretRef 解析 "${NAME}" 形式的引用，返回里面的名字与“是否显式书写”。
 //
-// 为什么要一个显式写法：让「密钥从哪来」在配置文件里一眼可见，
-// 而不是靠“环境变量有没有值”猜——猜的结果是两种来源互相覆盖，很难排查。
-func envRefName(ref string) string {
+// 不带 ${} 的名字只查凭证存储；带 ${} 的先查存储、再退回同名环境变量。
+// 之所以还要保留裸名字：界面上「平台当前使用」直接显示名字，最省事。
+func parseSecretRef(ref string) (string, bool) {
 	ref = strings.TrimSpace(ref)
-	if len(ref) < 4 || !strings.HasPrefix(ref, "${") || !strings.HasSuffix(ref, "}") {
-		return ""
+	if len(ref) > 3 && strings.HasPrefix(ref, "${") && strings.HasSuffix(ref, "}") {
+		if inner := strings.TrimSpace(ref[2 : len(ref)-1]); inner != "" {
+			return inner, true
+		}
 	}
-	return strings.TrimSpace(ref[2 : len(ref)-1])
+	return ref, false
 }
 
 // searchRefLabel 是「密钥配置」弹窗里那句“平台当前使用”的文案。
-func searchRefLabel(provider, envName string) string {
-	if envName != "" {
-		return fmt.Sprintf("web_search（环境变量 %s）", envName)
+func searchRefLabel(provider, name string, explicit bool) string {
+	if explicit {
+		return fmt.Sprintf("web_search（${%s}）", name)
 	}
 	return fmt.Sprintf("web_search（%s）", provider)
 }
 
-// searchRefSource 告诉管理页这条引用能不能在界面上管理。
-func searchRefSource(envName string) string {
-	if envName != "" {
-		return admin.SourceEnv
+// searchRefSource 告诉管理页这条引用最终落在哪：能查到同名凭证就是 store，
+// 否则是 env（此时界面上的录入区没有意义，显示成“来自环境变量”）。
+func searchRefSource(store *secret.FileStore, scope, name string, explicit bool) string {
+	if !explicit {
+		return admin.SourceStore
 	}
-	return admin.SourceStore
+	if v, err := store.Get(context.Background(), scope, name); err == nil && v != "" {
+		return admin.SourceStore
+	}
+	return admin.SourceEnv
 }

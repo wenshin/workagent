@@ -135,7 +135,7 @@ make web     # 前端 :5173
   占位符：`{{query}}` `{{limit}}` `{{freshness}}` `{{secret}}`（正好是占位符时保留类型，`{{limit}}` 仍是数字）。路径支持 `a.b[0].c`。`auth.in` ∈ `header|query|body`。`error_code` + `error_ok` 用于把业务错误码（如 `code != 0`）判成失败，而不是当成 0 条结果。
 - 声明式覆盖不到的情况（游标分页、非 JSON 响应、请求签名）走代码：实现 `search.Provider` 并在同文件 `init()` 里 `RegisterFactory`，装配层不加 case 分支。两条路并存，`search.spec` 优先。
 - 凭证名统一为 `default`（`search.DefaultSecretName`）：同一时刻只有一个搜索源在用，一把密钥就够，换源不用改密钥名。环境变量始终是 `SEARCH_API_KEY`，只用于首次播种；老部署里 provider 同名的旧凭证启动时自动迁移到 `default`。`search.secret` 字段已废弃，留空即可。
-- `search.secret` 只有两种写法，一眼能看出密钥从哪来：裸名字（如 `default`）= 凭证存储里的槽位，界面可管理；`${SEARCH_API_KEY}` = **直接读环境变量**，不落盘、不进凭证存储、跳过播种与迁移。环境变量空着时启动告警并在调用时报「环境变量 X 未设置」，不静默降级。
+- `search.secret` 两种写法，一眼能看出密钥从哪来：裸名字（如 `default`）= 只看凭证存储；`${NAME}` = **先查凭证存储同名条目，没有再读同名环境变量**。所以界面保存的凭证能被 `${}` 命中并优先于环境变量——后台可轮换，没配 `SECRET_KEK` 的机器也能直接用环境变量跑。两处都空时启动告警、调用时报「凭证存储里没有该条目，环境变量也未设置」，不静默降级；写 `${}` 时跳过播种与旧名迁移。
 - 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
 - 配置优先级：系统空间 `config.json` / `net_whitelist.json` → 环境变量 `SEARCH_*`。启动时读一次，改完需重启；配置写错**启动失败**而不是静默用默认值。
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
