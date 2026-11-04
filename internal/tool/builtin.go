@@ -168,15 +168,15 @@ func resourceSearch() Tool {
 		Capability: "system.source.search",
 		Description: "按关键词检索可用的技能（skills）、工具（tools）与 MCP 服务（mcps），返回最相关的若干条及读取路径。" +
 			"资源总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
+			"不确定有什么可用能力时，可以省略 query 只给 kind，按名称列出该类资源再挑。" +
 			"命中多个同名资源时先让用户选择，不要自行假设。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "query": {"type": "string", "description": "检索关键词，用能力名或任务关键词，如 周报、pdf、数据库"},
+    "query": {"type": "string", "description": "检索关键词，用能力名或任务关键词，如 周报、pdf、数据库；省略时需同时给 kind"},
     "kind": {"type": "string", "enum": ["skills", "tools", "mcps"], "description": "只检索某一类，省略则全部"},
     "limit": {"type": "integer", "description": "返回条数，默认 8，最大 20"}
   },
-  "required": ["query"],
   "additionalProperties": false
 }`),
 		Risk:        policy.RiskReadOnly,
@@ -195,12 +195,13 @@ func resourceSearch() Tool {
 				return "", fmt.Errorf("参数解析失败：%w", err)
 			}
 			query := strings.TrimSpace(in.Query)
-			if query == "" {
-				return "", fmt.Errorf("query 不能为空：用要查找的能力关键词检索")
-			}
 			kind := normalizeSourceKind(in.Kind)
 			if in.Kind != "" && kind == "" {
 				return "", fmt.Errorf("kind 只能是 skills / tools / mcps")
+			}
+			// 不再常驻技能索引，所以允许「只给 kind」按名称拉取该类目录
+			if query == "" && kind == "" {
+				return "", fmt.Errorf("query 与 kind 至少提供一个：给关键词检索，或给 kind 列出该类资源")
 			}
 			if in.Limit <= 0 {
 				in.Limit = 8
@@ -216,6 +217,11 @@ func resourceSearch() Tool {
 			hits := make([]scoredSource, 0, len(entries))
 			for _, e := range entries {
 				if kind != "" && e.Kind != kind {
+					continue
+				}
+				if query == "" {
+					// 只给 kind：按名称列目录，score 取相同值让排序退化为 kind + name
+					hits = append(hits, scoredSource{SourceEntry: e, Score: 1})
 					continue
 				}
 				if score := scoreSource(query, e); score > 0 {
@@ -241,6 +247,8 @@ func resourceSearch() Tool {
 			switch {
 			case res.Matched == 0:
 				res.Hint = "没有匹配的资源，可换关键词重试；当前空间的文件用 file_list 查看"
+			case query == "":
+				res.Hint = "未按关键词过滤，按名称列出；用 query 可以缩小范围"
 			case looksAmbiguous(res.Items):
 				res.Hint = "存在同名资源（来源不同），使用前请让用户确认用哪一个"
 			}

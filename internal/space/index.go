@@ -111,6 +111,16 @@ func (s *Service) MergedSources(ctx context.Context, spaceID string) IndexBundle
 	return out
 }
 
+// isSystemCapabilityPath 判断相对路径是否落在可跨空间读取的能力目录内。
+func isSystemCapabilityPath(rel string) bool {
+	for _, dir := range []string{systemSkillsDir, systemToolsDir, systemMCPsDir} {
+		if rel == dir || strings.HasPrefix(rel, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // SystemSpaceID 返回系统空间 ID；系统空间尚未初始化时返回 store.ErrNotFound。
 //
 // 平台配置（agents / config / net_whitelist）必须显式用这个 ID 读取，
@@ -151,6 +161,11 @@ func (s *Service) ReadSourceFile(ctx context.Context, spaceID, rawPath string, l
 
 	sys, sysErr := s.store.GetSpaceByType(ctx, SpaceTypeSystem)
 	if sysErr != nil || sys.ID == spaceID {
+		return "", ErrFileNotFound
+	}
+	// 只允许回落到能力目录。agents/、config.json、net_whitelist.json 是平台配置，
+	// 不能经这条通道被普通空间读到（否则等于公开了白名单与接入点）。
+	if !isSystemCapabilityPath(rel) {
 		return "", ErrFileNotFound
 	}
 	return s.readAt(ctx, sys.ID, rel, limit)

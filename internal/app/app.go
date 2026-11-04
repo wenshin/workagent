@@ -6,10 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
 	"github.com/workagent/auto-agent/internal/agentspec"
+	"github.com/workagent/auto-agent/internal/confstore"
 	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
 	_ "github.com/workagent/auto-agent/internal/agent/direct"
 	"github.com/workagent/auto-agent/internal/auth"
@@ -112,30 +114,44 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	if !secretStore.Enabled() {
 		log.Warn("凭证存储未启用（未配置 SECRET_KEK），需要密钥的能力不可用")
 	}
+	// 平台配置：系统空间的 config.json / net_whitelist.json，读不到就回退环境变量。
+	// 配置写错直接启动失败，避免「看起来改好了、实际还在用默认值」。
+	platCfg, netAllow, err := confstore.NewLoader(spaceSvc).Load(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("读取平台配置失败: %w", err)
+	}
+	searchProvider := firstNonEmpty(platCfg.Search.Provider, cfg.SearchProvider)
+	searchEndpoint := firstNonEmpty(platCfg.Search.Endpoint, cfg.SearchEndpoint)
+	searchSecret := firstNonEmpty(platCfg.Search.Secret, searchProvider)
+	allow := netAllow.Domains
+	if len(allow) == 0 {
+		allow = cfg.SearchAllow
+	}
+
 	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准
 	if secretStore.Enabled() && cfg.SearchAPIKey != "" {
 		seedCtx := context.Background()
-		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, cfg.SearchProvider); getErr != nil {
-			if putErr := secretStore.Put(seedCtx, search.SecretScope, cfg.SearchProvider, cfg.SearchAPIKey); putErr != nil {
+		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, searchSecret); getErr != nil {
+			if putErr := secretStore.Put(seedCtx, search.SecretScope, searchSecret, cfg.SearchAPIKey); putErr != nil {
 				log.Warn("搜索密钥播种失败", "err", putErr)
 			} else {
-				log.Info("搜索密钥已写入凭证存储", "provider", cfg.SearchProvider)
+				log.Info("搜索密钥已写入凭证存储", "secret", searchSecret)
 			}
 		}
 	}
 
 	// 搜索（§5.6.1）：出网统一走 Guard，provider 只认识平台配置的 endpoint
-	searchReg := search.NewRegistry(cfg.SearchProvider)
-	switch cfg.SearchProvider {
+	searchReg := search.NewRegistry(searchProvider)
+	switch searchProvider {
 	case "bocha":
-		searchReg.Register(search.NewBocha(cfg.SearchEndpoint, func(ctx context.Context) (string, error) {
-			return secretStore.Get(ctx, search.SecretScope, "bocha")
-		}, search.NewGuard(cfg.SearchAllow)))
+		searchReg.Register(search.NewBocha(searchEndpoint, func(ctx context.Context) (string, error) {
+			return secretStore.Get(ctx, search.SecretScope, searchSecret)
+		}, search.NewGuard(allow)))
 	default:
-		log.Warn("未知的搜索 provider，web_search 将不可用", "provider", cfg.SearchProvider)
+		log.Warn("未知的搜索 provider，web_search 将不可用", "provider", searchProvider)
 	}
-	log.Info("搜索能力已装配", "provider", cfg.SearchProvider,
-		"available", searchReg.Names(), "allow", cfg.SearchAllow, "secret_ready", secretStore.Enabled())
+	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
+		"available", searchReg.Names(), "allow", allow, "secret_ready", secretStore.Enabled())
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 	agentLoader := agentspec.NewLoader(spaceSvc)
@@ -204,4 +220,14 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
+}
+
+// firstNonEmpty 返回第一个非空值，用于「系统空间配置优先、环境变量兜底」。
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

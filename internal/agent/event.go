@@ -106,8 +106,6 @@ type RunInput struct {
 	Query string
 	// Tools 非空时直接使用（测试用）；为空则按注册表加载
 	Tools []tool.Tool
-	// Skills 是当前空间 + 系统空间合并后的技能索引，注入系统提示词的「可用技能」段
-	Skills []tool.SourceEntry
 	// ActiveSkill 是会话绑定的技能，正文直接进系统提示词
 	ActiveSkill *ActiveSkill
 	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后

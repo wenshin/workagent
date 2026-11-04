@@ -404,8 +404,7 @@ func (s *Service) Chat(
 		return emit(ev)
 	}
 
-	// 技能：索引常驻提示词，会话绑定的技能正文直接注入
-	skills := s.skillIndex(ctx, sess.SpaceID)
+	// 技能：不再常驻索引，只有会话绑定的技能正文直接注入
 	var activeSkill *agent.ActiveSkill
 	if sess.SkillPath != "" {
 		skill, err := s.loadSkill(ctx, sess.SpaceID, sess.SkillPath)
@@ -470,7 +469,6 @@ func (s *Service) Chat(
 		},
 		History:     contextMessages,
 		Query:       text,
-		Skills:      skills,
 		ActiveSkill: activeSkill,
 		AgentPrompt: agentPrompt,
 	}, emitEvent)
