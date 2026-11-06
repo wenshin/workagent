@@ -36,6 +36,10 @@ type Search struct {
 	// Spec 是声明式搜索源定义（请求模板 + 响应字段映射），由 internal/search 解析。
 	// 给了 spec 就不需要内置 provider 实现，接新搜索 API 只改这里。
 	Spec json.RawMessage `json:"spec,omitempty"`
+	// Script 是脚本搜索源的入口文件（.ts/.js），由 deno 在只读无网沙箱里执行。
+	// 声明式表达不了的（请求签名、游标分页、非 JSON 响应）才需要它。
+	// 优先级：script > spec > 内置 provider。
+	Script string `json:"script,omitempty"`
 }
 
 // Config 是 config.json 的结构。

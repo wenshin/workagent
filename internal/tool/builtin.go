@@ -30,6 +30,7 @@ func builtinTools() []Tool {
 		resourceSearch(),
 		resourceRead(),
 		webSearch(),
+		shellExec(),
 	}
 }
 

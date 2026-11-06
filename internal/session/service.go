@@ -15,6 +15,7 @@ import (
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/resource"
+	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
@@ -83,18 +84,20 @@ type Service struct {
 	agents *agentspec.Loader
 	// search 是搜索 provider 注册表，为 nil 时 web_search 返回「能力未配置」
 	search *search.Registry
-	log    *slog.Logger
+	// shell 是命令执行沙箱，为 nil 时 shell_exec 返回「能力未配置」
+	shell sandbox.Runner
+	log   *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
 // wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
-func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, agentLoader *agentspec.Loader, searcher *search.Registry, wallClock time.Duration, log *slog.Logger) *Service {
+func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, agentLoader *agentspec.Loader, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
 	if wallClock <= 0 {
 		wallClock = defaultRunBudget
 	}
 	return &Service{
 		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
-		memory: memory, agents: agentLoader, search: searcher,
+		memory: memory, agents: agentLoader, search: searcher, shell: shell,
 		runBudget: wallClock + runBudgetBackstopMargin, log: log,
 	}
 }
@@ -454,6 +457,9 @@ func (s *Service) Chat(
 			},
 			// 搜索：provider 与密钥都在装配层，工具只拿到注册表
 			Search: s.search,
+			// 命令执行：沙箱后端在装配层选定（bwrap / sandbox-exec / local），
+			// 工具只拿到 Runner，无法自行降级到无隔离执行。
+			Shell: s.shell,
 			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
 			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
 			CreateSkill: func(ctx context.Context, name, description string) (string, error) {

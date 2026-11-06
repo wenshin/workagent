@@ -34,6 +34,10 @@ func New(root string) (*FS, error) {
 // SpaceKey 返回空间根目录 key。
 func (f *FS) SpaceKey(spaceID string) string { return "spaces/" + spaceID }
 
+// LocalPath 把 key 解析成本机真实路径，供需要直接访问文件系统的调用方使用
+// （命令执行、外部脚本适配器）。校验规则与其它方法一致，不会跳出根目录。
+func (f *FS) LocalPath(key string) (string, error) { return f.resolve(key) }
+
 // resolve 校验并解析 key，防止目录穿越。
 func (f *FS) resolve(key string) (string, error) {
 	k := strings.TrimSpace(strings.ReplaceAll(key, "\\", "/"))

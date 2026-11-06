@@ -65,6 +65,9 @@ type Spec struct {
 	// Env 是追加/覆盖的环境变量（KEY=VALUE）。
 	// 父进程环境不会继承，只有 PATH 等少数无害变量会带进去，避免密钥泄漏。
 	Env []string
+	// Stdin 是喂给命令的标准输入。密钥这类敏感数据只走这里：
+	// argv 会出现在 ps 里，环境变量会出现在 /proc/<pid>/environ 里，stdin 不会。
+	Stdin []byte
 	// Mode 决定文件系统与网络边界，零值按 ModeReadOnly 处理。
 	Mode Mode
 	// Timeout 是墙钟上限，<=0 用 DefaultTimeout。
@@ -167,6 +170,9 @@ func (r *runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = spec.Dir
 	cmd.Env = env
+	if len(spec.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(spec.Stdin)
+	}
 	stdout := newCapWriter(spec.MaxOutput, cancel)
 	stderr := newCapWriter(spec.MaxOutput, cancel)
 	cmd.Stdout = stdout

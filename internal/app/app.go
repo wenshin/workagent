@@ -26,6 +26,7 @@ import (
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/resource"
+	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/session"
@@ -181,6 +182,16 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		searchSpec = &s
 	}
 
+	// 命令执行沙箱：按平台挑最强后端（bwrap > sandbox-exec > local）。
+	// 降级到 local 就是没有任何隔离，必须显式告警——让它出现在日志里，
+	// 而不是等到出事才发现「沙箱」其实是裸跑。
+	shellRunner := sandbox.Detect()
+	if shellRunner.Name() == "local" {
+		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）")
+	} else {
+		log.Info("命令执行沙箱已就绪", "backend", shellRunner.Name())
+	}
+
 	// 搜索（§5.6.1）：出网统一走 Guard。
 	searchReg := search.NewRegistry(searchProvider)
 	keyFunc := func(ctx context.Context) (string, error) {
@@ -198,7 +209,22 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		return "", fmt.Errorf("密钥 %s 不可用：凭证存储里没有该条目，环境变量也未设置", searchName)
 	}
 	guard := search.NewGuard(allow)
+
+	// 优先级：脚本 > 声明式 spec > 内置 provider。
+	// 脚本能覆盖声明式表达不了的（签名、分页、非 JSON），但它是可选项：
+	// 脚本坏了只告警并回退，不让整个服务起不来。
+	scriptReady := false
+	if searchScript := strings.TrimSpace(platCfg.Search.Script); searchScript != "" {
+		if provider, buildErr := search.NewDeno(searchProvider, searchScript, searchEndpoint, keyFunc, guard, shellRunner); buildErr != nil {
+			log.Warn("搜索脚本不可用，回退到声明式/内置 provider", "script", searchScript, "err", buildErr)
+		} else {
+			searchReg.Register(provider)
+			scriptReady = true
+		}
+	}
+
 	switch {
+	case scriptReady:
 	case searchSpec != nil:
 		provider, buildErr := search.NewHTTPJSON(searchProvider, searchEndpoint, *searchSpec, keyFunc, guard)
 		if buildErr != nil {
@@ -216,7 +242,8 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
 		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
-		"declarative", searchSpec != nil, "secret_ready", secretStore.Enabled() || searchExplicit)
+		"declarative", searchSpec != nil, "script", scriptReady,
+		"secret_ready", secretStore.Enabled() || searchExplicit)
 
 	// 启动时就把「引用的密钥在不在」说清楚。
 	// 引用的名字写错（凭证没录入 / 环境变量没导出）是最容易出现的错配：
@@ -230,7 +257,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 	agentLoader := agentspec.NewLoader(spaceSvc)
 
-	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, agentLoader, searchReg, cfg.LLMMaxWallClock, log)
+	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, agentLoader, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
 
 	return &App{
 		cfg:         cfg,

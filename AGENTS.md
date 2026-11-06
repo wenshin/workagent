@@ -144,6 +144,8 @@ make web     # 前端 :5173
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
 - 新增 provider：在 `internal/search` 下新建文件实现 `search.Provider`，并用 `init()` 调 `RegisterFactory("名字", ...)`；装配层（`internal/app`）按名字从工厂表解析，**不加 case 分支**，工具与提示词也不用改。provider 面板/路由只认 `config.json` 的 `search.provider`。
 
+- **脚本搜索源**（`search.script`，优先级 script > spec > 内置）：签名、游标分页、非 JSON 响应这类声明式表达不了的，写成 `.ts` 脚本交给 `deno` 执行。脚本**没有网络权限**，两段式：`plan` 输出 `{request:{method,url,headers,body}}`，`map` 收 `{status,body}` 输出 `{results:[...]}`；出网仍由 `Guard` 完成。密钥只走 stdin，不进 argv（`ps` 可见）也不进环境变量（`/proc/<pid>/environ` 可见）。脚本坏了只告警并回退，不让服务起不来。
+
 # 命令执行沙箱（`internal/sandbox`）
 
 - 入口是 `sandbox.Runner`（`Name()` + `Run(ctx, Spec)`），三个后端：`bwrap`（Linux）、`sandbox-exec`（macOS Seatbelt）、`local`（无隔离，仅开发/降级）。`Detect()` 按强度降级，调用方**必须检查 `Name()`**，把 `local` 当沙箱用是错误用法。
@@ -151,6 +153,7 @@ make web     # 前端 :5173
 - 每次调用固定做四件事：`MkdirTemp` 私有 `TMPDIR`/`HOME`（结束即删）、清空父进程环境（只保留 `PATH`/`LANG`/`TZ` 等无害项，防止密钥被 `env`/`cat` 带走）、墙钟超时、`stdout`/`stderr` 各 64KB 上限（超限即 kill）。
 - 进程组语义：`Setpgid` + `Kill(-pgid)`，超时或输出超限时**整棵进程树**一起回收，不留孤儿。非零退出码是数据（`Result.ExitCode`），只有启动失败 / 超时 / 输出超限才返回 error。
 - 路径要先 `EvalSymlinks`：macOS 上 `/var` → `/private/var`，不解析会出现「策略放开了写权限却报 Operation not permitted」。
+- `shell_exec`（能力 `shell.exec`，risk=write，副作用限空间工作区）把命令跑在当前空间 `files/` 下，固定 `ModeWorkspaceWrite` + 无网、默认 15s / 最多 25s（Invoker 墙钟是 30s）。非零退出码、超时、输出超限都作为结果回给模型，只有「沙箱不可用 / 存储不是本地路径」才返回 error。后端降级到 `local` 时启动日志会显式告警。
 
 # 资源发布与「资源管理」
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
@@ -46,6 +47,10 @@ type Env struct {
 	// Search 是搜索 provider 注册表（internal/search），为 nil 时 web_search 不可用。
 	// 密钥与出网策略都在实现内部，不经由工具参数传递。
 	Search *search.Registry
+
+	// Shell 是命令执行沙箱（internal/sandbox），为 nil 时 shell_exec 不可用。
+	// 隔离档位、超时与环境清理都由它的实现决定，工具只负责拼参数与格式化输出。
+	Shell sandbox.Runner
 }
 
 // Tool 是一个可被模型调用的工具。
