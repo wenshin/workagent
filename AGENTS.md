@@ -144,6 +144,14 @@ make web     # 前端 :5173
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
 - 新增 provider：在 `internal/search` 下新建文件实现 `search.Provider`，并用 `init()` 调 `RegisterFactory("名字", ...)`；装配层（`internal/app`）按名字从工厂表解析，**不加 case 分支**，工具与提示词也不用改。provider 面板/路由只认 `config.json` 的 `search.provider`。
 
+# 命令执行沙箱（`internal/sandbox`）
+
+- 入口是 `sandbox.Runner`（`Name()` + `Run(ctx, Spec)`），三个后端：`bwrap`（Linux）、`sandbox-exec`（macOS Seatbelt）、`local`（无隔离，仅开发/降级）。`Detect()` 按强度降级，调用方**必须检查 `Name()`**，把 `local` 当沙箱用是错误用法。
+- 三档策略 `Mode`：`read-only`（全盘只读）/ `workspace-write`（`Spec.Dir` + 私有临时目录可写）/ `full`（不套沙箱，审计记 `none`）。网络默认关闭，要开得显式 `Network: true`。
+- 每次调用固定做四件事：`MkdirTemp` 私有 `TMPDIR`/`HOME`（结束即删）、清空父进程环境（只保留 `PATH`/`LANG`/`TZ` 等无害项，防止密钥被 `env`/`cat` 带走）、墙钟超时、`stdout`/`stderr` 各 64KB 上限（超限即 kill）。
+- 进程组语义：`Setpgid` + `Kill(-pgid)`，超时或输出超限时**整棵进程树**一起回收，不留孤儿。非零退出码是数据（`Result.ExitCode`），只有启动失败 / 超时 / 输出超限才返回 error。
+- 路径要先 `EvalSymlinks`：macOS 上 `/var` → `/private/var`，不解析会出现「策略放开了写权限却报 Operation not permitted」。
+
 # 资源发布与「资源管理」
 
 - 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 资源管理板块（按需检索）**。发布范围只有用户范围：`public` 全部可见 / `private` 仅自己可见；没有「必须加载 / 可选加载」。
