@@ -154,6 +154,7 @@ make web     # 前端 :5173
 - 进程组语义：`Setpgid` + `Kill(-pgid)`，超时或输出超限时**整棵进程树**一起回收，不留孤儿。非零退出码是数据（`Result.ExitCode`），只有启动失败 / 超时 / 输出超限才返回 error。
 - 路径要先 `EvalSymlinks`：macOS 上 `/var` → `/private/var`，不解析会出现「策略放开了写权限却报 Operation not permitted」。
 - `shell_exec`（能力 `shell.exec`，risk=write，副作用限空间工作区）把命令跑在当前空间 `files/` 下，固定 `ModeWorkspaceWrite` + 无网、默认 15s / 最多 25s（Invoker 墙钟是 30s）。非零退出码、超时、输出超限都作为结果回给模型，只有「沙箱不可用 / 存储不是本地路径」才返回 error。后端降级到 `local` 时启动日志会显式告警。
+- **`SANDBOX_REQUIRE=true`（生产必须打开）**：启动阶段走 `sandbox.Ensure`，只有 `local` 就**启动失败**（`ErrNotIsolated`），把「以为有沙箱、其实在裸跑」挡在上线前。开发机默认 false，允许降级但一定留告警。后端名用常量 `sandbox.NameBwrap` / `NameSeatbelt` / `NameLocal` 比较，不要写字面量。
 
 # 资源发布与「资源管理」
 

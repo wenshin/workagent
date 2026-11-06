@@ -186,8 +186,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 降级到 local 就是没有任何隔离，必须显式告警——让它出现在日志里，
 	// 而不是等到出事才发现「沙箱」其实是裸跑。
 	shellRunner := sandbox.Detect()
-	if shellRunner.Name() == "local" {
-		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）")
+	// 生产环境应当打开 SANDBOX_REQUIRE：探测不到隔离后端就启动失败。
+	// 默认关闭是为了让开发机（可能没有 bwrap）能起来，但降级一定会留下告警。
+	if err := sandbox.Ensure(shellRunner, cfg.SandboxRequire); err != nil {
+		return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
+	}
+	if shellRunner.Name() == sandbox.NameLocal {
+		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）", "require", cfg.SandboxRequire)
 	} else {
 		log.Info("命令执行沙箱已就绪", "backend", shellRunner.Name())
 	}

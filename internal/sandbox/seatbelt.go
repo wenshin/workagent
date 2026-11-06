@@ -31,7 +31,7 @@ func NewSeatbelt() (Runner, error) {
 		return nil, fmt.Errorf("%w: sandbox-exec 探针失败: %v %s",
 			ErrUnavailable, probeErr, strings.TrimSpace(string(out)))
 	}
-	return &runner{name: "sandbox-exec", build: seatbeltBuild(bin)}, nil
+	return &runner{name: NameSeatbelt, build: seatbeltBuild(bin)}, nil
 }
 
 func seatbeltBuild(bin string) buildFunc {

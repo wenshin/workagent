@@ -28,7 +28,7 @@ func NewBwrap() (Runner, error) {
 		return nil, fmt.Errorf("%w: bwrap 探针失败（常见原因：user namespace 被禁用）: %v %s",
 			ErrUnavailable, probeErr, strings.TrimSpace(string(out)))
 	}
-	return &runner{name: "bwrap", build: bwrapBuild(bin)}, nil
+	return &runner{name: NameBwrap, build: bwrapBuild(bin)}, nil
 }
 
 func bwrapBuild(bin string) buildFunc {

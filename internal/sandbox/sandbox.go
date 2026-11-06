@@ -98,6 +98,16 @@ type Runner interface {
 	Run(ctx context.Context, spec Spec) (Result, error)
 }
 
+// 后端名。判定「有没有真隔离」是安全语义的一部分，不要用字面量比较。
+const (
+	NameBwrap    = "bwrap"
+	NameSeatbelt = "sandbox-exec"
+	NameLocal    = "local"
+)
+
+// ErrNotIsolated 表示当前没有可用的隔离后端，只有无隔离的 local。
+var ErrNotIsolated = errors.New("sandbox: 没有可用的隔离后端")
+
 // Detect 返回当前平台最强的可用后端；都不可用时回退 local。
 // 调用方应检查 Name() 并记录告警，不要假设一定隔离。
 func Detect() Runner {
@@ -110,10 +120,23 @@ func Detect() Runner {
 	return NewLocal()
 }
 
+// Ensure 校验探测结果。requireIsolation 为真时，降级到 local 直接报错，
+// 把「以为有沙箱、其实在裸跑」挡在启动阶段，而不是等出事才发现。
+func Ensure(r Runner, requireIsolation bool) error {
+	if r == nil {
+		return fmt.Errorf("%w：没有可用的执行器", ErrNotIsolated)
+	}
+	if requireIsolation && r.Name() == NameLocal {
+		return fmt.Errorf("%w：探测不到 bwrap / sandbox-exec（Linux 需安装 bubblewrap 且内核允许 user namespace）；"+
+			"开发机可设 SANDBOX_REQUIRE=false 跳过该校验", ErrNotIsolated)
+	}
+	return nil
+}
+
 // NewLocal 是不做任何隔离的执行器，只保留超时 / 输出上限 / 环境清理。
 // 它存在的意义是让开发机和 CI 能跑通，不是给生产用的。
 func NewLocal() Runner {
-	return &runner{name: "local", build: nil}
+	return &runner{name: NameLocal, build: nil}
 }
 
 // buildFunc 把 Spec 包装成最终命令行；env 由 Run 统一生成，bwrap 需要用它

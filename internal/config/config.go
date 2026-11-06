@@ -55,6 +55,11 @@ type Config struct {
 	// 未注册的名字在启动时告警并回退 builtin，不影响服务可用。
 	AgentImpl string
 
+	// SandboxRequire 要求命令执行必须有真实隔离后端（bwrap / sandbox-exec）。
+	// 生产环境打开：探测不到就启动失败，而不是悄悄退化成裸跑。
+	// 开发机保持默认（false），降级到 local 时日志里会有告警。
+	SandboxRequire bool
+
 	// 上下文压缩与记忆（§5.7.2 / §5.7.4）
 	LLMSummaryModel string // 摘要用小模型，为空则复用主模型
 	LLMEmbedBaseURL string
@@ -159,6 +164,8 @@ func Load() (*Config, error) {
 		LLMFallbackModel:    getenv("LLM_FALLBACK_MODEL", ""),
 
 		AgentImpl: getenv("AGENT_IMPL", "builtin"),
+
+		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
 
 		LLMSummaryModel: getenv("LLM_SUMMARY_MODEL", ""),
 		LLMEmbedBaseURL: strings.TrimRight(getenv("LLM_EMBED_BASE_URL", ""), "/"),
