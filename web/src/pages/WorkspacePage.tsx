@@ -12,6 +12,7 @@ import {
   useDeleteSession,
   useMe,
   useMessages,
+  usePluginCatalog,
   useSetSessionSkill,
   useSessions,
   useSkills,
@@ -20,9 +21,10 @@ import {
   useSpaces,
 } from '../api/hooks';
 import { streamChat } from '../api/stream';
-import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
+import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
+import PluginCatalogPanel, { PLUGIN_CATEGORY_LABEL } from '../components/PluginCatalogPanel';
 import ResourcePanel from '../components/ResourcePanel';
 import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
@@ -32,13 +34,22 @@ import SpaceTree, { FILE_KEY_PREFIX, SESSION_KEY_PREFIX } from '../components/Sp
 export default function WorkspacePage() {
   const location = useLocation();
   const navigate = useNavigate();
-  // 「工作空间」与「资源管理」同级：同一套外壳，用路由区分内容
-  const isResources = location.pathname.startsWith('/resources');
+  // 一级入口：工作空间 / 插件市场。已装插件属于空间，入口在空间页里。
+  const isSnapshots = location.pathname.startsWith('/resources/snapshots');
+  const isPlugins = location.pathname.startsWith('/plugins');
+  // 市场分类由路径决定，左侧二级菜单只是同一份状态的入口
+  const pluginCategory: PluginCategory = useMemo(() => {
+    const seg = location.pathname.split('/')[3];
+    return seg === 'internal' || seg === 'pending' || seg === 'system' || seg === 'external'
+      ? seg
+      : 'all';
+  }, [location.pathname]);
+  const { data: catalog } = usePluginCatalog();
   const { data: me } = useMe();
   const { data: spaces = [], isLoading: spacesLoading } = useSpaces();
   const { data: sessions = [], isLoading: sessionsLoading } = useSessions();
   const { data: dirs = [] } = useSpaceDirs();
-  const { data: files = [] } = useSpaceFiles();
+  const { data: files = [], isFetched: filesFetched } = useSpaceFiles();
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
@@ -89,9 +100,21 @@ export default function WorkspacePage() {
   }, [sessions, personalId]);
 
   useEffect(() => {
+    if (isPlugins || isSnapshots) return;
     if (urlSessionId || urlSpaceId || spaces.length === 0) return;
     if (defaultSessionId) setSearchParams({ session: defaultSessionId }, { replace: true });
-  }, [urlSessionId, urlSpaceId, defaultSessionId, spaces.length, setSearchParams]);
+  }, [isPlugins, isSnapshots, urlSessionId, urlSpaceId, defaultSessionId, spaces.length, setSearchParams]);
+
+  // 文件或它所在的目录被删掉后，URL 里还留着 ?file=<path>，内容面板会一直停在旧路径。
+  // 等文件列表至少成功拉取过一次再判断，避免首屏还没加载完就误清。
+  useEffect(() => {
+    if (!filesFetched || !urlFilePath) return;
+    if (files.some((f) => f.path === urlFilePath)) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('file');
+    if (!next.get('space') && selectedSpaceId) next.set('space', selectedSpaceId);
+    setSearchParams(next, { replace: true });
+  }, [filesFetched, files, urlFilePath, searchParams, selectedSpaceId, setSearchParams]);
 
   const { data: messages = [], isLoading: messagesLoading } = useMessages(selectedSession?.id);
   // 技能列表随会话所属空间变化：当前空间 + 系统空间合并，同名当前空间优先
@@ -110,9 +133,9 @@ export default function WorkspacePage() {
   );
 
   const addSession = useCallback(
-    async (spaceId: string, dir?: string) => {
+    async (spaceId: string, dir?: string, agentId?: string) => {
       try {
-        const res = await createSession.mutateAsync({ spaceId, dir });
+        const res = await createSession.mutateAsync({ spaceId, dir, agentId });
         setSearchParams({ session: res.session.id });
       } catch (e) {
         Toast.error(e instanceof Error ? e.message : '新建会话失败');
@@ -220,6 +243,15 @@ export default function WorkspacePage() {
       ? SESSION_KEY_PREFIX + selectedSession.id
       : selectedSpaceId;
 
+  // 市场分类计数与当前类型筛选无关：侧栏先给总量，明细在右侧筛
+  const catalogItems = catalog?.items ?? [];
+  const categoryCount = (c: PluginCategory) =>
+    c === 'all'
+      ? catalogItems.length
+      : catalogItems.filter((item) => (item.pending ? 'pending' : item.category) === c).length;
+  const openCategory = (c: PluginCategory) =>
+    navigate(c === 'all' ? '/plugins/market' : `/plugins/market/${c}`);
+
   return (
     <Layout className="app-shell">
       <Layout.Sider className="app-sider" style={{ width: 280 }}>
@@ -236,26 +268,48 @@ export default function WorkspacePage() {
           </div>
         </div>
 
-        {/* 一级菜单：工作空间 / 资源管理 */}
+        {/* 一级菜单：工作空间 / 插件 */}
         <nav className="sider-nav">
           <button
             type="button"
-            className={`sider-nav-item${isResources ? '' : ' active'}`}
+            className={`sider-nav-item${isPlugins ? '' : ' active'}`}
             onClick={() => navigate('/')}
           >
             工作空间
           </button>
           <button
             type="button"
-            className={`sider-nav-item${isResources ? ' active' : ''}`}
-            onClick={() => navigate('/resources')}
+            className={`sider-nav-item${isPlugins ? ' active' : ''}`}
+            onClick={() => navigate('/plugins/market')}
           >
-            资源管理
+            插件市场
           </button>
         </nav>
 
-        {/* 中部：工作空间树（资源管理下不展示树） */}
-        <div className="sider-main" hidden={isResources}>
+        {/* 中部：插件市场的分类二级菜单 */}
+        {isPlugins ? (
+          <div className="sider-main">
+            <div className="sider-head">
+              <span className="sider-title">插件市场</span>
+            </div>
+            <div className="sider-subnav">
+              {(['all', 'internal', 'pending', 'system', 'external'] as PluginCategory[]).map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  className={`sider-sub-item${pluginCategory === c ? ' active' : ''}`}
+                  onClick={() => openCategory(c)}
+                >
+                  <span>{PLUGIN_CATEGORY_LABEL[c]}</span>
+                  <span className="sider-sub-count">{categoryCount(c)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        {/* 中部：工作空间树（插件与发布记录下不展示树） */}
+        <div className="sider-main" hidden={isPlugins || isSnapshots}>
           <div className="sider-head">
             <span className="sider-title">工作空间</span>
             <Button
@@ -283,7 +337,7 @@ export default function WorkspacePage() {
               onAddDir={(space: Space, parent?: SpaceDir) =>
                 setDialog({ kind: 'create-dir', space, parent })
               }
-              onAddSkill={(space: Space) => setDialog({ kind: 'create-skill', space })}
+              onAddSkill={(space: Space) => setDialog({ kind: 'create-plugin', space })}
               onAddSession={(space: Space, dir?: SpaceDir) => void addSession(space.id, dir?.path)}
               onRename={(space: Space) => setDialog({ kind: 'rename', target: space })}
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
@@ -294,9 +348,9 @@ export default function WorkspacePage() {
           )}
         </div>
 
-        {isResources ? (
+        {isSnapshots ? (
           <div className="sider-main sider-note">
-            资源管理展示已发布资源：版本快照不可修改，停用后 Agent 不会再检索到。发布前请先在空间里写好技能正文。
+            发布记录是空间文件的版本快照：内容只读，可停用或删除；停用后 Agent 不再检索。
           </div>
         ) : null}
 
@@ -333,8 +387,12 @@ export default function WorkspacePage() {
       </Layout.Sider>
 
       <Layout.Content className="app-content">
-        {isResources ? (
+        {isSnapshots ? (
           <ResourcePanel />
+        ) : isPlugins ? (
+          <div className="resource-panel">
+            <PluginCatalogPanel defaultSpaceId={selectedSpaceId} category={pluginCategory} />
+          </div>
         ) : selectedFile ? (
           <FilePanel space={selectedSpace} file={selectedFile} />
         ) : selectedSession ? (
@@ -364,8 +422,9 @@ export default function WorkspacePage() {
             sessions={spaceSessions}
             loading={sessionsLoading}
             onOpenSession={openSession}
-            onAddSession={() => selectedSpace && void addSession(selectedSpace.id)}
+            onAddSession={(agentId?: string) => selectedSpace && void addSession(selectedSpace.id, undefined, agentId)}
             onOpenPlatform={() => setPlatformOpen(true)}
+            onOpenPublishRecords={() => navigate('/resources/snapshots')}
           />
         )}
       </Layout.Content>

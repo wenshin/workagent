@@ -1,7 +1,10 @@
-import { IconKey, IconPlus } from '@douyinfe/semi-icons';
-import { Button, Card, Empty, Spin, Typography } from '@douyinfe/semi-ui';
+import { IconHistory, IconKey, IconPlus } from '@douyinfe/semi-icons';
+import { Button, Card, Empty, Select, Spin, Typography } from '@douyinfe/semi-ui';
+import { useState } from 'react';
 
+import { useAgents } from '../api/hooks';
 import type { ChatSession, Space } from '../api/types';
+import PluginPanel from './PluginPanel';
 
 const { Text } = Typography;
 
@@ -10,9 +13,12 @@ interface Props {
   sessions: ChatSession[];
   loading: boolean;
   onOpenSession: (id: string) => void;
-  onAddSession: () => void;
+  /** agentId 为空时由后端用默认智能体（base） */
+  onAddSession: (agentId?: string) => void;
   /** 系统空间才有密钥配置入口（只影响平台能力，不涉及空间内容） */
   onOpenPlatform?: () => void;
+  /** 空间文件的发布记录（只读快照），入口跟着空间走，不放进插件市场 */
+  onOpenPublishRecords?: () => void;
 }
 
 function formatTime(iso: string) {
@@ -29,7 +35,15 @@ export default function SpacePanel({
   onOpenSession,
   onAddSession,
   onOpenPlatform,
+  onOpenPublishRecords,
 }: Props) {
+  // 智能体来自系统空间的全局安装 + 本空间安装，新建会话时选一次并固化在会话上
+  const { data: agentResp } = useAgents(space?.id);
+  const agents = agentResp?.agents ?? [];
+  const [agentId, setAgentId] = useState('');
+  const chosenAgent =
+    agentId || (agents.some((a) => a.id === 'base') ? 'base' : agents[0]?.id ?? '');
+
   if (!space) {
     return (
       <div className="panel-empty">
@@ -55,13 +69,32 @@ export default function SpacePanel({
           </Text>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          {writable && onOpenPublishRecords ? (
+            <Button icon={<IconHistory />} onClick={onOpenPublishRecords}>
+              发布记录
+            </Button>
+          ) : null}
           {space.type === 'system' && onOpenPlatform ? (
             <Button icon={<IconKey />} onClick={onOpenPlatform}>
               密钥配置
             </Button>
           ) : null}
+          {writable && agents.length > 0 ? (
+            <Select
+              value={chosenAgent}
+              onChange={(v) => setAgentId(String(v))}
+              style={{ width: 170 }}
+              placeholder="智能体"
+              optionList={agents.map((a) => ({ value: a.id, label: a.name }))}
+            />
+          ) : null}
           {writable ? (
-            <Button theme="solid" type="primary" icon={<IconPlus />} onClick={onAddSession}>
+            <Button
+              theme="solid"
+              type="primary"
+              icon={<IconPlus />}
+              onClick={() => onAddSession(chosenAgent || undefined)}
+            >
               新建会话
             </Button>
           ) : null}
@@ -88,6 +121,8 @@ export default function SpacePanel({
           ))}
         </div>
       )}
+
+      <PluginPanel space={space} />
     </div>
   );
 }

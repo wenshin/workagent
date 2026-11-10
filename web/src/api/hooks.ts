@@ -4,6 +4,7 @@ import { api } from './client';
 import type {
   AdminSettings,
   AgentInfo,
+  AgentSummary,
   AppendMessageResponse,
   ChatSession,
   DirsResponse,
@@ -11,6 +12,13 @@ import type {
   FilesResponse,
   MeResponse,
   MessagesResponse,
+  PluginBaselineStatus,
+  PluginCatalogResponse,
+  PluginConfigView,
+  PluginDetailResponse,
+  PluginDryRunResult,
+  PluginKind,
+  PluginsResponse,
   ProviderResponse,
   PublishedResource,
   ResourceDetailResponse,
@@ -31,11 +39,16 @@ export const queryKeys = {
   files: ['files'] as const,
   skills: (spaceId: string) => ['skills', spaceId] as const,
   agent: ['agent'] as const,
+  agents: (spaceId: string) => ['agents', spaceId] as const,
   messages: (sessionId: string) => ['messages', sessionId] as const,
   file: (spaceId: string, path: string) => ['file', spaceId, path] as const,
   resources: ['resources'] as const,
   resource: (id: string) => ['resource', id] as const,
   adminSettings: ['admin', 'settings'] as const,
+  plugins: (spaceId: string) => ['plugins', spaceId] as const,
+  pluginInstalled: (spaceId: string) => ['plugin', 'installed', spaceId] as const,
+  pluginConfig: (spaceId: string, slug: string) => ['plugin', 'config', spaceId, slug] as const,
+  pluginCatalog: ['plugin', 'catalog'] as const,
 };
 
 /** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
@@ -182,7 +195,31 @@ export function useCreateSkill() {
         method: 'POST',
         body: { name: input.name, description: input.description ?? '' },
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.dirs }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.dirs });
+      // 技能目录自带 SKILL.md，文件树里要立刻出现
+      qc.invalidateQueries({ queryKey: queryKeys.files });
+    },
+  });
+}
+
+/**
+ * 新建插件草稿：六类插件共用一条接口，kind 决定后端生成的骨架文件。
+ * 技能、工具、MCP、组件、智能体、搜索源。
+ */
+export function useCreateDraft() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; kind: PluginKind; name: string; description?: string }) =>
+      api<{ dir: SpaceDir }>(`/spaces/${input.spaceId}/drafts`, {
+        method: 'POST',
+        body: { kind: input.kind, name: input.name, description: input.description ?? '' },
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.dirs });
+      // 草稿目录自带 plugin.json 与入口文件，文件树要立刻出现
+      qc.invalidateQueries({ queryKey: queryKeys.files });
+    },
   });
 }
 
@@ -198,6 +235,9 @@ export function useRenameDir() {
       qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 目录改名会同步会话的 dir，树上的会话位置会变
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
+      // 目录下的文件路径整体变了，文件树不刷新会留在旧路径下
+      qc.invalidateQueries({ queryKey: queryKeys.files });
+      qc.invalidateQueries({ queryKey: ['file'] });
     },
   });
 }
@@ -213,17 +253,34 @@ export function useDeleteDir() {
       qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 目录内会话会移回空间根
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
+      // 目录里的文件是被磁盘递归删掉的，文件树必须一起失效，
+      // 否则 15s 内左侧树还会显示已经不存在的文件。
+      qc.invalidateQueries({ queryKey: queryKeys.files });
+      qc.invalidateQueries({ queryKey: ['file'] });
     },
+  });
+}
+
+/** 空间可选的智能体：kind=agent 插件，系统空间安装的对所有空间可见 */
+export function useAgents(spaceId?: string) {
+  return useQuery({
+    queryKey: queryKeys.agents(spaceId ?? ''),
+    enabled: Boolean(spaceId),
+    queryFn: () => api<{ agents: AgentSummary[] }>(`/spaces/${spaceId}/agents`),
   });
 }
 
 export function useCreateSession() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (input: { spaceId: string; title?: string; dir?: string }) =>
+    mutationFn: (input: { spaceId: string; title?: string; dir?: string; agentId?: string }) =>
       api<{ session: ChatSession }>(`/spaces/${input.spaceId}/sessions`, {
         method: 'POST',
-        body: { title: input.title ?? '', dir: input.dir ?? '' },
+        body: {
+          title: input.title ?? '',
+          dir: input.dir ?? '',
+          agent_id: input.agentId ?? '',
+        },
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.sessions }),
   });
@@ -397,5 +454,171 @@ export function useDeleteSecret() {
         { method: 'DELETE' },
       ),
     onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.adminSettings }),
+  });
+}
+
+/* ---- 插件：开发 → 发布 → 安装 → 运行 → 卸载 ---- */
+
+/** 空间内可见的插件（已安装 + 草稿），带基线升级提示 */
+export function usePlugins(spaceId?: string) {
+  return useQuery({
+    queryKey: queryKeys.plugins(spaceId ?? ''),
+    queryFn: () => api<PluginsResponse>(`/spaces/${spaceId}/plugins`).then((r) => r.items),
+    enabled: Boolean(spaceId),
+    staleTime: 10_000,
+  });
+}
+
+/** 资源管理：全部已发布插件（只读目录），用于安装到空间 */
+export function usePluginConfig(spaceId?: string, slug?: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.pluginConfig(spaceId ?? '', slug ?? ''),
+    queryFn: () =>
+      api<PluginConfigView>(`/spaces/${spaceId}/plugins/${slug}/config`),
+    enabled: Boolean(spaceId) && Boolean(slug) && enabled,
+  });
+}
+
+export function useUpdatePluginConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      spaceId: string;
+      slug: string;
+      values: Record<string, string>;
+    }) =>
+      api<PluginConfigView>(`/spaces/${input.spaceId}/plugins/${input.slug}/config`, {
+        method: 'PUT',
+        body: { values: input.values },
+      }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.pluginConfig(vars.spaceId, vars.slug) });
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginInstalled(vars.spaceId) });
+    },
+  });
+}
+
+export function usePluginCatalog() {
+  return useQuery({
+    queryKey: queryKeys.pluginCatalog,
+    queryFn: () => api<PluginCatalogResponse>('/plugins'),
+    staleTime: 10_000,
+  });
+}
+
+export function usePluginDetail(spaceId?: string, slug?: string) {
+  return useQuery({
+    queryKey: ['plugin', spaceId ?? '', slug ?? ''],
+    queryFn: () => api<PluginDetailResponse>(`/spaces/${spaceId}/plugins/${slug}`),
+    enabled: Boolean(spaceId && slug),
+    staleTime: 5_000,
+  });
+}
+
+/** 草稿试运行：不产生副作用，只回放样例输入 */
+export function useDryRunPlugin() {
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; input?: unknown }) =>
+      api<PluginDryRunResult>(`/spaces/${input.spaceId}/plugins/${input.slug}/dry-run`, {
+        method: 'POST',
+        body: { input: input.input ?? {} },
+      }),
+  });
+}
+
+/** 发布：草稿 → 不可变版本快照 */
+export function usePublishPlugin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; version?: string; notes?: string }) =>
+      api<{ version: string; sha256: string; risk: number }>(
+        `/spaces/${input.spaceId}/plugins/${input.slug}/publish`,
+        { method: 'POST', body: { version: input.version ?? '', notes: input.notes ?? '' } },
+      ),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    },
+  });
+}
+
+/** 安装：只接受已发布版本，安装即授权能力清单 */
+export function useInstallPlugin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; version: string }) =>
+      api<{ version: string }>(`/spaces/${input.spaceId}/plugins/${input.slug}/install`, {
+        method: 'POST',
+        body: { version: input.version },
+      }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    },
+  });
+}
+
+export function useUninstallPlugin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string }) =>
+      api<null>(`/spaces/${input.spaceId}/plugins/${input.slug}/uninstall`, { method: 'POST' }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    },
+  });
+}
+
+export function useTogglePlugin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; enabled: boolean }) =>
+      api<null>(
+        `/spaces/${input.spaceId}/plugins/${input.slug}/${input.enabled ? 'enable' : 'disable'}`,
+        { method: 'POST' },
+      ),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    },
+  });
+}
+
+export function usePluginBaseline(spaceId?: string, slug?: string, enabled = true) {
+  return useQuery({
+    queryKey: ['plugin', 'baseline', spaceId ?? '', slug ?? ''],
+    queryFn: () => api<PluginBaselineStatus>(`/spaces/${spaceId}/plugins/${slug}/baseline`),
+    enabled: Boolean(enabled && spaceId && slug),
+    staleTime: 10_000,
+  });
+}
+
+/** 用上游最新版覆盖本地副本；覆盖前平台会自动备份 */
+export function useResetPluginBaseline() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string }) =>
+      api<null>(`/spaces/${input.spaceId}/plugins/${input.slug}/baseline/reset`, { method: 'POST' }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.dirs });
+    },
+  });
+}
+
+export function useDismissPluginUpdate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; version: string }) =>
+      api<null>(`/spaces/${input.spaceId}/plugins/${input.slug}/baseline/dismiss`, {
+        method: 'POST',
+        body: { version: input.version },
+      }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
+      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    },
   });
 }

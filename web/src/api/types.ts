@@ -48,10 +48,20 @@ export interface SpaceDir {
   path: string;
   /** 展示名：skill 取自 .meta.json 的 name，其余等于末级目录名 */
   name: string;
-  /** true 表示该目录是 skill（目录下有隐藏的 .meta.json） */
+  /** true 表示该目录是 skill（新插件或旧的 .meta.json 目录） */
   is_skill: boolean;
+  /** 非空表示该目录是一个插件草稿（plugins/<slug>/），值即插件类型 */
+  plugin_kind?: PluginKind;
   /** true 表示系统空间的内置目录（skills / tools / mcps），不可改名删除 */
   builtin: boolean;
+  /** 安装副本：只读，只能启停/卸载 */
+  installed?: boolean;
+  /** 空间本地开发插件 */
+  local?: boolean;
+  /** 内容是否可编辑 */
+  mutable?: boolean;
+  /** 已安装或本地插件是否启用 */
+  enabled?: boolean;
   description?: string;
 }
 
@@ -253,4 +263,189 @@ export interface AdminSettings {
   secrets_enabled: boolean;
   refs: SecretRef[];
   items: SecretItem[];
+}
+
+/* ---- 插件：一份清单 + 一个执行器 + 一套能力声明，四类 kind 共用生命周期 ---- */
+
+export type PluginKind = 'skill' | 'tool' | 'mcp' | 'component' | 'agent' | 'source';
+
+/** 空间内可见的插件：已安装的 + 空间里的草稿 */
+export interface PluginItem {
+  slug: string;
+  kind: PluginKind;
+  name: string;
+  description: string;
+  version: string;
+  /** draft 未启用的本地插件 / enabled 已启用的本地插件 / installed / disabled */
+  status: 'draft' | 'enabled' | 'installed' | 'disabled';
+  origin: 'internal' | 'system' | 'external';
+  risk: number;
+  installed: boolean;
+  local: boolean;
+  enabled: boolean;
+  mutable: boolean;
+  published: boolean;
+  has_draft: boolean;
+  extensible: boolean;
+  update_available: boolean;
+  latest_version: string;
+  baseline_version?: string;
+  local_modified: boolean;
+  tools?: string[];
+}
+
+export interface PluginsResponse {
+  items: PluginItem[];
+}
+
+/** 插件市场左侧二级菜单的分类 */
+export type PluginCategory = 'all' | 'internal' | 'pending' | 'system' | 'external';
+
+/** 会话可选的智能体（kind=agent 插件；系统空间安装的全局可选） */
+export interface AgentSummary {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  extends?: string;
+}
+
+/** 资源管理里的已发布插件（只读） */
+export interface PluginCatalogItem {
+  slug: string;
+  kind: PluginKind;
+  name: string;
+  description: string;
+  latest_version: string;
+  visibility: 'public' | 'private';
+  extensible: boolean;
+  risk: number;
+  origin: 'internal' | 'system' | 'external';
+  category: 'internal' | 'system' | 'external';
+  pending: boolean;
+  installable: boolean;
+  can_publish: boolean;
+  source_space_id?: string;
+  source_space?: string;
+  author?: string;
+  published: boolean;
+  published_slug?: string;
+}
+
+export interface PluginCatalogResponse {
+  items: PluginCatalogItem[];
+  is_admin: boolean;
+}
+
+/** 安装级配置：MCP 的服务地址与鉴权；凭证只回显名字 */
+export interface PluginConfigField {
+  key: string;
+  label: string;
+  type: 'text' | 'url';
+  required: boolean;
+  placeholder?: string;
+  help?: string;
+}
+
+export interface PluginConfigView {
+  slug: string;
+  kind: PluginKind;
+  fields: PluginConfigField[];
+  values: Record<string, string>;
+}
+
+/** plugin.json 的内容：元数据的唯一定义点 */
+export interface PluginManifest {
+  protocol: string;
+  kind: PluginKind;
+  slug: string;
+  version?: string;
+  name: string;
+  description: string;
+  capability?: string;
+  input_schema?: Record<string, unknown>;
+  capabilities?: Array<{ method: string; hosts?: string[]; verbs?: string[]; paths?: string[] }>;
+  limits?: { timeout_ms?: number; max_rpc?: number; max_result_bytes?: number };
+  extensible?: boolean;
+  derived_from?: { plugin_id: string; version: string; sha256: string };
+  runtime?: { entry?: string; timeout_ms?: number; max_rpc?: number };
+  transport?: { type: string; url: string };
+  tools?: { allow: string[]; deny?: string[] };
+  ui?: { entry: string };
+  skill?: { entry?: string; assets?: string[] };
+  data_sources?: Array<{
+    id: string;
+    plugin: string;
+    tool?: string;
+    mode?: 'read' | 'action';
+    params?: Record<string, unknown>;
+  }>;
+}
+
+/** 组件 DSL：小程序式声明式 UI，由宿主原生渲染，不含可执行代码 */
+export type UiDSL = {
+  dsl: 'wa-ui/1';
+  height?: number;
+  state?: Record<string, unknown>;
+  data?: Record<string, { params?: Record<string, unknown>; auto?: boolean }>;
+  view: UiNode;
+};
+
+export type UiNode = {
+  type: string;
+  when?: UiCond;
+  action?: UiAction;
+  [key: string]: unknown;
+};
+
+export type UiCond = {
+  path: string;
+  op: 'eq' | 'ne' | 'gt' | 'lt' | 'in' | 'exists' | 'truthy';
+  value?: unknown;
+};
+
+export type UiAction =
+  | { type: 'reload'; target: string; params?: Record<string, unknown> }
+  | { type: 'invoke'; source: string; params?: Record<string, unknown>; confirm?: string }
+  | { type: 'message'; text: string };
+
+export interface PluginComponentView {
+  slug: string;
+  version: string;
+  height: number;
+  manifest: PluginManifest;
+  dsl: UiDSL;
+}
+
+export interface PluginDetailResponse {
+  item: PluginItem;
+  manifest: PluginManifest;
+}
+
+export interface PluginDryRunResult {
+  kind: PluginKind;
+  output?: string;
+  detail?: string;
+  duration: string;
+  risk: number;
+  /** 搜索源试跑的诊断：请求、状态码、响应顶层键、命中与样例 */
+  source?: {
+    method?: string;
+    url?: string;
+    status?: number;
+    top_keys?: string[];
+    items_path?: string;
+    hit: number;
+    dropped: number;
+    samples?: Array<{ title: string; url: string; snippet?: string }>;
+    warnings?: string[];
+  };
+}
+
+export interface PluginBaselineStatus {
+  baseline_version: string;
+  latest_version: string;
+  update_available: boolean;
+  local_modified: boolean;
+  dismissed: boolean;
 }

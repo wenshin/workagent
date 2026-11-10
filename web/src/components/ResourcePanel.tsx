@@ -1,6 +1,7 @@
-import { IconDelete, IconHistory, IconPlus, IconRefresh } from '@douyinfe/semi-icons';
+import { IconArrowLeft, IconDelete, IconHistory, IconPlus, IconRefresh } from '@douyinfe/semi-icons';
 import { Button, Card, Empty, Modal, Select, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 
 import {
   useDeleteResource,
@@ -10,6 +11,7 @@ import {
   useSetResourceStatus,
 } from '../api/hooks';
 import type { PublishedResource } from '../api/types';
+import { PluginIcon } from './PluginVisual';
 import PublishResourceDialog from './PublishResourceDialog';
 
 const { Text } = Typography;
@@ -37,8 +39,15 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** 资源管理：只展示名称、版本与描述，不展示原始 MCP / tool / DB 配置 */
+/**
+ * 发布记录：空间文件的历史发布快照。
+ *
+ * 它不再是「资源管理」里的一个并列 Tab——快照是空间文件的发布结果，
+ * 入口放在空间页里；平台级的插件安装则归到「插件市场」。
+ * 只展示名称、版本与描述，不展示原始 MCP / tool / DB 配置。
+ */
 export default function ResourcePanel() {
+  const navigate = useNavigate();
   const { data: resources, isLoading, refetch, isFetching } = useResources();
   const setStatus = useSetResourceStatus();
   const remove = useDeleteResource();
@@ -104,12 +113,19 @@ export default function ResourcePanel() {
     <div className="resource-panel">
       <div className="panel-head">
         <div className="panel-heading">
-          <h2 className="panel-title">资源管理</h2>
+          <h2 className="panel-title">发布记录</h2>
           <Text type="tertiary" size="small">
-            已发布资源独立存储、按版本快照保存；Agent 在需要时按关键词检索，命中同名资源会先请你确认
+            空间文件的历史发布快照：快照内容只读、按版本保存；Agent 按关键词检索，命中同名资源会先请你确认。停用后不再被检索。
           </Text>
         </div>
         <div className="panel-actions">
+          <Button
+            theme="borderless"
+            icon={<IconArrowLeft />}
+            onClick={() => navigate('/')}
+          >
+            返回工作空间
+          </Button>
           <Button
             theme="borderless"
             icon={<IconRefresh />}
@@ -164,7 +180,7 @@ export default function ResourcePanel() {
       ) : list.length === 0 ? (
         <div className="panel-empty">
           <Empty
-            title="还没有已发布资源"
+            title="还没有发布记录"
             description="在空间里写好技能后，点右上角「发布资源」，指定版本与用户范围。"
           />
         </div>
@@ -173,10 +189,9 @@ export default function ResourcePanel() {
           {list.map((r) => (
             <Card key={r.id} className="resource-card" bodyStyle={{ padding: 16 }}>
               <div className="resource-card-head">
+                {r.kind !== 'db' ? <PluginIcon kind={r.kind} /> : null}
                 <span className="resource-card-name">{r.name}</span>
-                <Tag size="small" color="blue">
-                  {KIND_LABEL[r.kind]}
-                </Tag>
+                <span className="plugin-kind-label">{KIND_LABEL[r.kind]}</span>
                 <Tag size="small" color={r.visibility === 'public' ? 'green' : 'grey'}>
                   {r.visibility === 'public' ? '全部可见' : '仅自己可见'}
                 </Tag>

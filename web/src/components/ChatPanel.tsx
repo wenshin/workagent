@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import type { ChatMessage, ChatSession, MessagePart, SpaceSkill, ToolCallRecord } from '../api/types';
 import MarkdownView from './Markdown';
+import { PluginIcon } from './PluginVisual';
 
 const { Text } = Typography;
 
@@ -153,11 +154,13 @@ function AssistantBody({
   reasoning,
   tools,
   live,
+  spaceId,
 }: {
   content: string;
   reasoning?: string;
   tools: ToolCallRecord[];
   live?: boolean;
+  spaceId?: string;
 }) {
   return (
     <>
@@ -167,7 +170,7 @@ function AssistantBody({
       ))}
       {content ? (
         <div className="chat-msg-content chat-msg-markdown">
-          <MarkdownView content={content} />
+          <MarkdownView content={content} spaceId={spaceId} />
         </div>
       ) : null}
     </>
@@ -206,6 +209,16 @@ export default function ChatPanel({
     setValue('');
     setError('');
   }, [session.id]);
+
+  // 组件的 message 动作不直接发消息，而是把文本填进输入框：发不发、改不改由用户决定
+  useEffect(() => {
+    const onUiMessage = (event: Event) => {
+      const text = (event as CustomEvent<{ text?: string }>).detail?.text;
+      if (text) setValue(text);
+    };
+    window.addEventListener('wa-ui-message', onUiMessage);
+    return () => window.removeEventListener('wa-ui-message', onUiMessage);
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -297,13 +310,16 @@ export default function ChatPanel({
                     className={`skill-picker-item${s.path === session.skill_path ? ' is-active' : ''}`}
                     onClick={() => pickSkill(s.path)}
                   >
-                    <span className="skill-picker-name">
-                      {s.name}
-                      <span className={`skill-source skill-source-${s.source}`}>
-                        {s.source === 'system' ? '系统' : '当前空间'}
+                    <PluginIcon kind="skill" size="sm" />
+                    <span className="skill-picker-body">
+                      <span className="skill-picker-name">
+                        {s.name}
+                        <span className={`skill-source skill-source-${s.source}`}>
+                          {s.source === 'system' ? '系统' : '当前空间'}
+                        </span>
                       </span>
+                      {s.description ? <span className="skill-picker-desc">{s.description}</span> : null}
                     </span>
-                    {s.description ? <span className="skill-picker-desc">{s.description}</span> : null}
                   </button>
                 ))
               )}
@@ -353,7 +369,12 @@ export default function ChatPanel({
                 ) : null}
               </div>
               {m.role === 'assistant' ? (
-                <AssistantBody content={m.content} reasoning={m.reasoning} tools={toRecords(m.parts)} />
+                <AssistantBody
+                  content={m.content}
+                  reasoning={m.reasoning}
+                  tools={toRecords(m.parts)}
+                  spaceId={session.space_id}
+                />
               ) : (
                 <div className="chat-msg-content">{m.content}</div>
               )}
@@ -383,7 +404,13 @@ export default function ChatPanel({
             {!stream.reasoning && !stream.text && stream.tools.length === 0 ? (
               <div className="chat-msg-content chat-msg-pending">正在思考…</div>
             ) : (
-              <AssistantBody content={stream.text} reasoning={stream.reasoning} tools={stream.tools} live />
+              <AssistantBody
+                content={stream.text}
+                reasoning={stream.reasoning}
+                tools={stream.tools}
+                live
+                spaceId={session.space_id}
+              />
             )}
           </div>
         ) : null}

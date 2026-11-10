@@ -5,6 +5,7 @@ import {
   IconFile,
   IconFolder,
   IconFolderStroked,
+  IconLock,
   IconMore,
   IconPlus,
 } from '@douyinfe/semi-icons';
@@ -14,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
+import { PluginIcon } from './PluginVisual';
 
 export const SESSION_KEY_PREFIX = 'session:';
 // 目录不是空间，单独用一套 key 前缀，选中时不做导航
@@ -42,6 +44,7 @@ interface Props {
   onSelectFile: (space: Space, file: SpaceFile) => void;
   onAddDir: (space: Space, parent?: SpaceDir) => void;
   onAddSession: (space: Space, dir?: SpaceDir) => void;
+  /** 新建插件：插件类型在对话框里选 */
   onAddSkill: (space: Space) => void;
   onRename: (space: Space) => void;
   onDelete: (space: Space) => void;
@@ -147,8 +150,11 @@ export default function SpaceTree({
           label: d.name,
           kind: 'dir',
           refId: `${d.space_id}/${d.path}`,
-          // skill 用书本图标区分：它是有 .meta.json 的特殊目录
-          icon: d.is_skill ? (
+          // 一个目录就是一个插件：按 plugin.json 的 kind 显示统一插件图标；
+          // 旧技能目录（.meta.json）仍用书本图标兜底，普通目录保持文件夹。
+          icon: d.plugin_kind ? (
+            <PluginIcon kind={d.plugin_kind} size="xs" />
+          ) : d.is_skill ? (
             <IconBook className="skill-icon" />
           ) : (
             <IconFolderStroked className="dir-icon" />
@@ -321,12 +327,22 @@ export default function SpaceTree({
       return (
         <span className="space-row">
           <span
-            className={`space-row-name ${dir.is_skill ? 'skill-name' : 'dir-name'}`}
-            title={dir.description || undefined}
+            className={`space-row-name ${dir.plugin_kind || dir.is_skill ? 'skill-name' : 'dir-name'}${
+              dir.plugin_kind && dir.enabled === false ? ' plugin-row-off' : ''
+            }`}
+            title={
+              dir.installed
+                ? `${dir.description || dir.name}（已安装，只读）`
+                : dir.description || undefined
+            }
           >
             {dir.name}
+            {/* 只读状态会继承到整棵子树，但锁只画在插件根目录上，子目录重复画会淹没层级 */}
+            {dir.installed && dir.plugin_kind ? (
+              <IconLock className="space-row-lock" aria-label="已安装只读" />
+            ) : null}
           </span>
-          {canWrite(owner) ? (
+          {canWrite(owner) && !dir.installed ? (
             <span className="space-row-actions" onClick={(e) => e.stopPropagation()}>
               <Dropdown
                 trigger="click"
@@ -335,6 +351,8 @@ export default function SpaceTree({
                   <Dropdown.Menu>
                     <Dropdown.Item onClick={() => onAddSession(owner, dir)}>新建会话</Dropdown.Item>
                     <Dropdown.Item onClick={() => onAddDir(owner, dir)}>新建目录</Dropdown.Item>
+                    {/* 插件草稿固定落在空间插件区，目录入口只是快捷方式，不跟随当前目录 */}
+                    <Dropdown.Item onClick={() => onAddSkill(owner)}>新建插件</Dropdown.Item>
                   </Dropdown.Menu>
                 }
               >
@@ -348,10 +366,10 @@ export default function SpaceTree({
                   render={
                     <Dropdown.Menu>
                       <Dropdown.Item onClick={() => onRenameDir(owner, dir)}>
-                        重命名{dir.is_skill ? '技能' : '目录'}
+                        重命名{dir.plugin_kind ? '插件目录' : dir.is_skill ? '技能' : '目录'}
                       </Dropdown.Item>
                       <Dropdown.Item onClick={() => onDeleteDir(owner, dir)}>
-                        删除{dir.is_skill ? '技能' : '目录'}
+                        删除{dir.plugin_kind ? '插件目录' : dir.is_skill ? '技能' : '目录'}
                       </Dropdown.Item>
                     </Dropdown.Menu>
                   }
@@ -360,7 +378,7 @@ export default function SpaceTree({
                     theme="borderless"
                     size="small"
                     icon={<IconMore />}
-                    aria-label={dir.is_skill ? '技能操作' : '目录操作'}
+                    aria-label={dir.plugin_kind ? '插件操作' : dir.is_skill ? '技能操作' : '目录操作'}
                   />
                 </Dropdown>
               ) : null}
@@ -397,7 +415,8 @@ export default function SpaceTree({
                 <Dropdown.Menu>
                   <Dropdown.Item onClick={() => onAddDir(space)}>新建目录</Dropdown.Item>
                   <Dropdown.Item onClick={() => onAddSession(space)}>新建会话</Dropdown.Item>
-                  <Dropdown.Item onClick={() => onAddSkill(space)}>新建技能</Dropdown.Item>
+                  {/* 六类插件共用「新建插件」，具体类型在对话框里选 */}
+                  <Dropdown.Item onClick={() => onAddSkill(space)}>新建插件</Dropdown.Item>
                 </Dropdown.Menu>
               }
             >

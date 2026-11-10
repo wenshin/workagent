@@ -28,10 +28,16 @@ export default defineConfig({
     // 前端 api() 收到 HTML 会抛 bad_response，表现为「接口没数据」而不是明确的 404。
     // 新增后端前缀（如 /admin）时要同步这里与生产反代配置。
     proxy: Object.fromEntries(
-      ['/auth', '/spaces', '/sessions', '/resources', '/admin', '/healthz', '/agent'].map((prefix) => [
-        prefix,
-        'http://127.0.0.1:8321',
-      ]),
+      [
+        '/auth',
+        '/spaces',
+        '/sessions',
+        '/resources',
+        '/admin',
+        '/healthz',
+        '/agent',
+        '/plugins',
+      ].map((prefix) => [prefix, 'http://127.0.0.1:8321']),
     ),
   },
 });

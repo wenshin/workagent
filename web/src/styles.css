@@ -1,3 +1,44 @@
+/* ---- 设计 token ----
+   规则见 docs/前端设计规范.md。命名直接用像素值，避免「这个 3 到底是几 px」的猜测。
+   颜色不在此处定义：一律用 Semi 的语义 token（--semi-color-*），保证深色主题一致。 */
+:root {
+  /* 间距：4px 基准、8px 主节奏 */
+  --wa-space-2: 2px;
+  --wa-space-4: 4px;
+  --wa-space-6: 6px;
+  --wa-space-8: 8px;
+  --wa-space-12: 12px;
+  --wa-space-16: 16px;
+  --wa-space-20: 20px;
+  --wa-space-24: 24px;
+  --wa-space-32: 32px;
+
+  /* 圆角：4 档 + 胶囊 */
+  --wa-radius-4: 4px;
+  --wa-radius-6: 6px;
+  --wa-radius-8: 8px;
+  --wa-radius-10: 10px;
+  --wa-radius-pill: 999px;
+
+  /* 字号：信息密集控制台，正文基准 13px */
+  --wa-text-xs: 11px;
+  --wa-text-sm: 12px;
+  --wa-text-base: 13px;
+  --wa-text-md: 14px;
+  --wa-text-lg: 16px;
+  --wa-text-xl: 20px;
+
+  /* 行高 */
+  --wa-leading-tight: 1.35;
+  --wa-leading-normal: 1.55;
+  --wa-leading-relaxed: 1.7;
+
+  /* 动效：只用于状态切换，不超过 200ms */
+  --wa-duration-fast: 120ms;
+  --wa-duration-base: 180ms;
+  --wa-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -255,6 +296,17 @@ body[theme-mode='dark'] {
   white-space: nowrap;
 }
 
+.space-row-lock {
+  margin-left: 4px;
+  color: var(--semi-color-text-3);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.plugin-row-off {
+  opacity: 0.55;
+}
+
 .space-row-actions {
   display: flex;
   align-items: center;
@@ -275,6 +327,21 @@ body[theme-mode='dark'] {
   color: var(--semi-color-success);
 }
 
+/* 树里的插件节点：同层其它图标（目录、会话）都是灰色单色字形，这里也只上颜色、不加底色，
+   保持同一视觉语言。16px 上塞实心渐变块 + 白色字形会糊成一团，还抢注意力，
+   实心块留给 32px 以上的卡片。Semi 只给内置 .semi-icon 加右间距，自绘图标要自己补。 */
+.space-tree .semi-tree-option-label .plugin-icon {
+  width: auto;
+  height: auto;
+  margin-right: var(--wa-space-8);
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--plugin-tint, var(--semi-color-text-2));
+  font-size: var(--wa-text-lg);
+  line-height: 1;
+}
+
 .space-tree .skill-name {
   font-weight: 500;
 }
@@ -284,12 +351,14 @@ body[theme-mode='dark'] {
 }
 
 /* ---- 会话面板 ---- */
+/* 整页滚动：子项按自然高度排布，超出就滚，不要把底部插件区裁掉 */
 .session-panel {
   display: flex;
   flex-direction: column;
   height: 100%;
   background: var(--semi-color-bg-1);
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .panel-head {
@@ -299,6 +368,15 @@ body[theme-mode='dark'] {
   gap: 16px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--semi-color-border);
+}
+
+/* 只有空间详情是整页滚动，头部跟着吸顶；其它面板的 header 保持原样 */
+.session-panel > .panel-head {
+  flex: none;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--semi-color-bg-1);
 }
 
 .panel-title {
@@ -314,9 +392,16 @@ body[theme-mode='dark'] {
   padding: 40px;
 }
 
+/* 会话为空时不要占满整屏，否则下面的插件区被推到首屏之外 */
+.session-panel > .panel-empty {
+  flex: none;
+  min-height: 220px;
+}
+
 .session-grid {
-  flex: 1;
-  overflow: auto;
+  /* 1 0 auto：内容少时撑满（把插件区推到底），内容多时按自然高度长出去由外层滚动 */
+  flex: 1 0 auto;
+  overflow: visible;
   padding: 20px;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -415,8 +500,8 @@ body[theme-mode='dark'] {
 
 .skill-picker-item {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: flex-start;
+  gap: 10px;
   padding: 6px 8px;
   border: none;
   border-radius: 6px;
@@ -431,6 +516,13 @@ body[theme-mode='dark'] {
 
 .skill-picker-item.is-active {
   background: var(--semi-color-primary-light-default);
+}
+
+.skill-picker-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
 .skill-picker-name {
@@ -805,9 +897,116 @@ body[theme-mode='dark'] {
   word-break: break-all;
 }
 
-/* 新建技能时的描述输入 */
-.dialog-desc-input {
-  margin-top: 10px;
+/* 新建插件这类「先说明背景、再填表」的弹窗：提示块与表单分开，避免长句子混进字段里 */
+.dialog-intro {
+  margin: 0 0 var(--wa-space-20);
+  padding: var(--wa-space-8) var(--wa-space-12);
+  border-radius: var(--wa-radius-8);
+  border-left: 3px solid var(--semi-color-primary);
+  background: var(--semi-color-fill-0);
+  font-size: var(--wa-text-base);
+  line-height: var(--wa-leading-relaxed);
+  color: var(--semi-color-text-1);
+}
+
+/* 字段成组：标签在上、控件在下，垂直节奏统一（组间 16px、标签与控件 6px） */
+.dialog-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-6);
+}
+
+.dialog-group + .dialog-group {
+  margin-top: var(--wa-space-16);
+}
+
+.dialog-group-title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wa-space-6);
+  font-size: var(--wa-text-sm);
+  font-weight: 500;
+  color: var(--semi-color-text-1);
+}
+
+.dialog-group-optional {
+  font-size: var(--wa-text-xs);
+  font-weight: 400;
+  color: var(--semi-color-text-3);
+}
+
+/* 类型选择：2 列卡片，图标 + 名称 + 一句话语义，选中态靠描边与浅底，不靠加粗 */
+.plugin-kind-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--wa-space-8);
+}
+
+.plugin-kind-option {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--wa-space-8);
+  min-height: 58px;
+  padding: var(--wa-space-8) var(--wa-space-12);
+  border: 1px solid var(--semi-color-border);
+  border-radius: var(--wa-radius-10);
+  background: var(--semi-color-bg-1);
+  color: var(--semi-color-text-0);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color var(--wa-duration-fast) var(--wa-ease),
+    background-color var(--wa-duration-fast) var(--wa-ease);
+}
+
+.plugin-kind-option:hover:not(:disabled) {
+  border-color: var(--semi-color-primary-light-active);
+}
+
+.plugin-kind-option:focus-visible {
+  outline: 2px solid var(--semi-color-primary);
+  outline-offset: 1px;
+}
+
+.plugin-kind-option.is-active {
+  border-color: var(--semi-color-primary);
+  background: var(--semi-color-primary-light-default);
+}
+
+.plugin-kind-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.plugin-kind-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-2);
+  min-width: 0;
+  /* 给右上角的勾留出位置，长文案不会压到角标下面 */
+  padding-right: var(--wa-space-12);
+}
+
+.plugin-kind-name {
+  font-size: var(--wa-text-base);
+  font-weight: 600;
+  line-height: var(--wa-leading-tight);
+}
+
+.plugin-kind-hint {
+  font-size: var(--wa-text-xs);
+  line-height: var(--wa-leading-tight);
+  color: var(--semi-color-text-2);
+}
+
+.plugin-kind-check {
+  position: absolute;
+  top: var(--wa-space-8);
+  right: var(--wa-space-8);
+  font-size: var(--wa-text-sm);
+  color: var(--semi-color-primary);
 }
 
 .dialog-error {
@@ -1010,7 +1209,7 @@ body[theme-mode='dark'] {
   font-weight: 600;
 }
 
-/* ---- 一级菜单：工作空间 / 资源管理 ---- */
+/* ---- 一级菜单：工作空间 / 插件 ---- */
 .sider-nav {
   display: flex;
   flex-direction: column;
@@ -1042,7 +1241,116 @@ body[theme-mode='dark'] {
   font-weight: 600;
 }
 
-/* 资源管理下侧栏不展示空间树，只留一段说明 */
+/* 插件入口的二级菜单：和空间树同一位置，不再是顶部并列 tab */
+.sider-subnav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sider-sub-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--semi-color-text-1);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sider-sub-count {
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+.sider-sub-item:hover {
+  background: var(--semi-color-fill-0);
+}
+
+.sider-sub-item.active {
+  background: var(--semi-color-primary-light-default);
+  color: var(--semi-color-primary);
+  font-weight: 600;
+}
+
+.sider-space-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sider-space-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px 7px 18px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--semi-color-text-1);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sider-space-item:hover {
+  background: var(--semi-color-fill-0);
+}
+
+.sider-space-item.active {
+  background: var(--semi-color-primary-light-default);
+  color: var(--semi-color-primary);
+}
+
+.sider-space-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sider-space-kind {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+/* 已装插件：已安装与平台内置分组，整页一个滚动区 */
+.installed-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding-bottom: 20px;
+}
+
+.installed-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 16px 20px 0;
+}
+
+.installed-section-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--semi-color-text-0);
+}
+
+.installed-body .resource-grid {
+  overflow: visible;
+  padding-top: 10px;
+}
+
+/* 发布记录下侧栏不展示空间树，只留一段说明 */
 .sider-note {
   flex: 0 0 auto;
   padding: 12px;
@@ -1051,12 +1359,96 @@ body[theme-mode='dark'] {
   line-height: 1.7;
 }
 
-/* ---- 资源管理 ---- */
+/* ---- 插件视觉标识：类型用固定图标 + 固定色，所有插件列表共用 ---- */
+.plugin-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: #fff;
+  border-radius: 9px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.plugin-icon-xs {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  font-size: 10px;
+}
+
+.plugin-icon-sm {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  font-size: 14px;
+}
+
+.plugin-icon-md {
+  width: 32px;
+  height: 32px;
+  font-size: 18px;
+}
+
+.plugin-icon-lg {
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  font-size: 22px;
+}
+
+/* 每种类型两个出口：--plugin-tint 给小尺寸线框图标着色，background 渐变给大尺寸实心块。
+   两处都改才算改完类型色。 */
+.plugin-icon-skill {
+  --plugin-tint: #8b9cff;
+  background: linear-gradient(135deg, #6c7cff, #4a5be0);
+}
+
+.plugin-icon-tool {
+  --plugin-tint: #45cdb9;
+  background: linear-gradient(135deg, #2bb6a3, #0f8f80);
+}
+
+.plugin-icon-mcp {
+  --plugin-tint: #e8a55a;
+  background: linear-gradient(135deg, #f0a640, #d97f12);
+}
+
+.plugin-icon-component {
+  --plugin-tint: #b9a4ff;
+  background: linear-gradient(135deg, #a78bfa, #7c4df0);
+}
+
+.plugin-icon-agent {
+  --plugin-tint: #4fb8ea;
+  background: linear-gradient(135deg, #38bdf8, #0284c7);
+}
+
+.plugin-icon-source {
+  --plugin-tint: #f0809e;
+  background: linear-gradient(135deg, #fb7185, #e11d48);
+}
+
+.plugin-kind-label {
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+/* ---- 插件市场 / 已装插件 / 发布记录 ---- */
 .resource-panel {
   display: flex;
   flex-direction: column;
   height: 100%;
   background: var(--semi-color-bg-1);
+  overflow: hidden;
+}
+
+/* 插件市场：页面只有一层滚动区，列表在内部滚，头部与类型筛选固定 */
+.plugin-catalog {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -1075,9 +1467,13 @@ body[theme-mode='dark'] {
 
 .resource-grid {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  /* 行高必须由内容撑开：flex 容器里给 grid 一个受限高度时，
+     auto 行会被压缩，底部的 meta / 操作区就被卡片裁掉了。 */
+  grid-auto-rows: max-content;
   gap: 12px;
   padding: 16px 20px;
   align-content: start;
@@ -1085,6 +1481,19 @@ body[theme-mode='dark'] {
 
 .resource-card {
   border: 1px solid var(--semi-color-border);
+  display: flex;
+  flex-direction: column;
+  height: auto;
+  /* Semi 的 Card 默认 overflow:hidden，内容略高一点就会被切掉 */
+  overflow: visible;
+}
+
+/* 让 body 撑满卡片，操作区用 margin-top:auto 贴底，卡片等高时不出现空洞 */
+.resource-card > .semi-card-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .resource-card-head {
@@ -1108,6 +1517,8 @@ body[theme-mode='dark'] {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  word-break: break-word;
+  min-height: 0;
 }
 
 .resource-card-meta {
@@ -1123,8 +1534,8 @@ body[theme-mode='dark'] {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-top: 12px;
-  padding-top: 10px;
+  margin-top: auto;
+  padding-top: 12px;
   border-top: 1px solid var(--semi-color-border);
 }
 
@@ -1183,3 +1594,386 @@ body[theme-mode='dark'] {
   flex-direction: column;
   gap: 6px;
 }
+
+.publish-label {
+  font-size: 13px;
+  color: var(--semi-color-text-1);
+}
+
+.publish-required {
+  color: var(--semi-color-danger);
+}
+
+/* ---- 插件面板 ---- */
+.resource-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 20px 0;
+  border-bottom: 1px solid var(--semi-color-border);
+}
+
+.resource-tab {
+  border: 0;
+  background: transparent;
+  padding: 8px 14px;
+  font-size: 14px;
+  color: var(--semi-color-text-2);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.resource-tab.active {
+  color: var(--semi-color-primary);
+  border-bottom-color: var(--semi-color-primary);
+  font-weight: 600;
+}
+
+.resource-tab-count {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+/* 与上方 .panel-head / .session-grid 的 20px 内边距对齐，否则标题和空态会贴着内容区边缘。
+   flex: none 是关键：插件多了不能被 flex 压缩，否则最后一行会被裁掉且滚不到。 */
+.plugin-panel {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--wa-space-12);
+  margin-top: var(--wa-space-24);
+  padding: var(--wa-space-20);
+  border-top: 1px solid var(--semi-color-border);
+}
+
+.plugin-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.plugin-panel-title {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+.plugin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-auto-rows: max-content;
+  gap: 12px;
+}
+
+.plugin-card {
+  border: 1px solid var(--semi-color-border);
+  display: flex;
+  flex-direction: column;
+  height: auto;
+  overflow: visible;
+}
+
+.plugin-card > .semi-card-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.plugin-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.plugin-card-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.plugin-card-desc {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--semi-color-text-1);
+}
+
+.plugin-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+}
+
+.plugin-slug {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.plugin-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+/* 空态自己撑出垂直呼吸感，不依赖外层 padding */
+.plugin-empty {
+  padding: var(--wa-space-32) 0;
+}
+
+.plugin-run-result {
+  margin-top: 12px;
+}
+
+.plugin-run-pre {
+  margin-top: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--semi-color-fill-0);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+/* 组件渲染：DSL 由宿主原生渲染，样式全部由这里定义，组件无法注入 CSS */
+.ui-block {
+  margin: 10px 0;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 8px;
+  background: var(--semi-color-bg-2);
+}
+
+.ui-block-loading,
+.ui-block-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 80px;
+  padding: 16px;
+}
+
+.ui-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--semi-color-border);
+}
+
+.ui-block-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ui-block-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--semi-color-text-0);
+}
+
+.ui-block-version {
+  margin-left: 6px;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--semi-color-text-3);
+}
+
+.ui-stack {
+  display: flex;
+  flex-direction: column;
+}
+
+.ui-row {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.ui-grid {
+  display: grid;
+}
+
+.ui-align-start { align-items: flex-start; }
+.ui-align-center { align-items: center; }
+.ui-align-end { align-items: flex-end; }
+.ui-align-between { justify-content: space-between; }
+
+.ui-gap-sm { gap: 6px; }
+.ui-gap-md { gap: 12px; }
+.ui-gap-lg { gap: 20px; }
+
+.ui-card {
+  padding: 12px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 6px;
+  background: var(--semi-color-bg-1);
+}
+
+.ui-card-title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ui-heading { font-weight: 600; color: var(--semi-color-text-0); }
+.ui-heading-1 { font-size: 20px; line-height: 28px; }
+.ui-heading-2 { font-size: 17px; line-height: 24px; }
+.ui-heading-3 { font-size: 15px; line-height: 22px; }
+.ui-heading-4 { font-size: 13px; line-height: 20px; }
+
+.ui-text { margin: 0; font-size: 13px; line-height: 21px; }
+.ui-size-sm { font-size: 12px; }
+.ui-size-lg { font-size: 15px; }
+
+.ui-tone-default { color: var(--semi-color-text-0); }
+.ui-tone-muted { color: var(--semi-color-text-3); }
+.ui-tone-success { color: var(--semi-color-success); }
+.ui-tone-warning { color: var(--semi-color-warning); }
+.ui-tone-danger { color: var(--semi-color-danger); }
+.ui-tone-info { color: var(--semi-color-primary); }
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  background: var(--semi-color-fill-0);
+}
+
+.ui-alert {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--semi-color-fill-0);
+}
+
+.ui-alert.ui-tone-danger { background: var(--semi-color-danger-light-default); }
+.ui-alert.ui-tone-warning { background: var(--semi-color-warning-light-default); }
+.ui-alert.ui-tone-success { background: var(--semi-color-success-light-default); }
+
+.ui-divider {
+  width: 100%;
+  margin: 4px 0;
+  border: 0;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+.ui-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ui-stat-label,
+.ui-stat-delta {
+  font-size: 12px;
+  color: var(--semi-color-text-3);
+}
+
+.ui-stat-value {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.ui-kv { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.ui-kv-row { display: flex; gap: 12px; font-size: 13px; }
+.ui-kv-row dt { min-width: 88px; margin: 0; color: var(--semi-color-text-3); }
+.ui-kv-row dd { margin: 0; color: var(--semi-color-text-0); }
+
+.ui-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.ui-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--semi-color-border);
+}
+.ui-list-item:last-child { border-bottom: 0; }
+.ui-list-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ui-list-title { font-size: 13px; color: var(--semi-color-text-0); }
+.ui-list-desc { font-size: 12px; color: var(--semi-color-text-3); }
+
+.ui-table-wrap { overflow-x: auto; }
+.ui-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-table th,
+.ui-table td {
+  padding: 7px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--semi-color-border);
+  white-space: nowrap;
+}
+.ui-table th { font-weight: 600; color: var(--semi-color-text-2); background: var(--semi-color-fill-0); }
+
+.ui-empty {
+  padding: 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--semi-color-text-3);
+}
+
+.ui-progress { display: flex; flex-direction: column; gap: 6px; }
+.ui-progress-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--semi-color-text-2); }
+.ui-progress-track { height: 6px; border-radius: 3px; overflow: hidden; background: var(--semi-color-fill-0); }
+.ui-progress-bar { height: 100%; border-radius: 3px; background: var(--semi-color-primary); }
+.ui-progress-bar.ui-tone-success { background: var(--semi-color-success); }
+.ui-progress-bar.ui-tone-warning { background: var(--semi-color-warning); }
+.ui-progress-bar.ui-tone-danger { background: var(--semi-color-danger); }
+
+.ui-button {
+  align-self: flex-start;
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--semi-color-border);
+  background: var(--semi-color-bg-1);
+  font-size: 13px;
+  cursor: pointer;
+}
+.ui-button:hover:not(:disabled) { background: var(--semi-color-fill-0); }
+.ui-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.ui-button.ui-tone-info { border-color: var(--semi-color-primary); color: var(--semi-color-primary); }
+
+.ui-field { display: flex; flex-direction: column; gap: 4px; }
+.ui-field-label { font-size: 12px; color: var(--semi-color-text-3); }
+.ui-input {
+  padding: 5px 10px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 6px;
+  background: var(--semi-color-bg-1);
+  font-size: 13px;
+  color: var(--semi-color-text-0);
+}
+
+.ui-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--semi-color-border); }
+.ui-tab {
+  padding: 6px 12px;
+  border: 0;
+  background: none;
+  font-size: 13px;
+  color: var(--semi-color-text-3);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.ui-tab.is-active { color: var(--semi-color-primary); border-bottom-color: var(--semi-color-primary); }

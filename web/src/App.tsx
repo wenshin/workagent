@@ -49,9 +49,30 @@ export default function App() {
                 </RequireAuth>
               }
             />
-            {/* 资源管理与工作空间同级：同一套外壳，用路由区分内容 */}
+            {/* 工作空间与插件同级；插件下分「插件市场 / 已装插件」。
+                发布记录是工作空间的次级页，保留旧路径兼容。 */}
+            <Route path="/plugins" element={<Navigate to="/plugins/market" replace />} />
             <Route
-              path="/resources"
+              path="/plugins/market"
+              element={
+                <RequireAuth>
+                  <WorkspacePage />
+                </RequireAuth>
+              }
+            />
+            {/* 市场分类走二级路由：左侧菜单与内容共用同一份路径状态 */}
+            <Route
+              path="/plugins/market/:category"
+              element={
+                <RequireAuth>
+                  <WorkspacePage />
+                </RequireAuth>
+              }
+            />
+            <Route path="/plugins/installed" element={<Navigate to="/plugins/market" replace />} />
+            <Route path="/resources" element={<Navigate to="/plugins/market" replace />} />
+            <Route
+              path="/resources/snapshots"
               element={
                 <RequireAuth>
                   <WorkspacePage />

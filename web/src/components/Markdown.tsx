@@ -1,5 +1,7 @@
 import { memo, type ReactNode } from 'react';
 
+import UiBlock, { parseUiBlock } from './UiBlock';
+
 /**
  * 轻量 Markdown 渲染：只覆盖文档类文件常用的语法（标题、列表、代码块、引用、表格、链接），
  * 不引入额外依赖，也不用 dangerouslySetInnerHTML，避免外部文件带 HTML 注入风险。
@@ -7,6 +9,8 @@ import { memo, type ReactNode } from 'react';
  */
 interface Props {
   content: string;
+  /** 会话所属空间：```ui-block 围栏里的组件用它决定数据请求落到哪 */
+  spaceId?: string;
 }
 
 /** 行内语法：`code`、**粗体**、[链接](url) */
@@ -57,7 +61,7 @@ function splitRow(line: string): string[] {
     .map((cell) => cell.trim());
 }
 
-function MarkdownView({ content }: Props) {
+function MarkdownView({ content, spaceId }: Props) {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
   const blocks: ReactNode[] = [];
   let i = 0;
@@ -76,6 +80,22 @@ function MarkdownView({ content }: Props) {
         i += 1;
       }
       i += 1; // 跳过结尾 ```
+      // 组件渲染块：```ui-block {"slug":"...","version":"1.0.0"}
+      if (lang.split(/\s+/)[0] === 'ui-block') {
+        const spec = parseUiBlock(code.join('\n'));
+        if (spec) {
+          blocks.push(
+            <UiBlock
+              key={key++}
+              slug={spec.slug}
+              version={spec.version}
+              props={spec.props}
+              spaceId={spaceId}
+            />,
+          );
+        }
+        continue;
+      }
       blocks.push(
         <pre key={key++} className="md-code">
           {lang ? <span className="md-code-lang">{lang}</span> : null}
