@@ -48,7 +48,7 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 | 18 | 明确 MVP 为**单租户（单企业）**，多租户仅预留字段 | §2.2 |
 | 19 | **存储策略已定**：MVP 用本地 FS（不引 HDFS），统一走 `Storage` 接口；元数据始终在 PostgreSQL | §4.3 |
 | 21 | **组件生成是一个可升级的 Skill**，不是硬编码流水线；MVP 后在产品内持续优化 | FR-7、FR-8 |
-| 22 | **组件来源封闭 + 零 iframe**：只接受平台生成组件，Shadow DOM 直挂渲染，能力白名单取数 | FR-7 |
+| 22 | **组件来源封闭 + 零 iframe**：只接受平台生成组件，声明式 DSL 由宿主渲染，数据源白名单取数 | FR-7 |
 | 20 | 补充并行提示：本 PRD 与技术方案的术语对齐（Capability / Tool / Resource / Binding） | §4.5 |
 
 ---
@@ -360,7 +360,7 @@ autoagent/                                 # 存储根
 | 项 | 已实现 | 未实现 |
 | --- | --- | --- |
 | 发布 | 从空间草稿发布技能：指定版本号（`x.y.z`）、发布说明、**用户范围**（`public` 全部可见 / `private` 仅自己可见）；发布件存 `published/{kind}/{resource_id}/{version}/`，与工作空间独立 | 连接测试、回滚、发布审核、按空间定向发布 |
-| 资源管理板块 | 与「工作空间」同级的独立菜单：列表、类型/范围/状态筛选、版本记录、启用/停用、删除资源、删除单个版本 | 被引用拦截、diff、授权成员、引用位置 |
+| 发布记录 | 空间页头部的次级入口（`/resources/snapshots`）：列表、类型/范围/状态筛选、版本记录、启用/停用、删除资源、删除单个版本；与插件市场不再并列 | 被引用拦截、diff、授权成员、引用位置 |
 | 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述与文件数/体积 | 版本级启停 |
 | 权限 | 发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除/启停仅发布者本人或系统管理员 | 资源管理角色表 |
 | Agent 侧 | 发布件作为独立一层进入 `resource_search`（`source=published`），`resource_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
@@ -380,23 +380,23 @@ autoagent/                                 # 存储根
 
 | 项 | 内容 |
 | --- | --- |
-| 组件模型 | 每个组件有 `manifest`：名称（slug）、版本、描述、props Schema、依赖数据源（资源 + 工具）、构建产物引用、最大高度、是否需要浮层能力 |
-| 构建 | 组件源码构建为 ESM bundle（`react`/`react-dom`/`@workagent/ui` 全部 external），存入 `Storage`（**MVP 本地 FS**），按 `slug@版本` 不可变寻址 |
-| **生成方式** | 组件由平台内置 Skill `ui-component-authoring` 对话式生成（追问 → 生成 TSX + manifest → 校验 → 预览 → 审核 → 发布）。**Skill 有版本、可升级、可灰度回滚**；MVP 先交付可用版本，上线后在产品内持续优化 |
+| 组件模型 | 每个组件 = `plugin.json`（slug、名称、描述、`data_sources` 声明）+ `ui.json`（`wa-ui/1` 声明式 DSL）；引用已安装插件工具取数，DSL 里不出现工具名、URL 与凭据 |
+| 构建 | **无构建**：两份 JSON 直接存 `Storage`（**MVP 本地 FS**），按 `slug@版本` 不可变寻址；DSL 在 dry-run / 发布 / 读取时校验 |
+| **生成方式** | 组件由平台内置 Skill `builtin_ui` 对话式生成（追问 → 生成 `plugin.json` + `ui.json` → dry-run 校验 → 预览 → 发布 → 安装）。**Skill 有版本、可升级**；生成规则变了发新版 Skill，渲染节点变了发新版平台 |
 | **渲染协议** | 消息内容为**结构化内容块数组**，组件以 `ui` 块表达，**不在正文里写版本号**：<br>`{"type":"text","text":"本月销售情况如下："}`<br>`{"type":"ui","component":"sales-dashboard","version":"1.2.0","props":{"period":"month"},"fallback":"[销售看板]"}` |
 | **版本由后端注入（本期确认项）** | 模型只输出组件 slug；服务端在持久化消息前解析版本并写入 `version` 字段：优先取「会话创建时锁定的组件版本」，无锁定时取当前 published 版本。**禁止模型自行书写版本号**；模型输出中的组件引用块会被服务端覆写为解析结果 |
 | **版本快照落库** | `message.component_refs` 固化 `{component, version, props, resolved_at}`，作为会话历史的一部分永久保留；历史消息永远按当时版本渲染，组件升级或下架都不影响既有消息 |
 | 前端行为 | 前端**不解析正文文本**，只渲染结构化块；不做正则扫描，避免与 `@提及`、代码块、Markdown 语法互相干扰 |
 | 文本降级 | 纯文本客户端（CLI、导出 Markdown）使用 `fallback`；需要行内引用时统一写作 `@component(slug)`（**不带版本**），块级用 `:::component{#slug}`（remark-directive），**一律不使用 `&` 分隔版本**（`&` 会被 HTML 实体与 Markdown 管道改写） |
 | 流式 | 先发 `ui.placeholder` 占位事件，props 就绪后 patch 为完整块，避免布局跳动 |
-| **来源封闭** | 只接受平台 Skill 生成 + 审核发布的组件；**不提供上传、导入或引用外部组件的能力**，统一 React + `@workagent/ui` + Token |
-| **渲染容器（不用 iframe）** | Shadow DOM（`mode: closed`）+ `adoptedStyleSheets` 样式隔离；Token 通过 CSS 自定义属性穿透继承，主题/密度自动跟随；与主应用同源直挂，**无 iframe 裁剪问题、无独立文档加载** |
-| **执行隔离** | ① 构建期禁止清单（`fetch`/`document`/`window`/`localStorage`/`eval`/动态 import 等，越界即编译失败）；② 运行期受限全局（Proxy 拦截，白名单外标识符抛错）；③ 组件唯一对外通道是宿主注入的 `ctx` |
-| **数据通道** | 组件无网络能力，取数只能 `ctx.tools.call()`：宿主校验 `manifest.dataSources` 白名单 + 用户权限 → BFF/MCP Gateway（凭证服务端注入）→ 脱敏 + 配额 + 审计 |
-| **浮层** | 组件不得自行实现浮层（不提供 iframe 内 portal），一律 `ctx.ui.popover({anchorRect, content})`，宿主挂到 `body` 的 top-layer，几何上不可能被裁剪；大面板用 `ctx.ui.fullscreen()` |
-| **加载性能** | 组件 bundle external（通常几 KB）+ 同版本单例注册表 + importmap 单 React 实例 + `modulepreload` 预取 + 版本化强缓存；`ui.placeholder` 骨架占位，无布局跳动 |
+| **来源封闭** | 只接受平台 Skill 生成 + 审核发布的组件；**不提供上传、导入或引用外部组件的能力**，组件只能是白名单 DSL 节点 |
+| **渲染容器（不用 iframe）** | 组件是声明式 DSL（`wa-ui/1`），由宿主原生 React 节点渲染；没有可执行 JS/CSS，样式全部来自宿主 Token，**无 iframe 裁剪问题、无独立文档加载、无样式注入** |
+| **执行隔离** | 组件没有可执行内容：无 JS/HTML/CSS 注入点，绑定只允许 `{{state.x}}` / `{{props.x}}` / `{{data.<id>.x}}`，动作为白名单枚举；节点/字段写错直接校验失败 |
+| **数据通道** | 组件不发请求：`data.<id>` 由宿主转成 `POST /spaces/{id}/plugins/{slug}/data`，后端校验 `data_sources` 白名单 + 用户权限，经 `Invoker`（凭证注入、审批、审计）执行 |
+| **浮层** | 组件不自己实现浮层：DSL 只提供宿主节点，浮层由宿主组件库渲染（Card/Alert 等），几何上不会被消息容器裁剪 |
+| **加载性能** | 一次 `GET .../ui` 拿到 `{manifest, dsl, height}`，无 JS 加载、无 importmap、无预取；历史版本读不可变发布件，天然可缓存 |
 | 降级 | 组件加载失败/超时/无权限 → 显示占位卡片 + 错误原因 + 「重试」，不阻塞消息阅读 |
-| 验收 | ① 会话中引用组件后，结构化块内**已带 `version` 与 props**；② 模型输出中的版本号被服务端覆写为实际解析版本；③ 组件升级到 v1.1 后历史消息仍渲染 v1.0，刷新一致；④ 组件内下拉浮层不被裁剪，且与宿主主题一致；⑤ 组件内 `fetch`/`document`/`localStorage` 均不可用（编译期或运行期拦截）；⑥ 组件越界调用未声明的数据源被拒绝并记审计；⑦ 同一组件在多条消息中复用不重复下载 bundle；⑧ 导出 Markdown 降级为 `fallback` 文本不报错 |
+| 验收 | ① 组件渲染无 iframe、无独立滚动条，主题切换即时生效；② 组件升级到新版本后历史消息仍渲染原版本；③ 引用未安装组件时显示占位卡而不是空块；④ DSL 越界（未声明数据源、未知节点、表达式）被拒绝并提示位置；⑤ 写数据源必须用户点击且带 `confirm`，只读权限用户伪造手势也被后端拒绝并记审计；⑥ 组件触发 `message` 只填充输入框、不自动发送；⑦ 导出 Markdown 降级为 `fallback` 文本不报错 |
 
 ### FR-8 Agent 核心能力与 Skill
 
@@ -488,7 +488,7 @@ autoagent/                                 # 存储根
 | 文件 | `GET /spaces/{id}/files?parent=`、`POST /files/upload`、`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
 | 资源 | 已实现：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；待实现：`POST /resources/{id}/test`、`POST /resources/{id}/versions/{v}/rollback`、`POST /resources/{id}/publish`（从草稿发布即 `POST /resources`） |
 | 公共资源 | `GET /public-resources`、`POST /publish-requests`、`POST /publish-requests/{id}/decision` |
-| 组件 | `GET /components`、`GET /components/{name}/versions/{version}/bundle`、`POST /components`、`POST /components/{id}/build` |
+| 组件 | `GET /plugins`、`GET /spaces/{id}/plugins/{slug}`、`POST .../plugins/{slug}/dry-run|publish|install`、`GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
 | 会话 | `GET/POST /sessions`、`PATCH/DELETE /sessions/{id}`、`GET /sessions/{id}/messages` |
 | 运行 | `POST /sessions/{id}/runs`、`GET /runs/{id}/stream`(SSE)、`POST /runs/{id}/cancel`、`POST /runs/{id}/confirm`（高危确认） |
 | 搜索 | `GET /search?q=&scope=space\|session` |
@@ -517,14 +517,14 @@ autoagent/                                 # 存储根
 | 单空间容量 | 默认 5GB（可配） |
 | 会话消息数 | 单会话 2000 条，超出提示新建会话 |
 | 单次运行 | 工具调用 ≤ 20 次，token ≤ 60k，时长 ≤ 5 分钟 |
-| 组件 bundle | 单包 ≤ 5MB |
+| 组件包 | ≤ 200 文件 / 5MB，`ui.json` ≤ 64KB、≤ 300 节点 |
 
 ### 9.3 安全与审计（补充）
 
 - 会话消息中的密码类字段展示与日志双重脱敏。
 - 高危操作（建资源、删文件、写 SQL）必须经过会话内确认并记审计。
 - 审计最小集：登录/登出、空间增删与分享、权限变更与审批、资源增删改与发布回滚、Agent 工具调用（含参数摘要）、文件上传下载。
-- 组件渲染：Shadow DOM 隔离 + 构建期禁止清单 + 运行期受限全局 + 取数走网关（禁止直连外网），不使用 iframe。
+- 组件渲染：声明式 DSL（`wa-ui/1`）+ 宿主原生渲染，无 JS/HTML/CSS 注入点，取数只经宿主与 Invoker，不使用 iframe。
 
 ### 9.4 可用性与降级
 

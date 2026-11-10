@@ -3,11 +3,12 @@
 
 # 文档与实现约定
 
-项目的设计依据是以下两份文档。**实现必须遵循技术方案**，不要自创架构、分层或命名：
+项目的设计依据是以下文档。**实现必须遵循技术方案**，不要自创架构、分层或命名：
 
 | 文档 | 内容 | 作用 |
 |---|---|---|
 | [docs/技术方案.md](docs/技术方案.md) | 分层架构、领域模型（五层模型 / 权限 / 资源）、模块设计、接口约定、安全与部署、演进路线 | **实现的事实标准**，代码与文档冲突时以文档为准 |
+| [docs/前端设计规范.md](docs/前端设计规范.md) | 间距/圆角/字号标尺、颜色 token、组件模式（按钮/字段/弹窗/四态）、可访问性底线、反模式与评审清单 | **UI 实现的事实标准**，新增界面或改样式前必读 |
 | [docs/MVP版本功能.md](docs/MVP版本功能.md) | MVP 范围、页面形态、功能优先级 | 范围裁剪与排期依据 |
 
 约定：
@@ -15,6 +16,7 @@
 1. 开发新功能前，先读技术方案中对应章节，按其中的分层、领域模型与接口约定实现。
 2. 需要偏离技术方案时，**先改文档并说明原因，再改代码**，不允许代码先行、文档长期滞后。
 3. 阶段性简化（如首版只支持内置工具、单 Agent 不做编排）要在提交信息里注明与方案的差距及后续补齐计划。
+4. 写前端样式或新组件前先读前端设计规范：间距、圆角、字号只从 `styles.css` 顶部的 `--wa-*` token 取，颜色只用 `--semi-color-*` 语义 token；规范没覆盖的新模式先补规范再落地。
 
 # 架构
 1. Agent Frontend Clients
@@ -78,41 +80,58 @@ make web     # 前端 :5173
 
 - 服务启动时按工号查 `app_user` 初始化（管理员未登录过则跳过，首次登录时创建），重复执行幂等。
 - 系统空间是 `space` 表中的一条 `type='system'` 记录（`is_system_reserved=true`），不可改名、不可删除，成员固定 `manage`。
-- 固定内容：一个默认会话、四个**内置目录**与两个平台配置文件，目录本身不可改名/删除，内容可编辑：
-  - `files/skills`：全局技能，每个技能含 `.meta.json` + `SKILL.md`
-  - `files/tools`：内置工具定义，与 `tool.BuiltinManifests()` 同步，一个工具一个 JSON
-  - `files/mcps`：MCP 服务快照，`README.md` + 每个已注册服务一个 JSON
-  - `files/agents`：智能体设定，`index.json` + 每个智能体 `agent.json` + `prompt.md`
-  - `files/config.json`：平台配置（搜索 provider / endpoint / 凭证引用名），**不含密钥**
-  - `files/net_whitelist.json`：出网白名单（域名列表）
-- `skills/` `tools/` 是 Agent 默认全局可见的能力搜索源，任何用户可读：Agent 用 `resource_search` 检索、`resource_read` 读文件（路径限定在 `skills/` `tools/` `mcps/` 下）。
-- `skills/` 与 `tools/` 是平台托管内容，随代码版本覆盖（否则升级后文档与运行时工具对不上）；`mcps/` 与 `agents/` 只在缺失时写入，管理员改过就不覆盖。
-- `agents/` `config.json` `net_whitelist.json` **不参与跨空间回落**：`ReadSourceFile` 只允许回落到 `skills/` `tools/` `mcps/`，否则普通空间可以用同名路径读到白名单与平台配置。平台自身读取时必须显式传系统空间 ID（`space.Service.SystemSpaceID`）。
+- 插件化之后系统空间**只剩平台配置与插件目录**：`config.json`（平台配置）、`net_whitelist.json`（出网白名单）、`plugins/`（全局安装目录）。
+- 内置件以插件形式发布到 `published/{kind}/{plugin_id}/{version}/`，随后**安装到系统空间**：`系统空间/files/plugins/<slug>/` 就是全局安装目录，其他空间在 `ensureLoaded` 时把系统空间的安装一并加载，所以内置技能与内置工具默认对所有空间可用，市场「平台内置」分组展示但不提供安装按钮。
+- `config.json` `net_whitelist.json` **不参与跨空间回落**：`ReadSourceFile` 只允许回落到 `plugins/` 与 `published/`，否则普通空间可以用同名路径读到白名单与平台配置。平台自身读取时必须显式传系统空间 ID（`space.Service.SystemSpaceID`）。
+
+# 插件体系（`internal/plugin`）
+
+六类 `kind`（`skill` / `tool` / `mcp` / `component` / `agent` / `source`）共用一份清单、一条生命周期，差异只在执行器：
+
+- **单一定义点**：元数据只在 `plugin.json`。`SKILL.md` 不写 frontmatter，DB 快照与索引字段都是派生值，不允许第二处可编辑定义。
+- **文件为内容事实、DB 为运行时态**：草稿在 `files/plugins/<slug>/`，发布后写 `plugin` + `plugin_version`，安装写 `plugin_install`；两边不互相镜像。
+- **风险推导**：`Derive(manifest)` 由 `capabilities` 推导 `risk` 与 `side_effects`，清单里写 `risk` 直接解析失败；`secret.use` + 外部写 = L4，发布与安装都需要系统管理员。
+- **发布权 / 安装权分离**：空间管理员只能启用本地插件（写 `plugin_candidate`，市场出现「待发布」元数据）；**系统管理员**才能发布（不可变快照）。安装由**空间管理员**执行，只在本空间生效，落 `plugins/<slug>/` 只读副本（所有 kind 都复制，写 `.install.json`）。
+- **本地插件默认停用**：`plugin_candidate.status=enabled` 才进入检索/工具/MCP/组件；安装副本默认启用，可停用、卸载。同 slug 的本地目录与安装记录互斥：安装检查目录，本地启用检查安装记录。
+- **平台内置 = 系统空间的安装**：`origin=system` 的插件只允许安装到系统空间，那份 `plugin_install` + `plugins/<slug>/` 副本就是「全局安装」；其他空间加载时并入快照，天然进检索池与工具列表。普通空间对内置件 `install` / `uninstall` / `enable|disable` 一律拒绝；系统空间里也由平台统一种子化，不作为普通插件启停。
+- **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.extends` 指父智能体（最多 4 层、禁止成环，可指向旧版 `base`），`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体没有执行器，不允许写 `capabilities`；它不进 `resource_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
+- **运行以空间副本为准**：已安装插件从发布件起 runtime，但空间 `plugins/<slug>/` 是只读展示副本；本地插件从 `plugins/<slug>/` 起 runtime。`extensible` 不再意味着安装后可编辑。
+- **组件是声明式 DSL，不是代码**：`ui.json`（`wa-ui/1`）只描述节点、绑定与动作，由前端 `UiView` 按白名单原生渲染——没有 JS/HTML/CSS 注入点，因此不用 iframe、也不用 Shadow DOM。节点/字段/绑定/动作在 dry-run、发布、读取时各校验一次（`internal/plugin/dsl.go`）。
+- **组件不直连接口**：消息里的 ` ```ui-block {"slug","version","props"} ` 由 `UiBlock` 取 `GET /spaces/{id}/plugins/{slug}/ui` 渲染；数据请求 `POST /spaces/{id}/plugins/{slug}/data` 经宿主转成依赖插件的工具调用，仍走 `Invoker`。只有已安装到当前空间的组件才能渲染。
+- **DSL 边界**：绑定只有 `{{state.x}}` / `{{props.x}}` / `{{data.<id>.x}}`；动作只有 `reload` / `invoke`（仅 `mode=action` 源、需手势与 `confirm`）/ `message`（填进输入框，不自动发送）；`data.*` 只能引用清单里的 `data_sources[].id`。
+- **脚本 ABI**：`sandbox.Start` 长驻进程 + NDJSON（`invoke` / `return` / `error` / `call` → `result`）；密钥只以 `secret:name` 句柄传递，宿主出网前替换；出网只经 `search.Guard`。
+- **审计永久保留**：`plugin.publish` / `install` / `uninstall` / `enable` / `reset_baseline` 都写 `audit_log`，卸载不删审计。
+- **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。
+- 配置项：`PLUGIN_DEFAULT_INSTALL`（逗号分隔 slug，新空间首次初始化时安装一次）；没有「是否允许安装」开关，安装权固定为空间 `manage`（L4 另需系统管理员）。
+- 接口：`GET /spaces/{id}/plugins`、`GET|POST .../{slug}/{dry-run,publish,install,uninstall,enable,disable,baseline,baseline/reset,baseline/dismiss,data,ui}`、`GET /plugins`（市场目录，含待发布元数据与 `is_admin`）、`GET|PUT /spaces/{id}/plugins/{slug}/config`（安装级配置）。`publish` 现在只允许系统管理员；组件产物不再对外暴露静态路由。
+- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能为 `builtin_ui`（组件 DSL）与 `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册）。
 
 # 能力索引与会话技能
 
-- 每个空间文件根下有一个隐藏索引 `files/.meta.json`，汇总该空间的 skills / tools / mcps（名称、描述、相对路径）。写操作（建/改/删技能目录、写文件、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
-- Agent 的能力源 = **当前空间 + 系统空间**，同名（Name）以当前空间为准；系统空间未初始化时自动降级为只用当前空间。
+- 每个空间文件根下有一个隐藏索引 `files/.meta.json`，只汇总 `plugins/` 下的四类插件。写操作（建/改/删插件目录、写文件、迁移、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
+- Agent 的能力源 = **已安装插件 + 当前空间草稿 + 系统空间草稿**，同名（Name）优先级：已安装 > 当前空间 > 系统空间。已安装件即使没有落副本（`extensible: false`）也会进检索池。
 - 资源总量不设上限，**不提供全量列举，也不常驻技能索引**：
   1. 系统提示词只写「何时必须检索」的硬规则：闲聊 / 翻译 / 改写 / 计算 / 总结已有材料直接做；提到「我们的规范 / 流程 / 模板 / 制度」、产出正式文档、执行明确业务动作必须先检索；检索不到要明说，不得用常识冒充公司规定。
-  2. `resource_search`：`query` 可选，只给 `kind` 时按名称列出该类资源（按需拉目录）；默认 8 条、最多 20 条。`resource_read` 读取正文（先当前空间、再系统空间，支持 `offset` / `limit`）。
-  3. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。
+  2. `resource_search`：`query` 可选，只给 `kind` 时按名称列出该类资源；`kind` ∈ `skills|tools|mcps|components`；默认 8 条、最多 20 条。
+  3. `resource_read` 读取正文：先当前空间，再系统空间；`published/{kind}/{slug}/{version}/...` 由插件层解析（已安装或 public 才可读），支持 `offset` / `limit`。
+  4. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。路径是相对 `files/` 的 `plugins/<slug>/SKILL.md`，内置件是 `published/skills/<slug>/<version>/SKILL.md`。
 - 命中同名多来源资源时，必须让用户在候选中选择，不得自行假设。
-- 上下文按 token 控制（不按字节）：单技能正文 4000 tokens（技能索引预算已删除），超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
-- 技能遵循 Agent Skills 规范：SKILL.md 带 YAML frontmatter（`name` ≤ 64 字符、`description` ≤ 1024 字符，写清“做什么 + 何时使用”），正文只写入口流程，长内容拆子文件且保持一层引用。
-- 技能路径统一为相对 `files/` 的 `SKILL.md` 路径：普通空间是 `<技能名>/SKILL.md`，系统空间是 `skills/<技能名>/SKILL.md`。
+- 上下文按 token 控制（不按字节）：单技能正文 4000 tokens，超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
 
 # 智能体设定（agents）
 
-- 一个智能体 = 系统空间 `agents/<id>/` 下的 `agent.json` + `prompt.md`；`index.json` 是选择器清单（不进模型上下文）。
-- `agent.json`：`id` / `name` / `version`（x.y.z）/ `description` / `extends` / `prompt` / `enabled`。`extends` 只允许空或 `base`，**禁止链式继承**；未知字段直接加载失败，不静默忽略。
+- **搜索源也是插件**：`kind=source`，`source.protocol` 取 `spec`（`search.json` 声明式）或 `script`（`main.ts` plan/map 两段式）。它不是模型可调用的工具，而是 `web_search` 背后的实现：安装/启用即注册进 `search.Registry`，**不需要重启**；装在系统空间即全局可用，装在普通空间只对该空间生效。`source.endpoint` 决定 Guard 白名单，`allow_private` 放开 http 与私网（推导 L3），`secret` 只写凭证名。清单里不允许 `capabilities`——出网终点已由 endpoint 固定。`plugin_try` 工具用来试跑草稿（搜索源必须传 `query`），回执里的 `top_keys` 决定 `items` 路径怎么写。
+- **唯一来源是 `kind=agent` 插件**：系统空间安装的智能体全局可选，普通空间安装的只在该空间可选。旧版系统空间 `agents/<id>/` 目录已废弃，启动时由 `plugin.Manager` 迁移成智能体插件（发布为 `origin=system` 并全局安装），随后目录被备份到 `plugins/.history/legacy/<ts>/agents` 并删除。
+- 清单里 `agent` 段：`entry`（提示词正文，默认 `AGENT.md`）/ `extends`（父智能体 slug，可多层，最多 4 层、禁止成环）/ `requires`（依赖的技能、MCP、工具，安装本插件时一并装进同一空间）。
+- 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：`extends: "base"` 表示继承它；平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。
 - **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
 - 智能体是行为设定，**不是权限**：可见工具仍由 `tool_binding` + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
-- 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改配置不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
+- 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
 
 # 通用搜索与凭证
 
-- `web_search`（能力 `search.query`）：参数只有 `query` / `limit`。provider、endpoint 与密钥都是平台属性，**schema 里不暴露 provider**——模型没有选源的时机，换源属于配置（`config.json` 的 `search.provider`），不属于对话。
+- `web_search`（能力 `search.query`）：参数是 `query` / `limit` / `scope`。**schema 里不暴露 provider**——模型只表达「内网 / 公网 / 都要」，源是平台资产（`config.json` 的 `search.sources` 或 `kind=source` 插件），换源不改工具契约。
+- 多源路由：`scope=auto`（默认）先查 `internal` 再补 `external`，按 `priority` 排序、按 URL 去重；`scope=internal|external` 只查对应范围。每个源有自己的墙钟与 Guard，单源失败不打断整体，只有全部失败才报错。
 - REST 搜索 API 没有行业标准（Bocha `data.webPages.value[]`、Tavily `results[]`、Serper `organic[]`，字段名各不相同），但差异都能归结为「请求参数名 + 响应字段路径」。所以提供**声明式搜索源**：`config.json` 写 `search.spec`，由 `internal/search.HTTPJSON` 解释，接新 API 不用写 Go、不用发版。
 
   ```json
@@ -156,16 +175,20 @@ make web     # 前端 :5173
 - `shell_exec`（能力 `shell.exec`，risk=write，副作用限空间工作区）把命令跑在当前空间 `files/` 下，固定 `ModeWorkspaceWrite` + 无网、默认 15s / 最多 25s（Invoker 墙钟是 30s）。非零退出码、超时、输出超限都作为结果回给模型，只有「沙箱不可用 / 存储不是本地路径」才返回 error。后端降级到 `local` 时启动日志会显式告警。
 - **`SANDBOX_REQUIRE=true`（生产必须打开）**：启动阶段走 `sandbox.Ensure`，只有 `local` 就**启动失败**（`ErrNotIsolated`），把「以为有沙箱、其实在裸跑」挡在上线前。开发机默认 false，允许降级但一定留告警。后端名用常量 `sandbox.NameBwrap` / `NameSeatbelt` / `NameLocal` 比较，不要写字面量。
 
-# 资源发布与「资源管理」
+# 资源发布、插件市场与发布记录
 
-- 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 资源管理板块（按需检索）**。发布范围只有用户范围：`public` 全部可见 / `private` 仅自己可见；没有「必须加载 / 可选加载」。
+- **一级菜单只有两个**：工作空间 / **插件市场**。市场对全员可见，分类是**左侧二级菜单**（路由 `/plugins/market/{category}`）：组织内已发布、组织内待发布（全员见元数据，内容仅系统管理员）、平台内置、外部（内部可见）。没有独立「已装插件」页；已装插件属于空间，入口在空间页。
+- **待发布 -> 发布 -> 安装**：空间管理员启用本地插件后进入市场「待发布」；系统管理员发布后其他空间才可安装；安装只对目标空间生效，写只读副本。
+- **安装级配置**：MCP 的服务地址、鉴权 Header、凭证名可以按空间覆盖，存 `plugin_install.config`（`0020_plugin_install_config.sql`），发布快照不动；`GET|PUT /spaces/{id}/plugins/{slug}/config`，写需要 `manage`，保存后整空间重载并记 `plugin.config` 审计。只存凭证名不存密钥；地址只允许 https（本机 http 放行）。技能/工具/组件没有安装级配置——参数属于清单与内容，改行为要重新发布。
+- 「资源快照」不是并列能力，降级为空间页头部的「发布记录」次级页（`/resources/snapshots`），因为它本质是空间文件的发布结果。
+- 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 发布记录页 / Agent 按需检索**。发布范围只有用户范围：`public` 全部可见 / `private` 仅自己可见；没有「必须加载 / 可选加载」。
 - 存储与工作空间分离：`{STORAGE_ROOT}/published/{kind}/{resource_id}/{version}/`，含快照文件与 `.meta.json`（kind / name / version / visibility / resource_id / source_space_id / published_at）。目录用 `resource_id` 是因为名称只在「发布者 + kind」内唯一。
 - 数据表：`resource`（kind / name / description / visibility / status / owner_id / source_space_id / latest_version）+ `resource_version`（version / notes / storage_path / file_count / total_bytes），见 `0016_resource_publish.sql`。
 - 接口：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；实现在 `internal/resource`，装配在 `internal/app/app.go`。
 - 权限：发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除资源 / 删除版本 / 启停仅发布者本人或系统管理员。资源接口只返回名称、版本、描述与文件数/体积，**不返回发布目录与原始 MCP / tool / DB 配置**。
 - 约束：版本号 `x.y.z`；同版本重复发布 409；只剩一个版本时禁止删版本；快照 ≤ 200 文件 / 5MB；发布技能必须有 SKILL.md 正文。
 - Agent 侧：发布件是独立一层能力源（`source=published`），不做同名覆盖，命中同名多来源时 `resource_search` 返回 hint 要求先问用户；停用资源不进入检索；`resource_read` 支持 `published/{kind}/{id}/{version}/...` 路径并校验可见性。
-- 前端：`web/src/components/ResourcePanel.tsx` + `PublishResourceDialog.tsx`，菜单与「工作空间」同级，路由 `/resources` 复用 `WorkspacePage` 外壳（用路径区分内容，不复制侧栏）。
+- 前端：`/plugins/market` 与 `/plugins/market/:category` 渲染插件市场（分类在左侧二级菜单，右侧只留类型筛选）；`/plugins/installed` 兼容跳转到市场；`/resources` 跳转到插件市场；`/resources/snapshots` 渲染 `ResourcePanel`（发布记录），入口在 `SpacePanel` 头部。所有路由复用 `WorkspacePage` 外壳。插件类型统一用 `PluginVisual` 的 `PluginIcon`；左侧空间树按 `Dir.PluginKind` 挂图标，安装副本额外显示锁，未启用本地插件置灰。
 
 # 身份接入（登录）
 
