@@ -19,6 +19,7 @@ import (
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
+	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -61,6 +62,13 @@ type Env struct {
 	// Plugins 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
 	// 「对话开发插件」如果没有试跑，就只能发布上线后才发现配置错。
 	Plugins PluginTry
+
+	// Secrets 是凭证存储，只用于查询「这个凭证配过没有」（名字 + 指纹）。
+	// 值是平台内部资产：这里没有 Get 通道，工具也永远不该拿到明文。
+	Secrets secret.Store
+	// CanWriteSecrets 表示当前用户能否写平台凭证（系统管理员）。
+	// 不能写时 secret_request 只给出「转给管理员」的指引，而不是弹一个填了也存不下的表单。
+	CanWriteSecrets bool
 }
 
 // Tool 是一个可被模型调用的工具。
@@ -193,6 +201,26 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 	if err != nil {
 		return nil, err
 	}
+	applyBindings(tools, bindings)
+
+	if len(tools) > r.limits.MaxTools {
+		tools = selectRelevant(tools, query, r.limits.TopK)
+	}
+	sort.SliceStable(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
+	return tools, nil
+}
+
+// RuntimeBuiltin 标记平台内置工具：随平台发版、代码受控，不随空间变化。
+const RuntimeBuiltin = "builtin"
+
+// applyBindings 把管理员的 tool_binding 贴到工具上。
+//
+// 内置工具视为已绑定：tool_binding 的语义是「授权这个工具访问哪段数据」
+// （数据库、MCP、自定义工具），而内置工具由平台发版、代码受控，也没有
+// 按空间逐个配置的入口。按 L2 要求绑定等于把能力整体关掉——plugin_try
+// 就因此被判成「需要管理员绑定」而拒绝。L3 仍要 allow_write、L4 仍要审批，
+// 这里只放开「有没有绑定」这一项，不扩大写权限。
+func applyBindings(tools []Tool, bindings []store.ToolBinding) {
 	byName := make(map[string]store.ToolBinding, len(bindings))
 	for _, b := range bindings {
 		byName[strings.ToLower(b.ToolName)] = b
@@ -210,15 +238,13 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 			if b, ok := byName[strings.ToLower(tools[i].ServerName+"/"+tools[i].Capability)]; ok {
 				tools[i].HasBinding = true
 				tools[i].Constraints = policy.ParseConstraints(b.Constraints)
+				continue
 			}
 		}
+		if tools[i].Runtime == RuntimeBuiltin {
+			tools[i].HasBinding = true
+		}
 	}
-
-	if len(tools) > r.limits.MaxTools {
-		tools = selectRelevant(tools, query, r.limits.TopK)
-	}
-	sort.SliceStable(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
-	return tools, nil
 }
 
 // Definitions 批量转换成模型工具定义。

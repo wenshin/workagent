@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/workagent/auto-agent/internal/agent"
-	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -19,20 +18,14 @@ const (
 	// maxSkillDocBytes 是读取技能正文的上限；真正的注入预算按 token 控制（见 agent.systemMessage），
 	// 这里只防止把超大文件整体读进内存
 	maxSkillDocBytes = 64 << 10
-	// publishedPathPrefix 是已发布资源在 resource_read 路径里的前缀
-	publishedPathPrefix = "published/"
-	// sourcePublished 标记条目来自「资源管理」中的发布件
-	sourcePublished = "published"
 )
 
-// sourceLoader 把「当前空间 + 系统空间 + 已发布资源」适配成工具层接口。
+// sourceLoader 把「当前空间 + 系统空间 + 已发布插件」适配成工具层接口。
 //
-// 空间与用户在构造时固定，工具侧不接受 space_id 参数，模型无法指定其他空间。
+// 空间在构造时固定，工具侧不接受 space_id 参数，模型无法指定其他空间。
 type sourceLoader struct {
-	spaces    *space.Service
-	published *resource.Service
-	spaceID   string
-	userID    string
+	spaces  *space.Service
+	spaceID string
 }
 
 func (l sourceLoader) Sources(ctx context.Context) ([]tool.SourceEntry, error) {
@@ -48,13 +41,13 @@ func (l sourceLoader) Sources(ctx context.Context) ([]tool.SourceEntry, error) {
 	return out, nil
 }
 
+// ReadSource 读能力源文件。
+//
+// published/<kind>/<slug>/<version>/<file> 也交给空间服务转发：路径里的 slug 与版本
+// 只有插件层能映射到真实发布目录（artifact 以 plugin id 落盘），会话层不重复实现。
+// 曾经在这里直接用旧的 resource.Service 解析，把 slug 当成资源 uuid 查库，
+// 结果内置技能一读就报 invalid input syntax for type uuid。
 func (l sourceLoader) ReadSource(ctx context.Context, rel string) (string, error) {
-	if strings.HasPrefix(rel, publishedPathPrefix) {
-		if l.published == nil {
-			return "", fmt.Errorf("已发布资源不可用")
-		}
-		return l.published.ReadPublished(ctx, l.userID, rel, sourceReadLimit)
-	}
 	return l.spaces.ReadSourceFile(ctx, l.spaceID, rel, sourceReadLimit)
 }
 

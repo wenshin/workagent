@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChatMessage, ChatSession, MessagePart, SpaceSkill, ToolCallRecord } from '../api/types';
 import MarkdownView from './Markdown';
 import { PluginIcon } from './PluginVisual';
+import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
 
 const { Text } = Typography;
 
@@ -116,7 +117,51 @@ function ReasoningBlock({ text, live }: { text: string; live?: boolean }) {
   );
 }
 
-function ToolCard({ tool }: { tool: ToolCallRecord }) {
+/** secret_request 的回执是 JSON：解析出来交给专用录入卡片，解析不出仍按普通工具展示 */
+function parseSecretRequest(tool: ToolCallRecord): SecretRequestData | null {
+  if (tool.name !== 'secret_request') return null;
+
+  // 回执先到就以回执为准（含 configured / fingerprint / can_write）
+  if (tool.result) {
+    try {
+      const parsed = JSON.parse(tool.result) as { secret_request?: SecretRequestData };
+      // 回执到了就以它为准（历史消息的回执没有 state 字段，靠 configured 判断即可）
+      if (parsed.secret_request) return { ...parsed.secret_request, pending: false };
+    } catch {
+      // 回执被截断或包了前缀时继续走下面的参数兜底，不要因此丢掉整张卡片
+    }
+  }
+
+  // 回执还没到（流式中途）或解析失败：用调用参数先渲染一张「检查中」的卡片，
+  // 让用户第一时间看到组件，而不是等一个可能永远不来的结果事件。
+  if (tool.args) {
+    try {
+      const args = JSON.parse(tool.args) as Partial<SecretRequestData>;
+      if (args.scope && args.name) {
+        return {
+          scope: args.scope,
+          name: args.name,
+          label: args.label || args.name,
+          hint: args.hint,
+          configured: false,
+          can_write: false,
+          available: true,
+          pending: true,
+        };
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function ToolCard({ tool, onSend }: { tool: ToolCallRecord; onSend?: (content: string) => void }) {
+  const secret = parseSecretRequest(tool);
+  // 需要用户动手的卡片不能塞进折叠区：折叠起来等于没提示
+  if (secret) {
+    return <SecretRequestCard data={secret} onContinue={onSend} />;
+  }
   return (
     <details className={`msg-tool msg-tool-${tool.status}`} open={tool.status === 'running'}>
       <summary className="msg-tool-head">
@@ -155,18 +200,20 @@ function AssistantBody({
   tools,
   live,
   spaceId,
+  onSend,
 }: {
   content: string;
   reasoning?: string;
   tools: ToolCallRecord[];
   live?: boolean;
   spaceId?: string;
+  onSend?: (content: string) => void;
 }) {
   return (
     <>
       {reasoning ? <ReasoningBlock text={reasoning} live={live && !content && tools.length === 0} /> : null}
       {tools.map((tool) => (
-        <ToolCard key={tool.id} tool={tool} />
+        <ToolCard key={tool.id} tool={tool} onSend={onSend} />
       ))}
       {content ? (
         <div className="chat-msg-content chat-msg-markdown">
@@ -288,6 +335,8 @@ export default function ChatPanel({
           <h2 className="panel-title">{session.title}</h2>
           <Text type="tertiary" size="small">
             {spaceName ? `${spaceName} · ` : ''}
+            {/* 会话可以挂在某个目录下开：把现场写进标题区，和树里的位置对得上 */}
+            {session.dir ? `目录 ${session.dir} · ` : ''}
             {agentReady ? `模型 ${model || '已就绪'}` : '模型未配置，无法对话'}
           </Text>
         </div>
@@ -374,6 +423,7 @@ export default function ChatPanel({
                   reasoning={m.reasoning}
                   tools={toRecords(m.parts)}
                   spaceId={session.space_id}
+                  onSend={(c) => void onSend(c)}
                 />
               ) : (
                 <div className="chat-msg-content">{m.content}</div>
@@ -410,6 +460,7 @@ export default function ChatPanel({
                 tools={stream.tools}
                 live
                 spaceId={session.space_id}
+                onSend={(c) => void onSend(c)}
               />
             )}
           </div>

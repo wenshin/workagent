@@ -181,6 +181,7 @@ var builtinToolLabels = map[string]string{
 	"skill_create":    "创建技能",
 	"web_search":      "联网搜索",
 	"shell_exec":      "执行命令",
+	"secret_request":  "录入凭证",
 }
 
 func builtinToolLabel(name string) string {

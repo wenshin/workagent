@@ -125,6 +125,8 @@ const pluginDevMCPDoc = `# MCP 插件（kind=mcp）
 - tools.allow 必填且非空：默认不信任远端全部工具；支持尾部 * 前缀匹配，deny 优先。
 - MCP 默认按 L3 处理（远端工具可能写数据）；同时用到密钥时按 L4 走系统管理员。
 - 安装后服务地址、鉴权 Header 名、凭证名可按空间覆盖（空间插件面板的「配置」），发布快照不动。
+- auth.secret 只写凭证名（如 crm_token），值用 secret_request（scope=mcp）让用户在会话里自己录；
+  **不要向用户索要 Token 明文**，用户贴了就提醒他作废重签，再走 secret_request。
 - 远端暂不可用不会让空间失去其他工具：连接失败只影响这个 MCP。`
 
 const pluginDevComponentDoc = `# 组件插件（kind=component）

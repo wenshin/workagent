@@ -701,6 +701,43 @@ body[theme-mode='dark'] {
 }
 
 /* ---- 工具调用卡片 ---- */
+/* 密钥录入卡片：需要用户动手，所以不做折叠，直接把表单摆出来 */
+.msg-secret-req {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 10px;
+  background: var(--semi-color-bg-2);
+  font-size: 13px;
+}
+
+.msg-secret-req-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.msg-secret-req-hint {
+  display: block;
+}
+
+.msg-secret-req-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.msg-secret-req-form .semi-input-wrapper {
+  flex: 1;
+}
+
+.msg-secret-req-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .msg-tool {
   overflow: hidden;
   border: 1px solid var(--semi-color-border);

@@ -312,6 +312,8 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	sessionSvc.SetAgentPlugins(pluginSvc)
 	// 插件试跑：会话里写完草稿直接验配置
 	sessionSvc.SetPluginTry(pluginSvc)
+	// 凭证存储：会话内的 secret_request 只查「配过没有」，值不进模型上下文
+	sessionSvc.SetSecrets(secretStore)
 
 	return &App{
 		cfg:         cfg,

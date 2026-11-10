@@ -32,6 +32,7 @@ func builtinTools() []Tool {
 		webSearch(),
 		shellExec(),
 		pluginTry(),
+		secretRequest(),
 	}
 }
 

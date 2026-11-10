@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
+	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
@@ -89,7 +92,9 @@ type Service struct {
 	shell sandbox.Runner
 	// pluginTry 是插件试跑（plugin_try），为 nil 时该工具不可用
 	pluginTry tool.PluginTry
-	log       *slog.Logger
+	// secrets 是凭证存储（secret_request 用它判断「配过没有」），为 nil 时该工具只报未启用
+	secrets secret.Store
+	log     *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
@@ -119,6 +124,12 @@ func (s *Service) SetAgentPlugins(src AgentPluginSource) { s.agentPlugins = src 
 
 // SetPluginTry 注入插件试跑能力；不注入时 plugin_try 返回「能力未配置」。
 func (s *Service) SetPluginTry(src tool.PluginTry) { s.pluginTry = src }
+
+// SetSecrets 注入凭证存储。
+//
+// 只用于 secret_request 查询「这个名字配过没有」以及是否可写；明文始终留在
+// 凭证存储里，工具链路上没有任何取得明文的通道。
+func (s *Service) SetSecrets(st secret.Store) { s.secrets = st }
 
 // AgentReady 返回模型服务是否可用。
 func (s *Service) AgentReady() bool { return s.agent != nil && s.agent.Ready() }
@@ -241,6 +252,70 @@ func (s *Service) Agents(ctx context.Context, userID, spaceID string) ([]agentsp
 	}
 	sort.Slice(plugins, func(i, j int) bool { return plugins[i].ID < plugins[j].ID })
 	return plugins, nil
+}
+
+// canWriteSecrets 判断当前用户能否写平台凭证。
+//
+// 与 /admin/secrets 用同一套判定（系统管理员），否则会出现「卡片给了输入框、
+// 保存却 403」这种更糟的体验。
+func (s *Service) canWriteSecrets(ctx context.Context, userID string) bool {
+	if userID == "" {
+		return false
+	}
+	user, err := s.store.GetUser(ctx, userID)
+	if err != nil {
+		return false
+	}
+	return s.spaces.IsAdmin(user)
+}
+
+// pluginKindLabels 是插件类型的中文名，只用于提示词，不参与校验。
+var pluginKindLabels = map[string]string{
+	"skill":     "技能插件",
+	"tool":      "工具插件",
+	"mcp":       "MCP 插件",
+	"component": "组件插件",
+	"agent":     "智能体插件",
+	"source":    "搜索源插件",
+}
+
+// dirPluginContext 判断会话目录是否属于某个插件（plugins/<slug>[/...]），
+// 返回插件画像供系统提示词使用。
+//
+// 这里不做完整清单校验：用户可能正写到一半，清单暂时不合规也要给得出上下文，
+// 所以只宽松解析展示字段；读不到也返回带 slug 的画像，至少让模型知道
+// 「这是一个插件目录」，而不是当成普通目录。
+func (s *Service) dirPluginContext(ctx context.Context, spaceID, dir string) *agent.DirPlugin {
+	rest, ok := strings.CutPrefix(dir, "plugins/")
+	if !ok {
+		return nil
+	}
+	slug, _, _ := strings.Cut(rest, "/")
+	if slug == "" {
+		return nil
+	}
+
+	info := &agent.DirPlugin{Slug: slug}
+	key := path.Join(s.storage.SpaceKey(spaceID), "files", "plugins", slug, "plugin.json")
+	rc, err := s.storage.Get(ctx, key)
+	if err != nil {
+		return info
+	}
+	defer func() { _ = rc.Close() }()
+
+	var raw struct {
+		Kind        string `json:"kind"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(io.LimitReader(rc, 64<<10)).Decode(&raw); err != nil {
+		s.log.Debug("插件清单读取失败，按目录名降级", "space", spaceID, "dir", dir, "err", err)
+		return info
+	}
+	info.Name = strings.TrimSpace(raw.Name)
+	info.Kind = pluginKindLabels[strings.TrimSpace(raw.Kind)]
+	info.Description = strings.TrimSpace(raw.Description)
+	return info
 }
 
 // normalizeDirPath 统一目录路径格式：去掉首尾斜杠与空白，空串表示空间根。
@@ -474,12 +549,11 @@ func (s *Service) Chat(
 			Store:     s.store,
 			Storage:   s.storage,
 			Log:       s.log,
-			// 能力源：当前空间 + 系统空间 + 已发布资源（发布件按需检索，不做同名覆盖）
+			// 能力源：当前空间 + 系统空间 + 已发布插件（发布件按需检索，不做同名覆盖）。
+			// published/... 路径也由空间服务转给插件层解析，这里不再单独持有资源服务。
 			Sources: sourceLoader{
-				spaces:    s.spaces,
-				published: s.resources,
-				spaceID:   sess.SpaceID,
-				userID:    userID,
+				spaces:  s.spaces,
+				spaceID: sess.SpaceID,
 			},
 			// 搜索：provider 与密钥都在装配层，工具只拿到注册表
 			Search: s.search,
@@ -488,6 +562,9 @@ func (s *Service) Chat(
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
 			Plugins: s.pluginTry,
+			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
+			Secrets:         s.secrets,
+			CanWriteSecrets: s.canWriteSecrets(ctx, userID),
 			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
 			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
 			CreateSkill: func(ctx context.Context, name, description string) (string, error) {
@@ -504,6 +581,8 @@ func (s *Service) Chat(
 		History:     contextMessages,
 		Query:       text,
 		ActiveSkill: activeSkill,
+		Dir:         sess.Dir,
+		DirPlugin:   s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
 		AgentPrompt: agentPrompt,
 	}, emitEvent)
 

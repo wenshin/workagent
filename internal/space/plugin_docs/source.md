@@ -166,6 +166,10 @@ export function map(resp: { status: number; body: string }) {
 ## 四、密钥与安全
 
 - `secret` 只写名字，例如 `"secret": "intranet"`；值由管理员在系统空间「密钥配置」录入，scope 是 `search`，和平台内置搜索源共用一份凭证。
+- 不知道用户配没配过时，调 `secret_request`（`scope=search`、`name=<清单里要写的名字>`）：会话里会弹出录入卡片，用户在界面上自己填，明文不进对话、不进模型上下文，你只会拿到「已配置 + 指纹」。
+- 回执 `state=configured` 说明凭证已存在：直接写清单往下做，**不要提示用户录入**；`plugin_try` 报 401/403 时也不要直接归因为缺凭证，先核对 `endpoint`、请求参数，以及这把 key 是否真能访问那个上游。`state=missing` 时卡片会自动出现，等用户填完再继续。
+- **不要向用户索要明文**。用户主动贴了 Key：提醒他这条已泄露、建议作废重签，然后用 `secret_request` 走正规通道。
+- 用户不是系统管理员时录入会失败，`secret_request` 会给出「转给管理员」的提示：把 scope 与凭证名告诉他即可，不要绕道要明文。
 - 不要把密钥写进 `search.json`、脚本或 `plugin.json`：这些文件会进发布快照、备份与检索结果。
 - 出网只走平台 Guard：域名白名单来自 `endpoint`，内网源还要 `allow_private: true`（推导 L3，安装到系统空间需要系统管理员）。即使开了 `allow_private`，链路本地地址（169.254.169.254）仍被拒绝。
 - 源只读：不要指望它写数据，也不要让它返回非 http(s) 链接。

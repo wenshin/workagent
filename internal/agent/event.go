@@ -108,6 +108,13 @@ type RunInput struct {
 	Tools []tool.Tool
 	// ActiveSkill 是会话绑定的技能，正文直接进系统提示词
 	ActiveSkill *ActiveSkill
+	// Dir 是会话所在目录（相对空间 files/），空表示挂在空间根。
+	// 会话从某个目录下开出来时，模型需要知道自己的「工作现场」，
+	// 否则会当成全局会话、凭空猜文件位置。
+	Dir string
+	// DirPlugin 非空表示该目录本身就是一个插件（plugins/<slug>），
+	// 用户默认想围绕这个插件展开。
+	DirPlugin *DirPlugin
 	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后
 	AgentPrompt string
 }
@@ -117,6 +124,14 @@ type ActiveSkill struct {
 	Name string
 	Path string
 	Doc  string
+}
+
+// DirPlugin 是会话所在目录对应插件的画像，只取系统提示词需要的展示字段。
+type DirPlugin struct {
+	Slug        string
+	Name        string
+	Kind        string // 中文类型名，如「技能」
+	Description string
 }
 
 // Result 是一次 Agent 运行的产出。

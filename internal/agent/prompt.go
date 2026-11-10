@@ -34,11 +34,41 @@ func BuildSystemMessage(in RunInput) llm.Message {
 - 需要外部实时信息（新闻、价格、政策、公开事实）时用 web_search；答案里引用搜索结果必须保留链接。
 - 需要在空间目录里做批量操作（统计、改名、跑脚本）时用 shell_exec：它跑在沙箱里，只有当前空间目录可写、默认没有网络。命令返回非零退出码时先看 stderr 再调整，不要重复执行同一条失败命令。
 - 工具返回「需要审批」或「策略拒绝」时，如实告知用户原因，不要重试同一工具。
+- 密钥类凭证（API Key / Token / 密码）**不要向用户索要明文**：用 secret_request 查状态（只传凭证名与用途），回执 state=configured 说明已经配好，直接往下做、不要提示用户录入；state=missing 时卡片会自己出现在消息里，等用户填完再继续。清单、正文、脚本里只写凭证名。
+- 用户主动贴出明文凭证时：先提醒这条已经泄露、建议作废重签，再引导用 secret_request 录入；不要复述、不要写进文件、不要转述给其他工具。
 - 不清楚的信息要明确说明，而不是猜测。
 - 代码用 Markdown 代码块输出，并标注语言。`
 
 	var b strings.Builder
 	b.WriteString(prompt)
+
+	// 目录上下文放在角色设定之前：这是平台事实（用户在哪开的会话），
+	// 智能体设定只能追加工作方式，不能改写现场。
+	if dir := strings.TrimSpace(in.Dir); dir != "" {
+		b.WriteString("\n\n## 当前会话的目录\n")
+		if p := in.DirPlugin; p != nil {
+			name := strings.TrimSpace(p.Name)
+			if name == "" {
+				name = p.Slug
+			}
+			// 清单还没读出来时只给 slug：拼接空的类型名会读成「插件（插件）」
+			if kind := strings.TrimSpace(p.Kind); kind != "" {
+				fmt.Fprintf(&b, "本会话创建在插件「%s」（%s）的目录 `%s` 下。", name, kind, dir)
+			} else {
+				fmt.Fprintf(&b, "本会话创建在插件「%s」的目录 `%s` 下。", name, dir)
+			}
+			if desc := strings.TrimSpace(p.Description); desc != "" {
+				fmt.Fprintf(&b, "\n说明：%s", desc)
+			}
+			fmt.Fprintf(&b, "\n用户默认想围绕这个插件做事：改它的清单与正文、解释它的行为、用 plugin_try 试跑。"+
+				"不要把它当成通用会话去聊别的；用户明确说了别的主题时按用户说的做，但事后回到这个插件。\n"+
+				"file_read / file_write 的 path 要写相对空间根的完整路径，例如 `%s/<文件名>`；不要写到别的插件目录。", dir)
+		} else {
+			fmt.Fprintf(&b, "本会话是在空间目录 `%s` 下创建的。用户默认在这个目录里工作：优先使用该目录下的文件，"+
+				"新建文件也放在这里；需要跨目录取用材料时先说明理由。\n"+
+				"读写文件时用相对空间根的完整路径，例如 `%s/<文件名>`。", dir, dir)
+		}
+	}
 
 	// 智能体设定：结构上只能追加在基础规则之后，并显式声明优先级，
 	// 避免配置里写「忽略以上要求」就能改掉平台约束（方案 A）。

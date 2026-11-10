@@ -888,29 +888,42 @@ func (m *Manager) InstalledSources(ctx context.Context, spaceID string) ([]space
 func (m *Manager) ReadPublished(ctx context.Context, spaceID, rel string) (string, error) {
 	parts := strings.SplitN(rel, "/", 5)
 	if len(parts) != 5 || parts[0] != "published" {
-		return "", store.ErrNotFound
+		return "", fmt.Errorf("发布件路径应形如 published/<kind>/<slug>/<version>/<文件>：%s", rel)
 	}
 	kind, slug, version, file := parts[1], parts[2], parts[3], parts[4]
 	if file == "" || strings.Contains(file, "..") {
-		return "", store.ErrNotFound
+		return "", fmt.Errorf("发布件路径非法：%s", rel)
 	}
 	p, err := m.o.Store.GetPluginBySlug(ctx, slug)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// 模型偶尔会照着 skill 只造路径：直接说清「路径要来自检索结果」
+			return "", fmt.Errorf("没有 slug 为 %s 的插件，路径请取自 resource_search 的结果，不要自行拼造", slug)
+		}
 		return "", err
 	}
 	// 只有安装到当前空间（或系统空间的全局安装）才能读发布件内容；市场浏览不暴露正文。
 	if _, err := m.installAnywhere(ctx, spaceID, slug); err != nil {
-		return "", store.ErrNotFound
+		if errors.Is(err, store.ErrNotFound) {
+			return "", fmt.Errorf("插件 %s 未安装到当前空间或系统空间，不能读取发布件", slug)
+		}
+		return "", err
 	}
-	if !strings.HasPrefix(string(p.Kind)+"s", kind) {
-		return "", store.ErrNotFound
+	if want := string(p.Kind) + "s"; kind != want {
+		return "", fmt.Errorf("路径里的类型 %s 与插件 %s 的实际类型 %s 不符", kind, slug, want)
 	}
 	v, err := m.o.Store.GetPluginVersion(ctx, p.ID, version)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return "", fmt.Errorf("插件 %s 没有版本 %s（可能已升级），请重新 resource_search 取回最新路径", slug, version)
+		}
 		return "", err
 	}
 	body, err := ReadFile(ctx, m.o.Storage, v.ArtifactPath, file)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("发布件 %s 里没有 %s，可用 file_list 查看 plugins/%s 下的实际文件", rel, file, slug)
+		}
 		return "", err
 	}
 	return clipText(body, 512<<10), nil

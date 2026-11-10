@@ -126,6 +126,7 @@ make web     # 前端 :5173
 - 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：`extends: "base"` 表示继承它；平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。
 - **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
 - 智能体是行为设定，**不是权限**：可见工具仍由 `tool_binding` + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
+- **内置工具视为已绑定**：`tool_binding` 只用于给资源型工具（数据库 / MCP / 自定义工具）授权数据范围；内置件随发版走、没有按空间配置的入口，按已绑定处理（`internal/tool.applyBindings`）。豁免只放开「有没有绑定」：L2 放行，L3 仍需 `allow_write`（否则审批），L4 一律审批。`plugin_try` 是 L2，之前没有这条豁免对所有空间都判「需要管理员绑定」。
 - 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
 
 # 通用搜索与凭证
@@ -160,6 +161,7 @@ make web     # 前端 :5173
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
 - **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（引用列表 + 指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。`config.json` 里存的只是凭证引用名，不是密钥。
 - 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间，并标出 `使用中 / 未引用`——只有与 `config.json` 引用一致的那条才会生效，避免改了 A 却仍跑在 B 上。
+- **会话内录入**（`secret_request`，能力 `system.secret.request`，L1）：模型只提供 `scope` / `name` / `label` / `hint`，前端在消息里渲染录入卡片（`SecretRequestCard`，不折叠），明文由浏览器直接 `PUT /admin/secrets/{scope}/{name}`，**不进工具参数、不进模型上下文、不进 `run_step` 审计**；模型回读到的只有「是否已配置 + 指纹」，`can_write` 由 `space.IsAdmin` 判定，非管理员只拿到「转给管理员」的指引。密钥存储没启用（无 `SECRET_KEK`）时工具直接说明，不引导填写，避免变相索要明文。平台基础规则与 `builtin_plugin_dev`（总纲 + `references/source.md` + `references/mcp.md`）都写明：需要凭证时用它，禁止向用户索要明文。
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
 - 新增 provider：在 `internal/search` 下新建文件实现 `search.Provider`，并用 `init()` 调 `RegisterFactory("名字", ...)`；装配层（`internal/app`）按名字从工厂表解析，**不加 case 分支**，工具与提示词也不用改。provider 面板/路由只认 `config.json` 的 `search.provider`。
 
