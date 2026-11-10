@@ -46,10 +46,12 @@ export default function WorkspacePage() {
   }, [location.pathname]);
   const { data: catalog } = usePluginCatalog();
   const { data: me } = useMe();
-  const { data: spaces = [], isLoading: spacesLoading } = useSpaces();
-  const { data: sessions = [], isLoading: sessionsLoading } = useSessions();
-  const { data: dirs = [] } = useSpaceDirs();
+  const { data: spaces = [], isLoading: spacesLoading, isFetched: spacesFetched } = useSpaces();
+  const { data: sessions = [], isLoading: sessionsLoading, isFetched: sessionsFetched } = useSessions();
+  const { data: dirs = [], isFetched: dirsFetched } = useSpaceDirs();
   const { data: files = [], isFetched: filesFetched } = useSpaceFiles();
+  // 树是四份数据拼出来的：齐了再定默认展开，否则后到的目录会被当成新增节点全部展开
+  const treeReady = spacesFetched && sessionsFetched && dirsFetched && filesFetched;
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
@@ -118,7 +120,7 @@ export default function WorkspacePage() {
 
   const { data: messages = [], isLoading: messagesLoading } = useMessages(selectedSession?.id);
   // 技能列表随会话所属空间变化：当前空间 + 系统空间合并，同名当前空间优先
-  const { data: skills = [] } = useSkills(selectedSession?.space_id);
+  const { data: skills = [], refetch: refetchSkills } = useSkills(selectedSession?.space_id);
 
   const spaceSessions = useMemo(
     () => sessions.filter((s) => s.space_id === selectedSpaceId),
@@ -330,6 +332,7 @@ export default function WorkspacePage() {
               sessions={sessions}
               dirs={dirs}
               files={files}
+              ready={treeReady}
               value={treeValue}
               onSelectSpace={openSpace}
               onSelectSession={openSession}
@@ -407,6 +410,9 @@ export default function WorkspacePage() {
             agentReady={agentInfo?.ready ?? false}
             model={agentInfo?.model}
             skills={skills}
+            onRefreshSkills={() => {
+              void refetchSkills();
+            }}
             onSelectSkill={(path) => {
               setSessionSkill.mutate(
                 { id: selectedSession.id, path },
@@ -429,7 +435,11 @@ export default function WorkspacePage() {
         )}
       </Layout.Content>
 
-      <SpaceDialog state={dialog} onClose={() => setDialog({ kind: 'none' })} />
+      <SpaceDialog
+        state={dialog}
+        onClose={() => setDialog({ kind: 'none' })}
+        onOpenSession={openSession}
+      />
       <SecretSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
 
       <Modal

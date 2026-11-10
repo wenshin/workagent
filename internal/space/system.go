@@ -77,16 +77,14 @@ func (s *Service) BootstrapSystemSpace(ctx context.Context) {
 	}
 }
 
-// seedSystemSpace 幂等写入系统空间的平台配置。
+// seedSystemSpace 幂等准备系统空间的文件区。
 //
-// 插件化之后系统空间只剩两类内容：平台配置文件（config.json / net_whitelist.json）
-// 与插件目录。内置技能、工具、智能体全部由插件管理器发布后**安装到系统空间**：
-// 系统空间的 `plugins/` 就是全局安装目录，其他空间在加载时把这份安装一并算作可用。
+// 插件化之后系统空间只剩插件目录：内置技能、工具、智能体全部由插件管理器发布后
+// **安装到系统空间**，系统空间的 `plugins/` 就是全局安装目录，其他空间在加载时
+// 把这份安装一并算作可用。平台不再往这里塞 config.json / net_whitelist.json：
+// 搜索源改由 kind=source 的插件声明，白名单跟着清单里的 endpoint 走。
 func (s *Service) seedSystemSpace(ctx context.Context, spaceID string) error {
 	if err := s.storage.EnsureDir(ctx, s.filesKey(spaceID)); err != nil {
-		return err
-	}
-	if err := s.seedConfigFiles(ctx, spaceID); err != nil {
 		return err
 	}
 	// 内置内容变了，索引要跟着重建（files/.meta.json）

@@ -74,6 +74,7 @@
 - `url`：必填。取不到 URL 的条目会被丢弃——回答里没有链接的引用就是编造。
 - `title` / `snippet` / `published_at`：可空。
 - 路径语法：`a.b[0].c`，只支持对象键与数组下标。
+- **路径可以写成数组**：`["summary", "snippet"]` 按顺序取第一个非空值。上游把正文放哪个字段并不稳定（博查开了 `summary` 就把正文放 `summary`，`snippet` 常为空），只写一个字段会静默产生空摘要。`items` 也支持数组，应对「正常返回在 A、降级返回在 B」。
 - 业务错误码：`error_code` + `error_ok`，如 `{"error_code":"code","error_ok":[0,"0"]}`。
 
 ### 三个模板

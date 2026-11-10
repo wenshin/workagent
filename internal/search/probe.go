@@ -37,7 +37,7 @@ type Prober interface {
 // 与 Search 的区别只在可观测性：这里保留非 2xx 的状态码与响应体，
 // 因为调试时 4xx 的业务错误体（{"code":401,"msg":"token 过期"}）比「失败」有用得多。
 func (h *HTTPJSON) Probe(ctx context.Context, req Request) (ProbeInfo, error) {
-	info := ProbeInfo{Items: h.spec.Response.Items}
+	info := ProbeInfo{Items: strings.Join(h.spec.Response.Items, " / ")}
 	if h.guard == nil {
 		return info, fmt.Errorf("搜索出网通道未初始化")
 	}
@@ -98,7 +98,7 @@ func (h *HTTPJSON) Probe(ctx context.Context, req Request) (ProbeInfo, error) {
 	} else {
 		info.Samples = results
 	}
-	if raw, ok := lookup(root, h.spec.Response.Items).([]any); ok {
+	if raw, ok := lookupFirst(root, h.spec.Response.Items).([]any); ok {
 		if dropped := len(raw) - len(results); dropped > 0 {
 			info.Dropped = dropped
 			info.Warnings = append(info.Warnings, fmt.Sprintf("%d 条结果没有可用 URL，已丢弃", dropped))

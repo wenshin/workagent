@@ -38,6 +38,13 @@ interface Props {
   sessions: ChatSession[];
   dirs: SpaceDir[];
   files: SpaceFile[];
+  /**
+   * 四个数据源是否都已到齐。
+   *
+   * 默认展开策略必须等数据齐了再定：这四份数据是四个请求，先到的批次里没有目录，
+   * 后到的目录会被当成「新增节点」并自动展开，表现就是刷新后整棵树全开。
+   */
+  ready?: boolean;
   value: string;
   onSelectSpace: (id: string) => void;
   onSelectSession: (id: string) => void;
@@ -96,6 +103,7 @@ export default function SpaceTree({
   sessions,
   dirs,
   files,
+  ready = true,
   value,
   onSelectSpace,
   onSelectSession,
@@ -235,18 +243,23 @@ export default function SpaceTree({
     return personal ? [personal.id] : [];
   }, [spaces]);
   useEffect(() => {
-    if (parentKeys.length === 0) return;
+    // 数据没到齐之前不建立基线：否则先到的空间/会话会先把 knownParents 定下来，
+    // 随后到的目录全部算「新增」，刷新后整棵树都被展开。
+    if (!ready || parentKeys.length === 0) return;
     const known = knownParents.current;
     knownParents.current = new Set(parentKeys);
     if (known.size === 0) {
-      setExpandedKeys(defaultExpanded.filter((key) => parentKeys.includes(key)));
+      // 首次同步只补默认展开，且不覆盖「选中会话/文件」已经展开的路径
+      setExpandedKeys((keys) =>
+        Array.from(new Set([...keys, ...defaultExpanded.filter((key) => parentKeys.includes(key))])),
+      );
       return;
     }
     // 没有新节点（含用户主动折叠）时保持用户的展开状态
     const added = parentKeys.filter((key) => !known.has(key));
     if (added.length === 0) return;
     setExpandedKeys((keys) => Array.from(new Set([...keys, ...added])));
-  }, [parentKeys, defaultExpanded]);
+  }, [ready, parentKeys, defaultExpanded]);
 
   // 选中空间时展开它：默认折叠的空间点一下就展开，不必先点箭头
   useEffect(() => {

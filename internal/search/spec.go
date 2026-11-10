@@ -8,14 +8,14 @@ import (
 	"strings"
 )
 
-// Spec 是「声明式搜索源」：请求怎么拼、响应怎么取，全写在 config.json 里。
+// Spec 是「声明式搜索源」：请求怎么拼、响应怎么取，全写在插件的 search.json 里。
 //
-// 为什么需要它：REST 搜索 API 没有统一规范——Bocha 是 data.webPages.value[]，
+// 为什么需要它：REST 搜索 API 没有统一规范——博查是 data.webPages.value[]，
 // Tavily 是 results[]，Serper 是 organic[]，字段名也各不相同。但差异几乎都能归结为
-// 「请求参数名」和「响应字段路径」两件事，于是接新搜索源不必写 Go。
+// 「请求参数名」和「响应字段路径」两件事，于是接新搜索源不必写 Go、不必发版。
 //
-// 覆盖不到的少数情况（游标分页、非 JSON 响应、请求签名）仍可回到代码：
-// 实现 Provider 并 RegisterFactory，两种方式并存。
+// 覆盖不到的少数情况（游标分页、非 JSON 响应、请求签名）走脚本源（kind=source,
+// protocol=script），两者共用同一套注册与出网边界。
 type Spec struct {
 	Request  RequestSpec  `json:"request"`
 	Response ResponseSpec `json:"response"`
@@ -45,17 +45,49 @@ type AuthSpec struct {
 	Prefix string `json:"prefix"`
 }
 
+// PathList 是一组候选字段路径，按顺序取第一个「有内容」的值。
+//
+// 写成单个字符串或字符串数组都行：摘要字段在哪家 API 里叫什么、有没有值并不稳定
+// （博查开了 summary 就把正文放 summary，snippet 可能是空的），只取一个字段会静默
+// 丢掉内容。数组形式让「回退」成为配置的一部分，而不是在 Go 里给某个厂商写特例。
+type PathList []string
+
+// UnmarshalJSON 同时接受 "a.b" 与 ["a.b", "a.c"]；空字符串视为「不取这个字段」。
+func (p *PathList) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		if strings.TrimSpace(one) == "" {
+			*p = nil
+			return nil
+		}
+		*p = PathList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return fmt.Errorf("字段路径只能是字符串或字符串数组，收到 %s", string(b))
+	}
+	out := make(PathList, 0, len(many))
+	for _, m := range many {
+		if strings.TrimSpace(m) != "" {
+			out = append(out, m)
+		}
+	}
+	*p = out
+	return nil
+}
+
 // ResponseSpec 描述从响应 JSON 里取哪些字段。
 //
 // 路径只支持「对象键 + 数组下标」，如 data.webPages.value 或 results[0].title。
 type ResponseSpec struct {
-	// Items 是结果数组路径，必填
-	Items string `json:"items"`
-	Title string `json:"title"`
+	// Items 是结果数组路径，必填；给了多个时取第一个能解析成数组的
+	Items PathList `json:"items"`
+	Title PathList `json:"title"`
 	// URL 必填：没有 URL 的结果无法回溯，直接丢弃
-	URL         string `json:"url"`
-	Snippet     string `json:"snippet"`
-	PublishedAt string `json:"published_at"`
+	URL         PathList `json:"url"`
+	Snippet     PathList `json:"snippet"`
+	PublishedAt PathList `json:"published_at"`
 	// ErrorCode 可选：响应里的业务错误码字段；取到的值不在 ErrorOK 里即视为失败
 	ErrorCode    string `json:"error_code"`
 	ErrorOK      []any  `json:"error_ok"`
@@ -78,10 +110,10 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("request.auth.name 不能为空")
 		}
 	}
-	if strings.TrimSpace(s.Response.Items) == "" {
+	if len(s.Response.Items) == 0 {
 		return fmt.Errorf("response.items 不能为空：不知道去哪取结果数组")
 	}
-	if strings.TrimSpace(s.Response.URL) == "" {
+	if len(s.Response.URL) == 0 {
 		return fmt.Errorf("response.url 不能为空：没有 URL 的结果无法回溯")
 	}
 	return nil
@@ -198,6 +230,22 @@ func lookup(root any, path string) any {
 		}
 	}
 	return cur
+}
+
+// lookupFirst 按候选顺序取第一个「有内容」的值：空字符串与 null 都算没取到。
+// 这是多字段回退的唯一实现点，Items / Title / URL / Snippet / PublishedAt 共用。
+func lookupFirst(root any, paths PathList) any {
+	for _, p := range paths {
+		v := lookup(root, p)
+		if v == nil {
+			continue
+		}
+		if s, ok := v.(string); ok && strings.TrimSpace(s) == "" {
+			continue
+		}
+		return v
+	}
+	return nil
 }
 
 // text 把 JSON 值转成字符串；数字按整数输出，避免 2024 变成 2024.000000。

@@ -27,7 +27,7 @@ function formatTime(iso?: string) {
  * 密钥配置（仅系统管理员）。
  *
  * 密钥只写不读：列表里只有名称、指纹与更新时间，明文永远不会从后端返回。
- * 名称对应平台配置里的引用（如 config.json 的 search.secret），值改完立即生效；
+ * 名称对应 source 插件清单里的 source.secret，值改完立即生效；
  * 新增其他名称只是「待用条目」，只有被引用的那一条会真正生效。
  */
 export default function SecretSettingsDialog({ visible, onClose }: Props) {

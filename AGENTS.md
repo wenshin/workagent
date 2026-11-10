@@ -80,9 +80,9 @@ make web     # 前端 :5173
 
 - 服务启动时按工号查 `app_user` 初始化（管理员未登录过则跳过，首次登录时创建），重复执行幂等。
 - 系统空间是 `space` 表中的一条 `type='system'` 记录（`is_system_reserved=true`），不可改名、不可删除，成员固定 `manage`。
-- 插件化之后系统空间**只剩平台配置与插件目录**：`config.json`（平台配置）、`net_whitelist.json`（出网白名单）、`plugins/`（全局安装目录）。
+- 插件化之后系统空间**只剩插件目录** `plugins/`（全局安装目录）。原 `config.json` / `net_whitelist.json` 已移除：搜索源改由 `kind=source` 插件声明，出网白名单跟着清单里的 `source.endpoint` 走，不再有第二处配置入口。
 - 内置件以插件形式发布到 `published/{kind}/{plugin_id}/{version}/`，随后**安装到系统空间**：`系统空间/files/plugins/<slug>/` 就是全局安装目录，其他空间在 `ensureLoaded` 时把系统空间的安装一并加载，所以内置技能与内置工具默认对所有空间可用，市场「平台内置」分组展示但不提供安装按钮。
-- `config.json` `net_whitelist.json` **不参与跨空间回落**：`ReadSourceFile` 只允许回落到 `plugins/` 与 `published/`，否则普通空间可以用同名路径读到白名单与平台配置。平台自身读取时必须显式传系统空间 ID（`space.Service.SystemSpaceID`）。
+- 平台级文件**不参与跨空间回落**：`ReadSourceFile` 只允许回落到 `plugins/` 与 `published/`，否则普通空间可以用同名路径读到平台内容。平台自身读取时必须显式传系统空间 ID（`space.Service.SystemSpaceID`）。
 
 # 插件体系（`internal/plugin`）
 
@@ -131,41 +131,38 @@ make web     # 前端 :5173
 
 # 通用搜索与凭证
 
-- `web_search`（能力 `search.query`）：参数是 `query` / `limit` / `scope`。**schema 里不暴露 provider**——模型只表达「内网 / 公网 / 都要」，源是平台资产（`config.json` 的 `search.sources` 或 `kind=source` 插件），换源不改工具契约。
+- `web_search`（能力 `search.query`）：参数是 `query` / `limit` / `scope`。**schema 里不暴露 provider**——模型只表达「内网 / 公网 / 都要」，源由 `kind=source` 插件提供，换源不改工具契约。
 - 多源路由：`scope=auto`（默认）先查 `internal` 再补 `external`，按 `priority` 排序、按 URL 去重；`scope=internal|external` 只查对应范围。每个源有自己的墙钟与 Guard，单源失败不打断整体，只有全部失败才报错。
-- REST 搜索 API 没有行业标准（Bocha `data.webPages.value[]`、Tavily `results[]`、Serper `organic[]`，字段名各不相同），但差异都能归结为「请求参数名 + 响应字段路径」。所以提供**声明式搜索源**：`config.json` 写 `search.spec`，由 `internal/search.HTTPJSON` 解释，接新 API 不用写 Go、不用发版。
+- **搜索源只有插件一条路**：平台不再从 `config.json` / `net_whitelist.json` / 环境变量拼装内置源（原 `search.provider`、`search.spec`、`search.script`、`SEARCH_*` 与内置 `bocha` provider 已全部移除）。装一个源 = 发布并安装 `kind=source` 插件，注册名是**插件 slug**，出网白名单由清单里的 `source.endpoint` 自动推导。
+- REST 搜索 API 没有行业标准（博查 `data.webPages.value[]`、Tavily `results[]`、Serper `organic[]`，字段名各不相同），但差异都能归结为「请求参数名 + 响应字段路径」。所以 `kind=source` 插件用 `search.json` 声明式描述，由 `internal/search.HTTPJSON` 解释，接新 API 不用写 Go、不用发版：
 
   ```json
-  "search": {
-    "provider": "tavily",
-    "endpoint": "https://api.tavily.com/search",
-    "spec": {
-      "request": {
-        "method": "POST",
-        "auth": { "in": "header", "name": "Authorization", "prefix": "Bearer " },
-        "body": { "query": "{{query}}", "max_results": "{{limit}}" }
-      },
-      "response": {
-        "items": "results", "title": "title", "url": "url", "snippet": "content"
-      }
+  {
+    "request": {
+      "method": "POST",
+      "auth": { "in": "header", "name": "Authorization", "prefix": "Bearer " },
+      "body": { "query": "{{query}}", "max_results": "{{limit}}" }
+    },
+    "response": {
+      "items": "results", "title": "title", "url": "url",
+      "snippet": ["summary", "snippet"]
     }
   }
   ```
 
   占位符：`{{query}}` `{{limit}}` `{{freshness}}` `{{secret}}`（正好是占位符时保留类型，`{{limit}}` 仍是数字）。路径支持 `a.b[0].c`。`auth.in` ∈ `header|query|body`。`error_code` + `error_ok` 用于把业务错误码（如 `code != 0`）判成失败，而不是当成 0 条结果。
-- 声明式覆盖不到的情况（游标分页、非 JSON 响应、请求签名）走代码：实现 `search.Provider` 并在同文件 `init()` 里 `RegisterFactory`，装配层不加 case 分支。两条路并存，`search.spec` 优先。
-- 凭证名统一为 `default`（`search.DefaultSecretName`）：同一时刻只有一个搜索源在用，一把密钥就够，换源不用改密钥名。环境变量始终是 `SEARCH_API_KEY`，只用于首次播种；老部署里 provider 同名的旧凭证启动时自动迁移到 `default`。`search.secret` 字段已废弃，留空即可。
-- `search.secret` 两种写法，一眼能看出密钥从哪来：裸名字（如 `default`）= 只看凭证存储；`${NAME}` = **先查凭证存储同名条目，没有再读同名环境变量**。所以界面保存的凭证能被 `${}` 命中并优先于环境变量——后台可轮换，没配 `SECRET_KEK` 的机器也能直接用环境变量跑。两处都空时启动告警、调用时报「凭证存储里没有该条目，环境变量也未设置」，不静默降级；写 `${}` 时跳过播种与旧名迁移。
+- **字段路径可以写成数组**：按顺序取第一个非空值（`"snippet": ["summary", "snippet"]`）。不同 API 把正文放哪个字段并不稳定（博查开了 `summary` 就把正文放 `summary`，`snippet` 常为空），只取一个字段会静默产生空摘要。`items` 也支持数组，用于应对「正常返回在 A、降级返回在 B」。
+- 声明式覆盖不到的情况（游标分页、非 JSON 响应、请求签名）用脚本源：同一份清单里 `source.protocol=script`，正文是 `.ts`（见下）。
+- 凭证由清单里的 `source.secret` 声明（如 `"secret": "bocha"`），scope 固定 `search`，每次搜索都从凭证存储读，轮换后立即生效。**没有统一 `default` 名、没有 `${ENV}` 写法、没有启动播种**：密钥从哪来只由插件声明 + 凭证存储决定。
 - 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
-- 配置优先级：系统空间 `config.json` / `net_whitelist.json` → 环境变量 `SEARCH_*`。启动时读一次，改完需重启；配置写错**启动失败**而不是静默用默认值。
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
-- **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（引用列表 + 指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。`config.json` 里存的只是凭证引用名，不是密钥。
-- 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间，并标出 `使用中 / 未引用`——只有与 `config.json` 引用一致的那条才会生效，避免改了 A 却仍跑在 B 上。
+- **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。插件清单里存的只是凭证名，不是密钥。
+- 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间。`refs` 传空——搜索凭证的引用关系由 `kind=source` 插件清单声明，属于运行期状态（随安装/卸载变化），启动时无法静态列出。
 - **会话内录入**（`secret_request`，能力 `system.secret.request`，L1）：模型只提供 `scope` / `name` / `label` / `hint`，前端在消息里渲染录入卡片（`SecretRequestCard`，不折叠），明文由浏览器直接 `PUT /admin/secrets/{scope}/{name}`，**不进工具参数、不进模型上下文、不进 `run_step` 审计**；模型回读到的只有「是否已配置 + 指纹」，`can_write` 由 `space.IsAdmin` 判定，非管理员只拿到「转给管理员」的指引。密钥存储没启用（无 `SECRET_KEK`）时工具直接说明，不引导填写，避免变相索要明文。平台基础规则与 `builtin_plugin_dev`（总纲 + `references/source.md` + `references/mcp.md`）都写明：需要凭证时用它，禁止向用户索要明文。
-- 搜索密钥改完**立即生效**（每次调用都从凭证存储取）；`config.json` / `net_whitelist.json` 改完需重启。
-- 新增 provider：在 `internal/search` 下新建文件实现 `search.Provider`，并用 `init()` 调 `RegisterFactory("名字", ...)`；装配层（`internal/app`）按名字从工厂表解析，**不加 case 分支**，工具与提示词也不用改。provider 面板/路由只认 `config.json` 的 `search.provider`。
+- 搜索密钥改完**立即生效**（每次调用都从凭证存储取）。插件安装/启用即注册进 `search.Registry`，停用/卸载立即移除，不需要重启。
+- 新增搜索源：写一个 `kind=source` 插件（`plugin.json` 的 `source.endpoint` / `scope` / `priority` / `secret` + `search.json` 或 `main.ts`），发布、安装。**没有「改 Go 代码注册 provider」这条路了**，`internal/search` 不再持有任何厂商实现。
 
-- **脚本搜索源**（`search.script`，优先级 script > spec > 内置）：签名、游标分页、非 JSON 响应这类声明式表达不了的，写成 `.ts` 脚本交给 `deno` 执行。脚本**没有网络权限**，两段式：`plan` 输出 `{request:{method,url,headers,body}}`，`map` 收 `{status,body}` 输出 `{results:[...]}`；出网仍由 `Guard` 完成。密钥只走 stdin，不进 argv（`ps` 可见）也不进环境变量（`/proc/<pid>/environ` 可见）。脚本坏了只告警并回退，不让服务起不来。
+- **脚本搜索源**（`source.protocol=script`）：签名、游标分页、非 JSON 响应这类声明式表达不了的，写成 `.ts` 脚本交给 `deno` 执行。脚本**没有网络权限**，两段式：`plan` 输出 `{request:{method,url,headers,body}}`，`map` 收 `{status,body}` 输出 `{results:[...]}`；出网仍由 `Guard` 完成。密钥只走 stdin，不进 argv（`ps` 可见）也不进环境变量（`/proc/<pid>/environ` 可见）。脚本写坏了只让这个源加载失败，其余源与内置能力照常可用。
 
 # 命令执行沙箱（`internal/sandbox`）
 

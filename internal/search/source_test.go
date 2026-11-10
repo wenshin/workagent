@@ -17,7 +17,7 @@ func TestSourceRouting(t *testing.T) {
 		t.Cleanup(srv.Close)
 		p, err := NewHTTPJSON("x", srv.URL, Spec{
 			Request:  RequestSpec{Method: "POST", Body: map[string]any{"q": "{{query}}"}},
-			Response: ResponseSpec{Items: "items", Title: "t", URL: "u", Snippet: "s"},
+			Response: ResponseSpec{Items: PathList{"items"}, Title: PathList{"t"}, URL: PathList{"u"}, Snippet: PathList{"s"}},
 		}, nil, NewSourceGuard([]string{"127.0.0.1"}, true))
 		if err != nil {
 			t.Fatalf("构造 %s 失败: %v", body, err)
@@ -79,7 +79,7 @@ func TestSourcePartialFailure(t *testing.T) {
 
 	mk := func(endpoint string) Provider {
 		p, err := NewHTTPJSON("x", endpoint, Spec{
-			Response: ResponseSpec{Items: "items", Title: "t", URL: "u"},
+			Response: ResponseSpec{Items: PathList{"items"}, Title: PathList{"t"}, URL: PathList{"u"}},
 		}, nil, NewSourceGuard([]string{"127.0.0.1"}, true))
 		if err != nil {
 			t.Fatal(err)
@@ -114,7 +114,7 @@ func TestSourceSpaceIsolation(t *testing.T) {
 	}))
 	defer p.Close()
 	prov, err := NewHTTPJSON("private", p.URL, Spec{
-		Response: ResponseSpec{Items: "items", Title: "t", URL: "u"},
+		Response: ResponseSpec{Items: PathList{"items"}, Title: PathList{"t"}, URL: PathList{"u"}},
 	}, nil, NewSourceGuard([]string{"127.0.0.1"}, true))
 	if err != nil {
 		t.Fatal(err)

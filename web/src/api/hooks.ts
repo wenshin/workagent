@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { QueryClient } from '@tanstack/react-query';
 
 import { api } from './client';
 import type {
@@ -50,6 +51,17 @@ export const queryKeys = {
   pluginConfig: (spaceId: string, slug: string) => ['plugin', 'config', spaceId, slug] as const,
   pluginCatalog: ['plugin', 'catalog'] as const,
 };
+
+/**
+ * 让会话右上角的技能选择器失效。
+ *
+ * 列表由「当前空间启用的技能插件 + 系统空间安装」合并而成，任何改变这个集合的操作
+ * （新建、删除、启停、安装、卸载）都要清理它，否则选择器会停在页面打开时的快照上。
+ * 用前缀匹配：系统空间的变化对所有空间的选择器都有效。
+ */
+function invalidateSkillLists(qc: QueryClient) {
+  qc.invalidateQueries({ queryKey: ['skills'] });
+}
 
 /** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
 export function useProviderInfo() {
@@ -199,6 +211,7 @@ export function useCreateSkill() {
       qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 技能目录自带 SKILL.md，文件树里要立刻出现
       qc.invalidateQueries({ queryKey: queryKeys.files });
+      invalidateSkillLists(qc);
     },
   });
 }
@@ -219,6 +232,7 @@ export function useCreateDraft() {
       qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 草稿目录自带 plugin.json 与入口文件，文件树要立刻出现
       qc.invalidateQueries({ queryKey: queryKeys.files });
+      invalidateSkillLists(qc);
     },
   });
 }
@@ -257,6 +271,7 @@ export function useDeleteDir() {
       // 否则 15s 内左侧树还会显示已经不存在的文件。
       qc.invalidateQueries({ queryKey: queryKeys.files });
       qc.invalidateQueries({ queryKey: ['file'] });
+      invalidateSkillLists(qc);
     },
   });
 }
@@ -555,6 +570,7 @@ export function useInstallPlugin() {
     onSuccess: (_d, vars) => {
       qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
       qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+      invalidateSkillLists(qc);
     },
   });
 }
@@ -567,6 +583,7 @@ export function useUninstallPlugin() {
     onSuccess: (_d, vars) => {
       qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
       qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+      invalidateSkillLists(qc);
     },
   });
 }
@@ -582,6 +599,7 @@ export function useTogglePlugin() {
     onSuccess: (_d, vars) => {
       qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
       qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+      invalidateSkillLists(qc);
     },
   });
 }

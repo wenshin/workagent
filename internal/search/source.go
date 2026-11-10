@@ -22,7 +22,7 @@ const (
 // SourceDef 是一个可用的搜索源。
 //
 // 来源有两类，形状完全一致，只是谁能看见不同：
-//   - 平台配置（config.json 的 search.sources）：全局，部署级；
+//   - 系统空间安装的 source 插件：全局，部署级；
 //   - source 插件（kind=source）：装到系统空间即全局，装到普通空间只对该空间生效。
 type SourceDef struct {
 	// Name 是源标识（插件 slug 或配置里的 name），用于日志、审计与前端展示

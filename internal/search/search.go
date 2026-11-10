@@ -8,10 +8,41 @@ package search
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 )
+
+// SecretScope 是搜索凭证在 secret.Store 里的 scope 名。
+// 搜索源一律通过清单里的 source.secret 声明凭证名，scope 固定为这个值。
+const SecretScope = "search"
+
+var tagRe = regexp.MustCompile(`(?s)<[^>]*>`)
+
+// stripTags 去掉摘要里的 HTML 标签：搜索结果会原样进模型上下文，粘上标签既浪费 token
+// 也可能被当成结构指令。
+//
+// 正则不是解析器，只处理搜索结果里常见的这几种情况：成对/自闭合标签、五个常见实体。
+// 嵌套实体（&amp;lt;）只解一层，<script> 只去掉标签、保留脚本正文——搜索摘要里出现
+// 这些的概率很低，为此引一个 HTML 解析器不值得。
+func stripTags(s string) string {
+	s = tagRe.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	s = strings.ReplaceAll(s, "&lt;", "<")
+	s = strings.ReplaceAll(s, "&gt;", ">")
+	s = strings.ReplaceAll(s, "&quot;", `"`)
+	return strings.TrimSpace(s)
+}
+
+func truncateRunes(s string, limit int) string {
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:limit]) + "…"
+}
 
 // Request 是一次搜索请求；provider 可忽略自己不支持的字段。
 type Request struct {
@@ -31,11 +62,9 @@ type Result struct {
 	Source      string `json:"source,omitempty"`
 }
 
-// DefaultSecretName 是平台凭证的统一名字。
-//
-// 凭证名不跟 provider 绑定：同一时刻只有一个搜索源在用，一把密钥就够。
-// 换源只改 provider / endpoint，密钥名与环境变量（SEARCH_API_KEY）都不用动。
-const DefaultSecretName = "default"
+// KeyFunc 返回 provider 的密钥。由装配层注入（读凭证存储），
+// 密钥只在本包内使用，不出现在工具参数、工具结果、日志与审计里。
+type KeyFunc func(ctx context.Context) (string, error)
 
 // Provider 是一个可插拔的搜索实现。
 //

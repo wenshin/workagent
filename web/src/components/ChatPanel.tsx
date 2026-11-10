@@ -35,6 +35,8 @@ interface Props {
   skills: SpaceSkill[];
   /** 选择会话技能，空串表示清除 */
   onSelectSkill: (path: string) => void;
+  /** 打开选择器前重新取一次：技能可能刚在另一个页面新建/启停过 */
+  onRefreshSkills?: () => void;
   onSend: (content: string) => Promise<void>;
   onStop: () => void;
 }
@@ -236,6 +238,7 @@ export default function ChatPanel({
   model,
   skills,
   onSelectSkill,
+  onRefreshSkills,
   onSend,
   onStop,
 }: Props) {
@@ -345,7 +348,11 @@ export default function ChatPanel({
           trigger="click"
           position="bottomRight"
           visible={skillPickerOpen}
-          onVisibleChange={setSkillPickerOpen}
+          onVisibleChange={(v) => {
+            setSkillPickerOpen(v);
+            // 每次打开都以服务端为准：技能可能在插件面板里刚新建、启用或停用
+            if (v) onRefreshSkills?.();
+          }}
           content={
             <div className="skill-picker">
               <div className="skill-picker-head">技能（当前空间与系统空间）</div>

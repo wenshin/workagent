@@ -79,6 +79,26 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 			return fmt.Errorf("发布内置工具 %s 失败: %w", bm.Name, err)
 		}
 	}
+
+	// 预置搜索源放在最后：它实现的是 search.query，不依赖其它内置件。
+	// 预置的意义是「新部署装完就有搜索能力」，而不是给平台留一条绕开插件体系的旁路——
+	// 它在市场里可见、可停用、可被用户自己的源按 priority 顶掉。
+	for _, src := range builtinSources() {
+		spec := src.Source
+		meta := Manifest{
+			Protocol:    Protocol,
+			Kind:        KindSource,
+			Slug:        src.Slug,
+			Name:        src.Name,
+			Description: src.Description,
+			Capability:  CapSearchQuery,
+			Source:      &spec,
+			Extensible:  boolPtr(false),
+		}
+		if err := m.seedBuiltin(ctx, ownerID, sysID, meta, src.Files); err != nil {
+			return fmt.Errorf("发布内置搜索源 %s 失败: %w", src.Slug, err)
+		}
+	}
 	return nil
 }
 

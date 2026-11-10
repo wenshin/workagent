@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   useCreateDir,
   useCreateDraft,
+  useCreateSession,
   useCreateSpace,
   useDeleteDir,
   useDeleteSpace,
@@ -40,6 +41,8 @@ const KIND_HINT: Record<PluginKind, string> = {
 interface Props {
   state: DialogState;
   onClose: () => void;
+  /** 新建插件后会自动在该插件目录下开会话，这里把用户带到那个会话 */
+  onOpenSession?: (id: string) => void;
 }
 
 function describe(state: DialogState) {
@@ -108,7 +111,7 @@ function describe(state: DialogState) {
   }
 }
 
-export default function SpaceDialog({ state, onClose }: Props) {
+export default function SpaceDialog({ state, onClose, onOpenSession }: Props) {
   const open = state.kind !== 'none';
   const meta = describe(state);
 
@@ -125,6 +128,7 @@ export default function SpaceDialog({ state, onClose }: Props) {
   const deleteSpace = useDeleteSpace();
   const createDir = useCreateDir();
   const createDraft = useCreateDraft();
+  const createSession = useCreateSession();
   const renameDir = useRenameDir();
   const deleteDir = useDeleteDir();
 
@@ -134,6 +138,7 @@ export default function SpaceDialog({ state, onClose }: Props) {
     deleteSpace.isPending ||
     createDir.isPending ||
     createDraft.isPending ||
+    createSession.isPending ||
     renameDir.isPending ||
     deleteDir.isPending;
 
@@ -147,9 +152,27 @@ export default function SpaceDialog({ state, onClose }: Props) {
     if (state.kind === 'create-plugin') setPluginKind('skill');
   }, [open, state]);
 
+  /**
+   * 新建插件后在该插件目录里开一个会话。
+   *
+   * 写插件基本都在对话里进行（读骨架、改清单、试跑），所以建完草稿直接把用户
+   * 带到「这个插件目录」的上下文里，省掉「关弹窗 → 找到目录 → 右键新建会话」。
+   * 会话建失败不回滚插件：草稿已经落盘，提示一下让用户手动建即可。
+   */
+  const openDraftSession = async (spaceId: string, dirPath: string, title: string) => {
+    try {
+      const res = await createSession.mutateAsync({ spaceId, dir: dirPath, title });
+      onOpenSession?.(res.session.id);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : '插件已创建，但开发会话没能建起来');
+    }
+  };
+
   const submit = async () => {
     setError('');
     const name = value.trim();
+    // 草稿建好后还要开会话，先记下来，等 switch 收尾统一处理
+    let draft: { spaceId: string; dir: string; title: string } | null = null;
 
     try {
       switch (state.kind) {
@@ -161,15 +184,17 @@ export default function SpaceDialog({ state, onClose }: Props) {
           if (!name) return setError('请输入目录名称');
           await createDir.mutateAsync({ spaceId: state.space.id, name, parent: state.parent?.path });
           break;
-        case 'create-plugin':
+        case 'create-plugin': {
           if (!name) return setError('请输入插件名称');
-          await createDraft.mutateAsync({
+          const { dir } = await createDraft.mutateAsync({
             spaceId: state.space.id,
             kind: pluginKind,
             name,
             description: description.trim(),
           });
+          draft = { spaceId: state.space.id, dir: dir.path, title: name };
           break;
+        }
         case 'rename':
           if (!name) return setError('请输入空间名称');
           await renameSpace.mutateAsync({ id: state.target.id, name });
@@ -197,6 +222,7 @@ export default function SpaceDialog({ state, onClose }: Props) {
             : '已保存',
       );
       onClose();
+      if (draft) await openDraftSession(draft.spaceId, draft.dir, draft.title);
     } catch (e) {
       setError(e instanceof Error ? e.message : '操作失败，请重试');
     }

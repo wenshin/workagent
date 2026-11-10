@@ -186,9 +186,9 @@ func (h *HTTPJSON) parse(data []byte, status int) ([]Result, error) {
 		}
 	}
 
-	raw, ok := lookup(root, rs.Items).([]any)
+	raw, ok := lookupFirst(root, rs.Items).([]any)
 	if !ok {
-		return nil, fmt.Errorf("响应里没找到结果数组（response.items=%s）", rs.Items)
+		return nil, fmt.Errorf("响应里没找到结果数组（response.items=%s）", strings.Join(rs.Items, " / "))
 	}
 
 	results := make([]Result, 0, len(raw))
@@ -196,10 +196,10 @@ func (h *HTTPJSON) parse(data []byte, status int) ([]Result, error) {
 		// 归一化只有一处出口（search.Normalize）：spec 与 script 两条路径
 		// 各自截断会让「换实现方式」悄悄改变模型看到的内容。
 		norm, ok := Normalize(Result{
-			Title:       text(lookup(item, rs.Title)),
-			URL:         text(lookup(item, rs.URL)),
-			Snippet:     text(lookup(item, rs.Snippet)),
-			PublishedAt: text(lookup(item, rs.PublishedAt)),
+			Title:       text(lookupFirst(item, rs.Title)),
+			URL:         text(lookupFirst(item, rs.URL)),
+			Snippet:     text(lookupFirst(item, rs.Snippet)),
+			PublishedAt: text(lookupFirst(item, rs.PublishedAt)),
 			Source:      h.name,
 		})
 		if !ok {

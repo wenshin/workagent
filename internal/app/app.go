@@ -2,19 +2,14 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/workagent/auto-agent/internal/admin"
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
-	"github.com/workagent/auto-agent/internal/confstore"
 	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
 	_ "github.com/workagent/auto-agent/internal/agent/direct"
 	"github.com/workagent/auto-agent/internal/auth"
@@ -122,68 +117,6 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	if !secretStore.Enabled() {
 		log.Warn("凭证存储未启用（未配置 SECRET_KEK），需要密钥的能力不可用")
 	}
-	// 平台配置：系统空间的 config.json / net_whitelist.json，读不到就回退环境变量。
-	// 配置写错直接启动失败，避免「看起来改好了、实际还在用默认值」。
-	platCfg, netAllow, err := confstore.NewLoader(spaceSvc).Load(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("读取平台配置失败: %w", err)
-	}
-	searchProvider := firstNonEmpty(platCfg.Search.Provider, cfg.SearchProvider)
-	searchEndpoint := firstNonEmpty(platCfg.Search.Endpoint, cfg.SearchEndpoint)
-	// 凭证引用有两种写法：
-	//   "default"            → 只看凭证存储里的槽位名（界面「密钥配置」里录入）
-	//   "${SEARCH_API_KEY}"  → 先查凭证存储同名条目，没有再读环境变量
-	//
-	// ${} 的作用只是让「密钥从哪来」在配置里显式可见，不是二选一的开关：
-	// 界面录入的那条同样能被 ${} 命中（且优先），这样既能在后台轮换，
-	// 也能在没配 SECRET_KEK 的机器上直接用环境变量跑起来。
-	searchSecret := firstNonEmpty(platCfg.Search.Secret, search.DefaultSecretName)
-	searchName, searchExplicit := parseSecretRef(searchSecret)
-	allow := netAllow.Domains
-	if len(allow) == 0 {
-		allow = cfg.SearchAllow
-	}
-
-	// 首次播种：SEARCH_API_KEY 只用于初始化，之后以凭证存储为准。
-	// 写的是 ${NAME} 时由引用自身决定来源，不需要再把环境变量抄一份进存储。
-	if !searchExplicit && secretStore.Enabled() && cfg.SearchAPIKey != "" {
-		seedCtx := context.Background()
-		if _, getErr := secretStore.Get(seedCtx, search.SecretScope, searchSecret); getErr != nil {
-			if putErr := secretStore.Put(seedCtx, search.SecretScope, searchSecret, cfg.SearchAPIKey); putErr != nil {
-				log.Warn("搜索密钥播种失败", "err", putErr)
-			} else {
-				log.Info("搜索密钥已写入凭证存储", "secret", searchSecret)
-			}
-		}
-	}
-
-	// 旧部署的凭证名曾是 provider 名（bocha），统一成 default 后搬一次，
-	// 否则升级完 web_search 会突然说「密钥不可用」。
-	if !searchExplicit && secretStore.Enabled() && searchSecret != searchProvider {
-		migCtx := context.Background()
-		if _, getErr := secretStore.Get(migCtx, search.SecretScope, searchSecret); errors.Is(getErr, secret.ErrNotFound) {
-			if v, legacyErr := secretStore.Get(migCtx, search.SecretScope, searchProvider); legacyErr == nil && v != "" {
-				if putErr := secretStore.Put(migCtx, search.SecretScope, searchSecret, v); putErr != nil {
-					log.Warn("搜索密钥迁移失败", "err", putErr)
-				} else {
-					_ = secretStore.Delete(migCtx, search.SecretScope, searchProvider)
-					log.Info("搜索密钥已迁移到统一凭证名", "from", searchProvider, "to", searchSecret)
-				}
-			}
-		}
-	}
-
-	// 声明式搜索源：config.json 里给了 search.spec 就按配置拼请求 / 取结果，
-	// 接一个新的 REST 搜索 API 不用写 Go、不用发版。
-	var searchSpec *search.Spec
-	if len(platCfg.Search.Spec) > 0 {
-		var s search.Spec
-		if err := json.Unmarshal(platCfg.Search.Spec, &s); err != nil {
-			return nil, fmt.Errorf("config.json 的 search.spec 解析失败: %w", err)
-		}
-		searchSpec = &s
-	}
-
 	// 命令执行沙箱：按平台挑最强后端（bwrap > sandbox-exec > local）。
 	// 降级到 local 就是没有任何隔离，必须显式告警——让它出现在日志里，
 	// 而不是等到出事才发现「沙箱」其实是裸跑。
@@ -201,7 +134,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 搜索注册表先于插件管理器构造：kind=source 的插件在安装/启用时直接注册进来，
 	// 装完即生效，不需要重启服务。
-	searchReg := search.NewRegistry(searchProvider)
+	searchReg := search.NewRegistry("")
 
 	// 插件体系（docs/插件体系设计.md）：五类插件共用清单与生命周期。
 	// 脚本插件跑在同一个沙箱里，密钥只经宿主替换，插件进程里没有明文。
@@ -244,66 +177,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		log.Warn("插件启动初始化失败（不影响服务启动）", "err", err)
 	}
 
-	// 搜索（§5.6.1）：出网统一走 Guard。
-	keyFunc := func(ctx context.Context) (string, error) {
-		if !searchExplicit {
-			return secretStore.Get(ctx, search.SecretScope, searchName)
-		}
-		// 存储优先：加密落盘、可在界面轮换、有指纹可审计。
-		if v, err := secretStore.Get(ctx, search.SecretScope, searchName); err == nil && v != "" {
-			return v, nil
-		}
-		// 没有同名凭证时退回环境变量，适合部署平台（k8s Secret / systemd）注入。
-		if v := strings.TrimSpace(os.Getenv(searchName)); v != "" {
-			return v, nil
-		}
-		return "", fmt.Errorf("密钥 %s 不可用：凭证存储里没有该条目，环境变量也未设置", searchName)
-	}
-	guard := search.NewGuard(allow)
-
-	// 优先级：脚本 > 声明式 spec > 内置 provider。
-	// 脚本能覆盖声明式表达不了的（签名、分页、非 JSON），但它是可选项：
-	// 脚本坏了只告警并回退，不让整个服务起不来。
-	scriptReady := false
-	if searchScript := strings.TrimSpace(platCfg.Search.Script); searchScript != "" {
-		if provider, buildErr := search.NewDeno(searchProvider, searchScript, searchEndpoint, keyFunc, guard, shellRunner); buildErr != nil {
-			log.Warn("搜索脚本不可用，回退到声明式/内置 provider", "script", searchScript, "err", buildErr)
-		} else {
-			searchReg.Register(provider)
-			scriptReady = true
-		}
-	}
-
-	switch {
-	case scriptReady:
-	case searchSpec != nil:
-		provider, buildErr := search.NewHTTPJSON(searchProvider, searchEndpoint, *searchSpec, keyFunc, guard)
-		if buildErr != nil {
-			return nil, fmt.Errorf("config.json 的 search.spec 不可用: %w", buildErr)
-		}
-		searchReg.Register(provider)
-	default:
-		// 没有 spec 时回落到内置 provider：名字 → 构造函数由工厂表解析。
-		if provider, ok := search.Build(searchProvider, searchEndpoint, keyFunc, guard); ok {
-			searchReg.Register(provider)
-		} else {
-			log.Warn("未知的搜索 provider，web_search 将不可用",
-				"provider", searchProvider, "known", search.ProviderNames())
-		}
-	}
-	log.Info("搜索能力已装配", "provider", searchProvider, "endpoint", searchEndpoint,
-		"secret", searchSecret, "available", searchReg.Names(), "allow", allow,
-		"declarative", searchSpec != nil, "script", scriptReady,
-		"secret_ready", secretStore.Enabled() || searchExplicit)
-
-	// 启动时就把「引用的密钥在不在」说清楚。
-	// 引用的名字写错（凭证没录入 / 环境变量没导出）是最容易出现的错配：
-	// 配置看着没问题、服务也能起，直到第一次搜索才报错。这里提前告警并给出名字。
-	if secretStore.Enabled() || searchExplicit {
-		if _, getErr := keyFunc(context.Background()); getErr != nil {
-			log.Warn("搜索密钥不可用，web_search 会报错", "secret", searchSecret, "err", getErr)
-		}
-	}
+	// 搜索源只有插件一条路：kind=source 的插件在安装/启用时注册进 searchReg，
+	// 平台不再从 config.json 或环境变量拼装内置源——那会让「用哪个搜索服务」
+	// 散落在配置、代码和环境变量三处，且换源必须发版或改文件。
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 
@@ -329,13 +205,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		pluginSvc:   pluginSvc,
 		pluginH:     plugin.NewHandler(pluginSvc, st, spaceSvc, authHandler.CurrentUser, log),
 		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
-		// refs 告诉管理页「哪一条密钥真正被引用」，避免改了 A 却仍跑在 B 上。
-		adminH: admin.NewHandler(spaceSvc, secretStore, []admin.SecretRef{{
-			Scope:  search.SecretScope,
-			Name:   searchName,
-			Label:  searchRefLabel(searchProvider, searchName, searchExplicit),
-			Source: searchRefSource(secretStore, search.SecretScope, searchName, searchExplicit),
-		}}, authHandler.CurrentUser, log),
+		// refs 传空：搜索凭证由 source 插件清单里的 source.secret 声明，
+		// 属于运行期状态（随插件安装/卸载变化），启动时无法静态列出。
+		adminH: admin.NewHandler(spaceSvc, secretStore, nil, authHandler.CurrentUser, log),
 	}, nil
 }
 
@@ -391,46 +263,4 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
 }
 
-// firstNonEmpty 返回第一个非空值，用于「系统空间配置优先、环境变量兜底」。
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
-}
 
-// parseSecretRef 解析 "${NAME}" 形式的引用，返回里面的名字与“是否显式书写”。
-//
-// 不带 ${} 的名字只查凭证存储；带 ${} 的先查存储、再退回同名环境变量。
-// 之所以还要保留裸名字：界面上「平台当前使用」直接显示名字，最省事。
-func parseSecretRef(ref string) (string, bool) {
-	ref = strings.TrimSpace(ref)
-	if len(ref) > 3 && strings.HasPrefix(ref, "${") && strings.HasSuffix(ref, "}") {
-		if inner := strings.TrimSpace(ref[2 : len(ref)-1]); inner != "" {
-			return inner, true
-		}
-	}
-	return ref, false
-}
-
-// searchRefLabel 是「密钥配置」弹窗里那句“平台当前使用”的文案。
-func searchRefLabel(provider, name string, explicit bool) string {
-	if explicit {
-		return fmt.Sprintf("web_search（${%s}）", name)
-	}
-	return fmt.Sprintf("web_search（%s）", provider)
-}
-
-// searchRefSource 告诉管理页这条引用最终落在哪：能查到同名凭证就是 store，
-// 否则是 env（此时界面上的录入区没有意义，显示成“来自环境变量”）。
-func searchRefSource(store *secret.FileStore, scope, name string, explicit bool) string {
-	if !explicit {
-		return admin.SourceStore
-	}
-	if v, err := store.Get(context.Background(), scope, name); err == nil && v != "" {
-		return admin.SourceStore
-	}
-	return admin.SourceEnv
-}

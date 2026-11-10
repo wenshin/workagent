@@ -10,7 +10,8 @@ import (
 // 声明式配置的价值就是「换个字段路径就能接新源」，这里用两家真实结构做对照。
 func TestHTTPJSONParseDifferentShapes(t *testing.T) {
 	bochaSpec := Spec{Response: ResponseSpec{
-		Items: "data.webPages.value", Title: "name", URL: "url", Snippet: "summary",
+		Items: PathList{"data.webPages.value"}, Title: PathList{"name"}, URL: PathList{"url"},
+		Snippet:   PathList{"summary"},
 		ErrorCode: "code", ErrorMessage: "msg",
 	}}
 	p := &HTTPJSON{name: "bocha", spec: bochaSpec}
@@ -30,7 +31,8 @@ func TestHTTPJSONParseDifferentShapes(t *testing.T) {
 	}
 
 	tavilySpec := Spec{Response: ResponseSpec{
-		Items: "results", Title: "title", URL: "url", Snippet: "content",
+		Items: PathList{"results"}, Title: PathList{"title"}, URL: PathList{"url"},
+		Snippet: PathList{"content"},
 	}}
 	p2 := &HTTPJSON{name: "tavily", spec: tavilySpec}
 	tavilyBody := `{"results":[{"title":"T","url":"https://b.example/2","content":"C"}]}`
@@ -45,7 +47,7 @@ func TestHTTPJSONParseDifferentShapes(t *testing.T) {
 
 func TestHTTPJSONParseBusinessError(t *testing.T) {
 	p := &HTTPJSON{name: "x", spec: Spec{Response: ResponseSpec{
-		Items: "data.value", URL: "url", ErrorCode: "code", ErrorMessage: "msg",
+		Items: PathList{"data.value"}, URL: PathList{"url"}, ErrorCode: "code", ErrorMessage: "msg",
 	}}}
 	if _, err := p.parse([]byte(`{"code":401,"msg":"invalid api key"}`), 200); err == nil {
 		t.Fatal("业务错误码非 0 时应报错")
@@ -53,7 +55,7 @@ func TestHTTPJSONParseBusinessError(t *testing.T) {
 }
 
 func TestHTTPJSONParseMissingItems(t *testing.T) {
-	p := &HTTPJSON{name: "x", spec: Spec{Response: ResponseSpec{Items: "data.value", URL: "url"}}}
+	p := &HTTPJSON{name: "x", spec: Spec{Response: ResponseSpec{Items: PathList{"data.value"}, URL: PathList{"url"}}}}
 	if _, err := p.parse([]byte(`{"data":{}}`), 200); err == nil {
 		t.Fatal("取不到结果数组时应报错，而不是返回空结果冒充「没搜到」")
 	}
@@ -122,13 +124,13 @@ func TestSpecValidate(t *testing.T) {
 		spec Spec
 		ok   bool
 	}{
-		{"缺 items", Spec{Response: ResponseSpec{URL: "url"}}, false},
-		{"缺 url", Spec{Response: ResponseSpec{Items: "results"}}, false},
+		{"缺 items", Spec{Response: ResponseSpec{URL: PathList{"url"}}}, false},
+		{"缺 url", Spec{Response: ResponseSpec{Items: PathList{"results"}}}, false},
 		{"认证方式写错", Spec{Request: RequestSpec{Auth: &AuthSpec{In: "cookie", Name: "k"}},
-			Response: ResponseSpec{Items: "results", URL: "url"}}, false},
+			Response: ResponseSpec{Items: PathList{"results"}, URL: PathList{"url"}}}, false},
 		{"method 写错", Spec{Request: RequestSpec{Method: "PUT"},
-			Response: ResponseSpec{Items: "results", URL: "url"}}, false},
-		{"正常", Spec{Response: ResponseSpec{Items: "results", URL: "url"}}, true},
+			Response: ResponseSpec{Items: PathList{"results"}, URL: PathList{"url"}}}, false},
+		{"正常", Spec{Response: ResponseSpec{Items: PathList{"results"}, URL: PathList{"url"}}}, true},
 	}
 	for _, c := range cases {
 		err := c.spec.Validate()
@@ -154,5 +156,52 @@ func TestLookup(t *testing.T) {
 	}
 	if got := lookup(root, "data.value[9].title"); got != nil {
 		t.Fatalf("越界应返回 nil，实际 %v", got)
+	}
+}
+
+// 摘要字段在哪家 API 里叫什么都不稳定（博查开了 summary 就把正文放 summary，
+// snippet 常常是空的）：数组路径按顺序回退，避免空摘要静默丢掉。
+func TestHTTPJSONSnippetFallback(t *testing.T) {
+	p := &HTTPJSON{name: "x", spec: Spec{Response: ResponseSpec{
+		Items:   PathList{"data.webPages.value"},
+		URL:     PathList{"url"},
+		Snippet: PathList{"summary", "snippet"},
+	}}}
+	body := `{"data":{"webPages":{"value":[
+		{"url":"https://a.example/1","summary":"","snippet":"只有 snippet"},
+		{"url":"https://a.example/2","summary":"只有 summary","snippet":""}
+	]}}}`
+	got, err := p.parse([]byte(body), 200)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("期望 2 条，实际 %d 条", len(got))
+	}
+	if got[0].Snippet != "只有 snippet" || got[1].Snippet != "只有 summary" {
+		t.Fatalf("回退没生效: %q / %q", got[0].Snippet, got[1].Snippet)
+	}
+}
+
+// 老清单里写的是字符串，新清单可以写数组：两种写法都必须能解析。
+func TestPathListUnmarshal(t *testing.T) {
+	var one Spec
+	if err := json.Unmarshal([]byte(`{"response":{"items":"a.b","url":"u","snippet":"summary"}}`), &one); err != nil {
+		t.Fatalf("字符串写法解析失败: %v", err)
+	}
+	if len(one.Response.Snippet) != 1 || one.Response.Snippet[0] != "summary" {
+		t.Fatalf("字符串写法解析结果不对: %+v", one.Response.Snippet)
+	}
+
+	var many Spec
+	raw := `{"response":{"items":["a.b","c.d"],"url":"u","snippet":["summary","snippet"],"published_at":""}}`
+	if err := json.Unmarshal([]byte(raw), &many); err != nil {
+		t.Fatalf("数组写法解析失败: %v", err)
+	}
+	if len(many.Response.Items) != 2 || len(many.Response.Snippet) != 2 {
+		t.Fatalf("数组写法解析结果不对: %+v", many.Response)
+	}
+	if len(many.Response.PublishedAt) != 0 {
+		t.Fatalf("空字符串应视为不取该字段，实际 %+v", many.Response.PublishedAt)
 	}
 }

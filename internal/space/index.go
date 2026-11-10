@@ -201,7 +201,7 @@ func (s *Service) ReadSourceFile(ctx context.Context, spaceID, rawPath string, l
 	if sysErr != nil || sys.ID == spaceID {
 		return "", ErrFileNotFound
 	}
-	// 只允许回落到能力目录。agents/、config.json、net_whitelist.json 是平台配置，
+	// 只允许回落到能力目录。agents/ 是平台配置，
 	// 不能经这条通道被普通空间读到（否则等于公开了白名单与接入点）。
 	if !isSystemCapabilityPath(rel) {
 		return "", ErrFileNotFound
