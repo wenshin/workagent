@@ -15,10 +15,12 @@
 package sandbox
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,6 +98,88 @@ type Runner interface {
 	// Name 是后端名，调用方用它判断是否真的隔离了。
 	Name() string
 	Run(ctx context.Context, spec Spec) (Result, error)
+	// Start 启动一个长驻进程，暴露 stdin/stdout 供双向协议使用（插件运行时）。
+	// 超时、进程组回收、环境清理与 Run 一致；调用方必须 Close。
+	Start(ctx context.Context, spec Spec) (*Proc, error)
+}
+
+// Proc 是一次长驻进程。它只负责进程生命周期，不解析协议。
+//
+// stdout 不做字节上限：长连接下每帧大小与帧总数由调用方（插件 runtime）
+// 控制，沙箱层再做一次截断会把合法的长会话误杀。stderr 仍然限量收集，
+// 用于失败时回传原因。
+type Proc struct {
+	Stdout  *bufio.Reader
+	Stdin   io.WriteCloser
+	name    string
+	cmd     *exec.Cmd
+	stderr  *capWriter
+	runCtx  context.Context
+	cancel  context.CancelFunc
+	cleanup func()
+	start   time.Time
+	exited  chan struct{}
+	waitErr error
+	once    sync.Once
+}
+
+// Write 写入一个协议帧；调用方负责加换行。
+func (p *Proc) Write(b []byte) error {
+	if p.Stdin == nil {
+		return errors.New("sandbox: 进程 stdin 不可写")
+	}
+	_, err := p.Stdin.Write(b)
+	return err
+}
+
+// Name 返回实际生效的后端名（ModeFull 下为 none）。
+func (p *Proc) Name() string { return p.name }
+
+// Stderr 返回目前已收集的错误输出。
+func (p *Proc) Stderr() string { return p.stderr.String() }
+
+// Kill 立即终止整棵进程树。
+func (p *Proc) Kill() {
+	if p.cmd.Process != nil {
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+// Wait 等待进程退出，返回退出码与耗时。
+//
+// 与 Run 一致：非零退出码不是 error，超时 / 输出超限才是。
+func (p *Proc) Wait() (Result, error) {
+	<-p.exited
+	res := Result{
+		Stderr:   p.stderr.String(),
+		Duration: time.Since(p.start),
+		Sandbox:  p.name,
+	}
+	if p.runCtx.Err() == context.DeadlineExceeded {
+		return res, fmt.Errorf("%w", ErrTimeout)
+	}
+	if p.waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(p.waitErr, &exitErr) {
+			res.ExitCode = exitErr.ExitCode()
+			return res, nil
+		}
+		return res, fmt.Errorf("启动命令失败: %w", p.waitErr)
+	}
+	return res, nil
+}
+
+// Close 关闭 stdin、回收进程与临时目录，可重复调用。
+func (p *Proc) Close() {
+	p.once.Do(func() {
+		if p.Stdin != nil {
+			_ = p.Stdin.Close()
+		}
+		p.Kill()
+		<-p.exited
+		p.cancel()
+		p.cleanup()
+	})
 }
 
 // 后端名。判定「有没有真隔离」是安全语义的一部分，不要用字面量比较。
@@ -155,44 +239,16 @@ func (r *runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err != nil {
 		return Result{Sandbox: r.name}, err
 	}
-
-	// 每次调用一个私有临时目录：TMPDIR / HOME 都指向它，结束即删。
-	// 这样 read-only 档位下命令依然能写临时文件，但不会残留到下一次调用。
-	tmp, err := os.MkdirTemp("", "sandbox-")
+	p, err := r.prepare(spec)
 	if err != nil {
-		return Result{Sandbox: r.name}, fmt.Errorf("创建临时目录失败: %w", err)
+		return Result{Sandbox: r.name}, err
 	}
-	// macOS 上 /var 是指向 /private/var 的符号链接，内核按真实路径匹配策略，
-	// 不先解开就会出现「明明放开了写权限却 Operation not permitted」。
-	if real, evalErr := filepath.EvalSymlinks(tmp); evalErr == nil {
-		tmp = real
-	}
-	defer os.RemoveAll(tmp)
-	// 同理：workspace 也统一成真实路径，才能和挂载点 / 策略里的路径对上。
-	if real, evalErr := filepath.EvalSymlinks(spec.Dir); evalErr == nil {
-		spec.Dir = real
-	}
-
-	env := buildEnv(spec, tmp)
-	name := r.name
-	argv := spec.Cmd
-	if spec.Mode == ModeFull {
-		// 明确声明不做隔离：审计里记 none，别让人误以为有边界。
-		name = "none"
-	} else if r.build != nil {
-		argv, err = r.build(spec, tmp, env)
-		if err != nil {
-			return Result{Sandbox: name}, err
-		}
-	}
+	defer p.cleanup()
 
 	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
 
-	// 必须用 CommandContext：Cancel 只有在这种情况下才会被 exec 包接管。
-	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
-	cmd.Dir = spec.Dir
-	cmd.Env = env
+	cmd := p.command(runCtx)
 	if len(spec.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(spec.Stdin)
 	}
@@ -200,20 +256,11 @@ func (r *runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	stderr := newCapWriter(spec.MaxOutput, cancel)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	// 独立进程组：超时 / 输出超限时整组 kill，避免脚本 fork 出的子进程变孤儿。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-	cmd.WaitDelay = time.Second
 
 	start := time.Now()
 	runErr := cmd.Run()
 	res := Result{
-		Sandbox:   name,
+		Sandbox:   p.name,
 		Stdout:    stdout.String(),
 		Stderr:    stderr.String(),
 		Duration:  time.Since(start),
@@ -239,6 +286,131 @@ func (r *runner) Run(ctx context.Context, spec Spec) (Result, error) {
 		return res, fmt.Errorf("启动命令失败: %w", runErr)
 	}
 	return res, nil
+}
+
+// Start 启动长驻进程，供插件 runtime 做 NDJSON 双向协议。
+//
+// spec.Stdin 若有内容，会在启动后先写入再关闭——这样一次性输入的插件
+// 与长连接插件共用同一套调用约定。
+func (r *runner) Start(ctx context.Context, spec Spec) (*Proc, error) {
+	spec, err := spec.normalize()
+	if err != nil {
+		return nil, err
+	}
+	p, err := r.prepare(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
+	cmd := p.command(runCtx)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		p.cleanup()
+		return nil, fmt.Errorf("创建 stdin 管道失败: %w", err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		p.cleanup()
+		return nil, fmt.Errorf("创建 stdout 管道失败: %w", err)
+	}
+	stderr := newCapWriter(spec.MaxOutput, cancel)
+	cmd.Stderr = stderr
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		p.cleanup()
+		return nil, fmt.Errorf("启动命令失败: %w", err)
+	}
+
+	proc := &Proc{
+		Stdout:  bufio.NewReaderSize(stdoutPipe, 64<<10),
+		Stdin:   stdin,
+		name:    p.name,
+		cmd:     cmd,
+		stderr:  stderr,
+		runCtx:  runCtx,
+		cancel:  cancel,
+		cleanup: p.cleanup,
+		start:   time.Now(),
+		exited:  make(chan struct{}),
+	}
+	go func() {
+		proc.waitErr = cmd.Wait()
+		close(proc.exited)
+	}()
+
+	if len(spec.Stdin) > 0 {
+		go func() {
+			_, _ = stdin.Write(spec.Stdin)
+			_ = stdin.Close()
+		}()
+	}
+	return proc, nil
+}
+
+// prepared 是一次执行的静态部分：命令、环境、工作目录与临时目录。
+type prepared struct {
+	argv    []string
+	env     []string
+	dir     string
+	name    string
+	cleanup func()
+}
+
+func (r *runner) prepare(spec Spec) (prepared, error) {
+	// 每次调用一个私有临时目录：TMPDIR / HOME 都指向它，结束即删。
+	// 这样 read-only 档位下命令依然能写临时文件，但不会残留到下一次调用。
+	tmp, err := os.MkdirTemp("", "sandbox-")
+	if err != nil {
+		return prepared{}, fmt.Errorf("创建临时目录失败: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	// macOS 上 /var 是指向 /private/var 的符号链接，内核按真实路径匹配策略，
+	// 不先解开就会出现「明明放开了写权限却 Operation not permitted」。
+	if real, evalErr := filepath.EvalSymlinks(tmp); evalErr == nil {
+		tmp = real
+	}
+	// 同理：workspace 也统一成真实路径，才能和挂载点 / 策略里的路径对上。
+	dir := spec.Dir
+	if real, evalErr := filepath.EvalSymlinks(dir); evalErr == nil {
+		dir = real
+	}
+
+	env := buildEnv(spec, tmp)
+	name := r.name
+	argv := spec.Cmd
+	if spec.Mode == ModeFull {
+		// 明确声明不做隔离：审计里记 none，别让人误以为有边界。
+		name = "none"
+	} else if r.build != nil {
+		argv, err = r.build(spec, tmp, env)
+		if err != nil {
+			cleanup()
+			return prepared{}, err
+		}
+	}
+	return prepared{argv: argv, env: env, dir: dir, name: name, cleanup: cleanup}, nil
+}
+
+// command 用准备好的静态部分构造 exec.Cmd，统一挂上进程组回收与取消语义。
+func (p prepared) command(ctx context.Context) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, p.argv[0], p.argv[1:]...)
+	cmd.Dir = p.dir
+	cmd.Env = p.env
+	// 独立进程组：超时 / 输出超限时整组 kill，避免脚本 fork 出的子进程变孤儿。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = time.Second
+	return cmd
 }
 
 func (s Spec) normalize() (Spec, error) {

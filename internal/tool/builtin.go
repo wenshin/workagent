@@ -31,6 +31,7 @@ func builtinTools() []Tool {
 		resourceRead(),
 		webSearch(),
 		shellExec(),
+		pluginTry(),
 	}
 }
 
@@ -167,7 +168,7 @@ func resourceSearch() Tool {
 	return Tool{
 		Name:       "resource_search",
 		Capability: "system.source.search",
-		Description: "按关键词检索可用的技能（skills）、工具（tools）与 MCP 服务（mcps），返回最相关的若干条及读取路径。" +
+		Description: "按关键词检索可用的技能（skills）、工具（tools）、MCP 服务（mcps）与组件（components），返回最相关的若干条及读取路径。" +
 			"资源总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
 			"不确定有什么可用能力时，可以省略 query 只给 kind，按名称列出该类资源再挑。" +
 			"命中多个同名资源时先让用户选择，不要自行假设。",
@@ -175,7 +176,7 @@ func resourceSearch() Tool {
   "type": "object",
   "properties": {
     "query": {"type": "string", "description": "检索关键词，用能力名或任务关键词，如 周报、pdf、数据库；省略时需同时给 kind"},
-    "kind": {"type": "string", "enum": ["skills", "tools", "mcps"], "description": "只检索某一类，省略则全部"},
+    "kind": {"type": "string", "enum": ["skills", "tools", "mcps", "components"], "description": "只检索某一类，省略则全部"},
     "limit": {"type": "integer", "description": "返回条数，默认 8，最大 20"}
   },
   "additionalProperties": false
@@ -198,7 +199,7 @@ func resourceSearch() Tool {
 			query := strings.TrimSpace(in.Query)
 			kind := normalizeSourceKind(in.Kind)
 			if in.Kind != "" && kind == "" {
-				return "", fmt.Errorf("kind 只能是 skills / tools / mcps")
+				return "", fmt.Errorf("kind 只能是 skills / tools / mcps / components")
 			}
 			// 不再常驻技能索引，所以允许「只给 kind」按名称拉取该类目录
 			if query == "" && kind == "" {
@@ -264,7 +265,7 @@ func resourceSearch() Tool {
 
 // resourceRead 读取资源文件：当前空间优先，找不到再到系统空间找。
 //
-// 普通空间根下的技能（<技能名>/SKILL.md）与系统空间的 skills/<技能名>/SKILL.md
+// 空间里的技能草稿（plugins/<技能slug>/SKILL.md）与内置件（published/skills/<slug>/<version>/SKILL.md）
 // 用同一个工具读取，模型不需要关心资源在哪一侧。
 func resourceRead() Tool {
 	return Tool{
@@ -275,7 +276,7 @@ func resourceRead() Tool {
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "相对空间 files 的路径，如 周报生成/SKILL.md 或 skills/空间管理/SKILL.md"},
+    "path": {"type": "string", "description": "相对空间 files 的路径，如 plugins/weekly_report/SKILL.md 或 published/skills/builtin_space/1.0.1/SKILL.md"},
     "offset": {"type": "integer", "description": "起始字节偏移，默认 0"},
     "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 24576"}
   },
@@ -333,6 +334,8 @@ func normalizeSourceKind(kind string) string {
 		return "tools"
 	case "mcp", "mcps":
 		return "mcps"
+	case "component", "components":
+		return "components"
 	default:
 		return ""
 	}

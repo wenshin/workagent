@@ -14,7 +14,6 @@ import (
 	"github.com/workagent/auto-agent/internal/admin"
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agent/builtin"
-	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/confstore"
 	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
 	_ "github.com/workagent/auto-agent/internal/agent/direct"
@@ -24,6 +23,7 @@ import (
 	"github.com/workagent/auto-agent/internal/identity"
 	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/sandbox"
@@ -48,6 +48,8 @@ type App struct {
 	resourceH   *resource.Handler
 	sessionSvc  *session.Service
 	sessionH    *session.Handler
+	pluginSvc   *plugin.Manager
+	pluginH     *plugin.Handler
 	adminH      *admin.Handler
 }
 
@@ -197,8 +199,52 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		log.Info("命令执行沙箱已就绪", "backend", shellRunner.Name())
 	}
 
-	// 搜索（§5.6.1）：出网统一走 Guard。
+	// 搜索注册表先于插件管理器构造：kind=source 的插件在安装/启用时直接注册进来，
+	// 装完即生效，不需要重启服务。
 	searchReg := search.NewRegistry(searchProvider)
+
+	// 插件体系（docs/插件体系设计.md）：五类插件共用清单与生命周期。
+	// 脚本插件跑在同一个沙箱里，密钥只经宿主替换，插件进程里没有明文。
+	pluginSvc, err := plugin.New(plugin.Options{
+		Store:          st,
+		Storage:        fs,
+		Runner:         shellRunner,
+		Secrets:        secretStore,
+		Logger:         log,
+		Invoker:        invoker,
+		RuntimeDir:     filepath.Join(cfg.StorageRoot, "plugin-runtime"),
+		DefaultInstall: cfg.PluginsDefaultInstall,
+		Sources:        searchReg,
+		OnChange: func(ctx context.Context, spaceID string) {
+			if err := spaceSvc.RebuildIndex(ctx, spaceID); err != nil {
+				log.Warn("重建空间索引失败", "space", spaceID, "err", err)
+			}
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("初始化插件管理器失败: %w", err)
+	}
+	// 插件工具与内置工具平级，统一走 Invoker 的策略链与审计。
+	registry.SetPluginProvider(pluginSvc)
+	// 已安装插件（含未落副本的预置件）进检索池；published/... 路径由插件层解析。
+	spaceSvc.SetInstalledSource(pluginSvc.InstalledSources)
+	spaceSvc.SetPublishedReader(pluginSvc.ReadPublished)
+	// 本地插件必须启用才进检索池（未启用的草稿仍可在文件树里编辑）。
+	spaceSvc.SetLocalPluginSource(pluginSvc.LocalEnabledMap)
+	// 直接删 plugins/<slug>/ 是文件操作，绕过了插件接口：删完要让运行时缓存失效。
+	spaceSvc.SetPluginChanged(pluginSvc.Reload)
+	// 新空间创建后补装部署者配置的默认安装集；失败只影响该空间的预装。
+	spaceSvc.SetSpaceCreated(func(ctx context.Context, spaceID string) {
+		if err := pluginSvc.EnsureBootstrap(ctx, spaceID); err != nil {
+			log.Warn("初始化空间默认安装集失败", "space", spaceID, "err", err)
+		}
+	})
+	// 启动期 reconcile：发布平台预置插件、一次性迁移旧技能目录、补默认安装集。
+	if err := pluginSvc.Bootstrap(context.Background()); err != nil {
+		log.Warn("插件启动初始化失败（不影响服务启动）", "err", err)
+	}
+
+	// 搜索（§5.6.1）：出网统一走 Guard。
 	keyFunc := func(ctx context.Context) (string, error) {
 		if !searchExplicit {
 			return secretStore.Get(ctx, search.SecretScope, searchName)
@@ -260,9 +306,12 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
-	agentLoader := agentspec.NewLoader(spaceSvc)
 
-	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, agentLoader, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
+	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
+	// 智能体也可以是插件（kind=agent）：系统空间安装的智能体对所有空间可选。
+	sessionSvc.SetAgentPlugins(pluginSvc)
+	// 插件试跑：会话里写完草稿直接验配置
+	sessionSvc.SetPluginTry(pluginSvc)
 
 	return &App{
 		cfg:         cfg,
@@ -275,6 +324,8 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		resourceH:   resource.NewHandler(resourceSvc, authHandler.CurrentUser, log),
 		sessionSvc:  sessionSvc,
 		sessionH:    session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
+		pluginSvc:   pluginSvc,
+		pluginH:     plugin.NewHandler(pluginSvc, st, spaceSvc, authHandler.CurrentUser, log),
 		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
 		// refs 告诉管理页「哪一条密钥真正被引用」，避免改了 A 却仍跑在 B 上。
 		adminH: admin.NewHandler(spaceSvc, secretStore, []admin.SecretRef{{
@@ -294,6 +345,7 @@ func (a *App) Handler() http.Handler {
 	a.spaceH.Register(mux)
 	a.resourceH.Register(mux)
 	a.sessionH.Register(mux)
+	a.pluginH.Register(mux)
 	a.adminH.Register(mux)
 
 	mux.HandleFunc("GET /healthz", a.healthz)

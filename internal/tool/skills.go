@@ -23,18 +23,19 @@ const (
 	maxSkillDescRunes = 1024
 )
 
-// skillCreate 在当前空间创建一个技能目录（含 .meta.json），并写入 SKILL.md。
+// skillCreate 在当前空间创建一个技能插件草稿，并写入 SKILL.md 正文。
 //
 // 目录与元数据由 space.Service.CreateSkill 负责（名字校验、权限、幂等冲突提示），
 // 工具只补写正文；这样 UI 新建技能与 Agent 新建技能走同一套规则。
+// 元数据只在 plugins/<slug>/plugin.json：SKILL.md 不写 frontmatter。
 func skillCreate() Tool {
 	return Tool{
 		Name:       "skill_create",
 		Capability: "skill.create",
-		Description: "在当前空间创建一个技能（skill）：生成技能目录、.meta.json 元数据与 SKILL.md。" +
-			"name 是技能名（同时作为目录名，不能含斜杠，不能重名），description 是一句话说明。 " +
-			"content 可选，直接作为 SKILL.md 正文，不传则写入待填充骨架；之后可用 file_write 继续完善 " +
-			"<name>/SKILL.md。用户说「帮我做一个技能」时用它。",
+		Description: "在当前空间创建一个技能插件（kind=skill）：生成 plugins/<slug>/plugin.json 与 SKILL.md。" +
+			"name 是技能展示名，description 是一句话说明（写清做什么 + 何时使用）。 " +
+			"content 可选，直接作为 SKILL.md 正文，不传则写入待填充骨架；之后可用 file_write 继续完善。" +
+			"用户说「帮我做一个技能」时用它。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -87,9 +88,9 @@ func skillCreate() Tool {
 			doc := in.Content
 			if strings.TrimSpace(doc) == "" {
 				doc = defaultSkillDoc(name, desc)
-			} else if !strings.HasPrefix(strings.TrimSpace(doc), "---") {
-				// 补齐规范要求的 YAML frontmatter，便于按元数据做检索与展示
-				doc = skillFrontMatter(name, desc) + "\n" + doc
+			} else {
+				// 单一定义点：元数据只在 plugin.json，正文里带 frontmatter 会变成第二处定义。
+				doc = stripSkillFrontmatter(doc)
 			}
 			if len(doc) > maxSkillDocBytes {
 				return "", fmt.Errorf("SKILL.md 过大（%d 字节），上限 %d 字节；建议把参考资料拆到子文件并用相对路径引用",
@@ -114,17 +115,16 @@ func skillCreate() Tool {
 			if len(doc) > 16*1024 {
 				hint = "；正文偏长，建议把模板/样例拆到子文件并在 SKILL.md 中相对路径引用"
 			}
-			return fmt.Sprintf("已创建技能 %s（%s）；SKILL.md 已写入 %d 字节，可继续用 file_write 完善 %s/SKILL.md%s",
-				dir, desc, len(doc), dir, hint), nil
+			return fmt.Sprintf("已创建技能插件 %s（%s），位于 %s；SKILL.md 已写入 %d 字节。"+
+				"元数据（名称/描述）在 %s/plugin.json，正文用 file_write 继续完善 %s/SKILL.md%s",
+				name, desc, dir, len(doc), dir, dir, hint), nil
 		},
 	}
 }
 
-// defaultSkillDoc 是新建技能的骨架，遵循 Agent Skills 规范：
-// YAML frontmatter 提供元数据，正文只写「何时用 / 输入 / 步骤 / 验收」，
-// 长内容拆到同目录子文件（最多一层引用），避免单个 SKILL.md 过长。
+// defaultSkillDoc 是新建技能的骨架：只写流程，长内容拆到同目录子文件。
 func defaultSkillDoc(name, desc string) string {
-	return skillFrontMatter(name, desc) + fmt.Sprintf(`
+	return fmt.Sprintf(`
 # %s
 
 ## 何时使用
@@ -148,10 +148,23 @@ func defaultSkillDoc(name, desc string) string {
 ## 参考文件（可选，最多一层）
 
 - 模板、样例、接口说明放同目录子文件，用相对路径引用，例如 `+"`templates.md`"+`。
+
+> 元数据只在 plugin.json 的 name / description 里，请勿在正文写 YAML frontmatter。
 `, name)
 }
 
-// skillFrontMatter 生成规范要求的 YAML frontmatter。
-func skillFrontMatter(name, desc string) string {
-	return fmt.Sprintf("---\nname: %q\ndescription: %q\n---\n", name, desc)
+// stripSkillFrontmatter 去掉旧格式的 YAML frontmatter（导入/迁移时兜底）。
+func stripSkillFrontmatter(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if !strings.HasPrefix(trimmed, "---") {
+		return body
+	}
+	rest := strings.TrimPrefix(trimmed, "---")
+	rest = strings.TrimLeft(rest, "\r\n")
+	for _, sep := range []string{"\n---\n", "\n---\r\n", "\r\n---\r\n"} {
+		if i := strings.Index(rest, sep); i >= 0 {
+			return strings.TrimLeft(rest[i+len(sep):], "\r\n")
+		}
+	}
+	return body
 }

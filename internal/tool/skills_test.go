@@ -50,10 +50,14 @@ func TestSkillCreateWritesSkeleton(t *testing.T) {
 	}
 
 	doc := readWorkspaceFile(t, env, "周报生成/SKILL.md")
-	for _, want := range []string{"---\nname:", "description:", "# 周报生成", "每周汇总进展并生成周报", "## 步骤"} {
+	for _, want := range []string{"# 周报生成", "## 步骤"} {
 		if !strings.Contains(doc, want) {
 			t.Fatalf("骨架缺少 %q: %s", want, doc)
 		}
+	}
+	// 元数据只在 plugin.json：正文不允许再出现 YAML frontmatter
+	if strings.HasPrefix(doc, "---") {
+		t.Fatalf("SKILL.md 不应带 frontmatter: %s", doc)
 	}
 }
 
@@ -65,26 +69,21 @@ func TestSkillCreateUsesProvidedContent(t *testing.T) {
 	callTool(t, skillCreate(), env, `{"name":"日报","description":"每日进展","content":"# 日报\n\n固定模板"}`)
 
 	doc := readWorkspaceFile(t, env, "日报/SKILL.md")
-	// 缺少 frontmatter 时按规范补齐，正文保持不变
-	if !strings.HasPrefix(doc, "---\nname: \"日报\"\n") {
-		t.Fatalf("缺少规范 frontmatter: %q", doc)
-	}
-	if !strings.HasSuffix(doc, "# 日报\n\n固定模板") {
-		t.Fatalf("正文应保留: %q", doc)
+	if doc != "# 日报\n\n固定模板" {
+		t.Fatalf("正文应原样保留且不加 frontmatter: %q", doc)
 	}
 }
 
-func TestSkillCreateKeepsExistingFrontMatter(t *testing.T) {
+func TestSkillCreateStripsExistingFrontMatter(t *testing.T) {
 	env := newTestEnv(t)
 	var calls []string
 	stubCreateSkill(t, &env, &calls)
 
-	content := "---\nname: 日报\ndescription: 自定义\n---\n\n# 日报"
 	callTool(t, skillCreate(), env, `{"name":"日报","description":"每日进展","content":"---\nname: 日报\ndescription: 自定义\n---\n\n# 日报"}`)
 
 	doc := readWorkspaceFile(t, env, "日报/SKILL.md")
-	if doc != content {
-		t.Fatalf("已带 frontmatter 的内容不应被改写: %q", doc)
+	if doc != "# 日报" {
+		t.Fatalf("导入的 frontmatter 应被剥离（元数据只在 plugin.json）: %q", doc)
 	}
 }
 

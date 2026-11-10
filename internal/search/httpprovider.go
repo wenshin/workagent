@@ -39,8 +39,10 @@ func NewHTTPJSON(name, endpoint string, spec Spec, key KeyFunc, guard *Guard) (*
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("endpoint 不是合法 URL: %q", ep)
 	}
-	if u.Scheme != "https" {
-		return nil, fmt.Errorf("endpoint 只允许 https，收到 %q", u.Scheme)
+	// 这里只做形状校验：是否允许明文由 Guard 决定（内网源的 allow_private）。
+	// 同一条策略不要写两处，否则「构造通过、请求被拒」会变成很难查的错。
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return nil, fmt.Errorf("endpoint 只允许 http / https，收到 %q", u.Scheme)
 	}
 	return &HTTPJSON{name: name, endpoint: ep, spec: spec, key: key, guard: guard}, nil
 }
@@ -191,17 +193,19 @@ func (h *HTTPJSON) parse(data []byte, status int) ([]Result, error) {
 
 	results := make([]Result, 0, len(raw))
 	for _, item := range raw {
-		link := text(lookup(item, rs.URL))
-		if strings.TrimSpace(link) == "" {
-			continue
-		}
-		results = append(results, Result{
-			Title:       truncateRunes(stripTags(text(lookup(item, rs.Title))), 120),
-			URL:         link,
-			Snippet:     truncateRunes(stripTags(text(lookup(item, rs.Snippet))), 400),
+		// 归一化只有一处出口（search.Normalize）：spec 与 script 两条路径
+		// 各自截断会让「换实现方式」悄悄改变模型看到的内容。
+		norm, ok := Normalize(Result{
+			Title:       text(lookup(item, rs.Title)),
+			URL:         text(lookup(item, rs.URL)),
+			Snippet:     text(lookup(item, rs.Snippet)),
 			PublishedAt: text(lookup(item, rs.PublishedAt)),
 			Source:      h.name,
 		})
+		if !ok {
+			continue
+		}
+		results = append(results, norm)
 	}
 	return results, nil
 }

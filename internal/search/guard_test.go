@@ -36,8 +36,19 @@ func TestNewGuardNormalizesRules(t *testing.T) {
 	if !g.Allowed("api.bocha.com") {
 		t.Error("协议前缀与端口应被规整掉")
 	}
-	if g.Allowed("127.0.0.1") {
-		t.Error("IP 字面量不应成为白名单规则")
+	// IP 字面量要保留：内网源常写成 https://10.1.2.3:9200。
+	// 白名单只回答「允许打到哪」，能不能打私网由拨号期的 dialAllowed 决定。
+	if !g.Allowed("127.0.0.1") {
+		t.Error("IP 字面量应保留在白名单里")
+	}
+	if g.dialAllowed(net.ParseIP("127.0.0.1")) {
+		t.Error("普通 Guard 仍应拒绝私网地址")
+	}
+	if !NewSourceGuard([]string{"127.0.0.1"}, true).dialAllowed(net.ParseIP("127.0.0.1")) {
+		t.Error("内网源应放开私网")
+	}
+	if NewSourceGuard([]string{"127.0.0.1"}, true).dialAllowed(net.ParseIP("169.254.169.254")) {
+		t.Error("即使 allow_private 也不能读链路本地地址")
 	}
 	if !g.Allowed("example.com") {
 		t.Error("带端口的规则应规整为域名")

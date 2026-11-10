@@ -47,6 +47,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// skill 本质是带 .meta.json 的特殊目录
 	mux.HandleFunc("POST /spaces/{id}/skills", h.createSkill)
+	// 插件草稿：kind 决定骨架（技能/工具/MCP/组件/智能体/搜索源）
+	mux.HandleFunc("POST /spaces/{id}/drafts", h.createDraft)
 	// 当前空间 + 系统空间合并后的技能列表，供会话技能选择器使用
 	mux.HandleFunc("GET /spaces/{id}/skills", h.listSkills)
 
@@ -205,8 +207,14 @@ type dirDTO struct {
 	Path    string `json:"path"`
 	Name    string `json:"name"`
 	IsSkill bool   `json:"is_skill"`
+	// PluginKind 非空表示该目录是一个插件草稿，值即插件类型。
+	PluginKind string `json:"plugin_kind,omitempty"`
 	// Builtin 表示系统空间的内置目录（skills / tools / mcps），不可改名删除
 	Builtin     bool   `json:"builtin"`
+	Installed   bool   `json:"installed,omitempty"`
+	Local       bool   `json:"local,omitempty"`
+	Mutable     bool   `json:"mutable,omitempty"`
+	Enabled     bool   `json:"enabled,omitempty"`
 	Description string `json:"description,omitempty"`
 }
 
@@ -216,7 +224,12 @@ func toDirDTO(d Dir) dirDTO {
 		Path:        d.Path,
 		Name:        d.Name,
 		IsSkill:     d.IsSkill,
+		PluginKind:  d.PluginKind,
 		Builtin:     d.Builtin,
+		Installed:   d.Installed,
+		Local:       d.Local,
+		Mutable:     d.Mutable,
+		Enabled:     d.Enabled,
 		Description: d.Description,
 	}
 }
@@ -378,6 +391,32 @@ func (h *Handler) createSkill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dir, err := h.svc.CreateSkill(r.Context(), user.ID, r.PathValue("id"), req.Name, req.Description)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusCreated, map[string]any{"dir": toDirDTO(dir)})
+}
+
+// createDraft 按类型建插件草稿：技能 / 工具 / MCP / 组件 / 智能体 / 搜索源共用一条路径，
+// 差别只在骨架文件与清单字段，前端不需要为每类各开一个接口。
+func (h *Handler) createDraft(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Kind        string `json:"kind"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := platform.DecodeJSON(r, &req); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
+		return
+	}
+
+	dir, err := h.svc.CreateDraft(r.Context(), user.ID, r.PathValue("id"), req.Kind, req.Name, req.Description)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return

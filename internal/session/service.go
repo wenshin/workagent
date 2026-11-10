@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -80,27 +81,44 @@ type Service struct {
 	memory    *ctxmgr.Manager
 	// runBudget 是单次回答的墙钟上限（ctx 兜底），由 LLM_MAX_WALL_CLOCK 加余量得到
 	runBudget time.Duration
-	// agents 是智能体设定加载器，为 nil 时会话不注入追加提示词
-	agents *agentspec.Loader
+	// agentPlugins 是智能体来源（kind=agent 插件），为空时不注入追加提示词
+	agentPlugins AgentPluginSource
 	// search 是搜索 provider 注册表，为 nil 时 web_search 返回「能力未配置」
 	search *search.Registry
 	// shell 是命令执行沙箱，为 nil 时 shell_exec 返回「能力未配置」
 	shell sandbox.Runner
-	log   *slog.Logger
+	// pluginTry 是插件试跑（plugin_try），为 nil 时该工具不可用
+	pluginTry tool.PluginTry
+	log       *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
 // wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
-func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, agentLoader *agentspec.Loader, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
+func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
 	if wallClock <= 0 {
 		wallClock = defaultRunBudget
 	}
 	return &Service{
 		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
-		memory: memory, agents: agentLoader, search: searcher, shell: shell,
+		memory: memory, search: searcher, shell: shell,
 		runBudget: wallClock + runBudgetBackstopMargin, log: log,
 	}
 }
+
+// AgentPluginSource 提供插件化智能体（kind=agent）。
+//
+// 之所以定义接口而不是直接依赖插件包：会话层只需要「有哪些智能体」和「某个智能体的正文」，
+// 不关心它来自发布件、空间安装还是系统空间的全局安装。
+type AgentPluginSource interface {
+	ListAgentPlugins(ctx context.Context, spaceID string) ([]agentspec.Summary, error)
+	ResolveAgentPlugin(ctx context.Context, spaceID, slug string) (agentspec.Resolved, error)
+}
+
+// SetAgentPlugins 注入插件化智能体来源；不注入时行为与旧版完全一致。
+func (s *Service) SetAgentPlugins(src AgentPluginSource) { s.agentPlugins = src }
+
+// SetPluginTry 注入插件试跑能力；不注入时 plugin_try 返回「能力未配置」。
+func (s *Service) SetPluginTry(src tool.PluginTry) { s.pluginTry = src }
 
 // AgentReady 返回模型服务是否可用。
 func (s *Service) AgentReady() bool { return s.agent != nil && s.agent.Ready() }
@@ -169,7 +187,7 @@ func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir,
 		return store.Session{}, err
 	}
 
-	agent, err := s.resolveAgent(ctx, agentID)
+	agent, err := s.resolveAgent(ctx, spaceID, agentID)
 	if err != nil {
 		return store.Session{}, err
 	}
@@ -184,21 +202,21 @@ func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir,
 
 // resolveAgent 取会话要绑定的智能体。
 //
-// 请求为空时用默认的 base；系统空间尚未种子化（全新部署）时退化为「无追加设定」，
-// 不阻塞会话创建。显式指定了不存在的智能体则报错，避免用户以为选上了。
-func (s *Service) resolveAgent(ctx context.Context, rawID string) (agentspec.Resolved, error) {
+// 请求为空时用默认的 base 插件；base 插件缺失（系统空间尚未种子化）时退化为
+// 「无追加设定」，不阻塞会话创建。显式指定了不存在的智能体则报错，避免用户以为选上了。
+func (s *Service) resolveAgent(ctx context.Context, spaceID, rawID string) (agentspec.Resolved, error) {
 	id := strings.TrimSpace(rawID)
 	useDefault := id == ""
 	if useDefault {
 		id = agentspec.BaseID
 	}
-	if s.agents == nil {
+	if s.agentPlugins == nil {
 		return agentspec.Resolved{ID: id}, nil
 	}
 
-	r, err := s.agents.Get(ctx, id)
+	r, err := s.agentPlugins.ResolveAgentPlugin(ctx, spaceID, id)
 	if err != nil {
-		if useDefault && errors.Is(err, agentspec.ErrNotFound) {
+		if useDefault && errors.Is(err, store.ErrNotFound) {
 			return agentspec.Resolved{}, nil
 		}
 		return agentspec.Resolved{}, err
@@ -207,14 +225,22 @@ func (s *Service) resolveAgent(ctx context.Context, rawID string) (agentspec.Res
 }
 
 // Agents 返回可选的智能体清单，供会话创建时的选择器使用。
+//
+// 唯一来源是 kind=agent 插件：系统空间安装的对所有空间可选，普通空间的只在本空间可选。
 func (s *Service) Agents(ctx context.Context, userID, spaceID string) ([]agentspec.Summary, error) {
 	if _, err := s.spaces.Get(ctx, userID, spaceID); err != nil {
 		return nil, err
 	}
-	if s.agents == nil {
+	if s.agentPlugins == nil {
 		return nil, nil
 	}
-	return s.agents.List(ctx)
+	plugins, err := s.agentPlugins.ListAgentPlugins(ctx, spaceID)
+	if err != nil {
+		s.log.Warn("读取智能体插件失败", "space", spaceID, "err", err)
+		return nil, nil
+	}
+	sort.Slice(plugins, func(i, j int) bool { return plugins[i].ID < plugins[j].ID })
+	return plugins, nil
 }
 
 // normalizeDirPath 统一目录路径格式：去掉首尾斜杠与空白，空串表示空间根。
@@ -418,11 +444,11 @@ func (s *Service) Chat(
 		}
 	}
 
-	// 智能体：优先用建会话时固化的提示词，管理员事后改 agents/ 不影响已开会话。
-	// 老会话（迁移前创建）没有快照，这里按当前配置补一次。
+	// 智能体：优先用建会话时固化的提示词，管理员事后改智能体不影响已开会话。
+	// 老会话（智能体还写在 agents/ 的年代）没有快照，这里按当前插件补一次。
 	agentPrompt := sess.AgentPrompt
-	if agentPrompt == "" && sess.AgentID != "" && s.agents != nil {
-		if r, err := s.agents.Get(ctx, sess.AgentID); err == nil {
+	if agentPrompt == "" && sess.AgentID != "" && s.agentPlugins != nil {
+		if r, err := s.agentPlugins.ResolveAgentPlugin(ctx, sess.SpaceID, sess.AgentID); err == nil {
 			agentPrompt = r.Prompt
 		} else {
 			s.log.Warn("智能体设定加载失败", "session_id", sessionID, "agent_id", sess.AgentID, "err", err)
@@ -460,6 +486,8 @@ func (s *Service) Chat(
 			// 命令执行：沙箱后端在装配层选定（bwrap / sandbox-exec / local），
 			// 工具只拿到 Runner，无法自行降级到无隔离执行。
 			Shell: s.shell,
+			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
+			Plugins: s.pluginTry,
 			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
 			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
 			CreateSkill: func(ctx context.Context, name, description string) (string, error) {

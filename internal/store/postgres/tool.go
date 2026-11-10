@@ -183,3 +183,26 @@ values (nullif($1, '')::uuid, nullif($2, '')::uuid, $3, $4::jsonb, $5, $6, $7)`
 	_, err := d.pool.Exec(ctx, q, r.SessionID, r.RunID, r.ToolName, args, r.Status, r.LatencyMS, r.RiskLevel)
 	return err
 }
+
+// DeletePluginToolRecords 卸载插件时清理它注册的能力、工具与绑定。
+//
+// 工具名约定：工具插件就是 slug，MCP 是 slug__<远端工具>，所以按前缀匹配。
+// audit_log / run_step 是历史，不在这里删。
+func (d *DB) DeletePluginToolRecords(ctx context.Context, slug string) error {
+	pattern := slug + `\_\_%`
+	const q = `
+with doomed as (
+    select id from tool where name = $1 or name like $2
+)
+delete from tool_binding where tool_id in (select id from doomed)`
+	if _, err := d.pool.Exec(ctx, q, slug, pattern); err != nil {
+		return err
+	}
+	if _, err := d.pool.Exec(ctx,
+		`delete from tool where name = $1 or name like $2`, slug, pattern); err != nil {
+		return err
+	}
+	_, err := d.pool.Exec(ctx,
+		`delete from capability where name = $1 or name like $2`, slug, pattern)
+	return err
+}

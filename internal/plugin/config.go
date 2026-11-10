@@ -1,0 +1,261 @@
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/workagent/auto-agent/internal/store"
+)
+
+// 安装级配置键：MCP 插件在不同空间可能连不同服务、用不同凭证，
+// 这些值属于「安装」而不是「发布」，所以放在 plugin_install.config。
+const (
+	ConfigURL      = "url"
+	ConfigAuthName = "auth_name"
+	ConfigSecret   = "secret"
+)
+
+// 凭证名 / Header 名只允许标识符字符：不允许表达式、路径或空格的逃逸空间。
+var configNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// ConfigField 是一个可编辑项，前端据此渲染表单，不写死字段名。
+type ConfigField struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Type        string `json:"type"`
+	Required    bool   `json:"required"`
+	Placeholder string `json:"placeholder,omitempty"`
+	Help        string `json:"help,omitempty"`
+}
+
+// ConfigView 是配置页的数据：字段定义 + 当前生效值（凭证只回显名字，不回显密钥）。
+type ConfigView struct {
+	Slug   string            `json:"slug"`
+	Kind   string            `json:"kind"`
+	Fields []ConfigField     `json:"fields"`
+	Values map[string]string `json:"values"`
+}
+
+// configFields 目前只有 MCP 有空间级配置：服务地址与鉴权。
+// 其它类型的参数属于清单/内容，不该在安装页改（否则等于绕过发布校验）。
+func configFields(meta Manifest) []ConfigField {
+	if meta.Kind != KindMCP || meta.Transport == nil {
+		return nil
+	}
+	fields := []ConfigField{{
+		Key: ConfigURL, Label: "服务地址", Type: "url", Required: true,
+		Placeholder: "https://mcp.example.com/mcp",
+		Help:        "安装级覆盖，不影响发布快照；只允许 https（本机调试可用 http://127.0.0.1）",
+	}}
+	if meta.Auth != nil {
+		fields = append(fields, ConfigField{
+			Key: ConfigAuthName, Label: "鉴权 Header", Type: "text",
+			Placeholder: "Authorization",
+			Help:        "留空表示沿用插件清单里的设置",
+		}, ConfigField{
+			Key: ConfigSecret, Label: "凭证名称", Type: "text",
+			Help: "密钥本身在「密钥配置」里维护，这里只填引用名，不存明文",
+		})
+	}
+	return fields
+}
+
+func configValues(meta Manifest, raw json.RawMessage) map[string]string {
+	values := map[string]string{}
+	if meta.Transport != nil {
+		values[ConfigURL] = meta.Transport.URL
+	}
+	if meta.Auth != nil {
+		values[ConfigAuthName] = meta.Auth.Name
+		values[ConfigSecret] = meta.Auth.Secret
+	}
+	var stored map[string]string
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &stored)
+	}
+	for k, v := range stored {
+		if v != "" {
+			values[k] = v
+		}
+	}
+	return values
+}
+
+// ConfigView 返回安装级配置；未安装时返回冲突错误（配置只对安装生效）。
+func (m *Manager) ConfigView(ctx context.Context, spaceID, slug string) (ConfigView, error) {
+	in, err := m.installOf(ctx, spaceID, slug)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	meta, err := m.installedManifest(ctx, in)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	return ConfigView{
+		Slug: slug, Kind: string(meta.Kind),
+		Fields: configFields(meta), Values: configValues(meta, in.Config),
+	}, nil
+}
+
+// UpdateConfig 保存安装级配置：只改配置、不动版本，保存后立刻重建运行时。
+func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string, values map[string]string) (ConfigView, error) {
+	in, err := m.installOf(ctx, spaceID, slug)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	meta, err := m.installedManifest(ctx, in)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	if len(configFields(meta)) == 0 {
+		return ConfigView{}, fmt.Errorf("%w：该插件没有可配置项", ErrConflict)
+	}
+	clean, err := normalizeConfig(values)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	raw, err := json.Marshal(clean)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	if err := m.o.Store.UpdatePluginInstallConfig(ctx, spaceID, in.PluginID, raw); err != nil {
+		return ConfigView{}, err
+	}
+
+	// 配置变了就整空间重载：只删单个 slug 会让 ensureLoaded 误以为已加载。
+	m.mu.Lock()
+	delete(m.inst, spaceID)
+	for key := range m.mcpCs {
+		if strings.HasPrefix(key, spaceID+"/") {
+			delete(m.mcpCs, key)
+		}
+	}
+	m.mu.Unlock()
+	if err := m.ensureLoaded(ctx, spaceID); err != nil {
+		m.o.Logger.Warn("按新配置重建插件运行时失败", "space", spaceID, "slug", slug, "err", err)
+	}
+
+	keys := make([]string, 0, len(clean))
+	for k := range clean {
+		keys = append(keys, k)
+	}
+	m.recordAudit(ctx, userID, "plugin.config", slug, in.Version,
+		map[string]any{"space": spaceID, "fields": keys})
+
+	updated, err := m.installOf(ctx, spaceID, slug)
+	if err != nil {
+		return ConfigView{}, err
+	}
+	return ConfigView{
+		Slug: slug, Kind: string(meta.Kind),
+		Fields: configFields(meta), Values: configValues(meta, updated.Config),
+	}, nil
+}
+
+// installedManifest 读取安装版本对应的清单（配置字段以它为准）。
+func (m *Manager) installedManifest(ctx context.Context, in store.PluginInstall) (Manifest, error) {
+	p, err := m.o.Store.GetPluginBySlug(ctx, in.Slug)
+	if err != nil {
+		return Manifest{}, err
+	}
+	v, err := m.o.Store.GetPluginVersion(ctx, p.ID, in.Version)
+	if err != nil {
+		return Manifest{}, err
+	}
+	return Parse(v.Manifest, true)
+}
+
+// applyInstallConfig 把安装级覆盖合并进清单；发布快照本身保持不变。
+func (m *Manager) applyInstallConfig(ctx context.Context, spaceID, slug string, meta Manifest) Manifest {
+	if meta.Kind != KindMCP {
+		return meta
+	}
+	in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug)
+	if err != nil || len(in.Config) == 0 {
+		return meta
+	}
+	var cfg map[string]string
+	if json.Unmarshal(in.Config, &cfg) != nil {
+		return meta
+	}
+	if v := strings.TrimSpace(cfg[ConfigURL]); v != "" {
+		transport := Transport{Type: "http"}
+		if meta.Transport != nil {
+			transport.Type = meta.Transport.Type
+		}
+		transport.URL = v
+		meta.Transport = &transport
+	}
+	auth := Auth{}
+	if meta.Auth != nil {
+		auth = *meta.Auth
+	}
+	if v := strings.TrimSpace(cfg[ConfigAuthName]); v != "" {
+		auth.Name = v
+	}
+	if v := strings.TrimSpace(cfg[ConfigSecret]); v != "" {
+		auth.Secret = v
+	}
+	if auth != (Auth{}) {
+		meta.Auth = &auth
+	}
+	return meta
+}
+
+// normalizeConfig 校验并裁剪覆盖值：空值表示「沿用清单」，未知键直接拒绝。
+func normalizeConfig(values map[string]string) (map[string]string, error) {
+	allowed := map[string]bool{ConfigURL: true, ConfigAuthName: true, ConfigSecret: true}
+	clean := map[string]string{}
+	for key, raw := range values {
+		if !allowed[key] {
+			return nil, fmt.Errorf("未知配置项：%s", key)
+		}
+		v := strings.TrimSpace(raw)
+		switch key {
+		case ConfigURL:
+			if v == "" {
+				continue
+			}
+			if err := validateMCPURL(v); err != nil {
+				return nil, err
+			}
+			clean[key] = v
+		case ConfigAuthName, ConfigSecret:
+			if v == "" {
+				continue
+			}
+			if !configNameRe.MatchString(v) {
+				return nil, fmt.Errorf("%s 只能是字母、数字、点、下划线或中划线（最多 64 位）", key)
+			}
+			clean[key] = v
+		}
+	}
+	return clean, nil
+}
+
+// validateMCPURL：默认只允许 https；本机调试放行 http://localhost / 127.0.0.1。
+func validateMCPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("服务地址不是合法 URL")
+	}
+	if u.User != nil {
+		return fmt.Errorf("服务地址不能带用户名密码，请改用凭证名称")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("服务地址必须使用 https（仅本机允许 http）")
+	default:
+		return fmt.Errorf("服务地址必须使用 https")
+	}
+}

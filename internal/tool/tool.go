@@ -23,6 +23,12 @@ import (
 	"github.com/workagent/auto-agent/internal/store"
 )
 
+// PluginTry 抽象「插件试跑」，避免 tool 包反向依赖 plugin 包。
+type PluginTry interface {
+	// DryRunJSON 返回可直接放进上下文的 JSON 回执；失败时也要尽量带回诊断。
+	DryRunJSON(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (string, error)
+}
+
 // Env 是工具执行时的上下文，决定能看到哪些数据。
 type Env struct {
 	UserID    string
@@ -51,6 +57,10 @@ type Env struct {
 	// Shell 是命令执行沙箱（internal/sandbox），为 nil 时 shell_exec 不可用。
 	// 隔离档位、超时与环境清理都由它的实现决定，工具只负责拼参数与格式化输出。
 	Shell sandbox.Runner
+
+	// Plugins 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
+	// 「对话开发插件」如果没有试跑，就只能发布上线后才发现配置错。
+	Plugins PluginTry
 }
 
 // Tool 是一个可被模型调用的工具。
@@ -109,13 +119,25 @@ type MCPProvider interface {
 	Call(ctx context.Context, serverID, toolName string, args json.RawMessage) (string, error)
 }
 
+// PluginProvider 抽象插件工具来源（docs/插件体系设计.md），
+// 避免 tool 包依赖 plugin 的具体实现。
+type PluginProvider interface {
+	// Tools 返回该空间已安装并启用的插件工具。
+	Tools(ctx context.Context, spaceID string) ([]Tool, error)
+}
+
 // Registry 组装当前可用的工具集合。
 type Registry struct {
-	store  store.Store
-	mcp    MCPProvider
-	limits Limits
-	log    *slog.Logger
+	store   store.Store
+	mcp     MCPProvider
+	plugins PluginProvider
+	limits  Limits
+	log     *slog.Logger
 }
+
+// SetPluginProvider 注入插件来源。插件在装配层晚于 Registry 构造，
+// 因此用 setter 而不是构造函数参数，避免把装配顺序变成隐式约束。
+func (r *Registry) SetPluginProvider(p PluginProvider) { r.plugins = p }
 
 // Limits 控制单次对话暴露给模型的工具规模（§5.7.2 Tool 结果与上下文保护）。
 type Limits struct {
@@ -153,6 +175,19 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 			tools = append(tools, mcpTool(item, r.mcp))
 		}
 	}
+	if r.plugins != nil {
+		extra, err := r.plugins.Tools(ctx, env.SpaceID)
+		if err != nil {
+			// 插件坏了不能拖垮对话：降级为「本次没有插件工具」，并在审计里留痕。
+			r.log.Warn("加载插件工具失败", "space", env.SpaceID, "err", err)
+		} else {
+			tools = append(tools, extra...)
+		}
+	}
+
+	// 同名工具只能留一个：模型看到两个同名函数会随机选，且策略判定会串味。
+	// 内置优先（先出现），插件与 MCP 重名时让路并留日志。
+	tools = dedupeByName(tools, r.log)
 
 	bindings, err := r.store.ListToolBindings(ctx, env.SpaceID, env.UserID)
 	if err != nil {
@@ -203,6 +238,24 @@ func Find(tools []Tool, name string) (Tool, bool) {
 		}
 	}
 	return Tool{}, false
+}
+
+// dedupeByName 去掉同名工具，保留最先出现的一个（内置 → MCP → 插件）。
+func dedupeByName(tools []Tool, log *slog.Logger) []Tool {
+	seen := make(map[string]struct{}, len(tools))
+	out := tools[:0]
+	for _, t := range tools {
+		key := strings.ToLower(t.Name)
+		if _, ok := seen[key]; ok {
+			if log != nil {
+				log.Warn("工具名重复，已忽略后出现的一个", "tool", t.Name, "runtime", t.Runtime)
+			}
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }
 
 func mcpTool(item MCPTool, provider MCPProvider) Tool {

@@ -226,21 +226,12 @@ func (d *Deno) run(ctx context.Context, in map[string]any, secret string) ([]byt
 func normalizeResults(items []Result, limit int) []Result {
 	out := make([]Result, 0, len(items))
 	for _, item := range items {
-		url := strings.TrimSpace(item.URL)
-		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		// 与声明式源共用同一套归一化，换协议不改变模型看到的内容。
+		norm, ok := Normalize(item)
+		if !ok {
 			continue
 		}
-		title := strings.TrimSpace(item.Title)
-		if title == "" {
-			title = url
-		}
-		out = append(out, Result{
-			Title:       clip(title, 300),
-			URL:         clip(url, 2048),
-			Snippet:     clip(strings.TrimSpace(item.Snippet), 2000),
-			PublishedAt: clip(strings.TrimSpace(item.PublishedAt), 64),
-			Source:      clip(strings.TrimSpace(item.Source), 64),
-		})
+		out = append(out, norm)
 		if len(out) >= limit {
 			break
 		}

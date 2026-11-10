@@ -93,7 +93,7 @@ func fileRead() Tool {
 		Name:       "file_read",
 		Capability: "fs.read",
 		Description: "读取当前空间内的文本文件（md / json / txt / yaml）。path 相对空间文件根目录，" +
-			"如 skills/空间管理/SKILL.md。长文件可用 offset / limit 分段读取。",
+			"如 plugins/weekly_report/SKILL.md。长文件可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -126,6 +126,9 @@ func fileRead() Tool {
 
 			rel, err := workspaceFilePath(in.Path)
 			if err != nil {
+				return "", err
+			}
+			if err := ensurePluginMutable(ctx, env, rel); err != nil {
 				return "", err
 			}
 			key := workspaceKey(env, rel)
@@ -183,6 +186,28 @@ func fileRead() Tool {
 	}
 }
 
+// ensurePluginMutable 阻止写入已安装插件目录：安装副本只读，只能启停/卸载。
+func ensurePluginMutable(ctx context.Context, env Env, rel string) error {
+	parts := strings.Split(rel, "/")
+	if len(parts) < 2 || parts[0] != "plugins" {
+		return nil
+	}
+	if env.Store == nil || env.SpaceID == "" {
+		return fmt.Errorf("文件存储不可用")
+	}
+	installs, err := env.Store.ListPluginInstalls(ctx, env.SpaceID)
+	if err != nil {
+		return err
+	}
+	slug := parts[1]
+	for _, in := range installs {
+		if in.Slug == slug {
+			return fmt.Errorf("插件 %s 已安装，目录为只读；请先卸载或改为本地开发插件", slug)
+		}
+	}
+	return nil
+}
+
 func fileWrite() Tool {
 	return Tool{
 		Name:       "file_write",
@@ -193,7 +218,7 @@ func fileWrite() Tool {
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "相对空间文件根目录的路径，如 skills/空间管理/SKILL.md"},
+    "path": {"type": "string", "description": "相对空间文件根目录的路径，如 plugins/weekly_report/SKILL.md"},
     "content": {"type": "string", "description": "要写入的完整文本内容"},
     "mode": {"type": "string", "enum": ["overwrite", "append", "create"], "description": "写入方式，默认 overwrite"}
   },
@@ -219,6 +244,9 @@ func fileWrite() Tool {
 
 			rel, err := workspaceFilePath(in.Path)
 			if err != nil {
+				return "", err
+			}
+			if err := ensurePluginMutable(ctx, env, rel); err != nil {
 				return "", err
 			}
 			key := workspaceKey(env, rel)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -288,6 +289,8 @@ type Store interface {
 	// ListToolBindings 返回空间维度与用户维度的有效绑定。
 	ListToolBindings(ctx context.Context, spaceID, userID string) ([]ToolBinding, error)
 	UpsertToolBinding(ctx context.Context, b ToolBinding) (ToolBinding, error)
+	// DeletePluginToolRecords 卸载插件时清掉它注册的能力/工具/绑定（审计与历史不计）。
+	DeletePluginToolRecords(ctx context.Context, slug string) error
 
 	// ---- MCP（§5.3.1 / §5.4）----
 	ListMCPServers(ctx context.Context) ([]MCPServer, error)
@@ -333,6 +336,39 @@ type Store interface {
 	DeleteResource(ctx context.Context, id string) error
 	// DeleteResourceVersion 删除一个版本；version 为空时删除 latest_version。
 	DeleteResourceVersion(ctx context.Context, resourceID, version string) error
+
+	// ---- 插件体系（docs/插件体系设计.md）----
+	// 内容以文件为准、状态以 DB 为准：草稿不落库，发布才写 plugin / plugin_version。
+	UpsertPlugin(ctx context.Context, p Plugin) (Plugin, error)
+	GetPluginBySlug(ctx context.Context, slug string) (Plugin, error)
+	ListPlugins(ctx context.Context) ([]Plugin, error)
+	AddPluginVersion(ctx context.Context, v PluginVersion, latest string) (PluginVersion, error)
+	GetPluginVersion(ctx context.Context, pluginID, version string) (PluginVersion, error)
+	ListPluginVersions(ctx context.Context, pluginID string) ([]PluginVersion, error)
+	UpsertPluginInstall(ctx context.Context, in PluginInstall) (PluginInstall, error)
+	ListPluginInstalls(ctx context.Context, spaceID string) ([]PluginInstall, error)
+	// GetPluginInstall 按「空间 + slug」取安装记录，用于配置读写。
+	GetPluginInstall(ctx context.Context, spaceID, slug string) (PluginInstall, error)
+	// UpdatePluginInstallConfig 覆盖安装级配置；只改配置，不动版本与状态。
+	UpdatePluginInstallConfig(ctx context.Context, spaceID, pluginID string, cfg json.RawMessage) error
+	DeletePluginInstall(ctx context.Context, spaceID, pluginID string) error
+	// ---- 插件候选：空间本地插件「已启用、未发布」的市场元数据 ----
+	UpsertPluginCandidate(ctx context.Context, c PluginCandidate) (PluginCandidate, error)
+	GetPluginCandidate(ctx context.Context, spaceID, slug string) (PluginCandidate, error)
+	// ListPluginCandidates 返回全部候选（市场「待发布」分类）。
+	ListPluginCandidates(ctx context.Context) ([]PluginCandidate, error)
+	// ListPluginCandidatesBySpace 返回某空间的候选，用于本地插件启用状态。
+	ListPluginCandidatesBySpace(ctx context.Context, spaceID string) ([]PluginCandidate, error)
+	// MarkPluginCandidatePublished 记录候选已发布到的 plugin；不改本地启用状态。
+	MarkPluginCandidatePublished(ctx context.Context, spaceID, slug, pluginID string) error
+	DeletePluginCandidate(ctx context.Context, spaceID, slug string) error
+	// ListAllSpaces 返回全部未删除空间，供启动时的存量迁移与默认安装集使用。
+	ListAllSpaces(ctx context.Context) ([]Space, error)
+	// CountSessionsUsingSkill 统计绑定了某个技能路径的会话，卸载前做引用检查。
+	CountSessionsUsingSkill(ctx context.Context, spaceID, prefix string) (int, error)
+	// MarkPluginBootstrapped 标记空间已完成默认安装集初始化；
+	// 返回 false 表示之前已经标记过（卸载后不再追溯安装）。
+	MarkPluginBootstrapped(ctx context.Context, spaceID string) (bool, error)
 }
 
 // Resource 是发布后的资源：独立于工作空间存储，只保留名称、版本、描述等最小信息。
@@ -394,4 +430,97 @@ type EmbeddingRecord struct {
 	Vector    []float32
 	Role      string
 	Content   string
+}
+
+// 插件状态。安装态与发布态分开：停用发布件不影响已安装的运行。
+const (
+	PluginStatusEnabled     = "enabled"
+	PluginStatusDisabled    = "disabled"
+	PluginStatusDeprecated  = "deprecated"
+	PluginInstallEnabled    = "enabled"
+	PluginInstallDisabled   = "disabled"
+	PluginVisibilityPublic  = "public"
+	PluginVisibilityPrivate = "private"
+
+	// 插件来源：组织内自建 / 平台内置 / 外部。
+	PluginOriginInternal = "internal"
+	PluginOriginSystem   = "system"
+	PluginOriginExternal = "external"
+
+	// 本地插件候选状态：只表示本空间是否启用，发布态由 plugin_id 是否为空判断。
+	PluginCandidateEnabled  = "enabled"
+	PluginCandidateDisabled = "disabled"
+)
+
+// Plugin 是已发布插件的元数据（不含内容）。草稿不落库。
+type Plugin struct {
+	ID            string
+	Slug          string
+	Kind          string
+	Name          string
+	Description   string
+	Visibility    string
+	Status        string
+	LatestVersion string
+	OwnerSpaceID  string
+	// Origin 区分组织内自建 / 平台内置 / 外部，市场分类依赖它。
+	Origin     string
+	Extensible bool
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// PluginCandidate 是空间本地插件的「启用 + 待发布」记录。
+//
+// 内容仍以空间文件为准；这里只存市场展示与状态需要的元数据。发布后
+// PluginID 指向全局 plugin，但本地插件仍可继续编辑，hash 变化即「有新版本」。
+type PluginCandidate struct {
+	ID            string
+	SpaceID       string
+	SpaceName     string
+	Slug          string
+	Kind          string
+	Name          string
+	Description   string
+	AuthorID      string
+	AuthorName    string
+	ManifestHash  string
+	Risk          int
+	Capabilities  json.RawMessage
+	Status        string
+	PluginID      string
+	PublishedName string
+	EnabledAt     time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// PluginVersion 是不可变发布快照。Manifest 是发布时的清单原文，
+// name / description 是快照，不是第二处可编辑的定义。
+type PluginVersion struct {
+	PluginID     string
+	Version      string
+	Manifest     []byte
+	ArtifactPath string
+	SHA256       string
+	Capabilities []byte
+	Risk         int
+	Notes        string
+	PublishedBy  string
+	PublishedAt  time.Time
+}
+
+// PluginInstall 是空间级安装记录：安装即授权，卸载不删审计。
+type PluginInstall struct {
+	SpaceID          string
+	PluginID         string
+	Slug             string
+	Version          string
+	Status           string
+	Risk             int
+	InstalledBy      string
+	InstalledAt      time.Time
+	DismissedVersion string
+	// Config 是空间级配置（连接地址、鉴权头、凭证名），空对象表示沿用清单。
+	Config json.RawMessage
 }

@@ -17,7 +17,7 @@ import (
 // 供 Agent 与会话技能选择器使用。隐藏文件，不进左侧树。
 const spaceIndexFile = ".meta.json"
 
-const indexVersion = 1
+const indexVersion = 2
 
 // IndexEntry 是索引中的一条资源。
 //
@@ -33,18 +33,20 @@ type IndexEntry struct {
 
 // IndexBundle 是一次读取的三类资源。
 type IndexBundle struct {
-	Skills []IndexEntry
-	Tools  []IndexEntry
-	MCPS   []IndexEntry
+	Skills     []IndexEntry
+	Tools      []IndexEntry
+	MCPS       []IndexEntry
+	Components []IndexEntry
 }
 
 // spaceIndex 是 files/.meta.json 的文件结构。
 type spaceIndex struct {
-	Version   int          `json:"version"`
-	UpdatedAt string       `json:"updated_at"`
-	Skills    []IndexEntry `json:"skills"`
-	Tools     []IndexEntry `json:"tools"`
-	MCPS      []IndexEntry `json:"mcps"`
+	Version    int          `json:"version"`
+	UpdatedAt  string       `json:"updated_at"`
+	Skills     []IndexEntry `json:"skills"`
+	Tools      []IndexEntry `json:"tools"`
+	MCPS       []IndexEntry `json:"mcps"`
+	Components []IndexEntry `json:"components"`
 }
 
 // 资源来源：同名时 current 优先于 system。
@@ -75,7 +77,7 @@ func (s *Service) LoadIndex(ctx context.Context, spaceID string) IndexBundle {
 		decodeErr := json.NewDecoder(io.LimitReader(f, 256<<10)).Decode(&idx)
 		_ = f.Close()
 		if decodeErr == nil && idx.Version == indexVersion {
-			return IndexBundle{Skills: idx.Skills, Tools: idx.Tools, MCPS: idx.MCPS}
+			return IndexBundle{Skills: idx.Skills, Tools: idx.Tools, MCPS: idx.MCPS, Components: idx.Components}
 		}
 	}
 
@@ -85,7 +87,7 @@ func (s *Service) LoadIndex(ctx context.Context, spaceID string) IndexBundle {
 			s.log.Warn("写空间索引失败", "space_id", spaceID, "err", putErr)
 		}
 	}
-	return IndexBundle{Skills: idx.Skills, Tools: idx.Tools, MCPS: idx.MCPS}
+	return IndexBundle{Skills: idx.Skills, Tools: idx.Tools, MCPS: idx.MCPS, Components: idx.Components}
 }
 
 // MergedSources 返回「当前空间 + 系统空间」合并后的资源索引。
@@ -95,9 +97,37 @@ func (s *Service) LoadIndex(ctx context.Context, spaceID string) IndexBundle {
 func (s *Service) MergedSources(ctx context.Context, spaceID string) IndexBundle {
 	cur := s.LoadIndex(ctx, spaceID)
 	out := IndexBundle{
-		Skills: marked(cur.Skills, SourceCurrent),
-		Tools:  marked(cur.Tools, SourceCurrent),
-		MCPS:   marked(cur.MCPS, SourceCurrent),
+		Skills:     marked(cur.Skills, SourceCurrent),
+		Tools:      marked(cur.Tools, SourceCurrent),
+		MCPS:       marked(cur.MCPS, SourceCurrent),
+		Components: marked(cur.Components, SourceCurrent),
+	}
+
+	// 已安装插件先入池：未落副本的预置件（extensible=false）不在文件树里，
+	// 但安装后必须能被检索到，否则「装了却用不了」。
+	if s.installed != nil {
+		items, err := s.installed(ctx, spaceID)
+		if err != nil {
+			s.log.Warn("读取已安装插件失败", "space_id", spaceID, "err", err)
+		}
+		var ins IndexBundle
+		for _, e := range items {
+			switch e.Kind {
+			case "skills":
+				ins.Skills = append(ins.Skills, e)
+			case "mcps":
+				ins.MCPS = append(ins.MCPS, e)
+			case "components":
+				ins.Components = append(ins.Components, e)
+			default:
+				ins.Tools = append(ins.Tools, e)
+			}
+		}
+		// 已安装优先，草稿同名让路（装好的版本是运行态的唯一事实）
+		out.Skills = mergeByName(marked(ins.Skills, SourceCurrent), out.Skills)
+		out.Tools = mergeByName(marked(ins.Tools, SourceCurrent), out.Tools)
+		out.MCPS = mergeByName(marked(ins.MCPS, SourceCurrent), out.MCPS)
+		out.Components = mergeByName(marked(ins.Components, SourceCurrent), out.Components)
 	}
 
 	sys, err := s.store.GetSpaceByType(ctx, SpaceTypeSystem)
@@ -108,12 +138,13 @@ func (s *Service) MergedSources(ctx context.Context, spaceID string) IndexBundle
 	out.Skills = mergeByName(out.Skills, marked(sysIdx.Skills, SourceSystem))
 	out.Tools = mergeByName(out.Tools, marked(sysIdx.Tools, SourceSystem))
 	out.MCPS = mergeByName(out.MCPS, marked(sysIdx.MCPS, SourceSystem))
+	out.Components = mergeByName(out.Components, marked(sysIdx.Components, SourceSystem))
 	return out
 }
 
 // isSystemCapabilityPath 判断相对路径是否落在可跨空间读取的能力目录内。
 func isSystemCapabilityPath(rel string) bool {
-	for _, dir := range []string{systemSkillsDir, systemToolsDir, systemMCPsDir} {
+	for _, dir := range []string{DraftDirName} {
 		if rel == dir || strings.HasPrefix(rel, dir+"/") {
 			return true
 		}
@@ -149,6 +180,13 @@ func (s *Service) ReadSourceFile(ctx context.Context, spaceID, rawPath string, l
 	rel, err := normalizeSourcePath(rawPath)
 	if err != nil {
 		return "", err
+	}
+	// 已发布件不在空间文件区：published/{kind}/{slug}/{version}/...
+	if strings.HasPrefix(rel, "published/") {
+		if s.published == nil {
+			return "", ErrFileNotFound
+		}
+		return s.published(ctx, spaceID, rel)
 	}
 
 	text, err := s.readAt(ctx, spaceID, rel, limit)
@@ -197,101 +235,47 @@ func (s *Service) readAt(ctx context.Context, spaceID, rel string, limit int64) 
 
 func (s *Service) buildIndex(ctx context.Context, spaceID string) spaceIndex {
 	idx := spaceIndex{
-		Version:   indexVersion,
-		Skills:    []IndexEntry{},
-		Tools:     []IndexEntry{},
-		MCPS:      []IndexEntry{},
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		Version:    indexVersion,
+		Skills:     []IndexEntry{},
+		Tools:      []IndexEntry{},
+		MCPS:       []IndexEntry{},
+		Components: []IndexEntry{},
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}
-	s.collectSkills(ctx, spaceID, "", 1, &idx.Skills)
-	idx.Tools = s.collectManifests(ctx, spaceID, systemToolsDir)
-	idx.MCPS = s.collectManifests(ctx, spaceID, systemMCPsDir)
+	// 只扫 plugins/：目录里有什么就执行什么，不再有 tools/mcps 的只读投影。
+	// 本地插件必须启用才进索引；安装副本由 plugin.InstalledSources 负责。
+	enabled := map[string]bool{}
+	if s.localPlugins != nil {
+		if m, err := s.localPlugins(ctx, spaceID); err == nil {
+			enabled = m
+		} else {
+			s.log.Warn("读取本地插件启用状态失败", "space_id", spaceID, "err", err)
+		}
+	}
+	plugins := s.collectPlugins(ctx, spaceID)
+	for _, e := range plugins {
+		if s.localPlugins != nil {
+			slug := strings.SplitN(strings.TrimPrefix(e.Path, DraftDirName+"/"), "/", 2)[0]
+			if !enabled[slug] {
+				continue
+			}
+		}
+		switch e.Kind {
+		case "skills":
+			idx.Skills = append(idx.Skills, e)
+		case "mcps":
+			idx.MCPS = append(idx.MCPS, e)
+		case "components":
+			idx.Components = append(idx.Components, e)
+		default:
+			idx.Tools = append(idx.Tools, e)
+		}
+	}
 	sortEntries(idx.Skills)
 	sortEntries(idx.Tools)
 	sortEntries(idx.MCPS)
+	sortEntries(idx.Components)
 	return idx
-}
-
-// collectSkills 递归找出带 .meta.json（type=skill）的目录。
-//
-// 覆盖两种布局：系统空间的 files/skills/<name>/，以及普通空间根下的 files/<name>/。
-func (s *Service) collectSkills(ctx context.Context, spaceID, parent string, depth int, out *[]IndexEntry) {
-	if depth > maxDirDepth {
-		return
-	}
-	key := s.filesKey(spaceID)
-	if parent != "" {
-		key = path.Join(key, parent)
-	}
-	entries, err := s.storage.List(ctx, key)
-	if err != nil {
-		if !errors.Is(err, storage.ErrNotFound) {
-			s.log.Warn("扫描技能索引失败", "space_id", spaceID, "dir", parent, "err", err)
-		}
-		return
-	}
-
-	for _, e := range entries {
-		if !e.IsDir {
-			continue
-		}
-		name := path.Base(e.Key)
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		rel := name
-		if parent != "" {
-			rel = parent + "/" + name
-		}
-		if meta, ok := s.readSkillMeta(ctx, spaceID, rel); ok {
-			display := meta.Name
-			if display == "" {
-				display = name
-			}
-			*out = append(*out, IndexEntry{
-				Kind:        "skills",
-				Name:        display,
-				Description: meta.Description,
-				Path:        path.Join(rel, "SKILL.md"),
-			})
-		}
-		s.collectSkills(ctx, spaceID, rel, depth+1, out)
-	}
-}
-
-// collectManifests 收集 tools/mcps 目录下的一层 JSON 清单。
-func (s *Service) collectManifests(ctx context.Context, spaceID, dir string) []IndexEntry {
-	key := path.Join(s.filesKey(spaceID), dir)
-	entries, err := s.storage.List(ctx, key)
-	if err != nil {
-		return []IndexEntry{}
-	}
-
-	out := make([]IndexEntry, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir {
-			continue
-		}
-		name := path.Base(e.Key)
-		if strings.HasPrefix(name, ".") || !strings.EqualFold(path.Ext(name), ".json") {
-			continue
-		}
-		entry := IndexEntry{Name: strings.TrimSuffix(name, ".json"), Path: path.Join(dir, name)}
-		if f, err := s.storage.Get(ctx, e.Key); err == nil {
-			var meta struct {
-				Name        string `json:"name"`
-				Description string `json:"description"`
-			}
-			_ = json.NewDecoder(io.LimitReader(f, 32<<10)).Decode(&meta)
-			_ = f.Close()
-			if meta.Name != "" {
-				entry.Name = meta.Name
-			}
-			entry.Description = meta.Description
-		}
-		out = append(out, entry)
-	}
-	return out
 }
 
 // refreshIndex 刷新索引；失败只告警，不影响已经完成的写操作。
@@ -346,4 +330,83 @@ func mergeByName(base, extra []IndexEntry) []IndexEntry {
 
 func sortEntries(entries []IndexEntry) {
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+}
+
+// DraftDirName 是空间文件区下存放插件的目录。
+const DraftDirName = "plugins"
+
+// collectPlugins 扫描 plugins/ 下的插件清单，产出检索条目。
+//
+// 这里只解析展示需要的字段，不引 plugin 包：space 是被 plugin 依赖的一方，
+// 反向导入会成环。校验与执行仍由 plugin.Manager 负责。
+func (s *Service) collectPlugins(ctx context.Context, spaceID string) []IndexEntry {
+	root := path.Join(s.filesKey(spaceID), DraftDirName)
+	entries, err := s.storage.List(ctx, root)
+	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			s.log.Warn("扫描插件索引失败", "space_id", spaceID, "err", err)
+		}
+		return nil
+	}
+
+	out := make([]IndexEntry, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir {
+			continue
+		}
+		slug := path.Base(e.Key)
+		if strings.HasPrefix(slug, ".") {
+			continue
+		}
+		raw, err := s.readAt(ctx, spaceID, path.Join(DraftDirName, slug, "plugin.json"), 8<<10)
+		if err != nil {
+			continue
+		}
+		var m struct {
+			Kind        string `json:"kind"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Skill       struct {
+				Entry string `json:"entry"`
+			} `json:"skill"`
+			Runtime struct {
+				Entry string `json:"entry"`
+			} `json:"runtime"`
+			UI struct {
+				Entry string `json:"entry"`
+			} `json:"ui"`
+		}
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			continue
+		}
+		entry := m.Skill.Entry
+		switch m.Kind {
+		case "tool":
+			entry = m.Runtime.Entry
+		case "component":
+			entry = m.UI.Entry
+		}
+		if entry == "" {
+			entry = "plugin.json"
+		}
+		out = append(out, IndexEntry{
+			Kind:        pluralKind(m.Kind),
+			Name:        m.Name,
+			Description: m.Description,
+			Path:        path.Join(DraftDirName, slug, entry),
+		})
+	}
+	return out
+}
+
+func pluralKind(kind string) string {
+	switch kind {
+	case "skill":
+		return "skills"
+	case "mcp":
+		return "mcps"
+	case "component":
+		return "components"
+	}
+	return "tools"
 }

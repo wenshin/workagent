@@ -37,24 +37,14 @@ type sourceLoader struct {
 
 func (l sourceLoader) Sources(ctx context.Context) ([]tool.SourceEntry, error) {
 	idx := l.spaces.MergedSources(ctx, l.spaceID)
-	out := make([]tool.SourceEntry, 0, len(idx.Skills)+len(idx.Tools)+len(idx.MCPS))
+	out := make([]tool.SourceEntry, 0, len(idx.Skills)+len(idx.Tools)+len(idx.MCPS)+len(idx.Components))
 	out = appendSource(out, "skills", idx.Skills)
 	out = appendSource(out, "tools", idx.Tools)
 	out = appendSource(out, "mcps", idx.MCPS)
+	out = appendSource(out, "components", idx.Components)
 
-	// 已发布资源单独成层：不与草稿做同名覆盖，命中多条同名时由 resource_search
-	// 返回 hint，让模型先向用户确认用哪一份。
-	if l.published != nil {
-		for _, e := range l.published.Sources(ctx, l.userID) {
-			out = append(out, tool.SourceEntry{
-				Kind:        pluralKind(e.Kind),
-				Name:        e.Name,
-				Description: e.Description,
-				Path:        e.Path,
-				Source:      sourcePublished,
-			})
-		}
-	}
+	// 发布件不再默认进检索池：只有安装到本空间的插件才可用。市场浏览走
+	// 插件接口；未安装的发布件不能被 resource_search 当成可用能力。
 	return out, nil
 }
 

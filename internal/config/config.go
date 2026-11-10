@@ -55,6 +55,10 @@ type Config struct {
 	// 未注册的名字在启动时告警并回退 builtin，不影响服务可用。
 	AgentImpl string
 
+	// PluginsDefaultInstall 是部署者定义的默认安装集：空间首次初始化时装这些内置插件。
+	// 空表示不预装。改动只影响之后新建的空间。
+	PluginsDefaultInstall []string
+
 	// SandboxRequire 要求命令执行必须有真实隔离后端（bwrap / sandbox-exec）。
 	// 生产环境打开：探测不到就启动失败，而不是悄悄退化成裸跑。
 	// 开发机保持默认（false），降级到 local 时日志里会有告警。
@@ -164,6 +168,8 @@ func Load() (*Config, error) {
 		LLMFallbackModel:    getenv("LLM_FALLBACK_MODEL", ""),
 
 		AgentImpl: getenv("AGENT_IMPL", "builtin"),
+
+		PluginsDefaultInstall: splitList(getenv("PLUGIN_DEFAULT_INSTALL", "")),
 
 		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
 
