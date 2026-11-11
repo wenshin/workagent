@@ -1,0 +1,507 @@
+package tool
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/storage"
+)
+
+// 企业 wiki：跨空间共享的 markdown 知识区，固定落在系统空间的 files/wiki/ 下。
+//
+// 为什么不让它跟着空间走：知识一旦按空间分家，同一个企业会出现 N 份互不相通的口径，
+// 而这恰恰是 wiki 要解决的问题。所以宿主固定为系统空间，工具参数里没有 space 维度。
+//
+// 并发策略（见 wikiWrite）：不引入分布式锁，靠三件事兜住——
+//   - 分片：日志类内容建议一天一页 / 一主题一页，写者不重叠；
+//   - 版本校对：overwrite 可带 if_version，不匹配就报冲突让模型重读重写；
+//   - 进程内串行：同一路径的读改写加互斥锁，挡住单实例内的并发。
+//
+// 单机部署下这套是安全的；多实例部署时 overwrite 仍可能丢更新，需要存储层支持
+// 条件写（S3 的 If-Match）才能真正消除，这里先不做，避免给本地文件系统造一套假锁。
+const (
+	// wikiRoot 是固定前缀，不接受参数覆盖，否则工具就能写到系统空间别处去
+	wikiRoot = "wiki"
+	// wikiMaxDepth 限制页面层级：wiki 靠 wiki_list 导航，埋太深模型找不到
+	wikiMaxDepth = 3
+	// wikiMaxWriteBytes 是单页上限。wiki 是条目不是仓库，页面过大说明该拆分
+	wikiMaxWriteBytes = 128 << 10
+	// wikiScanFiles / wikiScanBytes 限制一次 list/search 的扫描量
+	wikiScanFiles = 500
+	wikiScanBytes = 256 << 10
+)
+
+// errWikiPath 当模型试图用 file_* 工具读写 wiki/ 时给出改道提示。
+//
+// file_* 的根是当前空间，直接放行会让用户在各自空间里长出一份同名 wiki，
+// 与系统空间那份形成事实上的两个知识库，且两边都以为自己是权威。
+var errWikiPath = errors.New("wiki/ 是企业公共知识区，请改用 wiki_list / wiki_read / wiki_write / wiki_search")
+
+func isWikiPath(rel string) bool {
+	return rel == wikiRoot || strings.HasPrefix(rel, wikiRoot+"/")
+}
+
+// wikiLocks 按存储 key 串行化「读-改-写」，避免同进程内两个会话互相覆盖。
+var wikiLocks sync.Map
+
+func lockWiki(key string) func() {
+	v, _ := wikiLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// wikiReady 检查 wiki 宿主是否可用。缺失时明确报错而不是静默降级。
+func wikiReady(env Env) error {
+	if env.Storage == nil {
+		return fmt.Errorf("文件存储不可用")
+	}
+	if env.WikiSpaceID == "" {
+		return fmt.Errorf("企业 wiki 不可用：平台还没初始化系统空间（需要系统管理员登录一次）")
+	}
+	return nil
+}
+
+// wikiRel 校验 wiki 内的相对路径：复用工作区的越界与隐藏文件规则，再加深度与后缀。
+func wikiRel(raw string, dir bool) (string, error) {
+	rel, err := cleanRelPath(raw)
+	if err != nil {
+		return "", err
+	}
+	if rel == "" {
+		if dir {
+			return "", nil
+		}
+		return "", fmt.Errorf("path 不能为空")
+	}
+	if depthOfRel(rel) > wikiMaxDepth {
+		return "", fmt.Errorf("wiki 路径最多 %d 层，如 topics/报销制度.md", wikiMaxDepth)
+	}
+	if !dir && strings.ToLower(path.Ext(rel)) != ".md" {
+		return "", fmt.Errorf("wiki 只存 markdown 页面（.md），收到 %q", rel)
+	}
+	return rel, nil
+}
+
+func depthOfRel(rel string) int {
+	if rel == "" {
+		return 0
+	}
+	return strings.Count(rel, "/") + 1
+}
+
+func wikiKey(env Env, rel string) string {
+	return path.Join(env.Storage.SpaceKey(env.WikiSpaceID), workspaceFilesDir, wikiRoot, rel)
+}
+
+// contentVersion 是页面版本指纹：取内容 sha256 前 8 字节。
+//
+// 用内容哈希而不是单调版本号，因为存储层没有版本列；好处是不需要额外元数据，
+// 坏处是「改回原样」会被视为同一版本（对冲突检测无害）。
+func contentVersion(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:8])
+}
+
+type wikiEntry struct {
+	Path string
+	Size int64
+	Mod  time.Time
+}
+
+// readWikiFile 读整页内容；exists=false 表示文件不存在（不是错误）。
+func readWikiFile(ctx context.Context, env Env, key string) (string, bool, error) {
+	rc, err := env.Storage.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	b, err := io.ReadAll(io.LimitReader(rc, wikiMaxWriteBytes+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(b) > wikiMaxWriteBytes {
+		return "", false, fmt.Errorf("页面超过 %d 字节，请拆成多个页面", wikiMaxWriteBytes)
+	}
+	return string(b), true, nil
+}
+
+// walkWiki 递归收集 markdown 页面，返回相对 wiki 根的路径。
+func walkWiki(ctx context.Context, env Env, dirRel string) ([]wikiEntry, error) {
+	out := make([]wikiEntry, 0, 16)
+	var walk func(rel string) error
+	walk = func(rel string) error {
+		entries, err := env.Storage.List(ctx, wikiKey(env, rel))
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+		for _, e := range entries {
+			name := path.Base(e.Key)
+			// 隐藏文件是平台元数据，wiki 里也不暴露
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			child := name
+			if rel != "" {
+				child = rel + "/" + name
+			}
+			if e.IsDir {
+				if err := walk(child); err != nil {
+					return err
+				}
+				continue
+			}
+			if strings.ToLower(path.Ext(name)) != ".md" {
+				continue
+			}
+			if len(out) >= wikiScanFiles {
+				return nil
+			}
+			out = append(out, wikiEntry{Path: child, Size: e.Size, Mod: e.ModTime})
+		}
+		return nil
+	}
+	if err := walk(dirRel); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------- 工具
+
+func wikiList() Tool {
+	return Tool{
+		Name:       "wiki_list",
+		Capability: "wiki.list",
+		Description: "列出企业 wiki 里的页面（跨空间共享，宿主是系统空间）。" +
+			"写之前先 list 一遍，避免给同一个主题新建重复页面。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "prefix": {"type": "string", "description": "只列某个子目录，如 topics；省略表示全部"}
+  },
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskReadOnly,
+		SideEffects: policy.SideEffectsReadOnly,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if err := wikiReady(env); err != nil {
+				return "", err
+			}
+			var in struct {
+				Prefix string `json:"prefix"`
+			}
+			if len(args) > 0 {
+				if err := json.Unmarshal(args, &in); err != nil {
+					return "", fmt.Errorf("参数解析失败：%w", err)
+				}
+			}
+			rel, err := wikiRel(in.Prefix, true)
+			if err != nil {
+				return "", err
+			}
+
+			pages, err := walkWiki(ctx, env, rel)
+			if err != nil {
+				return "", err
+			}
+			if len(pages) == 0 {
+				return "wiki 里还没有页面。", nil
+			}
+
+			rows := make([]map[string]any, 0, len(pages))
+			for _, p := range pages {
+				rows = append(rows, map[string]any{
+					"path":     p.Path,
+					"size":     p.Size,
+					"modified": p.Mod.Format(time.RFC3339),
+				})
+			}
+			return marshalLimited(rows, 8*1024), nil
+		},
+	}
+}
+
+func wikiRead() Tool {
+	return Tool{
+		Name:       "wiki_read",
+		Capability: "wiki.read",
+		Description: "读取企业 wiki 的单个页面，返回正文与 version。" +
+			"overwrite 前必须先用本工具拿到 version，否则并发修改会被覆盖。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "description": "相对 wiki 根的路径，如 topics/报销制度.md"},
+    "offset": {"type": "integer", "description": "起始字节偏移，默认 0；长页面分段读"},
+    "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 24576"}
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}`),
+		Risk:           policy.RiskReadOnly,
+		SideEffects:    policy.SideEffectsReadOnly,
+		Runtime:        "builtin",
+		MaxResultBytes: maxReadBytes,
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if err := wikiReady(env); err != nil {
+				return "", err
+			}
+			var in struct {
+				Path   string `json:"path"`
+				Offset int    `json:"offset"`
+				Limit  int    `json:"limit"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			rel, err := wikiRel(in.Path, false)
+			if err != nil {
+				return "", err
+			}
+
+			body, exists, err := readWikiFile(ctx, env, wikiKey(env, rel))
+			if err != nil {
+				return "", err
+			}
+			if !exists {
+				return "", fmt.Errorf("页面不存在：%s；可用 wiki_list 查看现有页面", rel)
+			}
+
+			version := contentVersion(body)
+			offset := in.Offset
+			if offset < 0 {
+				offset = 0
+			}
+			if offset > len(body) {
+				offset = len(body)
+			}
+			limit := in.Limit
+			if limit <= 0 {
+				limit = defaultReadBytes
+			}
+			if limit > maxReadBytes {
+				limit = maxReadBytes
+			}
+			end := offset + limit
+			truncated := end < len(body)
+			if !truncated {
+				end = len(body)
+			}
+
+			var b strings.Builder
+			fmt.Fprintf(&b, "path: %s\nversion: %s\nsize: %d bytes, %d lines\n", rel, version, len(body), strings.Count(body, "\n")+1)
+			if offset > 0 || truncated {
+				fmt.Fprintf(&b, "range: %d-%d\n", offset, end)
+			}
+			b.WriteString("---\n")
+			b.WriteString(strings.ToValidUTF8(body[offset:end], ""))
+			if truncated {
+				fmt.Fprintf(&b, "\n…（已截断，可用 offset=%d 继续读取）", end)
+			}
+			return b.String(), nil
+		},
+	}
+}
+
+func wikiWrite() Tool {
+	return Tool{
+		Name:       "wiki_write",
+		Capability: "wiki.write",
+		Description: "写入企业 wiki 页面（跨空间共享）。mode：create 仅新建 / overwrite 覆盖（默认）/ append 追加。" +
+			"覆盖已有页面时务必带上 wiki_read 返回的 if_version，被他人改过会报冲突；" +
+			"日志类内容用 append 追加到按日期命名的页面，天生不冲突。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "path": {"type": "string", "description": "相对 wiki 根的路径，如 topics/报销制度.md"},
+    "content": {"type": "string", "description": "要写入的完整 markdown 内容"},
+    "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "description": "写入方式，默认 overwrite"},
+    "if_version": {"type": "string", "description": "可选，覆盖前校验版本；不匹配则拒绝写入"}
+  },
+  "required": ["path", "content"],
+  "additionalProperties": false
+}`),
+		Risk: policy.RiskWrite,
+		// 写的是系统空间固定前缀，跨空间共享但范围锁死，按空间写权限放行
+		SideEffects: policy.SideEffectsShared,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if err := wikiReady(env); err != nil {
+				return "", err
+			}
+			var in struct {
+				Path      string `json:"path"`
+				Content   string `json:"content"`
+				Mode      string `json:"mode"`
+				IfVersion string `json:"if_version"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			rel, err := wikiRel(in.Path, false)
+			if err != nil {
+				return "", err
+			}
+
+			key := wikiKey(env, rel)
+			unlock := lockWiki(key)
+			defer unlock()
+
+			existing, exists, err := readWikiFile(ctx, env, key)
+			if err != nil {
+				return "", err
+			}
+
+			mode := strings.ToLower(strings.TrimSpace(in.Mode))
+			if mode == "" {
+				mode = "overwrite"
+			}
+
+			body := in.Content
+			switch mode {
+			case "create":
+				if exists {
+					return "", fmt.Errorf("页面已存在：%s；如需修改请先 wiki_read 再用 overwrite 带 if_version", rel)
+				}
+			case "overwrite":
+				if want := strings.TrimSpace(in.IfVersion); want != "" {
+					if !exists {
+						return "", fmt.Errorf("写入冲突：%s 已被删除（你读到的是 %s）；请重新 wiki_list 确认后再写", rel, want)
+					}
+					if cur := contentVersion(existing); cur != want {
+						return "", fmt.Errorf("写入冲突：%s 已被他人修改（当前 version=%s，你读到的是 %s）。"+
+							"请重新 wiki_read 拿到最新内容后重写；若只是追加信息，改用 mode=append", rel, cur, want)
+					}
+				}
+			case "append":
+				if exists {
+					if !strings.HasSuffix(existing, "\n") {
+						existing += "\n"
+					}
+					body = existing + body
+				}
+			default:
+				return "", fmt.Errorf("mode 只能是 create / overwrite / append")
+			}
+
+			if len(body) > wikiMaxWriteBytes {
+				return "", fmt.Errorf("页面超过 %d 字节，请拆成多个页面", wikiMaxWriteBytes)
+			}
+			if _, err := env.Storage.Put(ctx, key, strings.NewReader(body), int64(len(body))); err != nil {
+				return "", err
+			}
+
+			return fmt.Sprintf("已写入 wiki/%s（%d 字节，mode=%s，version=%s）", rel, len(body), mode, contentVersion(body)), nil
+		},
+	}
+}
+
+func wikiSearch() Tool {
+	return Tool{
+		Name:       "wiki_search",
+		Capability: "wiki.search",
+		Description: "在整站 wiki 里按关键词找页面和所在行，适合回答前定位「这件事记在哪个页面」。" +
+			"命中结果给出 path，再用 wiki_read 读全文。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "关键词，大小写不敏感，按行匹配"},
+    "limit": {"type": "integer", "description": "最多返回多少条命中，默认 8，最大 20"}
+  },
+  "required": ["query"],
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskReadOnly,
+		SideEffects: policy.SideEffectsReadOnly,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if err := wikiReady(env); err != nil {
+				return "", err
+			}
+			var in struct {
+				Query string `json:"query"`
+				Limit int    `json:"limit"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			query := strings.TrimSpace(in.Query)
+			if query == "" {
+				return "", fmt.Errorf("query 不能为空")
+			}
+			limit := in.Limit
+			if limit <= 0 {
+				limit = 8
+			}
+			if limit > 20 {
+				limit = 20
+			}
+
+			pages, err := walkWiki(ctx, env, "")
+			if err != nil {
+				return "", err
+			}
+			if len(pages) == 0 {
+				return "wiki 里还没有页面。", nil
+			}
+
+			needle := strings.ToLower(query)
+			hits := make([]map[string]any, 0, limit)
+			for _, page := range pages {
+				if len(hits) >= limit {
+					break
+				}
+				body, exists, err := readWikiFile(ctx, env, wikiKey(env, page.Path))
+				if err != nil || !exists {
+					continue
+				}
+				for i, line := range strings.Split(body, "\n") {
+					if !strings.Contains(strings.ToLower(line), needle) {
+						continue
+					}
+					hits = append(hits, map[string]any{
+						"path": page.Path,
+						"line": i + 1,
+						"text": clipRunes(strings.TrimSpace(line), 160),
+					})
+					if len(hits) >= limit {
+						break
+					}
+				}
+			}
+			if len(hits) == 0 {
+				return fmt.Sprintf("没有页面命中 %q；可用 wiki_list 浏览全部页面。", query), nil
+			}
+			return marshalLimited(hits, 8*1024), nil
+		},
+	}
+}
+
+// clipRunes 按字符截断，避免把中文切成半个字。
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}

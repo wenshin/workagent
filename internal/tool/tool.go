@@ -39,6 +39,10 @@ type Env struct {
 	RunID string
 	// SpacePerm 是调用方在该空间的权限，空表示不是成员（策略据此拒绝）
 	SpacePerm string
+	// WikiSpaceID 是企业 wiki 的宿主空间（系统空间），wiki_* 工具只读写它的 files/wiki/。
+	// 为空表示平台还没初始化系统空间：此时 wiki 工具明确报不可用，不退回当前空间，
+	// 否则每个空间都会长出一份同名 wiki，知识反而分裂。
+	WikiSpaceID string
 
 	Store   store.Store
 	Storage storage.Storage

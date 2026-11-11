@@ -26,6 +26,10 @@ const (
 	// SideEffectsWorkspace 只改当前空间 workdir 内的数据（如 fs.write），
 	// 范围由工具自身约束，授权只看空间成员权限。
 	SideEffectsWorkspace = "write-workspace"
+	// SideEffectsShared 只改跨空间的共享区（如企业 wiki 固定在系统空间的 wiki/ 下）。
+	// 范围同样由工具锁死，授权沿用「在当前空间能否写」：
+	// 能写当前空间的成员，才有资格往共享区沉淀内容。
+	SideEffectsShared = "write-shared"
 	// SideEffectsExternal 会改动空间外的资源（外部系统、凭证等），一律走审批。
 	SideEffectsExternal = "write-external"
 )
@@ -118,11 +122,15 @@ func (RBACEngine) Check(_ context.Context, req Request) (Decision, error) {
 	case req.Risk >= RiskSensitive:
 		return Decision{NeedApproval: true, Reason: "高敏工具需审批", Constraints: constraints}, nil
 	case req.Risk >= RiskWrite:
-		// 空间工作区内的写入（如 fs.write）：范围已由工具限制在当前空间文件根下，
+		// 工作区 / 共享区写入：范围已由工具限制死（前者当前空间根，后者固定前缀），
 		// 因此由空间权限直接决定，不再逐次要求绑定与人工审批。
-		if req.SideEffects == SideEffectsWorkspace {
+		if req.SideEffects == SideEffectsWorkspace || req.SideEffects == SideEffectsShared {
 			if req.SpacePerm == "write" || req.SpacePerm == "manage" {
-				return Decision{Allow: true, Reason: "空间工作区写入", Constraints: constraints}, nil
+				reason := "空间工作区写入"
+				if req.SideEffects == SideEffectsShared {
+					reason = "共享知识区写入"
+				}
+				return Decision{Allow: true, Reason: reason, Constraints: constraints}, nil
 			}
 			return deny(fmt.Sprintf("你在该空间没有写权限，无法执行 %s", req.Tool))
 		}

@@ -202,6 +202,10 @@ var builtinToolLabels = map[string]string{
 	"web_search":      "联网搜索",
 	"shell_exec":      "执行命令",
 	"secret_request":  "录入凭证",
+	"wiki_list":       "列知识页",
+	"wiki_read":       "读知识页",
+	"wiki_write":      "写知识页",
+	"wiki_search":     "搜知识库",
 }
 
 func builtinToolLabel(name string) string {
@@ -214,8 +218,12 @@ func builtinToolLabel(name string) string {
 // builtinToolCapability 是插件层的单一能力标签（决定默认权限口径）。
 func builtinToolCapability(name string) string {
 	switch name {
-	case "file_write", "skill_create":
+	case "file_write", "skill_create", "wiki_write":
 		return CapFSWrite
+	case "wiki_list", "wiki_read", "wiki_search":
+		// wiki 是跨空间共享区，但读写仍是文件语义：按 fs 能力口径归类，
+		// 免得在市场里被当成「可调外部插件」而抬高风险。
+		return CapFSRead
 	case "shell_exec":
 		return CapShellExec
 	case "web_search":
@@ -229,6 +237,13 @@ func builtinToolRisk(name string) []Capability {
 	switch name {
 	case "file_write", "skill_create":
 		return []Capability{{Method: MethodFSWr, Paths: []string{"plugins/"}}}
+	case "wiki_write":
+		// 共享区写：毒性由 Derive 推成 L3 + workspace 副作用，
+		// 与运行时 tool.SideEffectsShared 的口径一致（按空间写权限放行）
+		return []Capability{{Method: MethodFSWr, Paths: []string{"wiki/"}}}
+	case "wiki_list", "wiki_read", "wiki_search":
+		// 只读页：Derive 对 fs.read 不抬风险，市场里显示为只读能力
+		return []Capability{{Method: MethodFSRead, Paths: []string{"wiki/"}}}
 	case "shell_exec":
 		return []Capability{{Method: MethodShell}}
 	case "web_search":

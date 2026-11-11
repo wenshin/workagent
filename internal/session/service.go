@@ -254,6 +254,21 @@ func (s *Service) Agents(ctx context.Context, userID, spaceID string) ([]agentsp
 	return plugins, nil
 }
 
+// wikiSpaceID 返回企业 wiki 的宿主空间（系统空间）。
+//
+// 取不到就返回空串而不是报错：wiki 是增强能力，系统空间没建好时
+// 对话本身不该受影响，由工具在调用点给出一条明确的「不可用」提示。
+func (s *Service) wikiSpaceID(ctx context.Context) string {
+	if s.spaces == nil {
+		return ""
+	}
+	id, err := s.spaces.SystemSpaceID(ctx)
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
 // canWriteSecrets 判断当前用户能否写平台凭证。
 //
 // 与 /admin/secrets 用同一套判定（系统管理员），否则会出现「卡片给了输入框、
@@ -546,9 +561,12 @@ func (s *Service) Chat(
 			SessionID: sessionID,
 			RunID:     run.ID,
 			SpacePerm: sp.Perm,
-			Store:     s.store,
-			Storage:   s.storage,
-			Log:       s.log,
+			// 企业 wiki 的宿主：固定系统空间，与当前会话所在空间无关。
+			// 未初始化时为空，wiki 工具会报「不可用」而不是写进当前空间。
+			WikiSpaceID: s.wikiSpaceID(ctx),
+			Store:       s.store,
+			Storage:     s.storage,
+			Log:         s.log,
 			// 能力源：当前空间 + 系统空间 + 已发布插件（发布件按需检索，不做同名覆盖）。
 			// published/... 路径也由空间服务转给插件层解析，这里不再单独持有资源服务。
 			Sources: sourceLoader{

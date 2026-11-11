@@ -26,6 +26,10 @@ func builtinTools() []Tool {
 		fileList(),
 		fileRead(),
 		fileWrite(),
+		wikiList(),
+		wikiRead(),
+		wikiWrite(),
+		wikiSearch(),
 		skillCreate(),
 		resourceSearch(),
 		resourceRead(),
@@ -446,6 +450,10 @@ func fileList() Tool {
 			rel, err := workspaceDirPath(in.Path)
 			if err != nil {
 				return "", err
+			}
+			// wiki 是系统空间里的共享区，file_* 只认当前空间，放行会让两处各长一份
+			if isWikiPath(rel) {
+				return "", errWikiPath
 			}
 
 			// 只列当前空间文件根下的内容，既避免越权访问其他空间，也不暴露平台元数据

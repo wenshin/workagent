@@ -128,6 +128,9 @@ func fileRead() Tool {
 			if err != nil {
 				return "", err
 			}
+			if isWikiPath(rel) {
+				return "", errWikiPath
+			}
 			if err := ensurePluginMutable(ctx, env, rel); err != nil {
 				return "", err
 			}
@@ -245,6 +248,9 @@ func fileWrite() Tool {
 			rel, err := workspaceFilePath(in.Path)
 			if err != nil {
 				return "", err
+			}
+			if isWikiPath(rel) {
+				return "", errWikiPath
 			}
 			if err := ensurePluginMutable(ctx, env, rel); err != nil {
 				return "", err
