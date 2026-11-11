@@ -28,7 +28,12 @@ func callTool(t *testing.T, tl Tool, env Env, args string) string {
 }
 
 func TestWorkspaceFilePath(t *testing.T) {
-	valid := []string{"a.md", "skills/空间管理/SKILL.md", "tools/x.json", "a/b.txt", "a/b.yaml"}
+	valid := []string{
+		"a.md", "skills/空间管理/SKILL.md", "tools/x.json", "a/b.txt", "a/b.yaml",
+		// 插件脚本：工具插件入口 index.ts、脚本型搜索源 main.ts
+		"plugins/dingtalk_notify/plugin.json", "plugins/dingtalk_notify/index.ts",
+		"plugins/x/main.js",
+	}
 	for _, p := range valid {
 		if _, err := workspaceFilePath(p); err != nil {
 			t.Errorf("%q 应合法，却被拒绝: %v", p, err)

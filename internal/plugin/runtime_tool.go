@@ -262,7 +262,10 @@ func (r *toolRuntime) httpRequest(ctx context.Context, in invokeInput, raw json.
 	if !in.Verbs[method] {
 		return nil, fmt.Errorf("插件未声明 HTTP 动词 %s（capabilities.verbs）", method)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, a.URL, strings.NewReader(a.Body))
+	// URL 也要做密钥替换：钉钉 / 企业微信这类机器人把 token 放在 query 里，
+	// 只替换 headers 会逼着模型把明文写进插件文件
+	target := r.resolveURLSecrets(ctx, a.URL, in.HasSecret)
+	req, err := http.NewRequestWithContext(ctx, method, target, strings.NewReader(a.Body))
 	if err != nil {
 		return nil, fmt.Errorf("请求地址非法: %w", err)
 	}
@@ -291,26 +294,75 @@ func (r *toolRuntime) httpRequest(ctx context.Context, in invokeInput, raw json.
 	}, nil
 }
 
-// resolveSecrets 把 secret:name 替换成真值；取不到时按空处理并留日志。
-func (r *toolRuntime) resolveSecrets(ctx context.Context, value string, allowed bool) string {
-	const prefix = "secret:"
-	if !strings.HasPrefix(value, prefix) {
-		return value
-	}
+// secretPrefix 是密钥引用的固定写法：secret:<名称>。
+// 规则是「整个值必须等于 secret:name」，不做子串替换——
+// 否则 "Bearer secret:token" 这类拼接会被误替换，普通文本里的 secret: 也会被当成引用。
+const secretPrefix = "secret:"
+
+// lookupSecret 取一次密钥明文。未声明 secret.use、名字为空或不存在的，一律返回空，
+// 让请求在目标侧失败得明显，而不是带着半个凭证跑出去。
+func (r *toolRuntime) lookupSecret(ctx context.Context, name string, allowed bool) (string, bool) {
 	if !allowed {
-		r.logger.Warn("插件未声明 secret.use，密钥引用被忽略")
-		return ""
+		r.logger.Warn("插件未声明 secret.use，密钥引用被忽略", "name", name)
+		return "", false
 	}
-	name := strings.TrimSpace(strings.TrimPrefix(value, prefix))
 	if name == "" || r.secrets == nil {
-		return ""
+		return "", false
 	}
 	secret, err := r.secrets.Get(ctx, "plugin", name)
 	if err != nil {
 		r.logger.Warn("插件引用的密钥不存在", "name", name, "error", err)
-		return ""
+		return "", false
 	}
+	return secret, true
+}
+
+// resolveSecrets 处理整值引用（主要用于 header 值）：值必须整体是 secret:name。
+func (r *toolRuntime) resolveSecrets(ctx context.Context, value string, allowed bool) string {
+	if !strings.HasPrefix(value, secretPrefix) {
+		return value
+	}
+	secret, _ := r.lookupSecret(ctx, strings.TrimSpace(strings.TrimPrefix(value, secretPrefix)), allowed)
 	return secret
+}
+
+// resolveURLSecrets 只替换 query 参数值里的 secret:name，其它部分原样保留。
+// URL 不能走整值规则（整段 URL 不会以 secret: 开头），也不能做全串替换：
+// 路径、host、参数名里出现的 secret: 一律不动，避免把普通文本误当引用。
+func (r *toolRuntime) resolveURLSecrets(ctx context.Context, raw string, allowed bool) string {
+	return replaceURLSecrets(raw, func(name string) (string, bool) {
+		return r.lookupSecret(ctx, name, allowed)
+	})
+}
+
+// replaceURLSecrets 是可单测的纯函数版本：只认「参数值整体是 secret:name」。
+// 命中时用 url.Values 重新编码，密钥里的 + / = 等字符不会破坏 URL 结构。
+// 注意：重编码会按参数名排序，带签名（参数顺序敏感）的 URL 不要用这种引用方式。
+func replaceURLSecrets(raw string, lookup func(name string) (string, bool)) string {
+	if !strings.Contains(raw, secretPrefix) {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return raw
+	}
+	q := u.Query()
+	changed := false
+	for _, vs := range q {
+		for i, v := range vs {
+			if !strings.HasPrefix(v, secretPrefix) {
+				continue
+			}
+			secret, _ := lookup(strings.TrimSpace(strings.TrimPrefix(v, secretPrefix)))
+			vs[i] = secret
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func (r *toolRuntime) spaceFilePath(spaceID, p string) (string, string, error) {

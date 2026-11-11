@@ -17,7 +17,7 @@ import (
 //
 // 三层约束：
 //   - 路径相对空间文件根，禁止绝对路径、`..` 与隐藏文件（.meta.json 由平台维护）
-//   - 只放行 md / json / txt / yaml，二进制不进模型上下文
+//   - 只放行 md / json / txt / yaml 与插件脚本（ts / js），二进制不进模型上下文
 //   - 单次读写有字节上限，避免超长内容撑爆上下文
 //
 // 空间 ID 来自会话所属空间（tool.Env.SpaceID），工具自身不接受 space_id 参数，
@@ -38,6 +38,10 @@ var workspaceExts = map[string]bool{
 	".txt":  true,
 	".yaml": true,
 	".yml":  true,
+	// 插件脚本：工具插件入口是 index.ts、脚本型搜索源是 main.ts，
+	// 白名单里没有它们，模型在会话里根本写不出一个能跑的工具插件。
+	".ts": true,
+	".js": true,
 }
 
 // cleanRelPath 归一化并校验相对路径，拒绝越界与隐藏段。
@@ -78,7 +82,7 @@ func workspaceFilePath(raw string) (string, error) {
 		return "", fmt.Errorf("path 不能为空")
 	}
 	if !workspaceExts[strings.ToLower(path.Ext(rel))] {
-		return "", fmt.Errorf("仅支持 md / json / txt / yaml 文件")
+		return "", fmt.Errorf("仅支持 md / json / txt / yaml / ts / js 文件")
 	}
 	return rel, nil
 }
@@ -92,7 +96,7 @@ func fileRead() Tool {
 	return Tool{
 		Name:       "file_read",
 		Capability: "fs.read",
-		Description: "读取当前空间内的文本文件（md / json / txt / yaml）。path 相对空间文件根目录，" +
+		Description: "读取当前空间内的文本文件（md / json / txt / yaml / ts / js）。path 相对空间文件根目录，" +
 			"如 plugins/weekly_report/SKILL.md。长文件可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
@@ -215,7 +219,7 @@ func fileWrite() Tool {
 	return Tool{
 		Name:       "file_write",
 		Capability: "fs.write",
-		Description: "写入当前空间内的文本文件（md / json / txt / yaml），path 相对空间文件根目录，" +
+		Description: "写入当前空间内的文本文件（md / json / txt / yaml / ts / js），path 相对空间文件根目录，" +
 			"父目录不存在时自动创建。mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
 			"修改已有文件前建议先用 file_read 读取现有内容。",
 		Parameters: json.RawMessage(`{
