@@ -115,6 +115,19 @@ export interface MessagePart {
   duration_ms?: number;
 }
 
+/**
+ * 流式过程中的一段内容：思考、正文片段或一次工具调用。
+ *
+ * 用有序数组而不是几个并列字段，是为了保住「先想一段、再说一句、调工具、再想一段」
+ * 的真实时间线——分组渲染会把工具卡全堆到正文上面、把思考永远钉在最顶部，
+ * 看起来像顺序错了，也看不出当前进展到哪一步。
+ * 只用于流式过程；落库后的历史消息没有这些片段的时间位置，仍按分组渲染。
+ */
+export type StreamItem =
+  | { kind: 'reasoning'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; tool: ToolCallRecord };
+
 export interface ChatMessage {
   id: string;
   session_id: string;

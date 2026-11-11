@@ -2,7 +2,14 @@ import { IconBook, IconClose, IconSend } from '@douyinfe/semi-icons';
 import { Button, Empty, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useRef, useState } from 'react';
 
-import type { ChatMessage, ChatSession, MessagePart, SpaceSkill, ToolCallRecord } from '../api/types';
+import type {
+  ChatMessage,
+  ChatSession,
+  MessagePart,
+  SpaceSkill,
+  StreamItem,
+  ToolCallRecord,
+} from '../api/types';
 import MarkdownView from './Markdown';
 import { PluginIcon } from './PluginVisual';
 import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
@@ -16,9 +23,8 @@ const INPUT_MAX_HEIGHT = 200;
 
 /** 流式过程中的临时视图 */
 export interface StreamView {
-  reasoning: string;
-  text: string;
-  tools: ToolCallRecord[];
+  /** 思考、正文与工具调用按到达顺序排列：渲染时照序输出，保持真实时间线 */
+  items: StreamItem[];
 }
 
 interface Props {
@@ -107,12 +113,20 @@ function statusLabel(status: ToolCallRecord['status']) {
   return '失败';
 }
 
+/**
+ * 思考块：默认折叠。
+ *
+ * 一轮对话里思考可能出现多次（想一段 → 调工具 → 再想一段），每段独立成块，
+ * 按时间线穿插在正文与工具卡之间。折叠是刻意的：思考是过程信息，
+ * 全部展开会把时间线淹掉；折叠后只看标题就能数出「已经想到第几段」。
+ */
 function ReasoningBlock({ text, live }: { text: string; live?: boolean }) {
   return (
-    <details className="msg-reasoning" open={live}>
+    <details className="msg-reasoning">
       <summary className="msg-reasoning-head">
         <span>思考过程</span>
-        {live ? <span className="msg-reasoning-live">生成中…</span> : null}
+        {live ? <span className="msg-reasoning-live">思考中…</span> : null}
+        <span className="msg-reasoning-size">{text.length} 字</span>
       </summary>
       <div className="msg-reasoning-body">{text}</div>
     </details>
@@ -199,29 +213,60 @@ function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
 function AssistantBody({
   content,
   reasoning,
-  tools,
+  tools = [],
+  items,
   live,
   spaceId,
   onSend,
 }: {
-  content: string;
+  content?: string;
   reasoning?: string;
-  tools: ToolCallRecord[];
+  tools?: ToolCallRecord[];
+  /** 流式过程中的有序片段；有值时按它渲染，不做分组 */
+  items?: StreamItem[];
   live?: boolean;
   spaceId?: string;
   onSend?: (content: string) => void;
 }) {
+  const hasBody = items ? items.length > 0 : Boolean(content) || tools.length > 0;
   return (
     <>
-      {reasoning ? <ReasoningBlock text={reasoning} live={live && !content && tools.length === 0} /> : null}
-      {tools.map((tool) => (
-        <ToolCard key={tool.id} tool={tool} onSend={onSend} />
-      ))}
-      {content ? (
-        <div className="chat-msg-content chat-msg-markdown">
-          <MarkdownView content={content} spaceId={spaceId} />
-        </div>
-      ) : null}
+      {reasoning ? <ReasoningBlock text={reasoning} live={live && !hasBody} /> : null}
+      {items ? (
+        // 流式：思考、正文与工具卡按实际到达顺序交错，
+        // 而不是「思考钉在顶部、工具全在上、正文全在下」
+        items.map((item, index) => {
+          if (item.kind === 'reasoning') {
+            return (
+              <ReasoningBlock
+                key={`reasoning-${index}`}
+                text={item.text}
+                // 只有最后一段思考才是「正在想」，前面的都已结束
+                live={live && index === items.length - 1}
+              />
+            );
+          }
+          if (item.kind === 'text') {
+            return (
+              <div key={`text-${index}`} className="chat-msg-content chat-msg-markdown">
+                <MarkdownView content={item.text} spaceId={spaceId} />
+              </div>
+            );
+          }
+          return <ToolCard key={`tool-${item.tool.id}`} tool={item.tool} onSend={onSend} />;
+        })
+      ) : (
+        <>
+          {tools.map((tool) => (
+            <ToolCard key={tool.id} tool={tool} onSend={onSend} />
+          ))}
+          {content ? (
+            <div className="chat-msg-content chat-msg-markdown">
+              <MarkdownView content={content} spaceId={spaceId} />
+            </div>
+          ) : null}
+        </>
+      )}
     </>
   );
 }
@@ -272,7 +317,7 @@ export default function ChatPanel({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages.length, session.id, stream?.text, stream?.tools.length, pendingUser]);
+  }, [messages.length, session.id, stream?.items, pendingUser]);
 
   useEffect(() => {
     if (!busy) {
@@ -458,13 +503,11 @@ export default function ChatPanel({
                 </span>
               ) : null}
             </div>
-            {!stream.reasoning && !stream.text && stream.tools.length === 0 ? (
+            {stream.items.length === 0 ? (
               <div className="chat-msg-content chat-msg-pending">正在思考…</div>
             ) : (
               <AssistantBody
-                content={stream.text}
-                reasoning={stream.reasoning}
-                tools={stream.tools}
+                items={stream.items}
                 live
                 spaceId={session.space_id}
                 onSend={(c) => void onSend(c)}

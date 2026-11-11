@@ -688,6 +688,14 @@ body[theme-mode='dark'] {
   color: var(--semi-color-primary);
 }
 
+/* 折叠状态下用字数当线索：不用点开也能判断这段想了多少 */
+.msg-reasoning-size {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--semi-color-text-2);
+  opacity: 0.75;
+}
+
 .msg-reasoning-body {
   max-height: 320px;
   margin-top: 8px;

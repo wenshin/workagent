@@ -1,7 +1,7 @@
 import { IconAlertCircle, IconExit, IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
 import { useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
@@ -20,7 +20,13 @@ import {
   useSpaceFiles,
   useSpaces,
 } from '../api/hooks';
-import { streamChat } from '../api/stream';
+import {
+  getLiveRun,
+  isLiveRunning,
+  startLiveRun,
+  stopLiveRun,
+  subscribeLiveRun,
+} from '../api/liveRun';
 import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
@@ -55,14 +61,12 @@ export default function WorkspacePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
-  const [stream, setStream] = useState<StreamView | null>(null);
-  const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [platformOpen, setPlatformOpen] = useState(false);
 
-  const abortRef = useRef<AbortController | null>(null);
-  // 本轮对话里 Agent 是否写过空间文件，决定结束后要不要刷新树与预览
-  const wroteFiles = useRef(false);
   const queryClient = useQueryClient();
+  // 流式状态放在模块级单例里：路由切换时本组件会被卸载，
+  // 状态若跟着组件走，「正在生成」的这段内容就一起没了
+  const liveRun = useSyncExternalStore(subscribeLiveRun, getLiveRun);
 
   const createSession = useCreateSession();
   const deleteSession = useDeleteSession();
@@ -95,6 +99,8 @@ export default function WorkspacePage() {
     [files, selectedSpaceId, urlFilePath],
   );
 
+  
+
   // 进入工作台默认打开个人空间里最近使用的会话
   const defaultSessionId = useMemo(() => {
     const personalSessions = sessions.filter((s) => s.space_id === personalId);
@@ -119,6 +125,17 @@ export default function WorkspacePage() {
   }, [filesFetched, files, urlFilePath, searchParams, selectedSpaceId, setSearchParams]);
 
   const { data: messages = [], isLoading: messagesLoading } = useMessages(selectedSession?.id);
+
+  // 只认当前会话的轮次：别的会话在后台跑时，这里应当显示历史消息而不是它的草稿
+  const stream: StreamView | null =
+    liveRun && liveRun.sessionId === selectedSession?.id ? liveRun : null;
+  // 用户消息在 run 开始时就已落库：列表里已有这条时不再渲染草稿气泡，
+  // 否则「切走再回来」会看到同一句话出现两遍
+  const lastMessage = messages[messages.length - 1];
+  const pendingUser =
+    liveRun && stream && !(lastMessage?.role === 'user' && lastMessage.content === liveRun.pendingUser)
+      ? liveRun.pendingUser
+      : null;
   // 技能列表随会话所属空间变化：当前空间 + 系统空间合并，同名当前空间优先
   const { data: skills = [], refetch: refetchSkills } = useSkills(selectedSession?.space_id);
 
@@ -164,66 +181,32 @@ export default function WorkspacePage() {
     }
   };
 
-  // 切换会话时中断正在进行的生成
-  useEffect(() => {
-    return () => {
-      abortRef.current?.abort();
-    };
-  }, [selectedSession?.id]);
-
+  // 切会话或离开页面都不主动中断：run 由 liveRun 单例持有，工具调用会在后台跑完并落库。
+  // 只有两种中断：用户点停止，或在另一个会话里发消息（此时才接管）。
   const send = async (content: string) => {
-    if (!selectedSession || abortRef.current) return;
+    if (!selectedSession) return;
     const sessionId = selectedSession.id;
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-    wroteFiles.current = false;
-    setPendingUser(content);
-    setStream({ reasoning: '', text: '', tools: [] });
-
-    try {
-      await streamChat(
-        sessionId,
-        content,
-        {
-          onReasoning: (delta) => setStream((s) => (s ? { ...s, reasoning: s.reasoning + delta } : s)),
-          onText: (delta) => setStream((s) => (s ? { ...s, text: s.text + delta } : s)),
-          onToolStart: (tool) => setStream((s) => (s ? { ...s, tools: [...s.tools, tool] } : s)),
-          onToolResult: (tool) => {
-            setStream((s) =>
-              s ? { ...s, tools: s.tools.map((t) => (t.id === tool.id ? tool : t)) } : s,
-            );
-            // Agent 改过空间文件（含新建技能目录）：结束后让树与当前预览重新拉取
-            if ((tool.name === 'file_write' || tool.name === 'skill_create') && tool.status === 'ok') {
-              wroteFiles.current = true;
-            }
-          },
-          onError: (message) => Toast.error(message),
-        },
-        controller.signal,
-      );
-    } catch (e) {
-      // 用户主动停止不算错误
-      const aborted = e instanceof DOMException && e.name === 'AbortError';
-      if (!aborted) {
-        Toast.error(e instanceof Error ? e.message : '发送失败，请重试');
-      }
-    } finally {
-      abortRef.current = null;
-      setStream(null);
-      setPendingUser(null);
-      await queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-      if (wroteFiles.current) {
-        queryClient.invalidateQueries({ queryKey: queryKeys.files });
-        queryClient.invalidateQueries({ queryKey: ['file'] });
-      }
-    }
+    // 同一会话还在生成：拦下来，别把这次输入吞掉
+    if (isLiveRunning(sessionId)) throw new Error('这轮回答还在生成，请先停止或等它结束');
+    // 别的会话在跑：startLiveRun 会接管（停掉旧的），提醒一句免得用户以为回答凭空消失
+    if (isLiveRunning()) Toast.info('已停止另一个会话的生成');
+    await startLiveRun({
+      sessionId,
+      content,
+      onError: (message) => Toast.error(message),
+      // 回调可能在本组件卸载后才跑，所以只用全局 queryClient，不碰组件状态
+      onSettled: (info) => {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+        if (info.wroteFiles) {
+          void queryClient.invalidateQueries({ queryKey: queryKeys.files });
+          void queryClient.invalidateQueries({ queryKey: ['file'] });
+        }
+      },
+    });
   };
 
-  const stopGenerating = () => {
-    abortRef.current?.abort();
-  };
+  const stopGenerating = () => stopLiveRun();
 
   const logout = async () => {
     try {
