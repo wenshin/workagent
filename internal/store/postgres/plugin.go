@@ -276,6 +276,21 @@ func (d *DB) DeletePluginInstall(ctx context.Context, spaceID, pluginID string) 
 	return err
 }
 
+// DeletePlugin 删除插件记录；plugin_version、plugin_install、plugin_scan 都是级联删除。
+//
+// 只给「代码里已经下线的内置件」用：用户自己发布的插件不能这么消失，
+// 那条路是卸载安装而不是删记录（审计要留着）。
+func (d *DB) DeletePlugin(ctx context.Context, id string) error {
+	tag, err := d.pool.Exec(ctx, `delete from plugin where id = $1::uuid`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 // ListAllSpaces 返回全部未删除空间（启动期迁移与默认安装集用）。
 func (d *DB) ListAllSpaces(ctx context.Context) ([]store.Space, error) {
 	const q = `
@@ -451,4 +466,67 @@ func (d *DB) DeletePluginCandidate(ctx context.Context, spaceID, slug string) er
 	_, err := d.pool.Exec(ctx,
 		`delete from plugin_candidate where space_id = $1::uuid and slug = $2`, spaceID, slug)
 	return err
+}
+
+// SavePluginScan 写入扫描结论。同一 plugin + version + rules_version 覆盖：
+// 规则没换时重扫只保留最新一次，换了规则则各自留痕。
+func (d *DB) SavePluginScan(ctx context.Context, s store.PluginScan) (store.PluginScan, error) {
+	findings := s.Findings
+	if len(findings) == 0 {
+		findings = json.RawMessage("[]")
+	}
+	const q = `
+insert into plugin_scan (plugin_id, version, artifact_sha256, rules_version, scanner,
+    status, max_severity, deps, lockfile, findings, blocked_reason, dep_error, scanned_by)
+values ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, nullif($13, '')::uuid)
+on conflict (plugin_id, version, rules_version) do update set
+    artifact_sha256 = excluded.artifact_sha256,
+    scanner         = excluded.scanner,
+    status          = excluded.status,
+    max_severity    = excluded.max_severity,
+    deps            = excluded.deps,
+    lockfile        = excluded.lockfile,
+    findings        = excluded.findings,
+    blocked_reason  = excluded.blocked_reason,
+    dep_error       = excluded.dep_error,
+    scanned_by      = excluded.scanned_by,
+    scanned_at      = now()
+returning id::text, plugin_id::text, version, artifact_sha256, rules_version, scanner,
+          status, max_severity, deps, lockfile, findings, blocked_reason, dep_error,
+          coalesce(scanned_by::text, ''), scanned_at`
+
+	var out store.PluginScan
+	err := d.pool.QueryRow(ctx, q,
+		s.PluginID, s.Version, s.SHA256, s.RulesVersion, s.Scanner,
+		s.Status, s.MaxSeverity, s.Deps, s.Lockfile, string(findings),
+		s.BlockedReason, s.DepError, s.ScannedBy,
+	).Scan(
+		&out.ID, &out.PluginID, &out.Version, &out.SHA256, &out.RulesVersion, &out.Scanner,
+		&out.Status, &out.MaxSeverity, &out.Deps, &out.Lockfile, &out.Findings,
+		&out.BlockedReason, &out.DepError, &out.ScannedBy, &out.ScannedAt,
+	)
+	return out, err
+}
+
+// GetPluginScan 取某版本最近一次的扫描结论。
+func (d *DB) GetPluginScan(ctx context.Context, pluginID, version string) (store.PluginScan, error) {
+	const q = `
+select id::text, plugin_id::text, version, artifact_sha256, rules_version, scanner,
+       status, max_severity, deps, lockfile, findings, blocked_reason, dep_error,
+       coalesce(scanned_by::text, ''), scanned_at
+from plugin_scan
+where plugin_id = $1::uuid and version = $2
+order by scanned_at desc
+limit 1`
+
+	var s store.PluginScan
+	err := d.pool.QueryRow(ctx, q, pluginID, version).Scan(
+		&s.ID, &s.PluginID, &s.Version, &s.SHA256, &s.RulesVersion, &s.Scanner,
+		&s.Status, &s.MaxSeverity, &s.Deps, &s.Lockfile, &s.Findings,
+		&s.BlockedReason, &s.DepError, &s.ScannedBy, &s.ScannedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.PluginScan{}, store.ErrNotFound
+	}
+	return s, err
 }

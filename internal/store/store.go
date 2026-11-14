@@ -352,6 +352,8 @@ type Store interface {
 	// UpdatePluginInstallConfig 覆盖安装级配置；只改配置，不动版本与状态。
 	UpdatePluginInstallConfig(ctx context.Context, spaceID, pluginID string, cfg json.RawMessage) error
 	DeletePluginInstall(ctx context.Context, spaceID, pluginID string) error
+	// DeletePlugin 删掉插件及其版本与安装记录（外键级联），用于下线已合并的内置件。
+	DeletePlugin(ctx context.Context, id string) error
 	// ---- 插件候选：空间本地插件「已启用、未发布」的市场元数据 ----
 	UpsertPluginCandidate(ctx context.Context, c PluginCandidate) (PluginCandidate, error)
 	GetPluginCandidate(ctx context.Context, spaceID, slug string) (PluginCandidate, error)
@@ -369,6 +371,11 @@ type Store interface {
 	// MarkPluginBootstrapped 标记空间已完成默认安装集初始化；
 	// 返回 false 表示之前已经标记过（卸载后不再追溯安装）。
 	MarkPluginBootstrapped(ctx context.Context, spaceID string) (bool, error)
+	// SavePluginScan 记录一次发布扫描结论。同一 plugin + version + rules_version
+	// 覆盖写：规则没换时重扫只保留最新一次。
+	SavePluginScan(ctx context.Context, s PluginScan) (PluginScan, error)
+	// GetPluginScan 取某版本最近一次的扫描结论，按扫描时间倒序。
+	GetPluginScan(ctx context.Context, pluginID, version string) (PluginScan, error)
 }
 
 // Resource 是发布后的资源：独立于工作空间存储，只保留名称、版本、描述等最小信息。
@@ -523,4 +530,28 @@ type PluginInstall struct {
 	DismissedVersion string
 	// Config 是空间级配置（连接地址、鉴权头、凭证名），空对象表示沿用清单。
 	Config json.RawMessage
+}
+
+// PluginScan 是一次发布扫描的结论（docs/插件安全基线.md §1.5）。
+//
+// 它是元数据，不是发布件的一部分：artifact_sha256 与发布快照无关，
+// 所以规则升级后可以重扫同一版本，结论会变、产物不会变。
+type PluginScan struct {
+	ID           string
+	PluginID     string
+	Version      string
+	SHA256       string
+	RulesVersion string
+	Scanner      string
+	// Status 取值见 securityscan：passed / blocked / unscanned / error。
+	Status      string
+	MaxSeverity string
+	Deps        int
+	Lockfile    string
+	// Findings 是命中的原始 JSON 数组，读取方自己按 securityscan.Finding 解码。
+	Findings      json.RawMessage
+	BlockedReason string
+	DepError      string
+	ScannedBy     string
+	ScannedAt     time.Time
 }

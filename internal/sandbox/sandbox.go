@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,6 +79,34 @@ type Spec struct {
 	MaxOutput int
 	// Network 为 true 才允许出网；默认 false（ModeFull 下无意义）。
 	Network bool
+	// Proxy 是出网代理的 unix socket 路径（见 internal/egress）。
+	//
+	// 非空时 Network 必须为 false：沙箱仍然 --unshare-net，这个 socket 是唯一的
+	// 对外通道，域名白名单在宿主侧判定。两者同时设置会直接报错——否则
+	// 「以为走了代理、其实直连」这种事故只会出现在线上。
+	Proxy string
+	// FS 是文件访问白名单。零值表示「系统只读基线 + Dir」，看不到任何业务数据。
+	FS FS
+	// Resident 表示这是长驻进程（插件运行时）：不施加墙钟上限，
+	// 生命周期由调用方 Close 决定，而不是靠 Timeout 杀掉。
+	Resident bool
+}
+
+// FS 是文件访问白名单。
+//
+// 语义是「列出来的才能碰」，不是「排除掉这些」：没列出的路径在沙箱里
+// 根本不存在。这个区别在运维上是决定性的——黑名单漏一项是静默泄露，
+// 白名单漏一项是一跑就报错。
+//
+// 路径必须是绝对路径，且必须是宿主机上的真实路径（调用方负责
+// EvalSymlinks，否则 macOS 上 /var → /private/var 会对不上）。
+type FS struct {
+	// Read 是额外允许读取的路径。系统只读基线（/usr、/lib、证书等）由后端补，
+	// 不需要在这里列。
+	Read []string
+	// Write 是允许写入的路径。ModeReadOnly 下会被忽略：
+	// 「只读档位」是调用方的意图，不能被一个 FS.Write 悄悄推翻。
+	Write []string
 }
 
 // Result 是一次执行的结果。命令正常退出（含非零退出码）时 error 为 nil，
@@ -302,7 +331,12 @@ func (r *runner) Start(ctx context.Context, spec Spec) (*Proc, error) {
 		return nil, err
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, spec.Timeout)
+	// 长驻进程不给墙钟：插件进程要在多次调用之间活着，
+	// 用 ctx 超时杀它会退化成「一次调用一进程」，也就没有常驻的意义了。
+	runCtx, cancel := context.Background(), context.CancelFunc(func() {})
+	if !spec.Resident {
+		runCtx, cancel = context.WithTimeout(ctx, spec.Timeout)
+	}
 	cmd := p.command(runCtx)
 
 	stdin, err := cmd.StdinPipe()
@@ -439,13 +473,158 @@ func (s Spec) normalize() (Spec, error) {
 	default:
 		return s, fmt.Errorf("未知的执行模式 %q", s.Mode)
 	}
-	if s.Timeout <= 0 {
+	if s.Timeout <= 0 && !s.Resident {
+		// 长驻进程没有「这次执行多久」的概念，不设默认值，
+		// 否则 30 秒后 Start 建的进程会被 context 杀掉。
 		s.Timeout = DefaultTimeout
 	}
 	if s.MaxOutput <= 0 {
 		s.MaxOutput = DefaultMaxOutput
 	}
+	if s.Proxy != "" {
+		if s.Network {
+			return s, fmt.Errorf("Proxy 与 Network 不能同时设置：有代理时必须断网")
+		}
+		if !filepath.IsAbs(s.Proxy) {
+			abs, err := filepath.Abs(s.Proxy)
+			if err != nil {
+				return s, fmt.Errorf("代理 socket 路径 %q 需要绝对路径: %w", s.Proxy, err)
+			}
+			s.Proxy = abs
+		}
+		// 策略按真实路径匹配：macOS 上 /tmp 是 /private/tmp 的符号链接，
+		// 不展开会让 seatbelt 的放行规则对不上，表现为 connect 直接被拒。
+		if real, err := filepath.EvalSymlinks(s.Proxy); err == nil {
+			s.Proxy = real
+		}
+	}
+	fixed, err := normalizeFS(s.FS)
+	if err != nil {
+		return s, err
+	}
+	// 解释器本身必须在沙箱里可见：deno 装在 /opt/deno/bin 这类非基线路径时，
+	// 不自动加进去会得到「找不到文件」这种与权限完全无关、极难排查的报错。
+	if dir := interpreterDir(s.Cmd[0]); dir != "" {
+		fixed.Read = append(fixed.Read, dir)
+	}
+	s.FS = fixed
 	return s, nil
+}
+
+// normalizeFS 校验白名单路径：必须绝对、必须干净。
+//
+// 相对路径不在这里 "解析成绝对" 而是直接报错：沙箱的工作目录由 Spec.Dir 决定，
+// 悄悄按它拼路径会让调用方以为自己限制的是空间 A、实际限制的是空间 B。
+func normalizeFS(fs FS) (FS, error) {
+	cleanList := func(in []string) ([]string, error) {
+		out := make([]string, 0, len(in))
+		for _, p := range in {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				return nil, fmt.Errorf("文件白名单路径必须是绝对路径: %q", p)
+			}
+			abs := filepath.Clean(p)
+			if abs != p {
+				p = abs
+			}
+			out = append(out, p)
+		}
+		return out, nil
+	}
+	read, err := cleanList(fs.Read)
+	if err != nil {
+		return FS{}, err
+	}
+	write, err := cleanList(fs.Write)
+	if err != nil {
+		return FS{}, err
+	}
+	return FS{Read: read, Write: write}, nil
+}
+
+// interpreterDir 返回可执行文件的绝对目录；命令是相对名（依赖 PATH）时返回空。
+func interpreterDir(bin string) string {
+	if bin == "" {
+		return ""
+	}
+	if filepath.IsAbs(bin) {
+		return filepath.Dir(bin)
+	}
+	if abs, err := exec.LookPath(bin); err == nil {
+		return filepath.Dir(abs)
+	}
+	return ""
+}
+
+// fsPaths 把 Spec 与后端基线合成最终的读 / 写挂载列表。
+//
+// 去重后排序：后端命令行的稳定性对排障很重要（同样的 Spec 应该得到同样的 argv），
+// 也让单测可以直接比字符串。
+func (s Spec) fsPaths(baseline []string) (read, write []string) {
+	read = append(read, baseline...)
+	read = append(read, ExtraRead()...)
+	read = append(read, s.FS.Read...)
+	// 工作目录必须可读，否则连「脚本文件所在目录」都进不去。
+	if s.Dir != "" {
+		read = append(read, s.Dir)
+	}
+	if s.Mode == ModeWorkspaceWrite {
+		write = append(write, s.FS.Write...)
+		write = append(write, s.Dir)
+	}
+	return sortedUnique(read), sortedUnique(write)
+}
+
+// extraRead 是运维补丁位：白名单化之后，装在非标准位置的运行时
+// （npm 装的 deno 是 node 包装脚本、自定义 node 发行版、内网镜像的 python）
+// 需要把安装前缀挂进来，否则会得到「找不到模块」这类与权限无关的报错。
+//
+// 只在启动时设置一次；放全局是因为它属于「这台机器的环境事实」，
+// 而不是某一次调用的参数。
+var (
+	extraReadMu sync.RWMutex
+	extraRead   []string
+)
+
+// SetExtraRead 设置全局额外只读路径，传空清空。
+func SetExtraRead(paths []string) {
+	clean := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" && filepath.IsAbs(p) {
+			clean = append(clean, filepath.Clean(p))
+		}
+	}
+	extraReadMu.Lock()
+	extraRead = clean
+	extraReadMu.Unlock()
+}
+
+// ExtraRead 返回当前全局额外只读路径（拷贝，调用方可安全修改）。
+func ExtraRead() []string {
+	extraReadMu.RLock()
+	defer extraReadMu.RUnlock()
+	return append([]string(nil), extraRead...)
+}
+
+func sortedUnique(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // baseEnvKeys 是允许从父进程继承的环境变量：都是无害的本地化 / 路径信息。
@@ -473,6 +652,10 @@ func buildEnv(spec Spec, tmp string) []string {
 	}
 	if !hasPath {
 		env = append(env, "PATH="+fallbackPath)
+	}
+	if spec.Proxy != "" {
+		// 约定变量：插件与依赖从这里拿到唯一的出网地址。
+		env = append(env, "WA_EGRESS_PROXY="+spec.Proxy)
 	}
 	return append(env, spec.Env...)
 }

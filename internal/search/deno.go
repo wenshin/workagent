@@ -45,6 +45,15 @@ type Deno struct {
 	keyFunc  func(context.Context) (string, error)
 	client   doer
 	shell    sandbox.Runner
+	// fs 是脚本进程的文件白名单：零值表示只有系统基线 + 脚本目录。
+	// 脚本源是纯变换，不需要读空间文件，默认就是最小权限。
+	fs sandbox.FS
+}
+
+// WithFS 设置脚本进程的文件白名单（由插件层按空间解析）。
+func (d *Deno) WithFS(fs sandbox.FS) *Deno {
+	d.fs = fs
+	return d
 }
 
 // NewDeno 构造脚本搜索源。script 是 .ts/.js 文件的绝对路径（相对路径按当前目录解析）。
@@ -200,6 +209,7 @@ func (d *Deno) run(ctx context.Context, in map[string]any, secret string) ([]byt
 			d.script,
 		},
 		Dir:       filepath.Dir(d.script),
+		FS:        d.fs,
 		Stdin:     payload,
 		Mode:      sandbox.ModeReadOnly,
 		Network:   false,

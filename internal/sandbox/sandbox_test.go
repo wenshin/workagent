@@ -65,8 +65,15 @@ func TestEnsure(t *testing.T) {
 
 func TestBwrapArgs(t *testing.T) {
 	bin := "/usr/bin/bwrap"
-	ws := "/work/space"
-	tmp := "/tmp/sandbox-1"
+	ws := t.TempDir()
+	tmp := filepath.Join(t.TempDir(), "sandbox-1")
+	extra := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(extra, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	env := []string{"PATH=/bin", "HOME=" + tmp}
 
 	cases := []struct {
@@ -76,15 +83,24 @@ func TestBwrapArgs(t *testing.T) {
 		notWant []string
 	}{
 		{
-			name:    "只读档默认禁网",
-			spec:    Spec{Cmd: []string{"sh", "-c", "ls"}, Dir: ws, Mode: ModeReadOnly},
-			want:    []string{"--ro-bind / /", "--unshare-net", "--clearenv", "--setenv PATH /bin", "--chdir " + ws},
-			notWant: []string{"--bind " + ws},
+			name: "只读档默认禁网且不挂全盘",
+			spec: Spec{Cmd: []string{"sh", "-c", "ls"}, Dir: ws, Mode: ModeReadOnly},
+			want: []string{"--unshare-net", "--clearenv", "--setenv PATH /bin", "--chdir " + ws,
+				"--ro-bind-try " + ws + " " + ws, "--ro-bind-try /usr /usr"},
+			// 白名单挂载的核心：根目录不再整体挂进来，空间目录也不可写
+			notWant: []string{"--ro-bind / /", "--bind " + ws + " " + ws},
 		},
 		{
-			name: "workspace 档多挂一个可写目录",
-			spec: Spec{Cmd: []string{"sh"}, Dir: ws, Mode: ModeWorkspaceWrite},
-			want: []string{"--bind " + ws + " " + ws, "--bind " + tmp + " " + tmp},
+			name: "workspace 档只放开 Dir 与显式声明的写路径",
+			spec: Spec{Cmd: []string{"sh"}, Dir: ws, Mode: ModeWorkspaceWrite,
+				FS: FS{Read: []string{extra}, Write: []string{extra}}},
+			want: []string{
+				"--bind " + ws + " " + ws,
+				"--bind " + extra + " " + extra,
+				"--ro-bind-try /etc/passwd /etc/passwd",
+				"--bind " + tmp + " " + tmp,
+			},
+			notWant: []string{"--ro-bind / /"},
 		},
 		{
 			name:    "显式允许网络时不隔离 netns",
@@ -117,9 +133,22 @@ func TestBwrapArgs(t *testing.T) {
 	}
 }
 
+// writeBlock 截出 (allow file-write* ...) 那一段：判断「能不能写」必须看这一段，
+// 整份 profile 里出现 workspace 是正常的（读权限里也要有它）。
+func writeBlock(profile string) string {
+	i := strings.Index(profile, "(allow file-write*")
+	if i < 0 {
+		return ""
+	}
+	return profile[i:]
+}
+
 func TestSeatbeltProfile(t *testing.T) {
-	ws := "/work/space"
-	tmp := "/private/tmp/sandbox-1"
+	ws := t.TempDir()
+	tmp := filepath.Join(t.TempDir(), "sandbox-1")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	ro, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeReadOnly}, tmp)
 	if err != nil {
@@ -130,15 +159,19 @@ func TestSeatbeltProfile(t *testing.T) {
 			t.Errorf("只读 profile 缺少 %q\n%s", w, ro)
 		}
 	}
-	if strings.Contains(ro, ws) {
+	if strings.Contains(writeBlock(ro), ws) {
 		t.Errorf("只读档不该给 workspace 写权限\n%s", ro)
+	}
+	// 读权限只走白名单，不能再有全盘可读
+	if !strings.Contains(ro, "(allow file-read*") || strings.Contains(ro, "(allow file-read*)\n") {
+		t.Errorf("读权限必须是 subpath 白名单\n%s", ro)
 	}
 
 	rw, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite, Network: true}, tmp)
 	if err != nil {
 		t.Fatalf("生成 profile 失败: %v", err)
 	}
-	if !strings.Contains(rw, `(subpath "`+ws+`")`) {
+	if !strings.Contains(writeBlock(rw), `(subpath "`+ws+`")`) {
 		t.Errorf("workspace 档应放开 workspace 写权限\n%s", rw)
 	}
 	if strings.Contains(rw, "(deny network*)") {
@@ -147,6 +180,26 @@ func TestSeatbeltProfile(t *testing.T) {
 
 	if _, err := seatbeltProfile(Spec{Dir: `/evil"path`, Mode: ModeWorkspaceWrite}, "/tmp"); err == nil {
 		t.Error("含引号的路径应该被拒绝，而不是拼进 profile")
+	}
+}
+
+// FS 白名单只接受绝对路径：相对路径会让「我限制的是哪个目录」变得不可推理。
+func TestFSNormalize(t *testing.T) {
+	if _, err := (Spec{Cmd: []string{"sh"}, FS: FS{Read: []string{"relative/dir"}}}).normalize(); err == nil {
+		t.Fatal("相对路径应该报错")
+	}
+	got, err := (Spec{Cmd: []string{"sh"}, Dir: "/tmp", FS: FS{Read: []string{"/data/"}}}).normalize()
+	if err != nil {
+		t.Fatalf("normalize 失败: %v", err)
+	}
+	found := false
+	for _, p := range got.FS.Read {
+		if p == "/data" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("路径没被 Clean: %#v", got.FS.Read)
 	}
 }
 
@@ -274,7 +327,8 @@ func TestSandboxWriteBoundary(t *testing.T) {
 		t.Fatalf("[%s] workspace 内写入失败: %v\nstderr: %s", r.Name(), err, res.Stderr)
 	}
 	if strings.TrimSpace(res.Stdout) != "hi" {
-		t.Errorf("[%s] workspace 内写入后读不回: %q / %s", r.Name(), res.Stdout, res.Stderr)
+		t.Errorf("[%s] workspace 内写入后读不回: exit=%d stdout=%q stderr=%q",
+			r.Name(), res.ExitCode, res.Stdout, res.Stderr)
 	}
 
 	outside := filepath.Join(os.TempDir(), fmt.Sprintf("sandbox-escape-%d.txt", time.Now().UnixNano()))

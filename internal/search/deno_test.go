@@ -1,12 +1,15 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/sandbox"
 )
@@ -41,13 +44,32 @@ func (f *fakeDoer) Do(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func denoAvailable() bool {
-	_, err := exec.LookPath("deno")
-	return err == nil
+// denoAvailable 要求 deno 真的能跑，并且能在**白名单沙箱**里跑。
+//
+// 包管理器装的 deno 往往是 node 包装脚本（`#!/usr/bin/env node`），
+// 真正的代码在安装前缀的 lib/ 下。白名单挂载只给了可执行文件所在目录，
+// 于是 node 会报「找不到模块」——这不是测试环境问题，而是生产上必须
+// 通过 SANDBOX_READ_EXTRA 显式放开的运维项，这里顺带把它配好。
+func denoAvailable(t *testing.T) bool {
+	t.Helper()
+	bin, err := exec.LookPath("deno")
+	if err != nil {
+		return false
+	}
+	if head, err := os.ReadFile(bin); err == nil && bytes.HasPrefix(head, []byte("#!")) {
+		// 包装脚本要在沙箱里跑，得靠 SANDBOX_READ_EXTRA 把安装前缀挂进去，
+		// 这里不模拟那套环境：适配器测试要验的是脚本协议，不是打包方式。
+		t.Logf("deno 是包装脚本（%s），跳过；生产环境请用原生二进制或配 SANDBOX_READ_EXTRA", bin)
+		return false
+	}
+	// 必须真的跑一段脚本：有些 shim 能响应 --version，但执行脚本会失败。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, bin, "eval", "1").Run() == nil
 }
 
 func TestDenoAdapterTwoPhase(t *testing.T) {
-	if !denoAvailable() {
+	if !denoAvailable(t) {
 		t.Skip("没装 deno，跳过脚本搜索源测试")
 	}
 	client := &fakeDoer{respBody: `{"code":0,"items":[
@@ -87,7 +109,7 @@ func TestDenoAdapterTwoPhase(t *testing.T) {
 }
 
 func TestDenoAdapterBusinessError(t *testing.T) {
-	if !denoAvailable() {
+	if !denoAvailable(t) {
 		t.Skip("没装 deno，跳过脚本搜索源测试")
 	}
 	client := &fakeDoer{respBody: `{"code":401,"msg":"invalid key"}`}

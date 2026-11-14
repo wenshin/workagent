@@ -1,0 +1,148 @@
+{
+  "version": "2026.11.1",
+  "rules": [
+    {
+      "id": "PROMPT-IGNORE-INSTRUCTION",
+      "kind": "prompt",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(忽略|无视|忘记|跳过)[^。\\n]{0,10}(之前|以上|前面|先前|上述)的?[^。\\n]{0,6}(指令|指示|规则|要求|约束)",
+      "message": "提示词要求模型忽略既有指令，可能被用来覆盖平台基础规则",
+      "ref": "OWASP LLM01"
+    },
+    {
+      "id": "PROMPT-IGNORE-EN",
+      "kind": "prompt",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(?i)ignore\\s+(all\\s+)?(the\\s+)?(previous|prior|above)\\s+(instructions|prompts|rules)",
+      "message": "Prompt asks the model to ignore previous instructions",
+      "ref": "OWASP LLM01"
+    },
+    {
+      "id": "PROMPT-ROLE-JAILBREAK",
+      "kind": "prompt",
+      "severity": "medium",
+      "blocking": false,
+      "pattern": "(开发者模式|DAN\\s*模式|进入无限制模式|你现在是[^。\\n]{0,12}(不受|没有)[^。\\n]{0,6}(限制|约束))",
+      "message": "提示词试图改变模型的角色约束，需人工确认其用途",
+      "ref": "OWASP LLM01"
+    },
+    {
+      "id": "PROMPT-NO-CONFIRM",
+      "kind": "prompt",
+      "severity": "medium",
+      "blocking": false,
+      "pattern": "(无需|不需要|不必)(再)?(征求|经过|等待|请求)?(用户)?(确认|同意|批准|许可)",
+      "message": "提示词要求跳过用户确认，需确认该动作确实无副作用",
+      "ref": "人审节点"
+    },
+    {
+      "id": "PROMPT-DANGER-CMD",
+      "kind": "prompt",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(rm\\s+-rf\\s+/|DROP\\s+(TABLE|DATABASE)|TRUNCATE\\s+TABLE|git\\s+push\\s+--force|--no-verify)",
+      "message": "提示词包含不可逆的破坏性操作",
+      "ref": "不可逆操作"
+    },
+    {
+      "id": "PROMPT-EXFIL",
+      "kind": "prompt",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(密钥|密钥值|凭证|token|Token|环境变量|密码)[^。\\n]{0,20}(发送|上传|外发|写入|拼接|附带|附在|放进)[^。\\n]{0,12}(http|https|url|链接|邮件|外部|第三方)",
+      "message": "提示词要求把凭证发往外部目的地，属于凭证外泄",
+      "ref": "OWASP LLM06"
+    },
+    {
+      "id": "PROMPT-EXTERNAL-INSTRUCTION",
+      "kind": "prompt",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(按照|根据|遵循)[^。\\n]{0,12}(网页|文档|邮件|搜索结果|聊天记录)[^。\\n]{0,8}(中|里)的[^。\\n]{0,6}(指令|要求|命令)",
+      "message": "提示词让模型执行外部内容里的指令，这是间接提示注入的放大器",
+      "ref": "OWASP LLM01"
+    },
+    {
+      "id": "SECRET-AWS-AK",
+      "kind": "secret",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "\\bAKIA[0-9A-Z]{16}\\b",
+      "message": "检测到 AWS Access Key"
+    },
+    {
+      "id": "SECRET-PRIVATE-KEY",
+      "kind": "secret",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
+      "message": "检测到私钥文件内容"
+    },
+    {
+      "id": "SECRET-GENERIC",
+      "kind": "secret",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "(?i)(api[_-]?key|secret[_-]?key|access[_-]?token|client[_-]?secret)\\s*[:=]\\s*[A-Za-z0-9_\\-]{24,}",
+      "message": "检测到硬编码的密钥或令牌"
+    },
+    {
+      "id": "SECRET-JWT",
+      "kind": "secret",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
+      "message": "检测到 JWT 字面量"
+    },
+    {
+      "id": "SECRET-GITHUB-PAT",
+      "kind": "secret",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "\\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}\\b",
+      "message": "检测到 GitHub Personal Access Token"
+    },
+    {
+      "id": "CODE-FORBID-EVAL",
+      "kind": "code",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "\\b(eval|new\\s+Function)\\s*\\(",
+      "message": "插件代码不得使用 eval / new Function（可绕过一切限制）"
+    },
+    {
+      "id": "CODE-FORBID-CHILD-PROCESS",
+      "kind": "code",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "\\b(Deno\\.Command|Deno\\.run|child_process|execSync|spawnSync)\\b",
+      "message": "插件不得直接创建子进程，应走宿主 ABI"
+    },
+    {
+      "id": "CODE-FORBID-FFI",
+      "kind": "code",
+      "severity": "critical",
+      "blocking": true,
+      "pattern": "(Deno\\.(dlopen|UnsafePointer|UnsafeCallback)|node:ffi)",
+      "message": "插件不得加载原生代码或直接操作内存"
+    },
+    {
+      "id": "CODE-REMOTE-IMPORT",
+      "kind": "code",
+      "severity": "high",
+      "blocking": true,
+      "pattern": "(from|import)\\s*\\(?\\s*[\\\"']https?://",
+      "message": "插件不得从远程 URL 导入依赖（供应链入口，且与离线要求冲突）"
+    },
+    {
+      "id": "CODE-DIRECT-NET",
+      "kind": "code",
+      "severity": "medium",
+      "blocking": false,
+      "pattern": "(Deno\\.connect|net\\.connect|socket\\.connect)\\s*\\(",
+      "message": "插件直接建连，应优先使用 host.call 以便统一校验与审计"
+    }
+  ]
+}
