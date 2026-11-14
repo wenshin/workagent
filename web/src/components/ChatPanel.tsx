@@ -652,6 +652,9 @@ export default function ChatPanel({
                 {m.source === 'task_result' ? (
                   <span className="chat-msg-time">任务回执</span>
                 ) : null}
+                {m.source === 'task_brief' ? (
+                  <span className="chat-msg-time">任务说明</span>
+                ) : null}
                 {m.interrupted ? <span className="chat-msg-time">已中断</span> : null}
                 <span className="chat-msg-time">{formatTime(m.created_at)}</span>
                 {m.role === 'assistant' ? (

@@ -55,8 +55,9 @@ func (b *autoRunBudget) allow(sessionID string, now time.Time) bool {
 
 // Dispatch 把一件事派发给子会话：子会话归属被派发人，父会话正常结束、继续可用。
 //
-// 只有会话创建者能派发；被派发人必须已经是空间成员——否则他连子会话都打不开，
-// 「拉个人进空间」这种事不该由模型的一次工具调用悄悄完成。
+// 子会话**建在被派发人的个人空间**，不建在父会话所在空间：他可能根本无权进入那个
+// 空间，而派发只是「请他做件事」，不该顺带给他开一片空间的读权限（那是可见的权限
+// 变更，不该由一次工具调用悄悄完成）。个人空间他天然 manage，任务一落地就看得见。
 func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in tool.TaskDispatchInput) (tool.TaskInfo, error) {
 	sess, sp, err := s.load(ctx, userID, sessionID)
 	if err != nil {
@@ -77,8 +78,10 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 	if assignee.ID == userID {
 		return tool.TaskInfo{}, errors.New("不能把任务派发给自己：直接在当前会话里完成即可")
 	}
-	if perm, err := s.store.SpacePerm(ctx, sess.SpaceID, assignee.ID); err == nil && perm == "" {
-		return tool.TaskInfo{}, fmt.Errorf("%s 不是本空间成员，无法接收任务", assignee.Name)
+	// 被派发人可能从没登录过平台：先把个人空间备好，否则子会话无处安放
+	personalSpaceID, err := s.ensurePersonalSpace(ctx, assignee.ID)
+	if err != nil {
+		return tool.TaskInfo{}, fmt.Errorf("为 %s 准备个人空间失败：%w", assignee.Name, err)
 	}
 
 	existing, err := s.store.ListTasks(ctx, sessionID)
@@ -97,21 +100,30 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 	}
 
 	brief := strings.TrimSpace(in.Brief)
-	child, err := s.store.CreateSession(ctx, sess.SpaceID, assignee.ID,
-		truncate(title, 60), sess.Dir, sess.AgentID, sess.AgentVersion, sess.AgentPrompt)
+	// dir 传空：父会话的目录是相对父空间 files/ 的路径，跨到个人空间后没有意义。
+	// 智能体设定照旧继承——它是行为设定，与空间无关。
+	child, err := s.store.CreateSession(ctx, personalSpaceID, assignee.ID,
+		truncate(title, 60), "", sess.AgentID, sess.AgentVersion, sess.AgentPrompt)
 	if err != nil {
 		return tool.TaskInfo{}, err
 	}
 
-	// 子会话的第一条消息就是任务说明：被派发人打开就知道要做什么、回什么。
+	// 子会话的第一条消息就是任务说明：被派发人打开就知道是谁派的、要做什么、回什么。
 	if brief != "" {
-		if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user", brief, "task_brief"); err != nil {
+		from := userID
+		if u, err := s.store.GetUser(ctx, userID); err == nil {
+			from = u.Name
+		}
+		intro := fmt.Sprintf("%s 通过智能体派了个任务给你，直接在本会话回复即可，结果会自动回传给他。", from)
+		if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user", intro+"\n\n"+brief, "task_brief"); err != nil {
 			s.log.Warn("写入任务说明失败", "task_session", child.ID, "err", err)
 		}
 	}
 
 	now := time.Now()
 	task, err := s.store.CreateTask(ctx, store.Task{
+		// space_id 记的是「任务从哪个空间派出」；子会话在别人的个人空间，
+		// 需要它的空间时用 child_session_id 反查，不要用这一列。
 		SpaceID:         sess.SpaceID,
 		ParentSessionID: sessionID,
 		ChildSessionID:  child.ID,
@@ -249,6 +261,24 @@ func (s *Service) completeParentTask(ctx context.Context, childSessionID, conten
 			s.log.Warn("回执触发父会话失败", "task_id", task.ID, "err", err)
 		}
 	}()
+}
+
+// ensurePersonalSpace 返回用户的个人空间 ID，没有就现建一个。
+//
+// 与登录共用 store.EnsurePersonalSpace：内部按 user_id 取 advisory lock，
+// 并发派发两次也只会建出一个空间。被派发人没用过平台时，他的个人空间
+// 就在这里被建出来——这是派发能覆盖「同事还没上过平台」的前提。
+func (s *Service) ensurePersonalSpace(ctx context.Context, userID string) (string, error) {
+	spaces, _, err := s.store.EnsurePersonalSpace(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	for _, sp := range spaces {
+		if sp.Type == "personal" && sp.OwnerID == userID && sp.ParentID == "" {
+			return sp.ID, nil
+		}
+	}
+	return "", errors.New("个人空间不可用（可能已停用），请联系管理员")
 }
 
 // resolveAssignee 把模型给的「人」解析成用户：先按 id，再按工号，最后按姓名/邮箱模糊匹配。
