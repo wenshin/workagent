@@ -146,6 +146,8 @@ export interface ChatMessage {
 export interface AgentInfo {
   ready: boolean;
   model: string;
+  /** 单文件上传上限（MB），由服务端 UPLOAD_MAX_FILE_MB 决定 */
+  upload_max_file_mb?: number;
 }
 
 export interface MeResponse {
@@ -174,6 +176,11 @@ export interface SpaceFile {
 }
 
 export interface FilesResponse {
+  files: SpaceFile[];
+}
+
+/** 上传结果：服务端落盘后的文件（同名会被改名为 xxx-1.md，以返回值为准） */
+export interface UploadFilesResponse {
   files: SpaceFile[];
 }
 

@@ -28,7 +28,8 @@ func BuildSystemMessage(in RunInput) llm.Message {
   - 用户提到「我们的规范 / 流程 / 模板 / 制度 / 标准」，或要求产出正式文档、执行明确的业务动作时，必须先 resource_search 检索；命中后用 resource_read 读正文再照做。
   - 检索不到就明确说没有找到相关规范，不要用常识冒充公司规定。
   - 命中多个同名资源时，先把候选给用户选，不要自行假设。
-- 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
+- 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / csv / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
+- 用户消息末尾出现「[引用文件]」时，那些是用户明确要求参考的空间文件：先逐个 file_read 读取再作答，不要凭空假设内容；文件不存在或读不到就如实说明。
 - 用户要「做一个技能」时，按 builtin_plugin_dev 的 references/skill.md 直接写文件：先 file_write 写 plugins/<slug>/plugin.json，再写 plugins/<slug>/SKILL.md。正文只写入口流程与判断规则，参考资料放子文件（最多一层引用），单个 SKILL.md 建议不超过 300 行。
 - 用户要「做一个组件 / 看板 / 表单 / 界面块」时，先 resource_search(kind=skills, query=组件) 找「前端组件」技能，按里面的 DSL 规则生成 plugins/<slug>/plugin.json 与 ui.json。组件是声明式 DSL，不是代码：不要生成 TSX/HTML/CSS，也不要让用户上传或引用外部组件。
 - 编程类任务先判断要不要用「编程实践」技能：解释代码、答语法 / API 问题、给示例片段直接做；要改空间里的代码、修 bug、补测试、重构、做评审或跑命令验证时，先 resource_search(kind=skills, query=编程) 取技能，按其中对应子手册执行；没跑过的验证不要说已验证。
@@ -73,6 +74,11 @@ func BuildSystemMessage(in RunInput) llm.Message {
 		}
 	}
 
+	// 平台部署事实：租户、IM 接入、当前用户与空间。
+	// 这些是「必须恒真」的现场信息，直接写进提示词；如果做成工具，模型会凭先验
+	// 抢答（用户问「我们用的是企微吧」它顺着答），而且每轮都要白带一份工具 schema。
+	writePlatformFacts(&b, in.Platform)
+
 	// 智能体设定：结构上只能追加在基础规则之后，并显式声明优先级，
 	// 避免配置里写「忽略以上要求」就能改掉平台约束（方案 A）。
 	if extra := strings.TrimSpace(in.AgentPrompt); extra != "" {
@@ -102,6 +108,42 @@ func BuildSystemMessage(in RunInput) llm.Message {
 	}
 
 	return llm.Message{Role: llm.RoleSystem, Content: b.String()}
+}
+
+// writePlatformFacts 把平台部署事实写成一小段提示词。
+//
+// 每一条都只在有值时出现：宁可让模型说「不知道租户名称」，也不能注入一个
+// 空括号或占位符让它读成「租户为空」。全部为空（如测试或未接线）时整段省略。
+func writePlatformFacts(b *strings.Builder, p PlatformFacts) {
+	parts := make([]string, 0, 4)
+	if tenant := strings.TrimSpace(p.Tenant); tenant != "" {
+		parts = append(parts, fmt.Sprintf("租户（企业）是「%s」", tenant))
+	}
+	if im := strings.TrimSpace(p.IMName); im != "" {
+		state := "登录已配置"
+		if !p.IMConfigured {
+			state = "登录凭证未配置，用户无法登录"
+		}
+		parts = append(parts, fmt.Sprintf("IM 接入是%s（%s）", im, state))
+	}
+	if user := strings.TrimSpace(p.UserName); user != "" {
+		who := user
+		if job := strings.TrimSpace(p.JobNumber); job != "" {
+			who = fmt.Sprintf("%s，工号 %s", user, job)
+		}
+		parts = append(parts, "当前登录用户是"+who)
+	}
+	if space := strings.TrimSpace(p.SpaceName); space != "" {
+		parts = append(parts, fmt.Sprintf("当前空间是「%s」", space))
+	}
+	if len(parts) == 0 {
+		return
+	}
+
+	b.WriteString("\n\n## 平台（部署事实）\n")
+	b.WriteString(strings.Join(parts, "；"))
+	b.WriteString("。\n")
+	b.WriteString("回答平台、租户、IM 相关问题时以这里为准；这里没有的信息就说不知道，不要凭常识或上下文猜测。")
 }
 
 // TruncateText 按字节截断文本并标注，避免超长内容挤占上下文。

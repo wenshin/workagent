@@ -30,6 +30,7 @@ var (
 	ErrDirTooDeep      = errors.New("目录最多支持 5 层")
 	ErrFileNotFound    = errors.New("文件不存在")
 	ErrFileUnsupported = errors.New("该文件类型不支持预览")
+	ErrFileTooLarge    = errors.New("文件超过单次上传大小上限")
 )
 
 const (
@@ -81,6 +82,24 @@ type Service struct {
 	// pluginChanged 在 plugins/ 目录被直接改动（删除草稿）后触发插件层重载，
 	// 否则已加载的实例会继续带着已经不存在的插件跑。
 	pluginChanged func(ctx context.Context, spaceID string) error
+	// uploadMaxBytes 是单文件上传大小上限（字节）。装配时由配置注入，
+	// 未注入按 DefaultUploadMaxBytes 处理。
+	uploadMaxBytes int64
+}
+
+// SetUploadMaxBytes 设置单文件上传大小上限；非正值表示沿用默认值。
+func (s *Service) SetUploadMaxBytes(n int64) {
+	if n > 0 {
+		s.uploadMaxBytes = n
+	}
+}
+
+// UploadMaxBytes 返回单文件上传大小上限（字节）。
+func (s *Service) UploadMaxBytes() int64 {
+	if s.uploadMaxBytes > 0 {
+		return s.uploadMaxBytes
+	}
+	return DefaultUploadMaxBytes
 }
 
 // SetSpaceCreated 注册空间创建后的回调。

@@ -1,3 +1,5 @@
+import type { SpaceFile, UploadFilesResponse } from './types';
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -70,4 +72,38 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   }
 
   return data as T;
+}
+
+/**
+ * 上传文件到空间：multipart/form-data，字段名 files，dir 是相对空间 files/ 的目录。
+ * 单独一个函数是因为 api() 只会发 JSON，而上传必须让浏览器自己带 boundary。
+ */
+export async function uploadSpaceFiles(
+  spaceId: string,
+  files: File[],
+  dir?: string,
+): Promise<SpaceFile[]> {
+  const form = new FormData();
+  files.forEach((file) => form.append('files', file));
+  if (dir) form.append('dir', dir);
+
+  let res: Response;
+  try {
+    res = await fetch(`/spaces/${spaceId}/files`, { method: 'POST', body: form });
+  } catch {
+    throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
+  }
+
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
+  }
+
+  const data: unknown = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = (data ?? {}) as ErrorBody;
+    throw new ApiError(err.message ?? `上传失败（${res.status}）`, res.status, err.code ?? 'unknown');
+  }
+
+  return (data as UploadFilesResponse).files ?? [];
 }

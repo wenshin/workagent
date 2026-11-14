@@ -33,6 +33,10 @@ type Config struct {
 
 	StorageRoot string
 
+	// UploadMaxFileMB 是会话上传单个文件的大小上限（MB），环境变量 UPLOAD_MAX_FILE_MB。
+	// 0 表示沿用默认 4MB（负数启动报错）；单次上传的文件数上限仍是 10 个。
+	UploadMaxFileMB int
+
 	// 系统管理员工号（逗号分隔）：只有这些用户能看到并编辑「系统空间」。
 	// MVP 用配置文件指定，后续接入组织架构后改为角色表。
 	AdminJobs []string
@@ -187,6 +191,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("LLM_MAX_WALL_CLOCK 不是合法的时长: %w", err)
 	}
 
+	// 上传单文件上限：按 MB 配，乘 2^20 落到字节；0 表示用 space 包的默认值（4MB）。
+	uploadMaxFileMB := 4
+	if v := getenv("UPLOAD_MAX_FILE_MB", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &uploadMaxFileMB); err != nil || uploadMaxFileMB < 0 {
+			return nil, fmt.Errorf("UPLOAD_MAX_FILE_MB 必须是非负整数")
+		}
+	}
+
 	c := &Config{
 		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8321"),
 		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8321"), "/"),
@@ -202,6 +214,7 @@ func Load() (*Config, error) {
 		SessionTTL:           ttl,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
+		UploadMaxFileMB:      uploadMaxFileMB,
 		AdminJobs:            splitList(getenv("ADMIN_JOB_NUMBERS", "")),
 
 		LLMProvider:  getenv("LLM_PROVIDER", "openai"),

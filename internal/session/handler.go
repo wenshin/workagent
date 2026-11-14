@@ -304,6 +304,9 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		Content string `json:"content"`
+		// References 是用户在图里勾选的引用文件（相对空间 files/ 的路径）。
+		// 只传路径，不传正文：是否读、读多少由 Agent 按任务决定。
+		References []string `json:"references"`
 	}
 	if err := platform.DecodeJSON(r, &req); err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
@@ -311,7 +314,15 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := r.PathValue("id")
-	if _, _, err := h.svc.ValidateChat(r.Context(), user.ID, sessionID, req.Content); err != nil {
+	refs, err := h.svc.ResolveReferences(r.Context(), user.ID, sessionID, req.References)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	// 引用清单拼在正文末尾一起落库：历史回放与后续轮次都能看到「参考了哪些文件」，
+	// 前端按标记把清单切出来渲染成文件标签。
+	content := ComposeContent(req.Content, refs)
+	if _, _, err := h.svc.ValidateChat(r.Context(), user.ID, sessionID, content); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -351,7 +362,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, req.Content, emit)
+	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, content, emit)
 	if err != nil {
 		switch {
 		case r.Context().Err() != nil:

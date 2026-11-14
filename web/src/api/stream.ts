@@ -59,6 +59,7 @@ function toToolRecord(payload: StreamPayload): ToolCallRecord {
 export async function streamChat(
   sessionId: string,
   content: string,
+  references: string[],
   handlers: StreamHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
@@ -67,7 +68,8 @@ export async function streamChat(
     res = await fetch(`/sessions/${sessionId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      // references 是相对空间 files/ 的路径；正文由服务端拼上引用清单落库
+      body: JSON.stringify({ content, references }),
       signal,
     });
   } catch (err) {

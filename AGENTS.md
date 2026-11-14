@@ -133,6 +133,7 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - 清单里 `agent` 段：`entry`（提示词正文，默认 `AGENT.md`）/ `extends`（父智能体 slug，可多层，最多 4 层、禁止成环）/ `requires`（依赖的技能、MCP、工具，安装本插件时一并装进同一空间）。
 - 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：`extends: "base"` 表示继承它；平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。
 - **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
+- **平台部署事实进提示词，不做成工具**：租户（企业）名称、IM 接入、当前用户与空间由 `session` 层填入 `RunInput.Platform`，`BuildSystemMessage` 渲染成 `## 平台（部署事实）`。理由：这些信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具会顺着猜而不调用；工具 schema 还会每轮常驻。新增同类事实（版本号、配额）优先走这里，只有「量大 / 需按权限裁剪 / 需审计」的才考虑工具。
 - 智能体是行为设定，**不是权限**：可见工具仍由 `tool_binding` + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
 - **内置工具视为已绑定**：`tool_binding` 只用于给资源型工具（数据库 / MCP / 自定义工具）授权数据范围；内置件随发版走、没有按空间配置的入口，按已绑定处理（`internal/tool.applyBindings`）。豁免只放开「有没有绑定」：L2 放行，L3 仍需 `allow_write`（否则审批），L4 一律审批。`plugin_try` 是 L2，之前没有这条豁免对所有空间都判「需要管理员绑定」。
 - 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。清单接口：`GET /spaces/{id}/agents`。

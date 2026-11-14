@@ -62,6 +62,8 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		log.Info("身份接入已就绪", "provider", idp.Name(), "display", idp.DisplayName())
 	}
 	spaceSvc := space.NewService(st, fs, log, cfg.AdminJobs)
+	// 上传上限按 MB 配置，0 表示沿用默认值（4MB）
+	spaceSvc.SetUploadMaxBytes(int64(cfg.UploadMaxFileMB) << 20)
 	// 管理员可能尚未登录过：启动时按配置工号尽量把系统空间准备好
 	spaceSvc.BootstrapSystemSpace(context.Background())
 
@@ -219,6 +221,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	sessionSvc.SetPluginTry(pluginSvc)
 	// 凭证存储：会话内的 secret_request 只查「配过没有」，值不进模型上下文
 	sessionSvc.SetSecrets(secretStore)
+	// 平台部署事实：租户兜底名来自配置（登录用户的通讯录资料更准），
+	// IM 以当前选定的身份接入实现为准；这些会随系统提示词注入，不做成工具
+	sessionSvc.SetPlatformFacts(agent.PlatformFacts{
+		Tenant:       cfg.DingTalkCorpName,
+		IMName:       idp.DisplayName(),
+		IMConfigured: idp.Ready(),
+	})
 
 	return &App{
 		cfg:         cfg,
@@ -303,6 +312,8 @@ func (a *App) agentInfo(w http.ResponseWriter, r *http.Request) {
 		"model":        a.sessionSvc.AgentModel(),
 		"impl":         a.sessionSvc.AgentImpl(),
 		"capabilities": a.sessionSvc.AgentCapabilities(),
+		// 前端用它显示上传上限，避免文案与 UPLOAD_MAX_FILE_MB 不一致
+		"upload_max_file_mb": a.spaceSvc.UploadMaxBytes() >> 20,
 	})
 }
 

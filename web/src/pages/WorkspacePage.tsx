@@ -19,6 +19,7 @@ import {
   useSpaceDirs,
   useSpaceFiles,
   useSpaces,
+  useUploadFiles,
 } from '../api/hooks';
 import {
   getLiveRun,
@@ -28,7 +29,7 @@ import {
   subscribeLiveRun,
 } from '../api/liveRun';
 import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
-import ChatPanel, { type StreamView } from '../components/ChatPanel';
+import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
 import PluginCatalogPanel, { PLUGIN_CATEGORY_LABEL } from '../components/PluginCatalogPanel';
 import ResourcePanel from '../components/ResourcePanel';
@@ -71,6 +72,7 @@ export default function WorkspacePage() {
   const createSession = useCreateSession();
   const deleteSession = useDeleteSession();
   const setSessionSkill = useSetSessionSkill();
+  const uploadFiles = useUploadFiles();
   const { data: agentInfo } = useAgentInfo();
 
   const personalId = useMemo(
@@ -132,8 +134,11 @@ export default function WorkspacePage() {
   // 用户消息在 run 开始时就已落库：列表里已有这条时不再渲染草稿气泡，
   // 否则「切走再回来」会看到同一句话出现两遍
   const lastMessage = messages[messages.length - 1];
+  // 落库后的用户消息在正文后追加了引用清单，比较前先切掉，否则占位气泡会重复出现
   const pendingUser =
-    liveRun && stream && !(lastMessage?.role === 'user' && lastMessage.content === liveRun.pendingUser)
+    liveRun &&
+    stream &&
+    !(lastMessage?.role === 'user' && splitReferences(lastMessage.content).text === liveRun.pendingUser)
       ? liveRun.pendingUser
       : null;
   // 技能列表随会话所属空间变化：当前空间 + 系统空间合并，同名当前空间优先
@@ -183,7 +188,7 @@ export default function WorkspacePage() {
 
   // 切会话或离开页面都不主动中断：run 由 liveRun 单例持有，工具调用会在后台跑完并落库。
   // 只有两种中断：用户点停止，或在另一个会话里发消息（此时才接管）。
-  const send = async (content: string) => {
+  const send = async (content: string, references: string[] = []) => {
     if (!selectedSession) return;
     const sessionId = selectedSession.id;
     // 同一会话还在生成：拦下来，别把这次输入吞掉
@@ -193,6 +198,7 @@ export default function WorkspacePage() {
     await startLiveRun({
       sessionId,
       content,
+      references,
       onError: (message) => Toast.error(message),
       // 回调可能在本组件卸载后才跑，所以只用全局 queryClient，不碰组件状态
       onSettled: (info) => {
@@ -390,8 +396,10 @@ export default function WorkspacePage() {
             sending={Boolean(stream)}
             stream={stream}
             pendingUser={pendingUser}
+            pendingRefs={stream ? liveRun?.pendingRefs : undefined}
             agentReady={agentInfo?.ready ?? false}
             model={agentInfo?.model}
+            uploadMaxMb={agentInfo?.upload_max_file_mb}
             skills={skills}
             onRefreshSkills={() => {
               void refetchSkills();
@@ -402,6 +410,16 @@ export default function WorkspacePage() {
                 { onError: (e) => Toast.error(e instanceof Error ? e.message : '技能切换失败') },
               );
             }}
+            // 引用文件只列当前空间：跨空间的路径会被后端跳过，列出来只会误导
+            spaceFiles={files.filter((f) => f.space_id === selectedSession.space_id)}
+            onUploadFiles={(list) =>
+              uploadFiles.mutateAsync({
+                spaceId: selectedSession.space_id,
+                files: list,
+                // 会话挂在某个目录下时，材料默认放进这个目录
+                dir: selectedSession.dir,
+              })
+            }
             onSend={send}
             onStop={stopGenerating}
           />

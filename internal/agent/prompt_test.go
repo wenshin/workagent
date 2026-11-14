@@ -143,3 +143,62 @@ func TestBasePromptForbidsAskingForPlaintextSecrets(t *testing.T) {
 		}
 	}
 }
+
+// 租户与 IM 接入是「必须恒真」的部署事实，直接进系统提示词。
+// 它们不做成工具：模型对「公司用什么 IM」有很强的先验，做成工具它会顺着猜。
+func TestPlatformFactsInjected(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{
+		Tenant:       "测试公司",
+		IMName:       "钉钉",
+		IMConfigured: true,
+		UserName:     "张三",
+		JobNumber:    "E001",
+		SpaceName:    "研发空间",
+	}})
+
+	for _, want := range []string{
+		"平台（部署事实）",
+		"租户（企业）是「测试公司」",
+		"IM 接入是钉钉（登录已配置）",
+		"张三，工号 E001",
+		"当前空间是「研发空间」",
+		"不要凭常识或上下文猜测",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("平台事实缺少 %q\n%s", want, msg.Content)
+		}
+	}
+	// 信息已注入，不应再给模型一个查询同名事实的工具
+	if strings.Contains(msg.Content, "platform_info") {
+		t.Fatal("平台事实已注入，基础规则里不应再提 platform_info 工具")
+	}
+}
+
+// 未接线或未登录时整段省略：注入空括号会被读成「租户为空」。
+func TestPlatformFactsOmittedWhenUnknown(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{})
+	if strings.Contains(msg.Content, "平台（部署事实）") {
+		t.Fatalf("没有事实时不应注入该段:\n%s", msg.Content)
+	}
+}
+
+// 凭证没配齐时要说清后果，否则模型会告诉用户「直接扫码登录」。
+func TestPlatformFactsReportUnconfiguredIM(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{IMName: "企业微信"}})
+	if !strings.Contains(msg.Content, "企业微信（登录凭证未配置，用户无法登录）") {
+		t.Fatalf("未配置的 IM 缺少说明:\n%s", msg.Content)
+	}
+}
+
+// 部署事实属于现场，必须排在智能体设定之前：智能体不能改写「我们用什么 IM」。
+func TestPlatformFactsBeforeAgentPrompt(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{
+		AgentPrompt: "AGENT-EXTRA",
+		Platform:    PlatformFacts{Tenant: "测试公司"},
+	})
+	facts := strings.Index(msg.Content, "平台（部署事实）")
+	extra := strings.Index(msg.Content, "AGENT-EXTRA")
+	if facts < 0 || extra < 0 || facts > extra {
+		t.Fatalf("平台事实应排在智能体设定之前: facts=%d extra=%d", facts, extra)
+	}
+}

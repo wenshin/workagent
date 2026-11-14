@@ -36,6 +36,7 @@ var workspaceExts = map[string]bool{
 	".md":   true,
 	".json": true,
 	".txt":  true,
+	".csv":  true,
 	".yaml": true,
 	".yml":  true,
 	// 插件脚本：工具插件入口是 index.ts、脚本型搜索源是 main.ts，
@@ -82,7 +83,7 @@ func workspaceFilePath(raw string) (string, error) {
 		return "", fmt.Errorf("path 不能为空")
 	}
 	if !workspaceExts[strings.ToLower(path.Ext(rel))] {
-		return "", fmt.Errorf("仅支持 md / json / txt / yaml / ts / js 文件")
+		return "", fmt.Errorf("仅支持 md / json / txt / csv / yaml / ts / js 文件")
 	}
 	return rel, nil
 }
@@ -96,7 +97,7 @@ func fileRead() Tool {
 	return Tool{
 		Name:       "file_read",
 		Capability: "fs.read",
-		Description: "读取当前空间内的文本文件（md / json / txt / yaml / ts / js）。path 相对空间文件根目录，" +
+		Description: "读取当前空间内的文本文件（md / json / txt / csv / yaml / ts / js）。path 相对空间文件根目录，" +
 			"如 plugins/weekly_report/SKILL.md。长文件可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
@@ -219,7 +220,7 @@ func fileWrite() Tool {
 	return Tool{
 		Name:       "file_write",
 		Capability: "fs.write",
-		Description: "写入当前空间内的文本文件（md / json / txt / yaml / ts / js），path 相对空间文件根目录，" +
+		Description: "写入当前空间内的文本文件（md / json / txt / csv / yaml / ts / js），path 相对空间文件根目录，" +
 			"父目录不存在时自动创建。mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
 			"修改已有文件前建议先用 file_read 读取现有内容。",
 		Parameters: json.RawMessage(`{

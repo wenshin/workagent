@@ -2,6 +2,7 @@ package space
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -56,6 +57,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// 这两个端点只读，且只暴露 md/json 等文本类型。
 	mux.HandleFunc("GET /spaces/files", h.listFiles)
 	mux.HandleFunc("GET /spaces/{id}/file", h.readFile)
+	// 上传只接受可预览的文本类型，落在空间 files/ 下（dir 可选，相对 files/）
+	mux.HandleFunc("POST /spaces/{id}/files", h.uploadFiles)
 }
 
 type spaceDTO struct {
@@ -491,6 +494,56 @@ func (h *Handler) readFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// uploadFiles 接收 multipart/form-data：文件字段名 files，可选 dir 表示目标子目录。
+//
+// 一次最多 10 个文件，单个大小上限由配置注入（默认 4MB）；扩展名与同名策略由 Service.SaveFile 兜底。
+func (h *Handler) uploadFiles(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+
+	// 先限制整个请求体：multipart 解析前就要挡住超大请求，否则会先落盘再拒绝。
+	// 多留 1MB 给表单边界与字段（Go 的 * 与 << 同级，括号不能省）
+	limit := h.svc.UploadMaxBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, limit*maxUploadFiles+(1<<20))
+	if err := r.ParseMultipartForm(limit); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body",
+			fmt.Sprintf("请用 multipart/form-data 上传文件，且单次不超过 %d 个、每个不超过 %dMB", maxUploadFiles, limit>>20))
+		return
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+
+	parts := r.MultipartForm.File["files"]
+	if len(parts) == 0 {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "没有收到文件（字段名应为 files）")
+		return
+	}
+	if len(parts) > maxUploadFiles {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_request", "一次最多上传 10 个文件")
+		return
+	}
+
+	dir := strings.TrimSpace(r.FormValue("dir"))
+	saved := make([]fileDTO, 0, len(parts))
+	for _, header := range parts {
+		f, err := header.Open()
+		if err != nil {
+			h.writeErr(w, r, err)
+			return
+		}
+		item, err := h.svc.SaveFile(r.Context(), user.ID, r.PathValue("id"), dir, header.Filename, f)
+		_ = f.Close()
+		if err != nil {
+			h.writeErr(w, r, err)
+			return
+		}
+		saved = append(saved, toFileDTO(item))
+	}
+
+	platform.WriteJSON(w, http.StatusCreated, map[string]any{"files": saved})
+}
+
 func (h *Handler) current(w http.ResponseWriter, r *http.Request) (store.User, bool) {
 	user, err := h.resolve(r)
 	if err != nil {
@@ -512,6 +565,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, ErrFileUnsupported):
 		platform.WriteError(w, r, http.StatusBadRequest, "unsupported_file", err.Error())
+	case errors.Is(err, ErrFileTooLarge):
+		platform.WriteError(w, r, http.StatusRequestEntityTooLarge, "file_too_large", err.Error())
 	case errors.Is(err, ErrDirExists):
 		platform.WriteError(w, r, http.StatusConflict, "dir_exists", err.Error())
 	case errors.Is(err, ErrNameInvalid), errors.Is(err, ErrConfirmMismatch),

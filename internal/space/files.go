@@ -1,8 +1,10 @@
 package space
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"path"
 	"sort"
@@ -12,19 +14,27 @@ import (
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
+// DefaultUploadMaxBytes 是单文件上传的默认上限（4MB）。
+// 部署时可用 UPLOAD_MAX_FILE_MB 覆盖，见 Service.SetUploadMaxBytes。
+const DefaultUploadMaxBytes int64 = 4 << 20
+
 const (
 	// maxFileBytes 是单个文件的读取上限：树里的文件是说明文档与配置，不承载大文件。
 	maxFileBytes = 256 << 10
 	// maxFilesPerSpace 是单个空间最多展示的文件数，避免树被海量文件拖垮。
 	maxFilesPerSpace = 500
+	// maxUploadFiles 是一次请求允许上传的文件数上限。
+	maxUploadFiles = 10
 )
 
-// previewExts 是可在树中展示并在右侧预览的文件类型。
-// 系统空间内置的是技能说明（md）与工具/MCP 定义（json），其余类型不进树。
+// previewExts 是可在树中展示、右侧预览，并且 Agent 能通过 file_read 读到的文件类型。
+// 上传只接受这些类型：其余二进制文件既不能预览也进不了模型上下文，
+// 收下来只会变成空间里的死文件。
 var previewExts = map[string]bool{
 	".md":   true,
 	".json": true,
 	".txt":  true,
+	".csv":  true,
 	".yaml": true,
 	".yml":  true,
 }
@@ -171,6 +181,103 @@ func (s *Service) ReadFile(ctx context.Context, userID, spaceID, rawPath string)
 		Content:   string(data),
 		Truncated: truncated,
 	}, nil
+}
+
+// SaveFile 把上传内容写入空间的 files/ 目录，返回落盘后的文件元信息。
+//
+// 约束只有两条：
+//   - 只接受可预览的文本类型（previewExts）：二进制文件既预览不了，file_read 也读不到；
+//   - 同名文件不覆盖：自动追加 -1、-2 后缀，避免上传把已有材料冲掉。
+//
+// 目录不设限（含 plugins/）：用户可以在空间里任何目录放材料。落在 plugins/ 下的
+// 文件属于插件内容，写完要刷新能力索引并让插件运行时重载，否则工具列表还是旧的。
+func (s *Service) SaveFile(ctx context.Context, userID, spaceID, rawDir, rawName string, r io.Reader) (File, error) {
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return File{}, err
+	}
+	if !canWrite(sp.Perm) {
+		return File{}, ErrForbidden
+	}
+
+	dir, err := normalizeRelPath(rawDir)
+	if err != nil {
+		return File{}, err
+	}
+
+	name, err := normalizeName(path.Base(strings.ReplaceAll(rawName, "\\", "/")))
+	if err != nil {
+		return File{}, err
+	}
+	if !previewExts[strings.ToLower(path.Ext(name))] {
+		return File{}, ErrFileUnsupported
+	}
+
+	limit := s.UploadMaxBytes()
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return File{}, err
+	}
+	if int64(len(data)) > limit {
+		return File{}, fmt.Errorf("%w（单个文件 ≤ %dMB）", ErrFileTooLarge, limit>>20)
+	}
+
+	base := s.filesKey(sp.ID)
+	rel, err := s.uniqueFilePath(ctx, base, dir, name)
+	if err != nil {
+		return File{}, err
+	}
+	key := path.Join(base, rel)
+	if _, err := s.storage.Put(ctx, key, bytes.NewReader(data), int64(len(data))); err != nil {
+		return File{}, err
+	}
+
+	entry, err := s.storage.Stat(ctx, key)
+	if err != nil {
+		return File{}, err
+	}
+
+	// 插件目录里的文件就是插件内容：索引与运行时缓存都要跟着变
+	if rel == DraftDirName || strings.HasPrefix(rel, DraftDirName+"/") {
+		if s.pluginChanged != nil {
+			if err := s.pluginChanged(ctx, sp.ID); err != nil {
+				s.log.Warn("重载插件失败", "space_id", sp.ID, "path", rel, "err", err)
+			}
+		}
+		s.refreshIndex(ctx, sp.ID)
+	}
+
+	return File{
+		SpaceID: sp.ID,
+		Path:    rel,
+		Dir:     dir,
+		Name:    path.Base(rel),
+		Size:    entry.Size,
+		ModTime: entry.ModTime,
+	}, nil
+}
+
+// uniqueFilePath 为上传文件找一个不冲突的相对路径：name.ext → name-1.ext → name-2.ext。
+func (s *Service) uniqueFilePath(ctx context.Context, base, dir, name string) (string, error) {
+	ext := path.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for i := 0; i < 100; i++ {
+		candidate := name
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+		}
+		rel := candidate
+		if dir != "" {
+			rel = dir + "/" + candidate
+		}
+		if _, err := s.storage.Stat(ctx, path.Join(base, rel)); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return rel, nil
+			}
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("%w：同名文件过多，请改名后重试", ErrNameInvalid)
 }
 
 // normalizeFilePath 校验相对 files/ 的文件路径：禁止越界、隐藏文件与不支持的扩展名。

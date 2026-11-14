@@ -153,7 +153,9 @@ func (a *Agent) runSubAgent(
 		DirPlugin:      parent.DirPlugin,
 		ActiveSkill:    nil, // 技能属于父会话的上下文，不传给子 Agent
 		AgentPrompt:    parent.AgentPrompt,
-		History:        nil,
+		// 部署事实是环境，不是父会话的上下文：子 Agent 同样需要知道租户与 IM
+		Platform: parent.Platform,
+		History:  nil,
 	}, nil)
 	if runErr != nil && res.Content == "" {
 		return "", fmt.Errorf("子 Agent 未产出结果：%w", runErr)

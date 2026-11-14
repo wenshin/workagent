@@ -15,6 +15,8 @@ export interface LiveRunView {
   sessionId: string;
   /** 本轮用户输入，用于在消息列表里先占位 */
   pendingUser: string;
+  /** 本轮引用的空间文件（相对 files/ 的路径），占位气泡里渲染成文件标签 */
+  pendingRefs: string[];
   /** 思考、正文与工具调用按到达顺序排列：这是真实时间线，渲染时照序输出即可 */
   items: StreamItem[];
   /** 本轮是否写过空间文件，结束后据此刷新文件树与预览 */
@@ -57,6 +59,8 @@ export function stopLiveRun(): void {
 export interface LiveRunOptions {
   sessionId: string;
   content: string;
+  /** 引用的空间文件路径；服务端负责校验并拼进用户消息 */
+  references?: string[];
   onError?: (message: string) => void;
   onSettled?: (info: { sessionId: string; wroteFiles: boolean; aborted: boolean }) => void;
 }
@@ -80,6 +84,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   current = {
     sessionId: opts.sessionId,
     pendingUser: opts.content,
+    pendingRefs: opts.references ?? [],
     items: [],
     wroteFiles: false,
   };
@@ -101,6 +106,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       await streamChat(
         opts.sessionId,
         opts.content,
+        opts.references ?? [],
         {
           // 连续增量合并进同一段：每个 token 单独成段会把 Markdown 切碎，
           // 思考也会碎成几十个折叠块。中间插了工具或正文时，再开新的一段。

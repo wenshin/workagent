@@ -119,6 +119,10 @@ type RunInput struct {
 	DirPlugin *DirPlugin
 	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后
 	AgentPrompt string
+	// Platform 是本轮已确认的平台部署事实（租户、IM、当前用户与空间），
+	// 直接注入系统提示词。做成工具的话模型会凭先验抢答「我们用钉钉吧」，
+	// 而这类事实必须恒真，不能放在概率路径上。
+	Platform PlatformFacts
 
 	// Depth 是嵌套深度：0 表示用户发起的一轮，>0 表示由 agent_dispatch 派生的子 Agent。
 	// 实现必须据此限制派发层级，否则子 Agent 可以无限递归。
@@ -139,6 +143,24 @@ type ActiveSkill struct {
 	Name string
 	Path string
 	Doc  string
+}
+
+// PlatformFacts 是本轮已知的平台部署事实，只保留「回答用户问题需要」的字段。
+//
+// 这些字段短、稳定、必须恒真，所以进系统提示词而不是做成工具：工具要多一轮模型
+// 调用才生效，而模型对「公司用什么 IM」有很强的先验，往往会顺着猜而不去查。
+type PlatformFacts struct {
+	// Tenant 是租户（企业）名称，为空表示未知，提示词里就不写这一句
+	Tenant string
+	// IMName 是 IM 展示名（钉钉 / 企业微信 / 飞书），空表示身份接入未接线
+	IMName string
+	// IMConfigured 表示该 IM 的凭证是否配置齐；false 时登录不可用
+	IMConfigured bool
+	// UserName 是当前登录用户姓名，JobNumber 是工号
+	UserName  string
+	JobNumber string
+	// SpaceName 是当前会话所在空间名称
+	SpaceName string
 }
 
 // DirPlugin 是会话所在目录对应插件的画像，只取系统提示词需要的展示字段。

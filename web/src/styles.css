@@ -575,6 +575,94 @@ body[theme-mode='dark'] {
   color: var(--semi-color-danger);
 }
 
+/* 引用文件浮层：Semi 的 Popover 不带内边距，必须自带，否则标题贴着浮层边缘 */
+.file-picker {
+  width: 320px;
+  padding: var(--wa-space-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-8);
+}
+
+.file-picker-head {
+  padding: 0 var(--wa-space-6);
+  font-size: var(--wa-text-sm);
+  color: var(--semi-color-text-2);
+}
+
+.file-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-2);
+  max-height: 280px;
+  overflow: auto;
+}
+
+.file-picker-empty {
+  padding: var(--wa-space-12) var(--wa-space-8);
+  font-size: var(--wa-text-sm);
+  color: var(--semi-color-text-3);
+  text-align: center;
+}
+
+.file-picker-item {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-8);
+  padding: var(--wa-space-6);
+  border: none;
+  border-radius: var(--wa-radius-6);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-picker-item:hover {
+  background: var(--semi-color-fill-0);
+}
+
+.file-picker-item.is-active {
+  background: var(--semi-color-primary-light-default);
+}
+
+.file-picker-icon {
+  color: var(--semi-color-text-2);
+  flex: none;
+}
+
+.file-picker-item.is-active .file-picker-icon {
+  color: var(--semi-color-primary);
+}
+
+.file-picker-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-2);
+  min-width: 0;
+  flex: 1;
+}
+
+.file-picker-name {
+  font-size: var(--wa-text-base);
+  color: var(--semi-color-text-0);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-picker-path {
+  font-size: var(--wa-text-xs);
+  color: var(--semi-color-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-picker-check {
+  color: var(--semi-color-primary);
+  flex: none;
+}
+
 .chat-body {
   flex: 1;
   overflow: auto;
@@ -823,19 +911,97 @@ body[theme-mode='dark'] {
   border-top: 1px solid var(--semi-color-border);
 }
 
-/* 输入框与发送按钮同一行：边框画在外层，按钮嵌在右侧内部 */
+/* 输入框与发送按钮同一行：边框画在外层，按钮嵌在右侧内部。
+   引用文件标签单独占上方一行，所以外层是纵向布局 */
 .chat-composer {
   position: relative;
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 6px 6px 6px 12px;
+  flex-direction: column;
+  gap: var(--wa-space-6);
+  padding: var(--wa-space-6) var(--wa-space-6) var(--wa-space-6) var(--wa-space-12);
   border: 1px solid var(--semi-color-border);
   border-radius: 14px;
   background: var(--semi-color-bg-2);
   transition:
     border-color 0.2s,
     box-shadow 0.2s;
+}
+
+/* 文本区与右侧按钮列 */
+.chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--wa-space-8);
+  min-width: 0;
+}
+
+/* 引用文件标签：输入框上方、消息气泡里共用 */
+.chat-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wa-space-6);
+  padding: 0 var(--wa-space-6);
+}
+
+.chat-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--wa-space-4);
+  max-width: 220px;
+  padding: var(--wa-space-2) var(--wa-space-6) var(--wa-space-2) var(--wa-space-8);
+  border-radius: var(--wa-radius-6);
+  background: var(--semi-color-fill-0);
+  color: var(--semi-color-text-1);
+  font-size: var(--wa-text-xs);
+}
+
+.chat-ref-icon {
+  color: var(--semi-color-text-2);
+  flex: none;
+}
+
+.chat-ref-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-ref-remove {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--semi-color-text-2);
+  cursor: pointer;
+}
+
+.chat-ref-remove:hover {
+  color: var(--semi-color-danger);
+}
+
+/* 消息气泡里的引用标签同宽对齐正文 */
+.chat-msg .chat-refs {
+  padding: 0;
+  margin-top: var(--wa-space-6);
+}
+
+/* 输入框内的次要操作：上传、引用，与发送按钮同尺寸 */
+.chat-tool-btn.semi-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--semi-color-text-2);
+}
+
+.chat-tool-btn.semi-button:hover {
+  color: var(--semi-color-text-0);
+}
+
+.chat-tool-btn.is-active.semi-button {
+  color: var(--semi-color-primary);
+  background: var(--semi-color-primary-light-default);
 }
 
 /* 拖拽手柄浮在上边框上：往上拖变高，双击恢复自动高度。

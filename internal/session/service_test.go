@@ -5,10 +5,33 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/workagent/auto-agent/internal/storage/localfs"
 )
+
+// 引用文件清单必须带稳定标记：前端靠它切分正文与文件标签，
+// 模型靠它识别「用户要求先读这些文件」。
+func TestComposeContentWithReferences(t *testing.T) {
+	content := ComposeContent("帮我总结", []string{"docs/规范.md", "docs/模板.md"})
+
+	if !strings.HasPrefix(content, "帮我总结") {
+		t.Fatalf("正文应保持在前: %q", content)
+	}
+	if !strings.Contains(content, ReferenceMarker) {
+		t.Fatalf("缺少引用标记: %q", content)
+	}
+	for _, want := range []string{"- docs/规范.md", "- docs/模板.md", "file_read"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("引用块缺少 %q", want)
+		}
+	}
+
+	if got := ComposeContent("没有引用", nil); got != "没有引用" {
+		t.Fatalf("没有引用时不应改变正文: %q", got)
+	}
+}
 
 // 会话挂在 plugins/<slug> 下时，模型必须知道自己在哪个插件里，
 // 否则会当成全局会话去聊别的。

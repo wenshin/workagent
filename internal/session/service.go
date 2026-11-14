@@ -47,6 +47,14 @@ const (
 	// runBudgetBackstopMargin 是 ctx 兜底比实现内部预算多留的余量：
 	// 让实现先按自己的预算收尾，ctx 只兜住不自己计时的实现（如直答 direct）
 	runBudgetBackstopMargin = 30 * time.Second
+
+	// spaceFilesDir 与 space 包的文件根一致（spaces/{id}/files）；用字面量避免为一行常量牵出循环依赖
+	spaceFilesDir = "files"
+	// maxReferences 是单条消息最多引用的文件数：够用即可，避免把上下文塞满路径清单
+	maxReferences = 20
+	// ReferenceMarker 是用户消息里「引用文件」块的起始标记。
+	// 前端按它把正文与文件标签分开渲染，模型按它识别用户明确要求参考的材料。
+	ReferenceMarker = "\n\n[引用文件]"
 )
 
 // 中断原因（§7.3 run.finished.reason）：一次被掐断的流要能区分「用户停止」与「服务端到点」。
@@ -96,7 +104,9 @@ type Service struct {
 	pluginTry tool.PluginTry
 	// secrets 是凭证存储（secret_request 用它判断「配过没有」），为 nil 时该工具只报未启用
 	secrets secret.Store
-	log     *slog.Logger
+	// platform 是平台部署事实（租户 / IM 接入），每轮注入系统提示词
+	platform agent.PlatformFacts
+	log      *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
@@ -132,6 +142,10 @@ func (s *Service) SetPluginTry(src tool.PluginTry) { s.pluginTry = src }
 // 只用于 secret_request 查询「这个名字配过没有」以及是否可写；明文始终留在
 // 凭证存储里，工具链路上没有任何取得明文的通道。
 func (s *Service) SetSecrets(st secret.Store) { s.secrets = st }
+
+// SetPlatformFacts 注入平台部署事实（租户兜底名、IM 接入），每轮写进系统提示词。
+// 不注入时只是少一段事实，模型会如实说不知道，而不是猜。
+func (s *Service) SetPlatformFacts(f agent.PlatformFacts) { s.platform = f }
 
 // AgentReady 返回模型服务是否可用。
 func (s *Service) AgentReady() bool { return s.agent != nil && s.agent.Ready() }
@@ -275,15 +289,31 @@ func (s *Service) wikiSpaceID(ctx context.Context) string {
 //
 // 与 /admin/secrets 用同一套判定（系统管理员），否则会出现「卡片给了输入框、
 // 保存却 403」这种更糟的体验。
-func (s *Service) canWriteSecrets(ctx context.Context, userID string) bool {
-	if userID == "" {
-		return false
-	}
-	user, err := s.store.GetUser(ctx, userID)
-	if err != nil {
+func (s *Service) canWriteSecrets(user store.User) bool {
+	if user.ID == "" {
 		return false
 	}
 	return s.spaces.IsAdmin(user)
+}
+
+// platformFacts 汇总本轮注入系统提示词的平台事实。
+//
+// 租户名称以登录用户的通讯录资料为准（多租户部署下比配置里的兜底值准确），
+// 取不到时沿用装配层注入的兜底值；IM 接入只来自装配层。查询失败不影响对话。
+func (s *Service) platformFacts(user store.User, sp store.Space) agent.PlatformFacts {
+	f := s.platform
+	if sp.Name != "" {
+		f.SpaceName = sp.Name
+	}
+	if user.ID == "" {
+		return f
+	}
+	if tenant := strings.TrimSpace(user.CorpName); tenant != "" {
+		f.Tenant = tenant
+	}
+	f.UserName = strings.TrimSpace(user.Name)
+	f.JobNumber = strings.TrimSpace(user.JobNumber)
+	return f
 }
 
 // pluginKindLabels 是插件类型的中文名，只用于提示词，不参与校验。
@@ -411,6 +441,80 @@ func (s *Service) ValidateChat(ctx context.Context, userID, sessionID, content s
 	return sess, sp, nil
 }
 
+// ResolveReferences 校验用户勾选的引用文件，返回去重后的相对路径（相对空间 files/）。
+//
+// 只做存在性校验，不做内容读取：正文由 Agent 在需要时用 file_read 自己取，
+// 否则一条消息引用了大文件就会把上下文直接撑爆。文件在这期间被删掉时跳过，
+// 不让一条已不存在的路径阻塞整条消息。
+func (s *Service) ResolveReferences(ctx context.Context, userID, sessionID string, refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	sess, _, err := s.load(ctx, userID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	base := path.Join(s.storage.SpaceKey(sess.SpaceID), spaceFilesDir)
+
+	seen := make(map[string]bool, len(refs))
+	out := make([]string, 0, len(refs))
+	for _, raw := range refs {
+		rel := strings.Trim(strings.TrimSpace(strings.ReplaceAll(raw, "\\", "/")), "/")
+		if rel == "" || strings.Contains(rel, "..") {
+			continue
+		}
+		hidden := false
+		for _, seg := range strings.Split(rel, "/") {
+			if seg == "" || seg == "." || strings.HasPrefix(seg, ".") {
+				hidden = true
+				break
+			}
+		}
+		if hidden || seen[rel] {
+			continue
+		}
+		entry, err := s.storage.Stat(ctx, path.Join(base, rel))
+		if err != nil || entry.IsDir {
+			continue
+		}
+		seen[rel] = true
+		out = append(out, rel)
+		if len(out) >= maxReferences {
+			break
+		}
+	}
+	return out, nil
+}
+
+// referenceFree 去掉消息末尾的引用清单：会话标题、日志摘要只该来自用户写的话。
+func referenceFree(content string) string {
+	if idx := strings.Index(content, ReferenceMarker); idx >= 0 {
+		return content[:idx]
+	}
+	return content
+}
+
+// ComposeContent 把引用文件清单拼到用户消息末尾。
+//
+// 用一个稳定的标记块而不是各写各的自然语言：前端据此把清单渲染成文件标签，
+// 模型据此知道这些文件是用户明确要求参考的、需要先 file_read 再作答。
+func ComposeContent(text string, refs []string) string {
+	if len(refs) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(text)
+	b.WriteString(ReferenceMarker)
+	b.WriteString("（相对当前空间文件根目录）\n")
+	for _, ref := range refs {
+		b.WriteString("- ")
+		b.WriteString(ref)
+		b.WriteString("\n")
+	}
+	b.WriteString("回答前先逐个 file_read 读取这些文件，以文件内容为准；读不到时如实说明。")
+	return b.String()
+}
+
 // ChatOutcome 是一轮对话的落库结果与运行统计，供 SSE 收尾事件使用。
 type ChatOutcome struct {
 	Message store.Message
@@ -439,6 +543,13 @@ func (s *Service) Chat(
 	}
 	text := strings.TrimSpace(content)
 
+	// 用户资料一次查够：管理员判定（canWriteSecrets）与平台事实都要用；
+	// 查失败只降级（少几句事实、不给写凭证），不阻断对话
+	user, err := s.store.GetUser(ctx, userID)
+	if err != nil {
+		s.log.Warn("读取用户资料失败", "user_id", userID, "err", err)
+	}
+
 	// 先读历史，再写入本条用户消息，避免同一条消息重复进入上下文
 	history, err := s.store.ListMessages(ctx, sessionID)
 	if err != nil {
@@ -453,9 +564,9 @@ func (s *Service) Chat(
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
 	}
 
-	// 首条消息决定会话名
+	// 首条消息决定会话名：标题只取用户写的话，引用清单不进标题
 	if sess.TitleAuto {
-		if title := summarize(text); title != "" {
+		if title := summarize(referenceFree(text)); title != "" {
 			if err := s.store.RenameSession(ctx, sessionID, title, false); err != nil {
 				s.log.Warn("会话标题自动生成失败", "session_id", sessionID, "err", err)
 			} else {
@@ -584,7 +695,7 @@ func (s *Service) Chat(
 			Plugins: s.pluginTry,
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
 			Secrets:         s.secrets,
-			CanWriteSecrets: s.canWriteSecrets(ctx, userID),
+			CanWriteSecrets: s.canWriteSecrets(user),
 		},
 		History: contextMessages,
 		Query:   text,
@@ -594,6 +705,8 @@ func (s *Service) Chat(
 		Dir:           sess.Dir,
 		DirPlugin:     s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
 		AgentPrompt:   agentPrompt,
+		// 平台事实进系统提示词，不做成工具：租户、IM 这类信息必须恒真
+		Platform: s.platformFacts(user, sp),
 	}, emitEvent)
 
 	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来

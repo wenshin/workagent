@@ -1,11 +1,20 @@
-import { IconBook, IconClose, IconSend } from '@douyinfe/semi-icons';
-import { Button, Empty, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
-import { useEffect, useRef, useState } from 'react';
+import {
+  IconBook,
+  IconClose,
+  IconFile,
+  IconPaperclip,
+  IconSearch,
+  IconSend,
+  IconTick,
+} from '@douyinfe/semi-icons';
+import { Button, Empty, Input, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   ChatMessage,
   ChatSession,
   MessagePart,
+  SpaceFile,
   SpaceSkill,
   StreamItem,
   ToolCallRecord,
@@ -27,6 +36,54 @@ export interface StreamView {
   items: StreamItem[];
 }
 
+/**
+ * 用户消息里的「引用文件」块标记，与后端 session.ReferenceMarker 保持一致。
+ * 正文之后是服务端追加的文件清单，前端把它切成标签而不是一整段文本。
+ */
+const REFERENCE_MARKER = '\n\n[引用文件]';
+
+/** 拆出正文与引用文件路径；没有标记时原样返回 */
+export function splitReferences(content: string): { text: string; refs: string[] } {
+  const idx = content.indexOf(REFERENCE_MARKER);
+  if (idx < 0) return { text: content, refs: [] };
+  const refs = content
+    .slice(idx + REFERENCE_MARKER.length)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2).trim())
+    .filter(Boolean);
+  return { text: content.slice(0, idx), refs };
+}
+
+/** 引用文件标签：输入框上方可删除，消息气泡里只读 */
+function ReferenceChips({ paths, onRemove }: { paths: string[]; onRemove?: (path: string) => void }) {
+  if (paths.length === 0) return null;
+  return (
+    <div className="chat-refs">
+      {paths.map((p) => {
+        const name = p.split('/').pop() || p;
+        return (
+          <span key={p} className="chat-ref" title={p}>
+            <IconFile size="small" className="chat-ref-icon" />
+            <span className="chat-ref-name">{name}</span>
+            {onRemove ? (
+              <button
+                type="button"
+                className="chat-ref-remove"
+                aria-label={`移除 ${name}`}
+                onClick={() => onRemove(p)}
+              >
+                <IconClose size="small" />
+              </button>
+            ) : null}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 interface Props {
   session: ChatSession;
   spaceName?: string;
@@ -37,14 +94,34 @@ interface Props {
   pendingUser: string | null;
   agentReady: boolean;
   model?: string;
+  /** 单文件上传上限（MB），来自服务端配置 UPLOAD_MAX_FILE_MB */
+  uploadMaxMb?: number;
   /** 当前空间 + 系统空间合并后的技能 */
   skills: SpaceSkill[];
   /** 选择会话技能，空串表示清除 */
   onSelectSkill: (path: string) => void;
   /** 打开选择器前重新取一次：技能可能刚在另一个页面新建/启停过 */
   onRefreshSkills?: () => void;
-  onSend: (content: string) => Promise<void>;
+  /** 当前空间里可引用的文件 */
+  spaceFiles: SpaceFile[];
+  /** 上传文件到当前空间，返回服务端落盘后的文件（同名会被改名） */
+  onUploadFiles: (files: File[]) => Promise<SpaceFile[]>;
+  /** references 是相对空间 files/ 的引用文件路径 */
+  onSend: (content: string, references: string[]) => Promise<void>;
   onStop: () => void;
+  /** 本轮占位气泡里已引用的文件（流式过程中还没落库） */
+  pendingRefs?: string[];
+}
+
+/** 用户消息：正文 + 引用文件标签 */
+function UserBody({ content, refs }: { content: string; refs?: string[] }) {
+  const parsed = splitReferences(content);
+  return (
+    <>
+      <div className="chat-msg-content">{parsed.text}</div>
+      <ReferenceChips paths={refs ?? parsed.refs} />
+    </>
+  );
 }
 
 function formatTime(iso: string) {
@@ -281,15 +358,26 @@ export default function ChatPanel({
   pendingUser,
   agentReady,
   model,
+  uploadMaxMb,
   skills,
   onSelectSkill,
   onRefreshSkills,
+  spaceFiles,
+  onUploadFiles,
   onSend,
   onStop,
+  pendingRefs,
 }: Props) {
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  // 本次要引用的文件（相对空间 files/ 的路径）：发送时随消息一起提交
+  const [refs, setRefs] = useState<string[]>([]);
+  const [refPickerOpen, setRefPickerOpen] = useState(false);
+  const [refQuery, setRefQuery] = useState('');
+  // 输入框里打 @ 触发的就地引用：start 是 @ 的位置，query 是 @ 之后到光标前的文本
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
+  const [uploading, setUploading] = useState(false);
   // 流式期间的本地计时，用于「生成中 · 12.3s」；落库后的总耗时以后端 duration_ms 为准
   const [elapsedMs, setElapsedMs] = useState(0);
   // 拖拽设定的输入框最小高度；0 表示不干预，交给 autosize 按内容决定
@@ -297,19 +385,115 @@ export default function ChatPanel({
   const startedAtRef = useRef<number | null>(null);
   const composerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const busy = sending || Boolean(stream);
 
   useEffect(() => {
     setValue('');
     setError('');
+    setRefs([]);
+    setRefQuery('');
+    setMention(null);
   }, [session.id]);
+
+  const removeRef = (path: string) => setRefs((prev) => prev.filter((p) => p !== path));
+
+  const addRef = (path: string) =>
+    setRefs((prev) => {
+      if (prev.includes(path)) return prev;
+      // 与后端 maxReferences 对齐：超出部分不再追加，避免发送后才被截断
+      if (prev.length >= 20) return prev;
+      return [...prev, path];
+    });
+
+  const toggleRef = (path: string) =>
+    setRefs((prev) => {
+      if (prev.includes(path)) return prev.filter((p) => p !== path);
+      // 与后端 maxReferences 对齐：超出部分不再追加，避免发送后才被截断
+      if (prev.length >= 20) return prev;
+      return [...prev, path];
+    });
+
+  // 输入框里打 @ 就地选文件：@ 之后到光标前没有空白就当作在搜文件。
+  // 中文里「总结@合同」通常不带空格，所以不能要求 @ 前面是空白。
+  const handleChange = (next: string) => {
+    setValue(next);
+    const at = next.lastIndexOf('@');
+    const token = at >= 0 ? next.slice(at + 1) : '';
+    if (at >= 0 && !/[\s@]/.test(token)) {
+      setMention({ start: at, query: token });
+      return;
+    }
+    if (mention) setMention(null);
+  };
+
+  // 从 @ 候选里选一个：把 @query 从正文里删掉，文件变成引用标签，焦点还给输入框
+  const selectFromMention = (path: string) => {
+    if (!mention) return;
+    setValue(value.slice(0, mention.start) + value.slice(mention.start + 1 + mention.query.length));
+    setMention(null);
+    addRef(path);
+    requestAnimationFrame(() => {
+      const box = composerRef.current?.querySelector<HTMLTextAreaElement>('textarea');
+      if (!box) return;
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
+    });
+  };
+
+  // @ 浮层与按钮浮层共用一个 Popover：谁触发都渲染同一份文件列表
+  const pickerVisible = refPickerOpen || mention !== null;
+  const pickerQuery = mention ? mention.query : refQuery;
+
+  // 上传成功即引用：用户传文件的下一步几乎总是让 Agent 读它
+  const handleUpload = async (list: FileList | null) => {
+    const picked = Array.from(list ?? []);
+    if (picked.length === 0) return;
+    // 已知上限时先本地挡一次，省掉一次注定 413 的往返
+    if (uploadMaxMb) {
+      const limitBytes = uploadMaxMb * 1024 * 1024;
+      const tooBig = picked.find((f) => f.size > limitBytes);
+      if (tooBig) {
+        setError(`「${tooBig.name}」超过 ${uploadMaxMb}MB 上限`);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        return;
+      }
+    }
+    setError('');
+    setUploading(true);
+    try {
+      const saved = await onUploadFiles(picked);
+      setRefs((prev) => {
+        const next = [...prev];
+        saved.forEach((f) => {
+          if (!next.includes(f.path) && next.length < 20) next.push(f.path);
+        });
+        return next;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '上传失败，请重试');
+    } finally {
+      setUploading(false);
+      // 允许再次选择同一个文件
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const fileOptions = useMemo(() => {
+    const q = pickerQuery.trim().toLowerCase();
+    const list = q ? spaceFiles.filter((f) => f.path.toLowerCase().includes(q)) : spaceFiles;
+    return list.slice(0, 100);
+  }, [spaceFiles, pickerQuery]);
 
   // 组件的 message 动作不直接发消息，而是把文本填进输入框：发不发、改不改由用户决定
   useEffect(() => {
     const onUiMessage = (event: Event) => {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
-      if (text) setValue(text);
+      if (text) {
+        setValue(text);
+        setMention(null);
+      }
     };
     window.addEventListener('wa-ui-message', onUiMessage);
     return () => window.removeEventListener('wa-ui-message', onUiMessage);
@@ -337,8 +521,10 @@ export default function ChatPanel({
     if (!text || sending) return;
     setError('');
     try {
-      await onSend(text);
+      await onSend(text, refs);
       setValue('');
+      setRefs([]);
+      setMention(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : '发送失败，请重试');
     }
@@ -475,10 +661,10 @@ export default function ChatPanel({
                   reasoning={m.reasoning}
                   tools={toRecords(m.parts)}
                   spaceId={session.space_id}
-                  onSend={(c) => void onSend(c)}
+                  onSend={(c) => void onSend(c, [])}
                 />
               ) : (
-                <div className="chat-msg-content">{m.content}</div>
+                <UserBody content={m.content} />
               )}
             </div>
           ))
@@ -489,7 +675,7 @@ export default function ChatPanel({
             <div className="chat-msg-meta">
               <span>我</span>
             </div>
-            <div className="chat-msg-content">{pendingUser}</div>
+            <UserBody content={pendingUser} refs={pendingRefs} />
           </div>
         ) : null}
 
@@ -510,7 +696,7 @@ export default function ChatPanel({
                 items={stream.items}
                 live
                 spaceId={session.space_id}
-                onSend={(c) => void onSend(c)}
+                onSend={(c) => void onSend(c, [])}
               />
             )}
           </div>
@@ -520,7 +706,7 @@ export default function ChatPanel({
       </div>
 
       <div className="chat-input">
-        {/* 输入框与操作按钮同一行：按钮嵌在输入框内部右侧 */}
+        {/* 输入框与操作按钮同一行：按钮嵌在输入框内部右侧；引用标签单独占上方一行 */}
         <div className="chat-composer" ref={composerRef}>
           <div
             className="chat-composer-resize"
@@ -532,46 +718,145 @@ export default function ChatPanel({
           >
             <span className="chat-composer-resize-bar" />
           </div>
-          <TextArea
-            className="chat-composer-input"
-            value={value}
-            onChange={setValue}
-            placeholder={agentReady ? '描述你的任务…' : '模型服务未配置，暂时无法发送消息'}
-            autosize={{ minRows: 1 }}
-            textareaStyle={inputMinHeight ? { minHeight: inputMinHeight } : undefined}
-            borderless
-            disabled={busy || !agentReady}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-          />
-          <div className="chat-composer-actions">
-            {busy ? (
-              <Tooltip content="停止生成" position="topRight">
+          <ReferenceChips paths={refs} onRemove={removeRef} />
+          <div className="chat-composer-row">
+            <TextArea
+              className="chat-composer-input"
+              value={value}
+              onChange={handleChange}
+              placeholder={agentReady ? '描述你的任务…（输入 @ 引用空间文件）' : '模型服务未配置，暂时无法发送消息'}
+              autosize={{ minRows: 1 }}
+              textareaStyle={inputMinHeight ? { minHeight: inputMinHeight } : undefined}
+              borderless
+              disabled={busy || !agentReady}
+              onKeyDown={(e) => {
+                if (mention) {
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setMention(null);
+                    return;
+                  }
+                  // 键盘优先选第一个候选：@ 列表打开时回车不该直接把半截文件名发出去
+                  if (e.key === 'Enter' && !e.shiftKey && fileOptions.length > 0) {
+                    e.preventDefault();
+                    selectFromMention(fileOptions[0].path);
+                    return;
+                  }
+                }
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <div className="chat-composer-actions">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                hidden
+                accept=".md,.json,.txt,.csv,.yaml,.yml"
+                onChange={(e) => void handleUpload(e.target.files)}
+              />
+              <Tooltip
+                content={`上传文件到当前空间（md / json / txt / csv / yaml，${
+                  uploadMaxMb ? `单个 ≤ ${uploadMaxMb}MB` : '单个大小受服务端配置限制'
+                }）`}
+                position="topRight"
+              >
                 <Button
-                  className="chat-stop-btn"
+                  className="chat-tool-btn"
                   theme="borderless"
-                  type="danger"
-                  icon={<IconClose />}
-                  onClick={onStop}
-                  aria-label="停止生成"
+                  icon={<IconPaperclip />}
+                  loading={uploading}
+                  disabled={busy || !agentReady}
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-label="上传文件"
                 />
               </Tooltip>
-            ) : (
-              <Button
-                className="chat-send-btn"
-                theme="solid"
-                type="primary"
-                icon={<IconSend />}
-                loading={sending}
-                disabled={!value.trim() || !agentReady}
-                onClick={send}
-                aria-label="发送"
-              />
-            )}
+              <Popover
+                trigger="click"
+                position="topRight"
+                visible={pickerVisible}
+                onVisibleChange={(v) => {
+                  setRefPickerOpen(v);
+                  if (!v) setMention(null);
+                }}
+                content={
+                  <div className="file-picker">
+                    <div className="file-picker-head">
+                      {mention ? `引用文件：${mention.query || '全部'}` : '引用当前空间的文件（可多选）'}
+                    </div>
+                    {/* @ 触发时搜索词来自输入框里的 @query，不再放第二个搜索框 */}
+                    {mention ? null : (
+                      <Input
+                        size="small"
+                        prefix={<IconSearch />}
+                        placeholder="搜索文件名或路径"
+                        value={refQuery}
+                        showClear
+                        onChange={setRefQuery}
+                      />
+                    )}
+                    <div className="file-picker-list">
+                      {fileOptions.length === 0 ? (
+                        <div className="file-picker-empty">
+                          {spaceFiles.length === 0 ? '当前空间还没有文件，可先上传' : '没有匹配的文件'}
+                        </div>
+                      ) : (
+                        fileOptions.map((f) => (
+                          <button
+                            key={`${f.space_id}/${f.path}`}
+                            type="button"
+                            className={`file-picker-item${refs.includes(f.path) ? ' is-active' : ''}`}
+                            aria-pressed={refs.includes(f.path)}
+                            onClick={() => (mention ? selectFromMention(f.path) : toggleRef(f.path))}
+                          >
+                            <IconFile className="file-picker-icon" />
+                            <span className="file-picker-body">
+                              <span className="file-picker-name">{f.name}</span>
+                              <span className="file-picker-path">{f.dir || '空间根'}</span>
+                            </span>
+                            {refs.includes(f.path) ? <IconTick className="file-picker-check" /> : null}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                }
+              >
+                <Button
+                  className={`chat-tool-btn${refs.length > 0 ? ' is-active' : ''}`}
+                  theme="borderless"
+                  icon={<IconFile />}
+                  disabled={busy || !agentReady}
+                  aria-label="引用文件"
+                />
+              </Popover>
+              {busy ? (
+                <Tooltip content="停止生成" position="topRight">
+                  <Button
+                    className="chat-stop-btn"
+                    theme="borderless"
+                    type="danger"
+                    icon={<IconClose />}
+                    onClick={onStop}
+                    aria-label="停止生成"
+                  />
+                </Tooltip>
+              ) : (
+                <Button
+                  className="chat-send-btn"
+                  theme="solid"
+                  type="primary"
+                  icon={<IconSend />}
+                  loading={sending}
+                  disabled={!value.trim() || !agentReady}
+                  onClick={send}
+                  aria-label="发送"
+                />
+              )}
+            </div>
           </div>
         </div>
         <div className="chat-input-foot">

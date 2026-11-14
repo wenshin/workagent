@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 
-import { api } from './client';
+import { api, uploadSpaceFiles } from './client';
 import type {
   AdminSettings,
   AgentInfo,
@@ -183,6 +183,23 @@ export function useFileContent(spaceId: string | undefined, path: string | undef
       ).then((r) => r.file),
     enabled: Boolean(spaceId && path),
     staleTime: 10_000,
+  });
+}
+
+/**
+ * 上传文件到空间：成功后刷新文件树，并把落盘结果返回给调用方。
+ * dir 为空表示空间根；同名冲突由后端改名，前端以返回值为准。
+ */
+export function useUploadFiles() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; files: File[]; dir?: string }) =>
+      uploadSpaceFiles(input.spaceId, input.files, input.dir),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.files });
+      // 目标目录可能刚被创建出来（会话目录被删后重传），树也要刷新
+      qc.invalidateQueries({ queryKey: queryKeys.dirs });
+    },
   });
 }
 

@@ -194,7 +194,8 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 
 - 会话归属空间，并可额外指定所属目录（`session.dir`，相对 `spaces/{space_id}/files/`）；`dir` 为空表示直接挂在空间根。
 - 左侧树把会话渲染在其所属目录节点下；目录改名时会话路径同步迁移，目录删除时会话移回空间根而不是被删除。
-- **文件节点**：目录下的 `md` / `json`（以及 `txt` / `yaml`）文件作为叶子节点展示在树中，点击后右侧内容面板只读预览；接口为 `GET /spaces/files`（清单）与 `GET /spaces/{id}/file?path=`（正文），路径限定在该空间 `files/` 下，隐藏文件与二进制类型不暴露。
+- **文件节点**：目录下的 `md` / `json`（以及 `txt` / `csv` / `yaml`）文件作为叶子节点展示在树中，点击后右侧内容面板只读预览；接口为 `GET /spaces/files`（清单）与 `GET /spaces/{id}/file?path=`（正文），路径限定在该空间 `files/` 下，隐藏文件与二进制类型不暴露。
+- **上传与引用**：会话输入框支持把文件上传到当前空间（`POST /spaces/{id}/files`，multipart，可选 `dir`；单个 ≤ `UPLOAD_MAX_FILE_MB`（默认 4MB）、一次 ≤ 10 个、只收可预览的文本类型；同名自动追加 `-1`、`-2` 后缀，不覆盖已有文件），上传成功即加入本轮引用。引用文件以路径随消息提交（`POST /sessions/{id}/chat` 的 `references`，最多 20 个），服务端校验后把清单以固定标记块（`[引用文件]`）拼进用户消息落库：模型据此用 `file_read` 读正文，前端据此把清单渲染成文件标签。输入框里直接打 `@` 也能就地搜索并引用：`@` 之后到光标前没有空白即按文件名/路径过滤，回车或点击选中，正文里的 `@query` 会被删掉并换成引用标签。引用只做存在性校验、不预读正文，避免一条消息把大文件塞进上下文。
 
 ### 4.2.1 系统空间（system）
 
@@ -340,7 +341,7 @@ autoagent/                                 # 存储根
 | 流式 | 首 token 尽快出现；生成中可「停止」；断线自动重连并补齐已生成内容 |
 | 操作 | 停止、重新生成、复制、编辑用户消息后重发、删除消息、导出会话（Markdown） |
 | 高危确认（补充） | Agent 要执行写操作（写文件、创建/删除资源、执行写 SQL）时，消息流中出现确认卡片，用户点「确认执行」才继续；超时 5 分钟视为取消 |
-| 文件交互 | 会话内可上传附件（进入 `attachments/{session_id}/`）；Agent 产出的文件给下载入口 |
+| 文件交互 | 当前实现：输入框可上传文件到当前空间 `files/`（会话挂在目录下时落在该目录），并可从当前空间文件里勾选引用；引用清单作为用户消息的一部分落库，Agent 先 `file_read` 再作答。未实现：独立附件目录 `attachments/{session_id}/`、拖拽上传、下载入口与大文件断点续传 |
 | 验收 | ① 场景 1–4 的对话过程能完整呈现思考、工具调用与结果；② 停止生成后状态正确、可继续对话；③ 未确认的高危操作不会被执行；④ 刷新页面后消息与工具卡片完整还原 |
 
 ### FR-5 资源管理
@@ -407,6 +408,7 @@ autoagent/                                 # 存储根
 | 对话正文与输入区（2026-11） | 助手回答按 **Markdown** 渲染成有样式的正文，复用仓库既有的轻量渲染器（`web/src/components/Markdown.tsx`，与文件预览同一套 `md-*` 样式）：标题、有序/无序列表、表格、代码块（带语言标签）、引用、分割线、粗体、行内代码、外链；**不引入第三方解析器、不用 `dangerouslySetInnerHTML`**（原始 HTML 按纯文本输出，没有脚本注入面），外链新窗口打开。用户消息保持纯文本、按原样换行。输入框默认一行、上下间距与发送按钮一致，**拖拽上边框**可调整高度（双击恢复自动高度），内容变多仍自动增高，到上限后改为框内滚动 |
 | └ 已知差距 | 该渲染器不支持嵌套列表（平铺成同级列表）、任务列表、斜体、图片与自动链接；需要完整 CommonMark 时按组件注释替换为 marked/markdown-it |
 | 编排实现可切换（2026-11） | 契约在 `internal/agent`（`Agent` 接口 + §7.3 事件协议），实现：`internal/agent/builtin`（ReAct，默认）、`internal/agent/direct`（无工具直答）；`AGENT_IMPL` 切换，未知实现回退 builtin，`GET /agent/info` 返回当前实现与能力，`run.budget.impl` 留痕。平台侧（审批判定、checkpoint、压缩、预算、SSE 契约）不因实现而变。差距：断点续跑（`Capabilities.Resume`）只声明未实现；审批只推 `approval.req`，没有审批记录与恢复入口；模型 failover 由 ModelRouter 提供，尚未按实现区分 |
+| 平台部署事实 | 租户（企业）名称、IM 接入方与登录是否已配置、当前用户（姓名/工号）与所在空间，由会话层填入系统提示词的 `## 平台（部署事实）` 段，**不做成工具**：这类信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具它会顺着猜而不调用，工具 schema 还要每轮常驻。任一字段拿不到时整段省略，模型如实说不知道；智能体设定只能排在其后，不能改写 |
 | 内置工具 | `time_now`、`resource_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`resource_search` / `resource_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`resource_search` 按关键词检索能力源（资源无上限，不提供全量列举），`resource_read` 读取正文并支持分页 |
 | Skill | MVP 内置 4 个：`创建数据库资源`、`创建 MCP 服务资源`、`find/创建工具资源`、`创建 UI 组件资源`；每个 Skill 定义询问参数清单与校验规则 |
 | **Skill 作为一等资产** | Skill 有独立版本，复用 Agent 的版本/发布/灰度/回滚机制；生成规则（组件白名单、禁止 API、追问话术、模板库）写在 Skill 里而非硬编码；**MVP 先交付可用版本，上线后直接在产品内迭代优化**，每轮优化产出新版本并对比“生成一次通过率” |
@@ -485,7 +487,7 @@ autoagent/                                 # 存储根
 | 认证 | `GET /auth/provider`、`GET /auth/login/url`、`GET /auth/login`、`GET\|POST /auth/callback`、`POST /auth/logout`、`GET /auth/me`（旧 `/auth/dingtalk/*` 为兼容别名） |
 | 空间 | `GET/POST /spaces`、`GET/PATCH/DELETE /spaces/{id}`、`GET /spaces/{id}/tree`、`POST /spaces/{id}/members`、`PATCH/DELETE /spaces/{id}/members/{userId}` |
 | 权限申请 | `POST /permission-requests`、`GET /permission-requests?role=applicant\|approver`、`POST /permission-requests/{id}/decision` |
-| 文件 | `GET /spaces/{id}/files?parent=`、`POST /files/upload`、`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
+| 文件 | 已实现：`GET /spaces/files`（清单）、`GET /spaces/{id}/file?path=`（正文）、`POST /spaces/{id}/files`（上传，multipart + `dir`）。待实现：`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
 | 资源 | 已实现：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；待实现：`POST /resources/{id}/test`、`POST /resources/{id}/versions/{v}/rollback`、`POST /resources/{id}/publish`（从草稿发布即 `POST /resources`） |
 | 公共资源 | `GET /public-resources`、`POST /publish-requests`、`POST /publish-requests/{id}/decision` |
 | 组件 | `GET /plugins`、`GET /spaces/{id}/plugins/{slug}`、`POST .../plugins/{slug}/dry-run|publish|install`、`GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
