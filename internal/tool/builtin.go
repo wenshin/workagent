@@ -25,6 +25,7 @@ func builtinTools() []Tool {
 		sessionList(),
 		taskCreate(),
 		taskList(),
+		taskRemind(),
 		taskCancel(),
 		fileList(),
 		fileRead(),
@@ -609,6 +610,48 @@ func taskCancel() Tool {
 				return "", err
 			}
 			return `{"status":"cancelled"}`, nil
+		},
+	}
+}
+
+// taskRemind 是「同一件事再问一次」的正确路径：催办原会话，不新建。
+// 没有它，模型想追问时只能再调 task_create，对方空间里就会堆出一串相似会话。
+func taskRemind() Tool {
+	return Tool{
+		Name:       "task_remind",
+		Capability: "task.remind",
+		Description: "同一个任务需要再问一次时用这个，不要重新派发：向原任务会话追加一条提醒，" +
+			"不会新建会话、不改变被派发人。先用 task_list 找到那个任务的 id。" +
+			"如果对方已经回复，回执会自动回来，不需要催。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {"task_id": {"type": "string", "description": "task_list 返回的任务 id"}},
+  "required": ["task_id"],
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskWrite,
+		SideEffects: policy.SideEffectsWorkspace,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if env.Tasks == nil {
+				return "", fmt.Errorf("任务派发不可用")
+			}
+			var in struct {
+				TaskID string `json:"task_id"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			task, err := env.Tasks.RemindTask(ctx, env.UserID, in.TaskID)
+			if err != nil {
+				return "", err
+			}
+			return marshalLimited(map[string]any{
+				"task_id":        task.ID,
+				"status":         task.Status,
+				"dispatch_count": task.DispatchCount,
+				"note":           "已催办，对方回复后结果会自动回到本会话。",
+			}, 4*1024), nil
 		},
 	}
 }

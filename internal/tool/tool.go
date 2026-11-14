@@ -101,6 +101,9 @@ type TaskDispatcher interface {
 	Dispatch(ctx context.Context, userID, sessionID string, in TaskDispatchInput) (TaskInfo, error)
 	Tasks(ctx context.Context, userID, sessionID string) ([]TaskInfo, error)
 	CancelTask(ctx context.Context, userID, taskID string) error
+	// RemindTask 催办已有任务：只往原会话补一条提醒，不新建会话、不改被派发人。
+	// 模型必须先 task_list 拿到 task_id，否则会退化成「再派发一次」。
+	RemindTask(ctx context.Context, userID, taskID string) (TaskInfo, error)
 }
 
 // Tool 是一个可被模型调用的工具。

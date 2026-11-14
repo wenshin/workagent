@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -16,6 +17,10 @@ const (
 	// maxActiveTasks 是每会话同时未完成的异步任务上限。
 	// 同步任务不占这个额度——它们仍然串行执行（§15.12.1）。
 	maxActiveTasks = 50
+	// baseAgentID 是平台默认智能体：派发出去的会话用它，不继承发起方的智能体。
+	// B 要的是一个通用助理帮他把话说清楚，A 那个特定角色的行为设定对他没有意义；
+	// A 的上下文在回执回到父会话时自然恢复，两边各用各的。
+	baseAgentID = "base"
 	// autoRunPerMinute 限制「回执触发的 run」的密度：
 	// 十个回执同时到达时不该催出十轮模型调用，剩下的留在消息里等下一轮一起读。
 	autoRunPerMinute = 3
@@ -71,6 +76,11 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 	if title == "" {
 		return tool.TaskInfo{}, errors.New("缺少任务标题")
 	}
+	// 标题会直接成为对方会话列表里的会话名：「任务」「咨询」这种名字堆几条就分不清了。
+	// 这里只卡下限，具体写什么由模型决定。
+	if utf8.RuneCountInString(title) < 4 {
+		return tool.TaskInfo{}, errors.New("任务标题太短，对方会话列表里会分不清：请写成包含对象和事项的具体标题")
+	}
 	assignee, err := s.resolveAssignee(ctx, in.Assignee)
 	if err != nil {
 		return tool.TaskInfo{}, err
@@ -93,6 +103,15 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 		switch t.Status {
 		case store.TaskPending, store.TaskRunning, store.TaskWaitingExternal:
 			active++
+			// 同一个被派发人 + 同一个标题 + 还没结束 = 几乎必然是重复派发。
+			// 只拦这一种确定的重复，把「到底是不是同一件事」的判断交回模型：
+			// 真要是另一件事，让它把 title 写具体，重复自然消失。
+			if t.Assignee == assignee.ID && strings.TrimSpace(t.Title) == title {
+				return tool.TaskInfo{}, fmt.Errorf(
+					"已经给 %s 派过同名任务（task_id=%s，状态=%s）。同一件事请用 task_remind 催办；"+
+						"如果确实是另一件事，请把 title 写得更具体以便区分",
+					assignee.Name, t.ID, t.Status)
+			}
 		}
 	}
 	if active >= maxActiveTasks {
@@ -101,9 +120,9 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 
 	brief := strings.TrimSpace(in.Brief)
 	// dir 传空：父会话的目录是相对父空间 files/ 的路径，跨到个人空间后没有意义。
-	// 智能体设定照旧继承——它是行为设定，与空间无关。
+	// 智能体不继承：用平台默认的通用助理，提示词与版本都留空，由运行时按 B 的空间解析。
 	child, err := s.store.CreateSession(ctx, personalSpaceID, assignee.ID,
-		truncate(title, 60), "", sess.AgentID, sess.AgentVersion, sess.AgentPrompt)
+		truncate(title, 60), "", baseAgentID, "", "")
 	if err != nil {
 		return tool.TaskInfo{}, err
 	}
@@ -206,9 +225,16 @@ func (s *Service) RemindTask(ctx context.Context, userID, taskID string) (tool.T
 		return tool.TaskInfo{}, err
 	}
 	if task.ChildSessionID != "" {
+		from := task.CreatedBy
+		if u, err := s.store.GetUser(ctx, task.CreatedBy); err == nil {
+			from = u.Name
+		}
+		// 这条消息由平台代发起人写入：正文里必须点名，否则 B 的助理会把它
+		// 当成 B 自己说的话，上下文就串了。
 		_, _ = s.store.CreateMessageFrom(ctx, task.ChildSessionID, "user",
-			fmt.Sprintf("（第 %d 次催办）请尽快回复上面的任务；如果已经不需要了，请直接说明。", task.DispatchCount),
-			"task_result")
+			fmt.Sprintf("【催办】%s 想确认上面这件事的进展（第 %d 次）。方便的话请尽快回复；"+
+				"如果已经不需要了，直接说一声即可。", from, task.DispatchCount),
+			"task_remind")
 	}
 	return toTaskInfo(task, ""), nil
 }
