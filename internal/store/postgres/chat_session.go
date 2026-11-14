@@ -189,19 +189,75 @@ func (d *DB) UpdateSessionSkill(ctx context.Context, id, path string) error {
 }
 
 const messageColumns = `id::text, session_id::text, role, content, reasoning,
-       coalesce(parts, '[]'::jsonb), in_tokens, out_tokens, duration_ms, created_at`
+       coalesce(parts, '[]'::jsonb), in_tokens, out_tokens, duration_ms,
+       streaming, interrupted, source, created_at`
 
 // CreateMessage 写入一条消息（用户/系统消息，无执行轨迹）。
 func (d *DB) CreateMessage(ctx context.Context, sessionID, role, content string) (store.Message, error) {
+	return d.CreateMessageFrom(ctx, sessionID, role, content, "user")
+}
+
+// CreateMessageFrom 写入一条带来源的消息：task_result / external 要能被 UI 与提示词区分。
+func (d *DB) CreateMessageFrom(ctx context.Context, sessionID, role, content, source string) (store.Message, error) {
+	if source == "" {
+		source = "user"
+	}
 	const q = `
-insert into message (session_id, role, content)
-values ($1::uuid, $2, $3)
+insert into message (session_id, role, content, source)
+values ($1::uuid, $2, $3, $4)
 returning ` + messageColumns
 
 	var m store.Message
-	if err := d.pool.QueryRow(ctx, q, sessionID, role, content).Scan(
+	if err := d.pool.QueryRow(ctx, q, sessionID, role, content, source).Scan(
 		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
-		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+		&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt,
+	); err != nil {
+		return store.Message{}, err
+	}
+	return m, nil
+}
+
+// CreateStreamingMessage 先占位一条「生成中」的助手消息。
+//
+// 只在首个增量到达时调用一次：占位让刷新后的列表能显示「这一轮确实开始了」，
+// 正文仍然在结束时一次性覆盖，避免逐 token 写库（§15.12.2）。
+func (d *DB) CreateStreamingMessage(ctx context.Context, sessionID string) (store.Message, error) {
+	const q = `
+insert into message (session_id, role, content, streaming)
+values ($1::uuid, 'assistant', '', true)
+returning ` + messageColumns
+
+	var m store.Message
+	if err := d.pool.QueryRow(ctx, q, sessionID).Scan(
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+		&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt,
+	); err != nil {
+		return store.Message{}, err
+	}
+	return m, nil
+}
+
+// FinishMessage 用最终正文覆盖占位消息，并把 streaming 置回 false。
+func (d *DB) FinishMessage(ctx context.Context, id, content, reasoning string, parts []byte, stats store.MessageStats, interrupted bool) (store.Message, error) {
+	if len(parts) == 0 {
+		parts = []byte("[]")
+	}
+	const q = `
+update message
+set content = $2, reasoning = $3, parts = $4::jsonb,
+    in_tokens = $5, out_tokens = $6, duration_ms = $7,
+    streaming = false, interrupted = $8
+where id = $1::uuid
+returning ` + messageColumns
+
+	var m store.Message
+	if err := d.pool.QueryRow(ctx, q, id, content, reasoning, parts,
+		stats.InTokens, stats.OutTokens, stats.DurationMS, interrupted).Scan(
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+		&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt,
 	); err != nil {
 		return store.Message{}, err
 	}
@@ -223,7 +279,8 @@ returning ` + messageColumns
 	if err := d.pool.QueryRow(ctx, q, sessionID, content, reasoning, parts,
 		stats.InTokens, stats.OutTokens, stats.DurationMS).Scan(
 		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
-		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+		&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt,
 	); err != nil {
 		return store.Message{}, err
 	}
@@ -248,7 +305,8 @@ order by created_at asc, id asc`
 	for rows.Next() {
 		var m store.Message
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
-			&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS, &m.CreatedAt); err != nil {
+			&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+			&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

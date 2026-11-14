@@ -1,4 +1,13 @@
-import type { SpaceFile, UploadFilesResponse } from './types';
+import type {
+  ActiveRunResponse,
+  ChatMessage,
+  SessionShare,
+  SessionTask,
+  SharesResponse,
+  SpaceFile,
+  TasksResponse,
+  UploadFilesResponse,
+} from './types';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -82,6 +91,51 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
  */
 export async function cancelRun(runId: string): Promise<void> {
   await api<{ run_id: string; status: string }>(`/runs/${runId}/cancel`, { method: 'POST' });
+}
+
+/** 刷新后的第一问：这个会话有没有在跑的 run，有就续流。 */
+export function getActiveRun(sessionId: string): Promise<ActiveRunResponse> {
+  return api<ActiveRunResponse>(`/sessions/${sessionId}/active-run`);
+}
+
+/** 派发任务列表 */
+export function listTasks(sessionId: string): Promise<TasksResponse> {
+  return api<TasksResponse>(`/sessions/${sessionId}/tasks`);
+}
+
+export function cancelTask(taskId: string): Promise<{ status: string }> {
+  return api<{ status: string }>(`/tasks/${taskId}/cancel`, { method: 'POST' });
+}
+
+/** 再次咨询：向同一子会话催办，不新建任务 */
+export function remindTask(taskId: string): Promise<SessionTask> {
+  return api<SessionTask>(`/tasks/${taskId}/remind`, { method: 'POST' });
+}
+
+/** 生成排障只读链接：默认 24h，最多 7 天 */
+export function createShare(sessionId: string, ttlHours: number): Promise<SessionShare> {
+  return api<SessionShare>(`/sessions/${sessionId}/share`, {
+    method: 'POST',
+    body: JSON.stringify({ ttl_hours: ttlHours }),
+  });
+}
+
+export function listShares(sessionId: string): Promise<SharesResponse> {
+  return api<SharesResponse>(`/sessions/${sessionId}/share`);
+}
+
+export function revokeShare(sessionId: string, shareId: string): Promise<{ status: string }> {
+  return api<{ status: string }>(`/sessions/${sessionId}/share/${shareId}`, { method: 'DELETE' });
+}
+
+/** 用链接查看一段对话：唯一不需要登录的读取路径 */
+export function viewShared(token: string): Promise<{
+  title: string;
+  created_at: string;
+  messages: ChatMessage[];
+  read_only: boolean;
+}> {
+  return api(`/share/${encodeURIComponent(token)}`);
 }
 
 /**

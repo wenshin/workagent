@@ -140,7 +140,70 @@ export interface ChatMessage {
   in_tokens?: number;
   out_tokens?: number;
   duration_ms?: number;
+  /** 还在生成中：刷新后据此渲染骨架，而不是当成一条空消息 */
+  streaming?: boolean;
+  /** 这一轮被取消或中断，正文只到中断点 */
+  interrupted?: boolean;
+  /** user 用户输入 / task_result 任务回执 / task_brief 任务说明 / external 外部回信 */
+  source?: string;
   created_at: string;
+}
+
+/** 一次派发任务（§15.12.4） */
+export type TaskStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_external'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export interface SessionTask {
+  id: string;
+  title: string;
+  assignee: string;
+  assignee_name?: string;
+  status: TaskStatus;
+  /** 开始等待的时间点；前端本地计时，不需要后端定时任务 */
+  waiting_since?: string | null;
+  dispatch_count: number;
+  result?: string;
+}
+
+export interface TasksResponse {
+  tasks: SessionTask[];
+}
+
+/** 排障只读链接（§15.12.3），token 只在创建时返回一次 */
+export interface SessionShare {
+  id: string;
+  expires_at: string;
+  revoked_at?: string | null;
+  view_count: number;
+  created_at: string;
+  token?: string;
+  url?: string;
+}
+
+export interface SharesResponse {
+  shares: SessionShare[];
+}
+
+export interface ActiveRunResponse {
+  active: boolean;
+  run?: RunState;
+}
+
+export interface RunState {
+  id: string;
+  session_id: string;
+  status: string;
+  provider?: string;
+  model?: string;
+  error?: string;
+  usage?: unknown;
+  started_at: string;
+  ended_at?: string | null;
 }
 
 export interface AgentInfo {

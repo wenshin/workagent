@@ -20,6 +20,8 @@ interface StreamPayload {
   content?: string;
   /** message.delta：思考过程增量 */
   reasoning?: string;
+  /** 累计字符数：续流时作为 after_offset 回传 */
+  offset?: number;
   call_id?: string;
   tool?: string;
   args?: string;
@@ -36,7 +38,7 @@ interface StreamPayload {
   session?: ChatSession;
   /** run.finished 失败或中断时的可读文案 */
   error?: string;
-  /** run.finished：中断原因（client_disconnected / wall_clock_exceeded） */
+  /** run.finished：中断原因（user_cancelled / wall_clock_exceeded） */
   reason?: string;
 }
 
@@ -49,6 +51,108 @@ function toToolRecord(payload: StreamPayload): ToolCallRecord {
     status: (payload.status as ToolCallRecord['status']) ?? 'running',
     duration_ms: payload.duration_ms,
   };
+}
+
+function handleEvent(event: string, payload: StreamPayload, handlers: StreamHandlers) {
+  switch (event) {
+    case 'run.started':
+      handlers.onRunStarted?.(payload.run_id ?? '');
+      break;
+    case 'message.delta':
+      // 思考过程与正文共用同一事件，用字段区分
+      if (payload.reasoning) handlers.onReasoning?.(payload.reasoning);
+      if (payload.content) handlers.onText?.(payload.content);
+      break;
+    case 'tool.call':
+      handlers.onToolStart?.(toToolRecord(payload));
+      break;
+    case 'tool.result':
+      handlers.onToolResult?.(toToolRecord(payload));
+      break;
+    case 'approval.req':
+      handlers.onApproval?.({
+        approvalId: payload.approval_id ?? '',
+        callId: payload.call_id ?? '',
+        tool: payload.tool ?? '',
+        timeoutS: payload.timeout_s ?? 0,
+      });
+      break;
+    case 'message.done':
+      if (typeof payload.message === 'object' && payload.message && payload.session) {
+        handlers.onDone?.({ message: payload.message, session: payload.session });
+      }
+      break;
+    case 'run.finished':
+      // 失败与中断都以 run.finished 收尾（成功时由 message.done 更新界面）
+      if (payload.status && payload.status !== 'succeeded') {
+        const fallback =
+          payload.status === 'cancelled' ? '回答已中断，已保留已生成的内容' : '生成失败，请重试';
+        handlers.onError?.(payload.error || fallback);
+      }
+      break;
+    case 'error':
+      handlers.onError?.(typeof payload.message === 'string' ? payload.message : '生成失败，请重试');
+      break;
+  }
+}
+
+/**
+ * 读取一条 SSE 流。chat 与 run 续流共用同一份解析，保证两条链路行为一致。
+ */
+async function readSSE(res: Response, handlers: StreamHandlers): Promise<void> {
+  if (!res.body) {
+    throw new ApiError('当前浏览器不支持流式响应', 0, 'stream_unsupported');
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const handleBlock = (block: string) => {
+    let event = 'message';
+    const dataLines: string[] = [];
+
+    block.split('\n').forEach((rawLine) => {
+      const line = rawLine.replace(/\r$/, '');
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    });
+    if (dataLines.length === 0) return;
+
+    let payload: StreamPayload;
+    try {
+      payload = JSON.parse(dataLines.join('\n')) as StreamPayload;
+    } catch {
+      return;
+    }
+    handleEvent(event, payload, handlers);
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sep = buffer.indexOf('\n\n');
+    while (sep >= 0) {
+      handleBlock(buffer.slice(0, sep));
+      buffer = buffer.slice(sep + 2);
+      sep = buffer.indexOf('\n\n');
+    }
+  }
+
+  if (buffer.trim()) handleBlock(buffer);
+}
+
+async function ensureOK(res: Response): Promise<void> {
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
+  }
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { message?: string; code?: string };
+    throw new ApiError(data.message ?? `请求失败（${res.status}）`, res.status, data.code ?? 'unknown');
+  }
 }
 
 /**
@@ -77,96 +181,30 @@ export async function streamChat(
     throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
   }
 
-  if (res.status === 401) {
-    redirectToLogin();
-    throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
+  await ensureOK(res);
+  await readSSE(res, handlers);
+}
+
+/**
+ * 续上一次仍在执行的 run：刷新页面后从这里接着往下看。
+ *
+ * afterOffset 传客户端已渲染到的累计字符数，服务端只补发之后的增量；
+ * 传 0 表示从头补（内存缓冲里这一轮的全部内容）。
+ */
+export async function streamRun(
+  runId: string,
+  afterOffset: number,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`/runs/${runId}/stream?after_offset=${afterOffset}`, { signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
   }
 
-  if (!res.ok) {
-    const data = (await res.json().catch(() => ({}))) as { message?: string; code?: string };
-    throw new ApiError(data.message ?? `请求失败（${res.status}）`, res.status, data.code ?? 'unknown');
-  }
-
-  if (!res.body) {
-    throw new ApiError('当前浏览器不支持流式响应', 0, 'stream_unsupported');
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-
-  const handleBlock = (block: string) => {
-    let event = 'message';
-    const dataLines: string[] = [];
-
-    block.split('\n').forEach((rawLine) => {
-      const line = rawLine.replace(/\r$/, '');
-      if (line.startsWith('event:')) event = line.slice(6).trim();
-      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
-    });
-    if (dataLines.length === 0) return;
-
-    let payload: StreamPayload;
-    try {
-      payload = JSON.parse(dataLines.join('\n')) as StreamPayload;
-    } catch {
-      return;
-    }
-
-    switch (event) {
-      case 'run.started':
-        handlers.onRunStarted?.(payload.run_id ?? '');
-        break;
-      case 'message.delta':
-        // 思考过程与正文共用同一事件，用字段区分
-        if (payload.reasoning) handlers.onReasoning?.(payload.reasoning);
-        if (payload.content) handlers.onText?.(payload.content);
-        break;
-      case 'tool.call':
-        handlers.onToolStart?.(toToolRecord(payload));
-        break;
-      case 'tool.result':
-        handlers.onToolResult?.(toToolRecord(payload));
-        break;
-      case 'approval.req':
-        handlers.onApproval?.({
-          approvalId: payload.approval_id ?? '',
-          callId: payload.call_id ?? '',
-          tool: payload.tool ?? '',
-          timeoutS: payload.timeout_s ?? 0,
-        });
-        break;
-      case 'message.done':
-        if (typeof payload.message === 'object' && payload.message && payload.session) {
-          handlers.onDone?.({ message: payload.message, session: payload.session });
-        }
-        break;
-      case 'run.finished':
-        // 失败与中断都以 run.finished 收尾（成功时由 message.done 更新界面）
-        if (payload.status && payload.status !== 'succeeded') {
-          const fallback =
-            payload.status === 'cancelled' ? '回答已中断，已保留已生成的内容' : '生成失败，请重试';
-          handlers.onError?.(payload.error || fallback);
-        }
-        break;
-      case 'error':
-        handlers.onError?.(typeof payload.message === 'string' ? payload.message : '生成失败，请重试');
-        break;
-    }
-  };
-
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    let sep = buffer.indexOf('\n\n');
-    while (sep >= 0) {
-      handleBlock(buffer.slice(0, sep));
-      buffer = buffer.slice(sep + 2);
-      sep = buffer.indexOf('\n\n');
-    }
-  }
-
-  if (buffer.trim()) handleBlock(buffer);
+  await ensureOK(res);
+  await readSSE(res, handlers);
 }

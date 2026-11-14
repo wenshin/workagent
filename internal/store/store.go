@@ -109,8 +109,61 @@ type Message struct {
 	// Parts 是结构化的执行轨迹（思考、工具调用），JSON 数组；为空表示纯文本消息
 	Parts []byte
 	// Stats 是这条助手消息的用量与耗时，仅 assistant 消息有值（历史消息为 0）
-	Stats     MessageStats
+	Stats MessageStats
+	// Streaming 表示这条消息还在生成中：首个增量到达时占位，结束时整段覆盖（§15.12.2）
+	Streaming bool
+	// Interrupted 表示这一轮被取消或中断，内容只覆盖到中断点
+	Interrupted bool
+	// Source 是消息来源：user 用户输入 / task_result 子任务回执 / external 外部回信
+	Source    string
 	CreatedAt time.Time
+}
+
+// TaskStatus 是派发任务的状态（§15.12.4）。没有「过期」：只能由用户取消。
+type TaskStatus string
+
+const (
+	TaskPending         TaskStatus = "pending"
+	TaskRunning         TaskStatus = "running"
+	TaskWaitingExternal TaskStatus = "waiting_external"
+	TaskSucceeded       TaskStatus = "succeeded"
+	TaskFailed          TaskStatus = "failed"
+	TaskCancelled       TaskStatus = "cancelled"
+)
+
+// Task 是一次派发：父会话把一件事交给子会话（归属被咨询人）去办。
+type Task struct {
+	ID              string
+	SpaceID         string
+	ParentSessionID string
+	ChildSessionID  string
+	Title           string
+	Brief           string
+	Assignee        string
+	Status          TaskStatus
+	WaitingSince    *time.Time
+	DispatchCount   int
+	Result          string
+	CreatedBy       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// Share 是一条用户授权的临时只读链接（§15.12.3）。库里只存 token 的 sha256。
+type Share struct {
+	ID        string
+	SessionID string
+	TokenHash string
+	ExpiresAt time.Time
+	RevokedAt *time.Time
+	ViewCount int
+	CreatedBy string
+	CreatedAt time.Time
+}
+
+// Expired 判断链接是否已不可用。
+func (s Share) Expired(now time.Time) bool {
+	return now.After(s.ExpiresAt) || s.RevokedAt != nil
 }
 
 // MessageStats 是产生一条助手消息的那一轮 run 的 token 消耗与总墙钟耗时（含工具轮次）。
@@ -233,6 +286,8 @@ type Store interface {
 
 	UpsertUserByIdentity(ctx context.Context, p IdentityProfile) (User, error)
 	GetUser(ctx context.Context, id string) (User, error)
+	// SearchUsers 按姓名/工号/邮箱模糊匹配，供派发任务时把人名解析成用户。
+	SearchUsers(ctx context.Context, keyword string, limit int) ([]User, error)
 	// FindUserByJobNumber 按工号查用户，用于按配置识别系统管理员。
 	FindUserByJobNumber(ctx context.Context, jobNumber string) (User, error)
 
@@ -278,6 +333,12 @@ type Store interface {
 	UpdateSessionAgent(ctx context.Context, id, agentID, agentVersion, agentPrompt string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
+	// CreateMessageFrom 写入一条带来源的消息（task_result / external 需要区分渲染与提示词包装）。
+	CreateMessageFrom(ctx context.Context, sessionID, role, content, source string) (Message, error)
+	// CreateStreamingMessage 先占位一条 streaming 的助手消息，首个增量到达时调用。
+	CreateStreamingMessage(ctx context.Context, sessionID string) (Message, error)
+	// FinishMessage 用最终正文覆盖占位消息；interrupted 标记这一轮是否被中断。
+	FinishMessage(ctx context.Context, id, content, reasoning string, parts []byte, stats MessageStats, interrupted bool) (Message, error)
 	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息，并记录这一轮的用量与耗时。
 	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte, stats MessageStats) (Message, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
@@ -310,8 +371,28 @@ type Store interface {
 	FinishRun(ctx context.Context, r Run) error
 	// GetRun 读一次执行的状态：前端刷新后据此判断「还在不在跑」。
 	GetRun(ctx context.Context, id string) (Run, error)
+	// GetActiveRun 返回会话当前活跃的 run（running / waiting_approval），没有则 ok=false。
+	GetActiveRun(ctx context.Context, sessionID string) (Run, bool, error)
 	// ListRunSteps 按 seq 返回一次执行的全部 checkpoint，供恢复时重放。
 	ListRunSteps(ctx context.Context, runID string) ([]RunStep, error)
+
+	// ---- 任务派发（§15.12.4）----
+	CreateTask(ctx context.Context, t Task) (Task, error)
+	GetTask(ctx context.Context, id string) (Task, error)
+	// GetTaskByChild 按子会话反查任务：子会话跑完时要据此回填父会话。
+	GetTaskByChild(ctx context.Context, childSessionID string) (Task, error)
+	// ListTasks 返回父会话派发出的任务，按创建时间倒序。
+	ListTasks(ctx context.Context, parentSessionID string) ([]Task, error)
+	// UpdateTask 覆盖可变字段：状态、子会话、等待起点、催办次数、结果。
+	UpdateTask(ctx context.Context, t Task) error
+
+	// ---- 排障只读链接（§15.12.3）----
+	CreateShare(ctx context.Context, s Share) (Share, error)
+	// GetShareByHash 按 token 的 sha256 取链接，连带返回会话（公开访问只有这一条查询）。
+	GetShareByHash(ctx context.Context, hash string) (Share, error)
+	RevokeShare(ctx context.Context, id string) error
+	ListShares(ctx context.Context, sessionID string) ([]Share, error)
+	TouchShareView(ctx context.Context, id string) error
 
 	// ---- 上下文与记忆（§5.7.2 / §5.7.4）----
 	GetSessionSummary(ctx context.Context, sessionID string) (SessionSummary, bool, error)

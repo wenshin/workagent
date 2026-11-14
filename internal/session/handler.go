@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/agent"
@@ -14,6 +16,7 @@ import (
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
+	"github.com/workagent/auto-agent/internal/tool"
 )
 
 // UserResolver 从请求中解析当前登录用户。
@@ -52,6 +55,20 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /runs/{id}", h.runState)
 	mux.HandleFunc("GET /runs/{id}/stream", h.runStream)
 	mux.HandleFunc("POST /runs/{id}/cancel", h.cancelRun)
+
+	// 刷新后的第一问：这个会话现在有没有在跑的 run
+	mux.HandleFunc("GET /sessions/{id}/active-run", h.activeRun)
+
+	// 任务派发：列表、取消、催办（§15.12.4）
+	mux.HandleFunc("GET /sessions/{id}/tasks", h.listTasks)
+	mux.HandleFunc("POST /tasks/{id}/cancel", h.cancelTask)
+	mux.HandleFunc("POST /tasks/{id}/remind", h.remindTask)
+
+	// 排障只读链接：创建、列表、吊销；查看走公开路径，不需要登录（§15.12.3）
+	mux.HandleFunc("POST /sessions/{id}/share", h.createShare)
+	mux.HandleFunc("GET /sessions/{id}/share", h.listShares)
+	mux.HandleFunc("DELETE /sessions/{id}/share/{shareID}", h.revokeShare)
+	mux.HandleFunc("GET /share/{token}", h.viewShared)
 }
 
 type sessionDTO struct {
@@ -84,7 +101,12 @@ type messageDTO struct {
 	InTokens   int    `json:"in_tokens"`
 	OutTokens  int    `json:"out_tokens"`
 	DurationMS int    `json:"duration_ms"`
-	CreatedAt  string `json:"created_at"`
+	// Streaming 表示还在生成中：刷新后据此渲染「生成中」骨架而不是空消息
+	Streaming   bool   `json:"streaming,omitempty"`
+	Interrupted bool   `json:"interrupted,omitempty"`
+	// Source 区分用户输入、任务回执与外部回信，前端据此换一种样式
+	Source    string `json:"source,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
@@ -122,10 +144,13 @@ func toMessageDTO(m store.Message) messageDTO {
 		Content:    m.Content,
 		Reasoning:  m.Reasoning,
 		Parts:      parts,
-		InTokens:   m.Stats.InTokens,
-		OutTokens:  m.Stats.OutTokens,
-		DurationMS: m.Stats.DurationMS,
-		CreatedAt:  m.CreatedAt.In(time.Local).Format(timeLayout),
+		InTokens:    m.Stats.InTokens,
+		OutTokens:   m.Stats.OutTokens,
+		DurationMS:  m.Stats.DurationMS,
+		Streaming:   m.Streaming,
+		Interrupted: m.Interrupted,
+		Source:      m.Source,
+		CreatedAt:   m.CreatedAt.In(time.Local).Format(timeLayout),
 	}
 }
 
@@ -533,6 +558,215 @@ func (h *Handler) runStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// activeRun 回答「这个会话现在有没有在跑」——刷新后的第一问。
+func (h *Handler) activeRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	run, found, err := h.svc.ActiveRun(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	if !found {
+		platform.WriteJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"active": true, "run": toRunDTO(run)})
+}
+
+type taskDTO struct {
+	ID            string  `json:"id"`
+	Title         string  `json:"title"`
+	Assignee      string  `json:"assignee"`
+	AssigneeName  string  `json:"assignee_name,omitempty"`
+	Status        string  `json:"status"`
+	WaitingSince  *string `json:"waiting_since"`
+	DispatchCount int     `json:"dispatch_count"`
+	Result        string  `json:"result,omitempty"`
+}
+
+func toTaskDTO(t tool.TaskInfo) taskDTO {
+	dto := taskDTO{
+		ID: t.ID, Title: t.Title, Assignee: t.Assignee, AssigneeName: t.AssigneeName,
+		Status: t.Status, DispatchCount: t.DispatchCount, Result: t.Result,
+	}
+	if t.WaitingSince != nil {
+		v := t.WaitingSince.In(time.Local).Format(timeLayout)
+		dto.WaitingSince = &v
+	}
+	return dto
+}
+
+func (h *Handler) listTasks(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	tasks, err := h.svc.Tasks(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	out := make([]taskDTO, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, toTaskDTO(t))
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"tasks": out})
+}
+
+func (h *Handler) cancelTask(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.CancelTask(r.Context(), user.ID, r.PathValue("id")); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": string(store.TaskCancelled)})
+}
+
+// remindTask 是「再次咨询」：向同一子会话催办，不新建任务。
+func (h *Handler) remindTask(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	task, err := h.svc.RemindTask(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, toTaskDTO(task))
+}
+
+type shareDTO struct {
+	ID        string  `json:"id"`
+	ExpiresAt string  `json:"expires_at"`
+	RevokedAt *string `json:"revoked_at"`
+	ViewCount int     `json:"view_count"`
+	CreatedAt string  `json:"created_at"`
+	// Token 只在创建时返回一次，列表里永远为空
+	Token string `json:"token,omitempty"`
+	URL   string `json:"url,omitempty"`
+}
+
+func toShareDTO(s store.Share) shareDTO {
+	dto := shareDTO{
+		ID:        s.ID,
+		ExpiresAt: s.ExpiresAt.In(time.Local).Format(timeLayout),
+		ViewCount: s.ViewCount,
+		CreatedAt: s.CreatedAt.In(time.Local).Format(timeLayout),
+	}
+	if s.RevokedAt != nil {
+		v := s.RevokedAt.In(time.Local).Format(timeLayout)
+		dto.RevokedAt = &v
+	}
+	return dto
+}
+
+// createShare 生成排障只读链接：默认 24h，最多 7 天，可随时吊销。
+func (h *Handler) createShare(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		TTLHours int `json:"ttl_hours"`
+	}
+	if r.ContentLength > 0 {
+		if err := platform.DecodeJSON(r, &in); err != nil {
+			h.writeErr(w, r, err)
+			return
+		}
+	}
+	share, token, err := h.svc.CreateShare(r.Context(), user.ID, r.PathValue("id"),
+		time.Duration(in.TTLHours)*time.Hour)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	dto := toShareDTO(share)
+	dto.Token = token
+	dto.URL = "/share/" + token
+	platform.WriteJSON(w, http.StatusOK, dto)
+}
+
+func (h *Handler) listShares(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	shares, err := h.svc.Shares(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	out := make([]shareDTO, 0, len(shares))
+	for _, s := range shares {
+		out = append(out, toShareDTO(s))
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"shares": out})
+}
+
+func (h *Handler) revokeShare(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.RevokeShare(r.Context(), user.ID, r.PathValue("id"), r.PathValue("shareID")); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// viewShared 是唯一不要求登录的读取路径：拿着用户授权的链接看一段对话。
+//
+// 不返回任何可操作能力（不能发消息、不能跑 run），也不返回会话所属空间等元数据，
+// 只给「这段对话长什么样」，够运维定位问题即可。
+func (h *Handler) viewShared(w http.ResponseWriter, r *http.Request) {
+	sess, msgs, err := h.svc.ViewShared(r.Context(), r.PathValue("token"),
+		clientIP(r), r.UserAgent())
+	if err != nil {
+		if errors.Is(err, ErrShareGone) {
+			platform.WriteError(w, r, http.StatusNotFound, "share_gone", "链接无效或已过期")
+			return
+		}
+		platform.WriteError(w, r, http.StatusInternalServerError, "internal", "读取失败")
+		return
+	}
+
+	out := make([]messageDTO, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, toMessageDTO(m))
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"title":      sess.Title,
+		"created_at": sess.CreatedAt.In(time.Local).Format(timeLayout),
+		"messages":   out,
+		"read_only":  true,
+	})
+}
+
+// clientIP 取来源地址：代理场景优先用 X-Forwarded-For 的第一跳。
+// 它只进审计，不参与任何鉴权判断——来源 IP 不是可信身份。
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i > 0 {
+			v = v[:i]
+		}
+		return strings.TrimSpace(v)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // userFacingCancelError 说明一次中断的原因，避免前端把它当成「失败，请重试」。

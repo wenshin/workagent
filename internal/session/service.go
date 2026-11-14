@@ -115,7 +115,9 @@ type Service struct {
 	// runs 是进程内正在执行的 run：既提供显式取消，也提供断流续传的缓冲。
 	// 它不持久化——run 的权威状态在库里，这里只是「还活着」的那一份视图。
 	runs *liveRuns
-	log  *slog.Logger
+	// autoBudget 限制「回执触发的 run」的密度，避免十条回执催出十轮模型调用。
+	autoBudget *autoRunBudget
+	log        *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
@@ -127,7 +129,8 @@ func NewService(st store.Store, spaces *space.Service, resources *resource.Servi
 	return &Service{
 		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
-		runBudget: wallClock + runBudgetBackstopMargin, runs: newLiveRuns(), log: log,
+		runBudget: wallClock + runBudgetBackstopMargin, runs: newLiveRuns(),
+		autoBudget: newAutoRunBudget(), log: log,
 	}
 }
 
@@ -555,6 +558,34 @@ func (s *Service) Chat(
 	userID, sessionID, content string,
 	emit func(agent.Event, int) error,
 ) (ChatOutcome, error) {
+	return s.chat(ctx, userID, sessionID, content, chatOptions{source: "user"}, emit)
+}
+
+// ChatWithSource 与 Chat 相同，但标记这条用户消息的来源（task_result / external）。
+//
+// 来源只影响「怎么渲染」与「进模型时如何包装」，不改变权限：run 的 actor 永远是
+// 会话所有者，外部回信不会让别人的内容驱动所有者的工具权限（§15.10）。
+func (s *Service) ChatWithSource(
+	ctx context.Context,
+	userID, sessionID, content, source string,
+	emit func(agent.Event, int) error,
+) (ChatOutcome, error) {
+	return s.chat(ctx, userID, sessionID, content, chatOptions{source: source}, emit)
+}
+
+// chatOptions 是内部执行开关，不对外暴露：来源影响渲染与提示词包装，不影响权限。
+type chatOptions struct {
+	source string
+	// skipUser 表示用户消息已经落库（回执是「先落消息、再起 run」），这一轮不要再写一次
+	skipUser bool
+}
+
+func (s *Service) chat(
+	ctx context.Context,
+	userID, sessionID, content string,
+	opt chatOptions,
+	emit func(agent.Event, int) error,
+) (ChatOutcome, error) {
 	out := ChatOutcome{}
 
 	sess, sp, err := s.ValidateChat(ctx, userID, sessionID, content)
@@ -576,9 +607,19 @@ func (s *Service) Chat(
 		return out, err
 	}
 
-	userMsg, err := s.store.CreateMessage(ctx, sessionID, "user", text)
-	if err != nil {
-		return out, err
+	source := opt.source
+	if source == "" {
+		source = "user"
+	}
+	var userMsg store.Message
+	if opt.skipUser {
+		// 回执消息已经落库，这一轮只是把它交给模型
+		userMsg = store.Message{SessionID: sessionID, Role: "user", Content: text, Source: source}
+	} else {
+		userMsg, err = s.store.CreateMessageFrom(ctx, sessionID, "user", text, source)
+		if err != nil {
+			return out, err
+		}
 	}
 	if err := s.store.TouchSession(ctx, sessionID); err != nil {
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
@@ -659,12 +700,34 @@ func (s *Service) Chat(
 	// 事件先落内存缓冲再推客户端：客户端断了写入会失败，但缓冲还在，
 	// 重连后按 offset 补齐（§15.12.2）。因此这里的错误一律吞掉——
 	// 让「写不出去」去中断 Agent，正是刷新丢任务的老问题。
+	// 首个正文增量到达时占位一条 streaming 消息：刷新后列表能看出「这一轮真的在跑」，
+	// 而不是空白。正文仍然在结束时一次性覆盖，不逐 token 写库（§15.12.2）。
+	var placeholderID string
+	ensurePlaceholder := func() {
+		if placeholderID != "" {
+			return
+		}
+		placeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		m, err := s.store.CreateStreamingMessage(placeCtx, sessionID)
+		cancel()
+		if err != nil {
+			s.log.Warn("占位消息写入失败", "session_id", sessionID, "err", err)
+			return
+		}
+		placeholderID = m.ID
+	}
+
 	emitEvent := func(ev agent.Event) error {
 		switch ev.Type {
 		case agent.EventToolCall, agent.EventToolResult:
 			appendStep(ev.Type, ev.Tool.Payload())
 		case agent.EventApprovalReq:
 			appendStep(ev.Type, ev.Approval)
+		case agent.EventMessageDelta:
+			// 思考不占位：只有真的开始写正文了，才值得在列表里留一条记录
+			if !ev.Reasoning {
+				ensurePlaceholder()
+			}
 		}
 		offset := live.broadcast(ev)
 		if emit != nil {
@@ -728,6 +791,8 @@ func (s *Service) Chat(
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
 			Plugins: s.pluginTry,
+			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
+			Tasks: s,
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
 			Secrets:         s.secrets,
 			CanWriteSecrets: s.canWriteSecrets(user),
@@ -828,7 +893,14 @@ func (s *Service) Chat(
 		OutTokens:  res.Usage.OutputTokens,
 		DurationMS: int(time.Since(startedAt).Milliseconds()),
 	}
-	msg, err := s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts, stats)
+	var msg store.Message
+	if placeholderID != "" {
+		// 占位消息已经存在：整段覆盖，并把 streaming 置回 false
+		msg, err = s.store.FinishMessage(saveCtx, placeholderID,
+			res.Content, res.Reasoning, parts, stats, reason != "")
+	} else {
+		msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts, stats)
+	}
 	if err != nil {
 		status = store.RunFailed
 		finish(err.Error())
@@ -861,11 +933,18 @@ func (s *Service) Chat(
 		go func() {
 			indexCtx, indexCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer indexCancel()
-			if err := s.memory.Index(indexCtx, sessionID, []store.Message{userMsg, msg}); err != nil {
+			batch := []store.Message{msg}
+			if userMsg.ID != "" {
+				batch = append([]store.Message{userMsg}, msg)
+			}
+			if err := s.memory.Index(indexCtx, sessionID, batch); err != nil {
 				s.log.Warn("写入消息向量失败", "session_id", sessionID, "err", err)
 			}
 		}()
 	}
+
+	// 这个会话如果是一个派发任务的子会话，把结果回填给父会话（§15.12.4）
+	s.completeParentTask(saveCtx, sessionID, res.Content)
 
 	s.log.Info("对话完成",
 		"session_id", sessionID, "space_id", sess.SpaceID, "by", userID, "run_id", run.ID,
@@ -883,6 +962,14 @@ func (s *Service) Chat(
 // 再决定是续流、还是直接取最终消息。
 func (s *Service) RunState(ctx context.Context, userID, runID string) (store.Run, error) {
 	return s.loadRun(ctx, userID, runID)
+}
+
+// ActiveRun 返回会话当前活跃的 run：刷新后的第一件事就是问它。
+func (s *Service) ActiveRun(ctx context.Context, userID, sessionID string) (store.Run, bool, error) {
+	if _, _, err := s.load(ctx, userID, sessionID); err != nil {
+		return store.Run{}, false, err
+	}
+	return s.store.GetActiveRun(ctx, sessionID)
 }
 
 // CancelRun 是唯一能停掉一轮执行的入口。

@@ -23,6 +23,9 @@ func builtinTools() []Tool {
 		timeNow(),
 		resourceList(),
 		sessionList(),
+		taskCreate(),
+		taskList(),
+		taskCancel(),
 		fileList(),
 		fileRead(),
 		fileWrite(),
@@ -500,6 +503,110 @@ func fileList() Tool {
 				return "目录为空。", nil
 			}
 			return marshalLimited(out, 8*1024), nil
+		},
+	}
+}
+
+// taskCreate 把一件事派发给指定的人：平台会为他单独建一个会话。
+//
+// 派发是「异步」的：调用返回后当前这一轮就正常结束，用户可以在本会话继续问别的事；
+// 对方回复后，平台会把回执作为一条消息送回本会话并自动续上一轮。
+func taskCreate() Tool {
+	return Tool{
+		Name:       "task_create",
+		Capability: "task.create",
+		Description: "把一件需要他人确认或处理的事派发出去（例如请数据负责人确认口径）。" +
+			"派发后本轮会正常结束，用户仍可继续对话；对方回复后回执会自动回到本会话。" +
+			"assignee 传姓名、工号或用户 id，匹配到多人时工具会报错并要求用工号指定。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "title": {"type": "string", "description": "一句话说明要对方做什么，会作为子会话标题"},
+    "brief": {"type": "string", "description": "完整说明：背景、具体问题、期望的回复形式"},
+    "assignee": {"type": "string", "description": "被派发人的姓名、工号或用户 id"}
+  },
+  "required": ["title", "brief", "assignee"],
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskWrite,
+		SideEffects: policy.SideEffectsWorkspace,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if env.Tasks == nil {
+				return "", fmt.Errorf("任务派发不可用")
+			}
+			var in TaskDispatchInput
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			task, err := env.Tasks.Dispatch(ctx, env.UserID, env.SessionID, in)
+			if err != nil {
+				return "", err
+			}
+			return marshalLimited(map[string]any{
+				"task_id": task.ID,
+				"title":   task.Title,
+				"status":  task.Status,
+				"note":    "任务已派发，请告知用户：对方回复后结果会自动回到本会话。",
+			}, 4*1024), nil
+		},
+	}
+}
+
+// taskList 查看本会话派发出的任务及其等待时长。
+func taskList() Tool {
+	return Tool{
+		Name:        "task_list",
+		Capability:  "task.list",
+		Description: "列出本会话派发出去的任务与当前状态。用户问「那个任务怎么样了」时使用。",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		Risk:        policy.RiskReadOnly,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, _ json.RawMessage, env Env) (string, error) {
+			if env.Tasks == nil {
+				return "", fmt.Errorf("任务派发不可用")
+			}
+			tasks, err := env.Tasks.Tasks(ctx, env.UserID, env.SessionID)
+			if err != nil {
+				return "", err
+			}
+			if len(tasks) == 0 {
+				return "本会话还没有派发过任务。", nil
+			}
+			return marshalLimited(tasks, 8*1024), nil
+		},
+	}
+}
+
+// taskCancel 取消一个尚未完成的任务。
+func taskCancel() Tool {
+	return Tool{
+		Name:        "task_cancel",
+		Capability:  "task.cancel",
+		Description: "取消一个还没完成的任务。已经拿到结果或已被取消的任务不可再取消。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {"task_id": {"type": "string", "description": "task_list 返回的任务 id"}},
+  "required": ["task_id"],
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskWrite,
+		SideEffects: policy.SideEffectsWorkspace,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if env.Tasks == nil {
+				return "", fmt.Errorf("任务派发不可用")
+			}
+			var in struct {
+				TaskID string `json:"task_id"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			if err := env.Tasks.CancelTask(ctx, env.UserID, in.TaskID); err != nil {
+				return "", err
+			}
+			return `{"status":"cancelled"}`, nil
 		},
 	}
 }

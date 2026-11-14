@@ -642,10 +642,17 @@ export default function ChatPanel({
             />
           </div>
         ) : (
-          messages.map((m) => (
+          messages
+            // 占位的空 streaming 消息由下面的实时视图接管，避免出现一条空气泡
+            .filter((m) => !(m.streaming && !m.content))
+            .map((m) => (
             <div key={m.id} className={`chat-msg chat-msg-${m.role}`}>
               <div className="chat-msg-meta">
                 <span>{m.role === 'user' ? '我' : m.role === 'assistant' ? 'Agent' : '系统'}</span>
+                {m.source === 'task_result' ? (
+                  <span className="chat-msg-time">任务回执</span>
+                ) : null}
+                {m.interrupted ? <span className="chat-msg-time">已中断</span> : null}
                 <span className="chat-msg-time">{formatTime(m.created_at)}</span>
                 {m.role === 'assistant' ? (
                   <MessageStats

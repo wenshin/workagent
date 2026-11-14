@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/policy"
@@ -69,6 +70,37 @@ type Env struct {
 	// CanWriteSecrets 表示当前用户能否写平台凭证（系统管理员）。
 	// 不能写时 secret_request 只给出「转给管理员」的指引，而不是弹一个填了也存不下的表单。
 	CanWriteSecrets bool
+
+	// Tasks 是任务派发能力（session 包实现），为 nil 时 task_* 工具不可用。
+	// 派发要代建会话、校验空间成员，这些都不该由工具直接碰存储，所以走接口注入。
+	Tasks TaskDispatcher
+}
+
+// TaskDispatchInput 是一次派发的入参。
+type TaskDispatchInput struct {
+	Title string `json:"title"`
+	Brief string `json:"brief"`
+	// Assignee 可以是用户 id、工号或姓名；解析规则由实现决定。
+	Assignee string `json:"assignee"`
+}
+
+// TaskInfo 是任务的对外视图。
+type TaskInfo struct {
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Assignee      string     `json:"assignee"`
+	AssigneeName  string     `json:"assignee_name,omitempty"`
+	Status        string     `json:"status"`
+	WaitingSince  *time.Time `json:"waiting_since,omitempty"`
+	DispatchCount int        `json:"dispatch_count"`
+	Result        string     `json:"result,omitempty"`
+}
+
+// TaskDispatcher 是「主 Agent 派发子任务」的能力边界。
+type TaskDispatcher interface {
+	Dispatch(ctx context.Context, userID, sessionID string, in TaskDispatchInput) (TaskInfo, error)
+	Tasks(ctx context.Context, userID, sessionID string) ([]TaskInfo, error)
+	CancelTask(ctx context.Context, userID, taskID string) error
 }
 
 // Tool 是一个可被模型调用的工具。

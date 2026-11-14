@@ -6,6 +6,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 
 import { useMe } from './api/hooks';
 import LoginPage from './pages/LoginPage';
+import SharePage from './pages/SharePage';
 import WorkspacePage from './pages/WorkspacePage';
 
 const queryClient = new QueryClient({
@@ -41,6 +42,8 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
+            {/* 排障只读页：不需要登录，凭链接里的 token 读取一段对话（§15.12.3） */}
+            <Route path="/share/:token" element={<SharePage />} />
             <Route
               path="/"
               element={

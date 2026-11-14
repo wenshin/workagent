@@ -271,6 +271,81 @@ body[theme-mode='dark'] {
   background: var(--semi-color-bg-0);
 }
 
+/* 排障只读页：不出现在登录后的布局里，独立阅读 */
+.share-page {
+  max-width: 840px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+.share-header {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--semi-color-border);
+  margin-bottom: 16px;
+}
+
+.share-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.share-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.share-empty {
+  padding: 96px 0;
+  text-align: center;
+}
+
+/* 会话区：任务条 + 对话面板，任务条只在有进行中任务时出现 */
+.chat-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.task-strip {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--semi-color-border);
+  background: var(--semi-color-fill-0);
+}
+
+.task-strip-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.task-strip-title {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 30%;
+}
+
+.task-strip-meta {
+  color: var(--semi-color-text-2);
+  white-space: nowrap;
+}
+
+.task-strip-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+
 /* ---- 空间树 ---- */
 .space-tree {
   width: 100%;

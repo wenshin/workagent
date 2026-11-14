@@ -1,10 +1,10 @@
 import { IconAlertCircle, IconExit, IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
 import { useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
-import { api } from '../api/client';
+import { api, getActiveRun } from '../api/client';
 import {
   queryKeys,
   useAgentInfo,
@@ -22,6 +22,7 @@ import {
   useUploadFiles,
 } from '../api/hooks';
 import {
+  attachLiveRun,
   getLiveRun,
   isLiveRunning,
   startLiveRun,
@@ -37,6 +38,7 @@ import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
 import SpaceTree, { FILE_KEY_PREFIX, SESSION_KEY_PREFIX } from '../components/SpaceTree';
+import TaskStrip from '../components/TaskStrip';
 
 export default function WorkspacePage() {
   const location = useLocation();
@@ -214,6 +216,40 @@ export default function WorkspacePage() {
 
   const stopGenerating = () => stopLiveRun();
 
+  // 刷新/切页回来：先问服务端「这个会话还有没有在跑」，有就接着往下看。
+  // run 已经和请求解耦（§15.12.1），所以断开只是解绑流，内容仍在内存缓冲里。
+  const attachedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const session = selectedSession;
+    if (!session) return;
+    if (isLiveRunning(session.id) || attachedRef.current.has(session.id)) return;
+    attachedRef.current.add(session.id);
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await getActiveRun(session.id);
+        if (cancelled || !res.active || !res.run) return;
+        if (isLiveRunning(session.id)) return;
+        await attachLiveRun({
+          sessionId: session.id,
+          runId: res.run.id,
+          onError: (message) => Toast.error(message),
+          onSettled: () => {
+            void queryClient.invalidateQueries({ queryKey: queryKeys.messages(session.id) });
+            void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+          },
+        });
+      } catch {
+        // 拉不到当次状态就当没在跑：用户可以重新发一条
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSession, queryClient]);
+
   const logout = async () => {
     try {
       await api('/auth/logout', { method: 'POST' });
@@ -388,7 +424,9 @@ export default function WorkspacePage() {
         ) : selectedFile ? (
           <FilePanel space={selectedSpace} file={selectedFile} />
         ) : selectedSession ? (
-          <ChatPanel
+          <div className="chat-shell">
+            <TaskStrip sessionId={selectedSession.id} />
+            <ChatPanel
             session={selectedSession}
             spaceName={selectedSpace?.name}
             messages={messages}
@@ -420,9 +458,10 @@ export default function WorkspacePage() {
                 dir: selectedSession.dir,
               })
             }
-            onSend={send}
-            onStop={stopGenerating}
-          />
+              onSend={send}
+              onStop={stopGenerating}
+            />
+          </div>
         ) : (
           <SpacePanel
             space={selectedSpace}

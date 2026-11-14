@@ -25,6 +25,8 @@ type Client struct {
 	endpoint   string
 	authHeader string
 	secret     string
+	// secretFn 优先于 secret：每次请求现取，用于服务令牌的按需重签
+	secretFn func() string
 	http       *http.Client
 	sessionID  string
 	nextID     atomic.Int64
@@ -39,6 +41,22 @@ func NewClient(name, endpoint, authHeader, secret string) *Client {
 		secret:     secret,
 		http:       &http.Client{Timeout: 20 * time.Second},
 	}
+}
+
+// SetSecretProvider 用回调替代静态凭证，每次请求现取。
+//
+// 服务令牌只有 1 小时，而运行时实例是长期驻留的：静态写死会让实例在
+// 1 小时后所有请求都带过期令牌（§15.11 决定 6）。回调里自行缓存与续签。
+func (c *Client) SetSecretProvider(fn func() string) {
+	c.secretFn = fn
+	c.secret = ""
+}
+
+func (c *Client) currentSecret() string {
+	if c.secretFn != nil {
+		return c.secretFn()
+	}
+	return c.secret
 }
 
 // ToolDef 是远端工具的描述。
@@ -222,8 +240,10 @@ func (c *Client) postWith(ctx context.Context, payload any, auth authOverride) (
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if c.authHeader != "" && c.secret != "" {
-		req.Header.Set(c.authHeader, c.secret)
+	if c.authHeader != "" {
+		if secret := c.currentSecret(); secret != "" {
+			req.Header.Set(c.authHeader, secret)
+		}
 	}
 	// 覆盖必须放在静态凭证之后：同一 header 名以本次调用的身份为准。
 	if auth.header != "" && auth.value != "" {

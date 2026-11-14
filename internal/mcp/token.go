@@ -42,6 +42,9 @@ type UserClaims struct {
 	JobNumber string `json:"job_number,omitempty"`
 	// Act 非空表示这是一次平台发起的调用（act=platform），不是某个用户。
 	Act string `json:"act,omitempty"`
+	// JTI 是令牌唯一标识：对端可据此做幂等与重放检测（§15.11 决定 3）。
+	// 平台侧不维护吊销表，这里只提供「可区分」这个能力。
+	JTI string `json:"jti,omitempty"`
 	Iss string `json:"iss"`
 	Aud string `json:"aud"`
 	Iat int64  `json:"iat"`
@@ -75,6 +78,13 @@ func SignUserToken(secret, app string, c UserClaims, ttl time.Duration) (string,
 	c.Exp = now.Add(ttl).Unix()
 	if c.Subject == "" {
 		c.Subject = c.UserID
+	}
+	// 每枚令牌都有独立 jti：对端可以用它做重放检测，也便于跨系统对账
+	if c.JTI == "" {
+		buf := make([]byte, 12)
+		if _, err := rand.Read(buf); err == nil {
+			c.JTI = base64.RawURLEncoding.EncodeToString(buf)
+		}
 	}
 
 	header, err := json.Marshal(map[string]string{"alg": jwtAlg, "typ": "JWT"})

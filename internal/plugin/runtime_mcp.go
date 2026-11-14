@@ -35,6 +35,32 @@ type mcpRuntime struct {
 	authHeader string
 	signingKey string
 	users      userReader
+	// userTTL 来自清单 auth.token_ttl_seconds（默认 300s，上限 3600s）
+	userTTL time.Duration
+
+	// 服务令牌按需重签：实例长期驻留，签一次会在一小时后全线 401
+	svcMu       sync.Mutex
+	signService func() (string, error)
+	svcSecret   string
+	svcIssued   time.Time
+}
+
+// serviceSecret 返回当前可用的服务令牌，临近过期时重新签发。
+// 重签失败时沿用旧令牌：让它自然过期被对端拒绝，也好过所有请求都带空鉴权。
+func (r *mcpRuntime) serviceSecret() string {
+	r.svcMu.Lock()
+	defer r.svcMu.Unlock()
+
+	if r.svcSecret != "" && time.Since(r.svcIssued) < mcp.ServiceTokenTTL-10*time.Minute {
+		return r.svcSecret
+	}
+	token, err := r.signService()
+	if err != nil {
+		return r.svcSecret
+	}
+	r.svcSecret = "Bearer " + token
+	r.svcIssued = time.Now()
+	return r.svcSecret
 }
 
 // userReader 是签发用户令牌需要的最小用户目录。
@@ -82,9 +108,13 @@ func newMCPRuntime(ctx context.Context, meta Manifest, secrets Secrets,
 				return nil, err
 			}
 			rt.app, rt.authHeader, rt.signingKey = app, authHeader, key
+			rt.userTTL = meta.Auth.UserTokenTTL()
 
 			// 握手与 tools/list 没有用户上下文：用应用自身的服务令牌。
 			// 用户令牌只在 tools/call 时按调用者现签，两者共用一把密钥。
+			//
+			// 服务令牌只签一次不够：运行时实例是长期驻留的，1 小时后所有请求都会带
+			// 过期令牌（§15.11 决定 6）。这里改成按需重签，提前 10 分钟换新。
 			serviceToken, err := mcp.SignUserToken(key, app, mcp.UserClaims{
 				Subject: "app:" + app,
 				Act:     "platform",
@@ -93,6 +123,13 @@ func newMCPRuntime(ctx context.Context, meta Manifest, secrets Secrets,
 				return nil, err
 			}
 			secret = "Bearer " + serviceToken
+			rt.signService = func() (string, error) {
+				return mcp.SignUserToken(key, app, mcp.UserClaims{
+					Subject: "app:" + app,
+					Act:     "platform",
+				}, mcp.ServiceTokenTTL)
+			}
+			rt.svcIssued = time.Now()
 		} else if meta.Auth.Secret != "" && secrets != nil {
 			v, err := secrets.Get(ctx, "plugin", meta.Auth.Secret)
 			if err != nil {
@@ -104,6 +141,10 @@ func newMCPRuntime(ctx context.Context, meta Manifest, secrets Secrets,
 	}
 
 	client := mcp.NewClient(meta.Slug, meta.Transport.URL, authHeader, secret)
+	if rt.signService != nil {
+		// 静态 secret 只在首次握手时有效，之后每次请求都现签
+		client.SetSecretProvider(rt.serviceSecret)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if err := client.Initialize(callCtx); err != nil {
@@ -244,9 +285,10 @@ func (r *mcpRuntime) userToken(ctx context.Context, env tool.Env) (string, error
 		return "", fmt.Errorf("取用户信息失败，无法签发 MCP 令牌: %w", err)
 	}
 	return mcp.SignUserToken(r.signingKey, r.app, mcp.UserClaims{
-		Subject:   u.ID,
+		Subject: u.ID,
+		// 主体跟着 sub 走：sub 已经能唯一标识用户，重复填 user_id 只是冗余
 		UserID:    u.ID,
 		Email:     u.Email,
 		JobNumber: u.JobNumber,
-	}, mcp.UserTokenTTL)
+	}, r.userTTL)
 }

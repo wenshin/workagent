@@ -1,5 +1,5 @@
 import { cancelRun } from './client';
-import { streamChat } from './stream';
+import { streamChat, streamRun, type StreamHandlers } from './stream';
 import type { StreamItem } from './types';
 
 /**
@@ -14,7 +14,7 @@ import type { StreamItem } from './types';
  */
 export interface LiveRunView {
   sessionId: string;
-  /** 本轮用户输入，用于在消息列表里先占位 */
+  /** 本轮用户输入，用于在消息列表里先占位；续流时为空（用户消息已经落库） */
   pendingUser: string;
   /** 本轮引用的空间文件（相对 files/ 的路径），占位气泡里渲染成文件标签 */
   pendingRefs: string[];
@@ -79,6 +79,61 @@ export interface LiveRunOptions {
   onSettled?: (info: { sessionId: string; wroteFiles: boolean; aborted: boolean }) => void;
 }
 
+/** 事件 → 视图的唯一映射，首发与续流共用，避免两条链路渲染不一致。 */
+function buildHandlers(
+  ctrl: AbortController,
+  patch: (fn: (view: LiveRunView) => LiveRunView) => void,
+  markWrote: () => void,
+  onError?: (message: string) => void,
+): StreamHandlers {
+  return {
+    onRunStarted: (runId) => {
+      if (controller === ctrl) currentRunId = runId || null;
+    },
+    // 连续增量合并进同一段：每个 token 单独成段会把 Markdown 切碎，
+    // 思考也会碎成几十个折叠块。中间插了工具或正文时，再开新的一段。
+    onReasoning: (delta) =>
+      patch((v) => {
+        const last = v.items[v.items.length - 1];
+        if (last && last.kind === 'reasoning') {
+          return {
+            ...v,
+            items: [...v.items.slice(0, -1), { kind: 'reasoning', text: last.text + delta }],
+          };
+        }
+        return { ...v, items: [...v.items, { kind: 'reasoning', text: delta }] };
+      }),
+    onText: (delta) =>
+      patch((v) => {
+        const last = v.items[v.items.length - 1];
+        if (last && last.kind === 'text') {
+          return {
+            ...v,
+            items: [...v.items.slice(0, -1), { kind: 'text', text: last.text + delta }],
+          };
+        }
+        return { ...v, items: [...v.items, { kind: 'text', text: delta }] };
+      }),
+    onToolStart: (tool) => patch((v) => ({ ...v, items: [...v.items, { kind: 'tool', tool }] })),
+    onToolResult: (tool) => {
+      // Agent 改过空间文件（含新建技能目录）：结束后让树与当前预览重新拉取
+      if (
+        tool.status === 'ok' &&
+        (tool.name === 'file_write' || tool.name === 'wiki_write' || tool.name === 'skill_create')
+      ) {
+        markWrote();
+      }
+      patch((v) => ({
+        ...v,
+        items: v.items.map((item): StreamItem =>
+          item.kind === 'tool' && item.tool.id === tool.id ? { kind: 'tool', tool } : item,
+        ),
+      }));
+    },
+    onError,
+  };
+}
+
 /**
  * 启动一轮对话；同一时间只允许一轮。返回的 Promise 在轮次结束时 resolve，
  * 与组件生命周期无关。
@@ -108,11 +163,14 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
 
   // 本轮是否写过空间文件：用局部变量记录，被接管后 current 已经换人，读不到旧值
   let wrote = false;
+  const markWrote = () => {
+    wrote = true;
+  };
 
   // 每次改动都换新对象：useSyncExternalStore 靠引用比较判断是否重渲染
   const patch = (fn: (view: LiveRunView) => LiveRunView) => {
     if (current === null || controller !== ctrl) return;
-    current = fn(current);
+    current = { ...fn(current), wroteFiles: wrote };
     emit();
   };
 
@@ -123,58 +181,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
         opts.sessionId,
         opts.content,
         opts.references ?? [],
-        {
-          onRunStarted: (runId) => {
-            if (controller === ctrl) currentRunId = runId || null;
-          },
-          // 连续增量合并进同一段：每个 token 单独成段会把 Markdown 切碎，
-          // 思考也会碎成几十个折叠块。中间插了工具或正文时，再开新的一段。
-          onReasoning: (delta) =>
-            patch((v) => {
-              const last = v.items[v.items.length - 1];
-              if (last && last.kind === 'reasoning') {
-                return {
-                  ...v,
-                  items: [
-                    ...v.items.slice(0, -1),
-                    { kind: 'reasoning', text: last.text + delta },
-                  ],
-                };
-              }
-              return { ...v, items: [...v.items, { kind: 'reasoning', text: delta }] };
-            }),
-          onText: (delta) =>
-            patch((v) => {
-              const last = v.items[v.items.length - 1];
-              if (last && last.kind === 'text') {
-                return {
-                  ...v,
-                  items: [...v.items.slice(0, -1), { kind: 'text', text: last.text + delta }],
-                };
-              }
-              return { ...v, items: [...v.items, { kind: 'text', text: delta }] };
-            }),
-          onToolStart: (tool) => patch((v) => ({ ...v, items: [...v.items, { kind: 'tool', tool }] })),
-          onToolResult: (tool) => {
-            // Agent 改过空间文件（含新建技能目录）：结束后让树与当前预览重新拉取
-            if (
-              tool.status === 'ok' &&
-              (tool.name === 'file_write' ||
-                tool.name === 'wiki_write' ||
-                tool.name === 'skill_create')
-            ) {
-              wrote = true;
-            }
-            patch((v) => ({
-              ...v,
-              items: v.items.map((item): StreamItem =>
-                item.kind === 'tool' && item.tool.id === tool.id ? { kind: 'tool', tool } : item,
-              ),
-              wroteFiles: wrote,
-            }));
-          },
-          onError: (message) => opts.onError?.(message),
-        },
+        buildHandlers(ctrl, patch, markWrote, opts.onError),
         ctrl.signal,
       );
     } catch (e) {
@@ -190,6 +197,72 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
         emit();
       }
       // 收尾回调对每一轮都要触发：被接管的旧会话同样要把已生成的内容刷进列表
+      opts.onSettled?.({ sessionId: opts.sessionId, wroteFiles: wrote, aborted });
+    }
+  })();
+}
+
+export interface AttachRunOptions {
+  sessionId: string;
+  runId: string;
+  /** 从第几个字符之后开始补：默认 0，表示这一轮的全部内容 */
+  afterOffset?: number;
+  onError?: (message: string) => void;
+  onSettled?: (info: { sessionId: string; wroteFiles: boolean; aborted: boolean }) => void;
+}
+
+/**
+ * 续上一次仍在执行的 run：刷新页面、切回标签页、从别的页面回来都走这里。
+ *
+ * 服务端把这一轮的增量留在进程内缓冲里，补发完之后继续跟着直播走——所以
+ * 刷新不会丢内容，也不需要平台逐 token 落库（§15.12.2）。
+ */
+export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
+  if (current && current.sessionId === opts.sessionId) return Promise.resolve();
+  controller?.abort();
+  currentRunId = opts.runId;
+
+  const ctrl = new AbortController();
+  controller = ctrl;
+  current = {
+    sessionId: opts.sessionId,
+    // 用户消息已经落库，不再补一个占位气泡
+    pendingUser: '',
+    pendingRefs: [],
+    items: [],
+    wroteFiles: false,
+  };
+  emit();
+
+  let wrote = false;
+  const markWrote = () => {
+    wrote = true;
+  };
+  const patch = (fn: (view: LiveRunView) => LiveRunView) => {
+    if (current === null || controller !== ctrl) return;
+    current = { ...fn(current), wroteFiles: wrote };
+    emit();
+  };
+
+  return (async () => {
+    let aborted = false;
+    try {
+      await streamRun(
+        opts.runId,
+        opts.afterOffset ?? 0,
+        buildHandlers(ctrl, patch, markWrote, opts.onError),
+        ctrl.signal,
+      );
+    } catch (e) {
+      aborted = e instanceof DOMException && e.name === 'AbortError';
+      if (!aborted) opts.onError?.(e instanceof Error ? e.message : '续接失败，请重试');
+    } finally {
+      if (controller === ctrl) {
+        current = null;
+        controller = null;
+        currentRunId = null;
+        emit();
+      }
       opts.onSettled?.({ sessionId: opts.sessionId, wroteFiles: wrote, aborted });
     }
   })();

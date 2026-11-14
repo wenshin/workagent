@@ -24,8 +24,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/policy"
 )
 
@@ -172,6 +174,21 @@ type Auth struct {
 	// App 是应用名：mode=jwt 时平台以它为粒度生成独立的签名密钥，
 	// 同一个应用在多个空间装同一个插件时共用一把密钥。留空回落到 slug。
 	App string `json:"app,omitempty"`
+	// TokenTTLSeconds 是用户令牌寿命（§15.11 决定 1）：默认 300，上限 3600。
+	// exp 仍然保留，作为对端可依赖的上限；对端还能用 iat 收紧自己的 max-age。
+	TokenTTLSeconds int `json:"token_ttl_seconds,omitempty"`
+}
+
+// UserTokenTTL 返回用户令牌寿命：默认 5 分钟，最多 1 小时。
+func (a *Auth) UserTokenTTL() time.Duration {
+	if a == nil || a.TokenTTLSeconds <= 0 {
+		return mcp.UserTokenTTL
+	}
+	ttl := time.Duration(a.TokenTTLSeconds) * time.Second
+	if ttl > time.Hour {
+		return time.Hour
+	}
+	return ttl
 }
 
 // MCP 鉴权模式。
