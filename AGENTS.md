@@ -10,6 +10,7 @@
 | [docs/技术方案.md](docs/技术方案.md) | 分层架构、领域模型（五层模型 / 权限 / 资源）、模块设计、接口约定、安全与部署、演进路线 | **实现的事实标准**，代码与文档冲突时以文档为准 |
 | [docs/前端设计规范.md](docs/前端设计规范.md) | 间距/圆角/字号标尺、颜色 token、组件模式（按钮/字段/弹窗/四态）、可访问性底线、反模式与评审清单 | **UI 实现的事实标准**，新增界面或改样式前必读 |
 | [docs/MVP版本功能.md](docs/MVP版本功能.md) | MVP 范围、页面形态、功能优先级 | 范围裁剪与排期依据 |
+| [docs/插件安全基线.md](docs/插件安全基线.md) | 发布扫描（CVE / 提示词 / 凭证，规则热更新）、运行时隔离（白名单挂载、断网与 socket 代理）、门禁口径 | **插件安全的事实标准**，改扫描或沙箱策略前必读 |
 
 约定：
 
@@ -99,12 +100,18 @@ make web     # 前端 :5173
 - **组件是声明式 DSL，不是代码**：`ui.json`（`wa-ui/1`）只描述节点、绑定与动作，由前端 `UiView` 按白名单原生渲染——没有 JS/HTML/CSS 注入点，因此不用 iframe、也不用 Shadow DOM。节点/字段/绑定/动作在 dry-run、发布、读取时各校验一次（`internal/plugin/dsl.go`）。
 - **组件不直连接口**：消息里的 ` ```ui-block {"slug","version","props"} ` 由 `UiBlock` 取 `GET /spaces/{id}/plugins/{slug}/ui` 渲染；数据请求 `POST /spaces/{id}/plugins/{slug}/data` 经宿主转成依赖插件的工具调用，仍走 `Invoker`。只有已安装到当前空间的组件才能渲染。
 - **DSL 边界**：绑定只有 `{{state.x}}` / `{{props.x}}` / `{{data.<id>.x}}`；动作只有 `reload` / `invoke`（仅 `mode=action` 源、需手势与 `confirm`）/ `message`（填进输入框，不自动发送）；`data.*` 只能引用清单里的 `data_sources[].id`。
-- **脚本 ABI**：`sandbox.Start` 长驻进程 + NDJSON（`invoke` / `return` / `error` / `call` → `result`）；密钥只以 `secret:name` 句柄传递，宿主出网前替换；出网只经 `search.Guard`。
+- **脚本 ABI**：`sandbox.Start` 长驻进程 + NDJSON（`invoke` / `return` / `error` / `call` → `result`）。宿主 ABI 只剩两件事：`log`，以及 `secret.get`（按名字取凭证明文，名字必须逐条声明在 `capabilities` 的 `secret.use` 里；没声明的名字直接拒绝，不是返回空串）。宿主**不再代发任何 HTTP 请求**：`http.request` 只是清单里的出网声明，请求由插件在沙箱里经代理发出。
+- **WebSocket**：`new WebSocket` 必须在清单里声明 `capabilities: [{"method":"ws.connect","hosts":["..."]}]`，否则升级请求被代理拒绝。做法是给沙箱注入 `HTTPS_PROXY=unix:<egress-sock>`（Deno 2.9 认这种写法），代理收到 absolute-form 的 `GET https://...` + `Upgrade: websocket`，自己连上游转发握手，收到 101 后双向透传。宿主只看得到域名与路径，看不到帧，也做不了体积限制——所以它是独立能力，不并入 `http.request`。
+- **文件直连**：脚本用 `Deno.readTextFile(wa.path("data/x"))` 直接读写，路径范围由沙箱挂载决定，同一份 `sandbox.FS` 还翻译成 `--allow-read/--allow-write`（挂载决定路径存不存在，deno 权限决定允不允许读，缺一层都算没管）。`host.call("fs.*")` 已废弃，调用直接报错。
+- **出网走代理**：`internal/plugin/egress_pool.go` 给每个插件实例建一条独立的 HTTP 代理，跑在 `/tmp/wa-egress-*.sock`（unix socket 路径上限 100 字节），`sandbox.Spec.Proxy` 单文件挂进沙箱，沙箱仍 `--unshare-net`。白名单来自 `Manifest.NetHosts()`，与 `search.Guard` 同源。插件侧由 `wa.fetch` 发 absolute-form 明文 HTTP/1.1，TLS 由宿主代理完成——**不能让插件自己建 TLS**：Deno 的 `startTls` 不接受 `UnixConn`，`createHttpClient` 的 `createConnection` 也已被移除。局限：只支持 HTTP/1.1 请求-响应，WebSocket / HTTP/2 不可用。
+- **插件默认一次性**：不写 `runtime.resident` 的工具每次调用起一个新进程、跑完即退。只有声明 `runtime.resident: true` 的才按 `空间|slug|目录` 复用一个子进程（`internal/plugin/resident.go`），空转 `PLUGIN_PROC_IDLE_SECONDS` 回收、上限 `PLUGIN_PROC_MAX`；安装/升级/停用/卸载/空间重载/草稿变更都会立刻杀掉对应进程。试运行（`plugin_try`）与搜索脚本 `plan/map` 走一次性 `Run`。
+- **文件权限**：默认只能**读**自己所在空间的工作区（`spaces/<id>/files`），**不能写**；空间之外不可见。写权限必须显式声明 `fs.write`，`fs.read` / `fs.write` 的每一项都必须是空间工作区下的**子目录**（`.`、绝对路径、`..` 一律拒绝），`fs.read_only` 覆盖 `fs.write`。文件权限只由 `fs` 段声明：`capabilities` 里写 `fs.read` / `fs.list` / `fs.write` 直接解析失败（宿主 RPC 不再有这三个 method），写文件由 `Derive` 抬到 L3。同一份 `sandbox.FS` 落到两个执行点——挂载决定「路径在沙箱里存不存在」，`--allow-read` / `--allow-write` 决定「deno 允不允许读」，缺一层就等于没管。`capabilities[].paths` 与 `runtime.timeout_ms` 已废弃（从未生效），写了直接解析失败。运行时装在非标准位置要用 `SANDBOX_READ_EXTRA`。
+- **权限展示**：`Manifest.Permissions()` 是权限文案的唯一定义点（文件 / 网络 / 凭证 / 命令 / 远端工具），市场目录（`permissions`）与空间列表（`permissions` / `latest_permissions`）都读它；安装与升级都要先弹确认展示，新增权限类别只改这一个函数。
 - **审计永久保留**：`plugin.publish` / `install` / `uninstall` / `enable` / `reset_baseline` 都写 `audit_log`，卸载不删审计。
 - **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。
 - 配置项：`PLUGIN_DEFAULT_INSTALL`（逗号分隔 slug，新空间首次初始化时安装一次）；没有「是否允许安装」开关，安装权固定为空间 `manage`（L4 另需系统管理员）。
 - 接口：`GET /spaces/{id}/plugins`、`GET|POST .../{slug}/{dry-run,publish,install,uninstall,enable,disable,baseline,baseline/reset,baseline/dismiss,data,ui}`、`GET /plugins`（市场目录，含待发布元数据与 `is_admin`）、`GET|PUT /spaces/{id}/plugins/{slug}/config`（安装级配置）。`publish` 现在只允许系统管理员；组件产物不再对外暴露静态路由。
-- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能为 `builtin_ui`（组件 DSL）与 `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册）。
+- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能只有 `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）。
 
 # 能力索引与会话技能
 
@@ -219,10 +226,14 @@ make web     # 前端 :5173
 | `LLM_MODEL` | 模型名 | `deepseek-chat` |
 | `LLM_TIMEOUT` | 单次模型调用超时（整请求，含流式读取），**必须 ≥ `LLM_MAX_WALL_CLOCK`** | `10m` |
 | `LLM_MAX_TOKENS` | 单次响应 token 上限，0 表示不传 | `4096` |
-| `LLM_MAX_ROUNDS` | 单轮对话内工具调用轮次上限 | `5` |
+| `LLM_MAX_ROUNDS` | 单轮对话内工具调用轮次上限（一轮 = 一次模型调用） | `8` |
 | `LLM_MAX_TOOL_CALLS` | 一次 run 内工具调用总次数上限 | `20` |
 | `LLM_MAX_PARALLEL` | 同一轮内并行执行的工具数 | `4` |
 | `LLM_MAX_WALL_CLOCK` | 一次 run 的墙钟预算 | `10m` |
+| `LLM_MAX_TOTAL_TOKENS` | 一次 run 的累计 token 上限（与单次响应的 `LLM_MAX_TOKENS` 不是一回事），0 表示不限 | `80000` |
+| `AGENT_DISPATCH` | 是否把 `agent_dispatch`（派生子 Agent）暴露给模型 | `true` |
+| `AGENT_MAX_DEPTH` | 派发深度上限，1 = 只能主 → 子 | `2` |
+| `AGENT_STALL_ROUNDS` | 连续多少轮没有任何新信息就收回工具、强制收尾 | `2` |
 | `LLM_SUMMARY_MODEL` | 历史摘要用小模型，为空复用主模型 | `deepseek-chat` |
 
 备模型与向量模型均为可选，不配则只跑主链路：
@@ -243,7 +254,11 @@ Agent 的「编排与循环」是唯一可替换的一层，按技术方案 §5.
 - 切换：`AGENT_IMPL`（`builtin` / `direct`），装配在 `internal/app/app.go`；未注册的名字启动告警并回退 `builtin`。当前实现与能力见 `GET /agent/info`，每次运行写入 `run.budget.impl`。
 - 平台侧不因实现而变，实现里不要重做：审批判定与挂起（`internal/tool/invoker` + `internal/policy`）、checkpoint（`run` / `run_step`，会话层按事件落库）、上下文压缩（`internal/ctxmgr`）、预算上限（实现用 `Budget()` 声明，循环外层兜底）、SSE 事件契约。
 - 实现只负责：每轮上下文如何拼（可复用 `BuildSystemMessage`）、循环与轮次控制、工具选择与并行调度、把工具执行结果翻译成 §7.3 事件。
-- 已知差距：`Capabilities.Resume` 只声明未实现（§5.7.5 断点续跑未落地）；审批目前只推 `approval.req`，没有审批记录与恢复入口。
+- **循环守卫（`builtin/guard.go`）**：每轮结束后判断「下一步还有没有价值」——同一工具 + 相同参数（参数按 JSON 规范化后取指纹）第 3 次起拦截、不执行；连续 `AGENT_STALL_ROUNDS` 轮没有任何新信息（空结果 / 报错 / 与之前完全相同）就**收回工具**，逼一次不带工具的结论，而不是继续烧预算。轮次用尽同样走这条收尾路径，因此不会再出现「轮次耗尽 → 空回答」。
+- **收尾语义**：拿到结论 → `run` 成功，`stop_reason` 记 `budget` / `stalled` 供归因；拿不到结论 → 返回 `ErrBudgetExceeded` / `ErrStalled`，会话层标 `cancelled` 并保留已生成内容。
+- **派发（`builtin/dispatch.go`）**：`agent_dispatch` 暴露为一个普通工具，子 Agent 跑同一套 `Invoker`（PDP / 审批 / 审计不变），上下文与轮次预算隔离，结论按 4KB 回填。规则：子 Agent 只能拿到父 Agent 已有的工具；深度受 `AGENT_MAX_DEPTH` 约束；**子 Agent 看不到父会话历史**，任务描述必须自包含。派发本身是 L2、无副作用，真正的权限判定发生在子 Agent 的每次工具调用上。
+- **黄金用例（`internal/golden`）**：harness 行为用脚本化模型跑成数据（`evals.json`），断言停止原因、工具序列、轮次与拦截次数；`internal/golden/testdata/harness.json` 是平台回归闸门。插件目录里的 `evals.json` 在**发布时**执行（`kind=tool` 走 `DryRun` 的确定性断言，`kind=agent` 用同一套脚本化执行），失败即 `409` 拒绝发布，审计记 `plugin.publish.eval_failed`。
+- 已知差距：`Capabilities.Resume` 只声明未实现（§5.7.5 断点续跑未落地）；审批目前只推 `approval.req`，没有审批记录与恢复入口；长任务仍受「run 绑定请求」限制，跨 run 的任务队列未落地。
 
 # 运行流与 checkpoint
 

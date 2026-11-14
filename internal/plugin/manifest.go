@@ -4,7 +4,7 @@
 // （开发 → 发布 → 安装 → 运行 → 卸载），差异只在执行器：
 //
 //	skill      无执行器，正文按需注入
-//	tool       Deno 进程 + 宿主 ABI（无网络、无文件写权限）
+//	tool       Deno 进程（默认一次性，runtime.resident 才复用）+ 宿主 ABI
 //	mcp        外部服务，平台按白名单代理
 //	component  前端产物，数据请求经宿主转成工具调用
 //
@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -84,13 +86,21 @@ var capabilities = map[string]bool{
 }
 
 // 宿主 RPC method（插件可申请的系统调用）。
+//
+// 文件不在其中：沙箱已经按 fs 段挂载，脚本用 Deno.readTextFile 直接读写。
+// 在挂载之外再留一条「宿主代读写」的通道，等于让脚本绕过挂载去看文件。
 const (
+	// MethodHTTP 是清单里的出网声明，不是宿主 RPC：请求由插件在沙箱里发，
+	// 宿主只按它建代理白名单。host.call("http.request") 已经不存在。
 	MethodHTTP   = "http.request"
-	MethodFSRead = "fs.read"
-	MethodFSList = "fs.list"
-	MethodFSWr   = "fs.write"
 	MethodSecret = "secret.use"
-	MethodLog    = "log"
+	// MethodWSConnect 声明「允许建立加密隧道」：wss:// 靠它走 CONNECT，
+	// 宿主只能看到目标域名，看不到隧道里的内容。不声明就没有隧道。
+	MethodWSConnect = "ws.connect"
+	// MethodSecretGet 是唯一的凭证通道：插件按清单里声明过的名字取明文。
+	MethodSecretGet = "secret.get"
+	// MethodLog 写一行宿主日志（插件进程的 stdout 有上限，长日志会被截）。
+	MethodLog = "log"
 	// MethodShell 对应命令执行：内置工具用它表达风险，脚本插件暂不开放。
 	MethodShell = "shell.exec"
 	// MethodSearch 对应联网检索：只计读成本，不允许写。
@@ -109,15 +119,40 @@ type Capability struct {
 	Method string   `json:"method"`
 	Hosts  []string `json:"hosts,omitempty"`
 	Verbs  []string `json:"verbs,omitempty"`
-	// Paths 是 fs.* 的相对路径前缀，空表示整个空间工作区。
-	Paths []string `json:"paths,omitempty"`
+	// Name 只对 secret.use 有意义：声明插件能取到哪一个凭证。
+	// 一个凭证一条能力，没声明的名字 secret.get 一律拒绝——
+	// 否则「有 secret.use」就等于「能读整个 plugin scope」。
+	Name string `json:"name,omitempty"`
+}
+
+// FSSpec 是插件声明的文件访问范围，路径相对「空间工作区」（files/）。
+//
+// 默认边界：整个空间工作区可读、不可写，空间之外一律不可见。
+// Read 声明后就只读声明的子目录；Write 必须显式声明才有写权限。
+// 两者都只能是空间工作区下的**子目录**（`.` 与空串等价于整个空间，直接拒绝）。
+// 声明只会在默认边界内收紧，不会扩权——所以这个字段不需要审批。
+type FSSpec struct {
+	// Read 是允许读取的子目录；空表示整个空间工作区。
+	Read []string `json:"read,omitempty"`
+	// Write 是允许写入的子目录；空表示没有写权限。
+	Write []string `json:"write,omitempty"`
+	// ReadOnly 为 true 时整个插件只读：即使声明了 Write 也不给写权限。
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 // RuntimeSpec 是 tool 的执行参数。
+//
+// 只有 Entry 有效：超时与 RPC 上限在 Limits（单次调用），进程寿命由常驻池管，
+// 都不属于这里。
 type RuntimeSpec struct {
-	Entry     string `json:"entry,omitempty"`
-	TimeoutMS int    `json:"timeout_ms,omitempty"`
-	MaxRPC    int    `json:"max_rpc,omitempty"`
+	Entry string `json:"entry,omitempty"`
+	// Resident 为 true 时跨调用复用同一个进程：模块级变量、连接、缓存都会保留，
+	// 代价是进程常占内存并占用常驻池的一个名额（默认池上限 32）。
+	// 默认 false：每次调用起一个一次性进程，跑完即退。
+	Resident bool `json:"resident,omitempty"`
+	// TimeoutMS / MaxRPC 已废弃，写了会被 Validate 拒绝。
+	TimeoutMS int `json:"timeout_ms,omitempty"`
+	MaxRPC    int `json:"max_rpc,omitempty"`
 }
 
 // Transport 是 mcp 的连接方式。
@@ -193,9 +228,16 @@ type Manifest struct {
 	Agent        *AgentSpec      `json:"agent,omitempty"`
 	Source       *SourceSpec     `json:"source,omitempty"`
 	DataSources  []DataSource    `json:"data_sources,omitempty"`
+	// FS 是文件访问范围（只能收紧平台默认边界）。
+	FS *FSSpec `json:"fs,omitempty"`
 	// Builtin 表示「平台已在 Go 侧实现」的工具：没有脚本运行时，
 	// 只借插件体系做全局安装与市场展示，执行仍走平台能力注册表。
 	Builtin bool `json:"builtin,omitempty"`
+
+	// DeriveRisk / DeriveEffects 只给平台内置件用，json:"-" 保证写不进清单。
+	// 内置工具没有 capabilities 可推导，风险直接来自 Go 侧的那份声明。
+	DeriveRisk    int    `json:"-"`
+	DeriveEffects string `json:"-"`
 }
 
 // 搜索源的实现协议：声明式 JSON 与两段式脚本。
@@ -283,26 +325,209 @@ func Parse(raw []byte, publishing bool) (Manifest, error) {
 	return m, nil
 }
 
-// HostAllow 把能力清单翻译成宿主方法白名单与 HTTP 动词集合。
+// HostAllow 把能力清单翻译成三张表：
+//   - allow：脚本能调的宿主 RPC（只有 log 与 secret.get）；
+//   - verbs：出网代理放行的 HTTP 动词；
+//   - secrets：secret.get 能取到的凭证名，只含清单里逐个声明过的。
 //
-// 脚本侧看到的 SDK 是一样的，能不能调到由这张表决定；verbs 为空时只放行 GET/HEAD，
-// 与 Derive 把「只读 HTTP」判成 L2 的规则保持一致。
-func (m Manifest) HostAllow() (allow, verbs map[string]bool, hasSecret bool) {
-	allow = map[string]bool{}
+// 注意 http.request 在这里不是 RPC，而是「出网声明」：它只决定代理白名单与动词集合，
+// 请求由插件自己在沙箱里发。verbs 为空时只放行 GET/HEAD，与 Derive 判 L2 的规则一致。
+func (m Manifest) HostAllow() (allow, verbs, secrets map[string]bool) {
+	allow = map[string]bool{MethodLog: true}
 	verbs = map[string]bool{}
+	secrets = map[string]bool{}
 	for _, c := range m.Capabilities {
-		allow[c.Method] = true
-		if c.Method == MethodHTTP {
+		switch c.Method {
+		case MethodHTTP:
 			for _, v := range c.Verbs {
 				verbs[strings.ToUpper(v)] = true
 			}
+		case MethodSecret:
+			if c.Name != "" {
+				secrets[c.Name] = true
+			}
 		}
 	}
-	if allow[MethodHTTP] && len(verbs) == 0 {
+	if len(verbs) == 0 && m.HasHTTP() {
 		verbs["GET"] = true
 		verbs["HEAD"] = true
 	}
-	return allow, verbs, allow[MethodSecret]
+	if len(secrets) > 0 {
+		allow[MethodSecretGet] = true
+	}
+	return allow, verbs, secrets
+}
+
+// HasHTTP 表示清单里有没有出网声明（有 hosts 才会建代理）。
+func (m Manifest) HasHTTP() bool {
+	for _, c := range m.Capabilities {
+		if c.Method == MethodHTTP && len(c.Hosts) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// NetHosts 返回清单声明的出网域名（小写去重）。
+//
+// 它是代理白名单与宿主守卫白名单的唯一来源：两处各算一份，就会出现
+// 「宿主代发能过、沙箱代理连不上」这种作者完全无法自查的差异。
+func (m Manifest) NetHosts() []string { return m.hostsOf(MethodHTTP) }
+
+// WSNetHosts 返回 ws.connect 声明的域名：它们只用于 CONNECT 隧道，
+// 与 http.request 的 absolute-form 白名单是两张表，不能混。
+func (m Manifest) WSNetHosts() []string { return m.hostsOf(MethodWSConnect) }
+
+func (m Manifest) hostsOf(method string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range m.Capabilities {
+		if c.Method != method {
+			continue
+		}
+		for _, h := range c.Hosts {
+			h = strings.ToLower(strings.TrimSpace(h))
+			if h == "" || seen[h] {
+				continue
+			}
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// FSWritable 表示插件是否被授予写权限：只有声明 fs.write 且没有 read_only。
+func (m Manifest) FSWritable() bool {
+	return m.FS != nil && !m.FS.ReadOnly && len(m.FS.Write) > 0
+}
+
+// Permissions 把清单翻译成「安装时展示给用户的权限条目」。
+//
+// 这里是权限文案的唯一定义点：市场、空间面板、安装确认都读它，前端只负责渲染。
+// 让前端按 capabilities 自己拼句子，同一个插件在两个页面就会写成两种说法，
+// 而且平台改了权限模型之后前端一定会漏改。
+func (m Manifest) Permissions() []string {
+	var out []string
+	switch m.Kind {
+	case KindSkill:
+		out = append(out, "把技能正文注入模型上下文（仅在这个技能被检索或绑定时）")
+	case KindAgent:
+		out = append(out, "作为会话智能体的行为设定，本身不带额外权限")
+		if m.Agent != nil && len(m.Agent.Requires) > 0 {
+			out = append(out, "随包安装依赖："+strings.Join(m.Agent.Requires, "、"))
+		}
+	case KindComponent:
+		out = append(out, "在会话里渲染界面（声明式 DSL，不含可执行代码）")
+		for _, ds := range m.DataSources {
+			verb := "读取"
+			if ds.Mode == "action" {
+				verb = "写操作"
+			}
+			id := ds.Plugin
+			if ds.Tool != "" {
+				id += "." + ds.Tool
+			}
+			out = append(out, verb+"插件数据："+id)
+		}
+	case KindTool:
+		if m.Builtin {
+			// 内置工具在 Go 侧实现，文件与网络由平台能力决定，不经过插件沙箱。
+			// 按脚本插件那套文案套过来只会写着「不授予写权限」，与实际相反。
+			out = append(out, "平台内置工具：由平台实现，不经过插件沙箱")
+			out = append(out, m.capabilityLines()...)
+			break
+		}
+		out = append(out, m.fsPermissionLines()...)
+		out = append(out, m.capabilityLines()...)
+	case KindMCP:
+		if m.Transport != nil {
+			out = append(out, "连接外部服务："+hostOf(m.Transport.URL))
+		}
+		if m.Tools != nil {
+			line := "调用远端工具：" + strings.Join(m.Tools.Allow, "、")
+			if len(m.Tools.Deny) > 0 {
+				line += "（排除 " + strings.Join(m.Tools.Deny, "、") + "）"
+			}
+			out = append(out, line)
+		}
+		if m.Auth != nil && m.Auth.Secret != "" {
+			out = append(out, "使用凭证："+m.Auth.Secret+"（明文不进插件）")
+		}
+	case KindSource:
+		if m.Source != nil {
+			out = append(out, "访问网络："+hostOf(m.Source.Endpoint))
+			if m.Source.AllowPrivate {
+				out = append(out, "可访问内网地址")
+			}
+			if m.Source.Protocol == SourceProtocolScript {
+				out = append(out, "执行搜索脚本（沙箱内，禁网）")
+			}
+			if m.Source.Secret != "" {
+				out = append(out, "使用凭证："+m.Source.Secret+"（明文不进插件）")
+			}
+		}
+	}
+	return out
+}
+
+// fsPermissionLines 把文件范围说成人话：默认只读这件事必须写出来，
+// 否则用户会以为「没写说明就是随便读写」。
+func (m Manifest) fsPermissionLines() []string {
+	read := "读取空间文件：全部（其他空间不可见）"
+	if m.FS != nil && len(m.FS.Read) > 0 {
+		read = "读取空间文件：" + strings.Join(m.FS.Read, "、")
+	}
+	out := []string{read}
+	if m.FSWritable() {
+		out = append(out, "写入空间文件："+strings.Join(m.FS.Write, "、"))
+	} else {
+		out = append(out, "不授予文件写权限")
+	}
+	return out
+}
+
+func (m Manifest) capabilityLines() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(line string) {
+		if !seen[line] {
+			seen[line] = true
+			out = append(out, line)
+		}
+	}
+	for _, c := range m.Capabilities {
+		switch c.Method {
+		case MethodHTTP:
+			verbs := make([]string, 0, len(c.Verbs))
+			for _, v := range c.Verbs {
+				verbs = append(verbs, strings.ToUpper(v))
+			}
+			if len(verbs) == 0 {
+				verbs = []string{"GET", "HEAD"}
+			}
+			add("访问网络：" + strings.Join(c.Hosts, "、") + "（" + strings.Join(verbs, "、") + "）")
+		case MethodShell:
+			add("执行命令（沙箱内，禁网）")
+		case MethodSearch:
+			add("调用平台搜索")
+		case MethodWSConnect:
+			add("建立加密隧道：" + strings.Join(c.Hosts, "、") + "（宿主只能看到域名，看不到隧道里的内容）")
+		case MethodSecret:
+			if c.Name != "" {
+				add("读取平台凭证 " + c.Name + "（明文会进入插件进程，插件代码可以记录它）")
+			}
+		}
+	}
+	return out
+}
+
+// hostOf 只留主机名：安装确认里展示完整 URL 会把路径与查询串（可能带 token）带出来。
+func hostOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
 }
 
 // AllowsTool 判断远端工具是否在白名单内：allow 支持尾部 `*` 前缀匹配，deny 优先。
@@ -390,6 +615,15 @@ func (m *Manifest) Validate(publishing bool) error {
 			return err
 		}
 	}
+	if err := validateFS(m.FS); err != nil {
+		return err
+	}
+
+	// resident 只对脚本工具有意义：技能/组件/智能体没有执行器，
+	// 搜索源脚本走 search 包，不经过常驻池。
+	if m.Runtime.Resident && m.Kind != KindTool {
+		return fmt.Errorf("runtime.resident 只对 tool 插件有效")
+	}
 
 	switch m.Kind {
 	case KindSkill:
@@ -409,6 +643,9 @@ func (m *Manifest) Validate(publishing bool) error {
 			if m.Runtime.Entry != "" {
 				return fmt.Errorf("builtin 工具不允许声明 runtime.entry")
 			}
+			if m.Runtime.Resident {
+				return fmt.Errorf("builtin 工具不允许声明 runtime.resident：它由 Go 实现，没有脚本进程")
+			}
 			break
 		}
 		if m.Runtime.Entry == "" {
@@ -416,6 +653,11 @@ func (m *Manifest) Validate(publishing bool) error {
 		}
 		if strings.Contains(m.Runtime.Entry, "..") {
 			return fmt.Errorf("runtime.entry 不能包含 ..")
+		}
+		// 进程寿命由 runtime.resident 决定，单次调用的上限只有 limits 一个入口。
+		// runtime.timeout_ms 从未生效过，留着会让作者以为「进程只活 8 秒」。
+		if m.Runtime.TimeoutMS != 0 || m.Runtime.MaxRPC != 0 {
+			return fmt.Errorf("runtime 只接受 entry 与 resident：超时与 RPC 上限统一写在 limits.timeout_ms / limits.max_rpc")
 		}
 		if len(m.InputSchema) == 0 {
 			return fmt.Errorf("tool 插件必须声明 input_schema")
@@ -676,18 +918,78 @@ func validateCapability(c Capability) error {
 				return fmt.Errorf("http.request 不支持动词 %q", v)
 			}
 		}
-	case MethodFSRead, MethodFSList, MethodFSWr:
-		for _, p := range c.Paths {
-			if strings.HasPrefix(p, "/") || strings.Contains(p, "..") {
-				return fmt.Errorf("fs 路径必须是空间内相对路径：%q", p)
+	case "fs.read", "fs.list", "fs.write":
+		// 已经不是宿主能力了：文件由沙箱挂载 + deno 权限管，不走 RPC。
+		return fmt.Errorf("%s 已移除：文件范围只写在顶层 fs 段（read / write / read_only），读写用 Deno 的 API", c.Method)
+	case MethodWSConnect:
+		// 隧道只能按域名授权：端口固定 443，路径与内容宿主看不到，
+		// 所以这里除了 hosts 不允许再写别的，避免给出「写了就生效」的错觉。
+		if len(c.Hosts) == 0 {
+			return fmt.Errorf("ws.connect 必须声明 hosts 白名单")
+		}
+		for _, h := range c.Hosts {
+			if err := validateHost(h); err != nil {
+				return err
 			}
+		}
+		if len(c.Verbs) > 0 {
+			return fmt.Errorf("ws.connect 不接受 verbs：隧道里的方法宿主看不见，写了也不会生效")
+		}
+		if c.Name != "" {
+			return fmt.Errorf("ws.connect 不接受 name：凭证请用 secret.use")
 		}
 	case MethodShell, MethodSearch:
 		// 平台已实现的能力，不接受额外参数：范围由能力本身决定
 	case MethodSecret:
-		// 只允许引用名字，不允许明文
+		// 必须写清楚能取哪个凭证：没有名字就拒，不能退化成「整个 scope 可读」。
+		if c.Name == "" {
+			return fmt.Errorf("secret.use 必须声明 name（要取的那个凭证名），一个凭证一条能力")
+		}
+		if !secretNameRe.MatchString(c.Name) {
+			return fmt.Errorf("secret.use 的 name %q 不合法：只允许字母、数字、下划线、连字符", c.Name)
+		}
+		if len(c.Hosts) > 0 || len(c.Verbs) > 0 {
+			return fmt.Errorf("secret.use 不接受 hosts / verbs：凭证与出网是两条独立声明")
+		}
 	default:
 		return fmt.Errorf("能力 method %q 不在宿主白名单内", c.Method)
+	}
+	return nil
+}
+
+// validateFS 只挡「越界」：路径必须相对、不能含 ..。
+//
+// 真正的越界在解析成绝对路径时还会再挡一次（resolveFSPaths），
+// 这里检查是为了让作者在试运行 / 发布时就拿到错误，而不是等运行时。
+func validateFS(fs *FSSpec) error {
+	if fs == nil {
+		return nil
+	}
+	lists := []struct {
+		field string
+		paths []string
+	}{
+		{"fs.read", fs.Read},
+		{"fs.write", fs.Write},
+	}
+	for _, l := range lists {
+		for _, p := range l.paths {
+			raw := strings.TrimSpace(p)
+			if raw == "" {
+				return fmt.Errorf("%s 不能包含空路径", l.field)
+			}
+			if strings.HasPrefix(raw, "/") || filepath.IsAbs(raw) {
+				return fmt.Errorf("%s 必须是相对空间工作区的路径：%q", l.field, p)
+			}
+			clean := path.Clean(raw)
+			if clean == ".." || strings.HasPrefix(clean, "../") {
+				return fmt.Errorf("%s 不能越出空间工作区：%q", l.field, p)
+			}
+			// 只允许声明子目录：`.` 等于整个空间，等于绕开这次收敛。
+			if clean == "." {
+				return fmt.Errorf("%s 必须是空间工作区下的子目录，不能用 %q 声明整个空间", l.field, p)
+			}
+		}
 	}
 	return nil
 }
@@ -718,6 +1020,16 @@ func validateHost(raw string) error {
 // 作者不能声明 risk：否则写一句 "risk": 1 就白拿了所有权限，
 // 和 tool_binding 里「不能自己降级」是同一个坑。
 func Derive(m Manifest) (int, string) {
+	// 平台内置工具没有脚本、也没有清单可推导的副作用：
+	// 它们的风险来自 Go 侧实现（tool.Manifest.Risk / SideEffects），
+	// seed 时写进这两个非 JSON 字段，作者无论如何也塞不进来。
+	if m.DeriveRisk > 0 {
+		if m.DeriveEffects == "" {
+			return m.DeriveRisk, policy.SideEffectsReadOnly
+		}
+		return m.DeriveRisk, m.DeriveEffects
+	}
+
 	risk := policy.RiskReadOnly
 	effects := policy.SideEffectsReadOnly
 	hasSecret, hasWriteHTTP := false, false
@@ -732,7 +1044,7 @@ func Derive(m Manifest) (int, string) {
 			} else {
 				risk = maxRisk(risk, policy.RiskReadCost)
 			}
-		case MethodFSWr, MethodShell:
+		case MethodShell:
 			risk = maxRisk(risk, policy.RiskWrite)
 			if effects == policy.SideEffectsReadOnly {
 				effects = policy.SideEffectsWorkspace
@@ -742,6 +1054,11 @@ func Derive(m Manifest) (int, string) {
 			if effects == policy.SideEffectsReadOnly {
 				effects = policy.SideEffectsExternal
 			}
+		case MethodWSConnect:
+			// 隧道里是任意协议：宿主看不见内容，也拦不住写，
+			// 只能按「外部写」给等级，并在安装确认里写清楚。
+			risk = maxRisk(risk, policy.RiskWrite)
+			effects = policy.SideEffectsExternal
 		case MethodSecret:
 			hasSecret = true
 			risk = maxRisk(risk, policy.RiskWrite)
@@ -765,6 +1082,14 @@ func Derive(m Manifest) (int, string) {
 		risk = maxRisk(risk, policy.RiskWrite)
 		if effects == policy.SideEffectsReadOnly {
 			effects = policy.SideEffectsExternal
+		}
+	}
+	// 文件写权限由 fs 段声明：能写空间文件就是写操作，
+	// 不能因为作者没在 capabilities 里重复写一行 fs.write 就按只读处理。
+	if m.FSWritable() {
+		risk = maxRisk(risk, policy.RiskWrite)
+		if effects == policy.SideEffectsReadOnly {
+			effects = policy.SideEffectsWorkspace
 		}
 	}
 	if hasSecret && hasWriteHTTP {

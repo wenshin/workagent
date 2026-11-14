@@ -396,7 +396,9 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 // userFacingCancelError 说明一次中断的原因，避免前端把它当成「失败，请重试」。
 // 预算用尽由实现给出具体说明（如「本轮对话超过时间预算（10m0s）」），其余给通用文案。
 func userFacingCancelError(err error) string {
-	if errors.Is(err, agent.ErrBudgetExceeded) {
+	// 预算与停滞都由实现给出了具体原因（「已用完 8 轮工具调用」「连续 2 轮没有新信息」），
+	// 直接透传比换成一句通用文案更有用：用户据此决定是改问法还是换个做法。
+	if errors.Is(err, agent.ErrBudgetExceeded) || errors.Is(err, agent.ErrStalled) {
 		return err.Error()
 	}
 	return RunBudgetExceededMessage

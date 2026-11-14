@@ -41,6 +41,10 @@ type Capabilities struct {
 	Approval bool `json:"approval"`
 	// Resume 是否支持从 checkpoint 续跑（§5.7.5，尚未实现）
 	Resume bool `json:"resume"`
+	// Dispatch 是否能派生子 Agent（agent_dispatch）
+	Dispatch bool `json:"dispatch"`
+	// Guard 是否在循环内做进度守卫（重复调用拦截、无进展收尾）
+	Guard bool `json:"guard"`
 }
 
 // Agent 是一次运行的编排实现。会话层只依赖本接口。
@@ -77,6 +81,11 @@ type Factory func(Deps) (Agent, error)
 // 循环外层据此把这次 run 判定为 cancelled（保留已生成内容并说明原因），而不是 failed——
 // 「重试就好」的提示对预算用尽是误导。
 var ErrBudgetExceeded = errors.New("运行预算已用尽")
+
+// ErrStalled 表示循环守卫判定「再走一步也不会带来新进展」而提前收尾：
+// 同一工具用相同参数反复调用、连续多轮没有任何新信息。与 ErrBudgetExceeded 的区别是
+// 预算用尽意味着「还有事没做完」，stalled 意味着「再做也一样」，重试没有意义。
+var ErrStalled = errors.New("运行已停滞，未产生新进展")
 
 var (
 	registryMu sync.RWMutex

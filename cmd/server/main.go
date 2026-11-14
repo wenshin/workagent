@@ -95,5 +95,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("优雅关闭失败", "err", err)
 	}
+	// 插件常驻进程要显式关：它们在独立进程组里，服务退出不会自动带走。
+	application.Close()
 	logger.Info("服务已停止")
 }

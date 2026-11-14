@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/admin"
 	"github.com/workagent/auto-agent/internal/agent"
@@ -15,6 +16,7 @@ import (
 	"github.com/workagent/auto-agent/internal/auth"
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
+	"github.com/workagent/auto-agent/internal/golden"
 	"github.com/workagent/auto-agent/internal/identity"
 	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
@@ -24,6 +26,7 @@ import (
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
+	"github.com/workagent/auto-agent/internal/securityscan"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
@@ -138,6 +141,22 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 插件体系（docs/插件体系设计.md）：五类插件共用清单与生命周期。
 	// 脚本插件跑在同一个沙箱里，密钥只经宿主替换，插件进程里没有明文。
+	// 沙箱是白名单挂载：运行时装在非标准位置时，必须显式把安装前缀挂进去。
+	sandbox.SetExtraRead(cfg.SandboxReadExtra)
+
+	// 发布扫描：规则与漏洞库都放在存储目录里，改规则不需要重启（每次发布前比对一次）。
+	scanner, err := securityscan.New(securityscan.Config{
+		RulesDir: cfg.ScanRulesDir,
+		OsvMode:  securityscan.OsvMode(cfg.ScanOsvMode),
+		OsvDir:   osvDir(cfg),
+		Logger:   log,
+		Allow:    allowRules(cfg.ScanAllowRules),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("初始化发布扫描器失败: %w", err)
+	}
+	log.Info("发布扫描已就绪", "rules", scanner.RulesVersion(), "osv", string(cfg.ScanOsvMode))
+
 	pluginSvc, err := plugin.New(plugin.Options{
 		Store:          st,
 		Storage:        fs,
@@ -148,6 +167,16 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		RuntimeDir:     filepath.Join(cfg.StorageRoot, "plugin-runtime"),
 		DefaultInstall: cfg.PluginsDefaultInstall,
 		Sources:        searchReg,
+		Scanner:        scanner,
+		ProcIdle:       time.Duration(cfg.PluginProcIdleSeconds) * time.Second,
+		ProcMax:        cfg.PluginProcMax,
+		// 发布门禁跑插件自带的黄金用例：确定性用例总跑，行为用例用平台预算跑
+		Evals: golden.Runner{Options: golden.Options{
+			MaxRounds:    cfg.LLMMaxRounds,
+			MaxToolCalls: cfg.LLMMaxToolCalls,
+			StallRounds:  cfg.AgentStallRounds,
+			MaxDepth:     cfg.AgentMaxDepth,
+		}},
 		OnChange: func(ctx context.Context, spaceID string) {
 			if err := spaceSvc.RebuildIndex(ctx, spaceID); err != nil {
 				log.Warn("重建空间索引失败", "space", spaceID, "err", err)
@@ -211,7 +240,37 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}, nil
 }
 
+// osvDir 决定本地漏洞库目录：显式配置优先，否则用存储根下的 osv/。
+func osvDir(cfg *config.Config) string {
+	if cfg.ScanOsvDir != "" {
+		return cfg.ScanOsvDir
+	}
+	if cfg.ScanOsvMode == string(securityscan.OsvLocal) {
+		return filepath.Join(cfg.StorageRoot, "osv")
+	}
+	return ""
+}
+
+func allowRules(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
+}
+
 // Handler 返回带中间件的根 handler。前端由 CDN/Nginx 托管并经同源反向代理访问本服务，无需 CORS。
+// Close 释放后台资源。插件常驻进程必须显式关掉，否则服务重启后
+// 会留下上一版的 deno 子进程（它们没有 --die-with-parent 之外的生命周期）。
+func (a *App) Close() {
+	if a.pluginSvc != nil {
+		a.pluginSvc.Close()
+	}
+}
+
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -262,5 +321,3 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
 }
-
-

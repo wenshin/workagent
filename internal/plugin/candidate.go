@@ -93,6 +93,7 @@ func (m *Manager) ListCandidates(ctx context.Context) ([]store.PluginCandidate, 
 }
 
 func (m *Manager) invalidate(spaceID, slug string) {
+	m.closeSlugProcs(spaceID, slug)
 	m.mu.Lock()
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)

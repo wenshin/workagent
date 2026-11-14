@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,6 +46,14 @@ type Config struct {
 	LLMMaxTokens int
 	LLMMaxRounds int // 单轮对话内允许的最大工具调用轮次
 
+	// AgentDispatch 控制是否把 agent_dispatch（派生子 Agent）暴露给模型。
+	// 关掉不影响主循环，只是模型看不到这个工具。
+	AgentDispatch bool
+	// AgentMaxDepth 是派发深度上限：1 表示只能主 → 子，2 表示允许再派一层。
+	AgentMaxDepth int
+	// AgentStallRounds 是「连续多少轮没有新信息」判定停滞并强制收尾。
+	AgentStallRounds int
+
 	// 失败降级（§5.7.3）：主模型 5xx / 超时后切备模型，协议族不同则不降级
 	LLMFallbackProvider string
 	LLMFallbackBaseURL  string
@@ -64,6 +73,16 @@ type Config struct {
 	// 开发机保持默认（false），降级到 local 时日志里会有告警。
 	SandboxRequire bool
 
+	// 插件常驻进程池（只装声明了 runtime.resident 的插件，docs/插件安全基线.md §2.5）
+	// 空闲多久回收：0 用默认 600s；进程数上限：0 用默认 32。
+	PluginProcIdleSeconds int
+	PluginProcMax         int
+
+	// 沙箱额外只读路径（逗号分隔，绝对路径）。
+	// 白名单挂载之后，装在非标准位置的运行时（npm 装的 deno 是 node 包装脚本、
+	// 自建 node / python 发行版）需要把安装前缀挂进去，否则会报「找不到模块」。
+	SandboxReadExtra []string
+
 	// 上下文压缩与记忆（§5.7.2 / §5.7.4）
 	LLMSummaryModel string // 摘要用小模型，为空则复用主模型
 	LLMEmbedBaseURL string
@@ -74,12 +93,22 @@ type Config struct {
 	LLMMaxToolCalls int
 	LLMMaxParallel  int
 	LLMMaxWallClock time.Duration
+	// LLMMaxTotalTokens 是一次 run 的累计 token 上限（所有轮次相加），
+	// 与 LLMMaxTokens（单次响应）不是一回事：后者限一次输出，前者限累计成本。
+	LLMMaxTotalTokens int
 
 	// 凭证加密（§5.5.2 的 MVP 形态）：KEK 只从环境变量读，不进仓库。
 	// 为空时凭证存储不可用，搜索等需要密钥的能力自动降级为「未配置」。
 	SecretKEK string
 
-	}
+	// 插件发布扫描（docs/插件安全基线.md）：
+	//   ScanRulesDir 为空则只用内置规则；有值时按 <dir>/active.json 热加载。
+	//   ScanOsvMode 取 off / local / remote；私有化默认 local，指向本地 OSV 镜像。
+	ScanRulesDir   string
+	ScanOsvMode    string
+	ScanOsvDir     string
+	ScanAllowRules []string
+}
 
 // Load 读取 .env（存在时）并解析环境变量。
 func Load() (*Config, error) {
@@ -97,7 +126,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("LLM_TIMEOUT 不是合法的时长: %w", err)
 	}
 
-	maxRounds := 5
+	// 轮次是「一次模型调用」：检索 → 读正文 → 写文件这类多步任务在 5 轮内经常差一步，
+	// 因此默认给到 8；真正的上限由墙钟、工具次数与累计 token 三道预算共同兜住。
+	maxRounds := 8
 	if v := getenv("LLM_MAX_ROUNDS", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxRounds); err != nil || maxRounds <= 0 {
 			return nil, fmt.Errorf("LLM_MAX_ROUNDS 必须是正整数")
@@ -115,6 +146,32 @@ func Load() (*Config, error) {
 	if v := getenv("LLM_MAX_PARALLEL", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxParallel); err != nil || maxParallel <= 0 {
 			return nil, fmt.Errorf("LLM_MAX_PARALLEL 必须是正整数")
+		}
+	}
+
+	// 累计 token 预算：0 表示不限（只靠墙钟与工具次数兜底），
+	// 默认 80000 大致对应「十来轮中等工具调用」，超过它继续跑基本是在绕圈。
+	maxTotalTokens := 80000
+	if v := getenv("LLM_MAX_TOTAL_TOKENS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxTotalTokens); err != nil || maxTotalTokens < 0 {
+			return nil, fmt.Errorf("LLM_MAX_TOTAL_TOKENS 必须是非负整数（0 表示不限）")
+		}
+	}
+
+	// 停滞判定窗口：连续两轮没有任何新信息就收尾。
+	// 一轮往往是「重试」，两轮才是「换汤不换药」。
+	stallRounds := 2
+	if v := getenv("AGENT_STALL_ROUNDS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &stallRounds); err != nil || stallRounds <= 0 {
+			return nil, fmt.Errorf("AGENT_STALL_ROUNDS 必须是正整数")
+		}
+	}
+
+	// 派发深度：1 = 主 → 子；2 = 允许再派一层。默认 2，够「主 + 专家 + 子任务」。
+	maxDepth := 2
+	if v := getenv("AGENT_MAX_DEPTH", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &maxDepth); err != nil || maxDepth < 1 {
+			return nil, fmt.Errorf("AGENT_MAX_DEPTH 必须是正整数")
 		}
 	}
 
@@ -160,22 +217,35 @@ func Load() (*Config, error) {
 		LLMFallbackAPIKey:   getenv("LLM_FALLBACK_API_KEY", ""),
 		LLMFallbackModel:    getenv("LLM_FALLBACK_MODEL", ""),
 
-		AgentImpl: getenv("AGENT_IMPL", "builtin"),
+		AgentImpl:        getenv("AGENT_IMPL", "builtin"),
+		AgentDispatch:    getenv("AGENT_DISPATCH", "true") == "true",
+		AgentMaxDepth:    maxDepth,
+		AgentStallRounds: stallRounds,
 
 		PluginsDefaultInstall: splitList(getenv("PLUGIN_DEFAULT_INSTALL", "")),
 
 		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
+
+		PluginProcIdleSeconds: getenvInt("PLUGIN_PROC_IDLE_SECONDS", 600),
+		PluginProcMax:         getenvInt("PLUGIN_PROC_MAX", 32),
+		SandboxReadExtra:      splitList(getenv("SANDBOX_READ_EXTRA", "")),
 
 		LLMSummaryModel: getenv("LLM_SUMMARY_MODEL", ""),
 		LLMEmbedBaseURL: strings.TrimRight(getenv("LLM_EMBED_BASE_URL", ""), "/"),
 		LLMEmbedAPIKey:  getenv("LLM_EMBED_API_KEY", ""),
 		LLMEmbedModel:   getenv("LLM_EMBED_MODEL", ""),
 
-		LLMMaxToolCalls: maxToolCalls,
-		LLMMaxParallel:  maxParallel,
-		LLMMaxWallClock: wallClock,
+		LLMMaxToolCalls:   maxToolCalls,
+		LLMMaxParallel:    maxParallel,
+		LLMMaxWallClock:   wallClock,
+		LLMMaxTotalTokens: maxTotalTokens,
 
 		SecretKEK: getenv("SECRET_KEK", ""),
+
+		ScanRulesDir:   getenv("SCAN_RULES_DIR", ""),
+		ScanOsvMode:    getenv("SCAN_OSV_MODE", "local"),
+		ScanOsvDir:     getenv("SCAN_OSV_DIR", ""),
+		ScanAllowRules: splitList(getenv("SCAN_ALLOW_RULES", "")),
 	}
 
 	if c.DatabaseURL == "" {
@@ -257,6 +327,15 @@ func splitList(raw string) []string {
 		}
 	}
 	return out
+}
+
+func getenvInt(key string, def int) int {
+	if v := strings.TrimSpace(getenv(key, "")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
 
 func getenv(key, def string) string {

@@ -1,62 +1,62 @@
 package plugin
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"testing"
+)
 
-// TestReplaceURLSecrets 锁定 URL 引用的替换规则：
-// 只有「query 参数值整体是 secret:name」才替换，别处出现的 secret: 一律不动。
-func TestReplaceURLSecrets(t *testing.T) {
-	lookup := func(name string) (string, bool) {
-		switch name {
-		case "dingtalk_token":
-			return "abc123+/=", true
-		case "cn_token":
-			return "密钥", true
-		}
-		return "", false
+type fakeSecrets struct{ values map[string]string }
+
+func (f fakeSecrets) Get(_ context.Context, scope, name string) (string, error) {
+	if v, ok := f.values[scope+"/"+name]; ok {
+		return v, nil
 	}
+	return "", errors.New("不存在")
+}
 
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{
-			name: "query 引用被替换并按 URL 规则编码",
-			in:   "https://oapi.dingtalk.com/robot/send?access_token=secret:dingtalk_token",
-			want: "https://oapi.dingtalk.com/robot/send?access_token=abc123%2B%2F%3D",
-		},
-		{
-			name: "中文密钥同样编码",
-			in:   "https://x.example.com/a?token=secret:cn_token",
-			want: "https://x.example.com/a?token=%E5%AF%86%E9%92%A5",
-		},
-		{
-			name: "没有引用时原样返回",
-			in:   "https://x.example.com/a?q=1",
-			want: "https://x.example.com/a?q=1",
-		},
-		{
-			name: "路径里的 secret: 不当引用",
-			in:   "https://x.example.com/secret:dingtalk_token/a",
-			want: "https://x.example.com/secret:dingtalk_token/a",
-		},
-		{
-			name: "参数值中间出现 secret: 不替换",
-			in:   "https://x.example.com/a?q=pre-secret:dingtalk_token",
-			want: "https://x.example.com/a?q=pre-secret:dingtalk_token",
-		},
-		{
-			name: "未知密钥替换为空，让请求在目标侧明确失败",
-			in:   "https://x.example.com/a?token=secret:missing",
-			want: "https://x.example.com/a?token=",
-		},
+func secretTestRuntime() *toolRuntime {
+	return &toolRuntime{
+		secrets: fakeSecrets{values: map[string]string{"plugin/erp_token": "s3cr3t"}},
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := replaceURLSecrets(tc.in, lookup); got != tc.want {
-				t.Fatalf("replaceURLSecrets(%q) = %q，期望 %q", tc.in, got, tc.want)
-			}
-		})
+// 声明过的名字才能取到值。
+func TestSecretGetReturnsDeclared(t *testing.T) {
+	rt := secretTestRuntime()
+	in := invokeInput{Secrets: map[string]bool{"erp_token": true}}
+
+	out, err := rt.secretGet(context.Background(), in, json.RawMessage(`{"name":"erp_token"}`))
+	if err != nil {
+		t.Fatalf("取凭证失败: %v", err)
+	}
+	got, _ := out.(map[string]any)
+	if got["value"] != "s3cr3t" {
+		t.Fatalf("凭证值 = %v，期望 s3cr3t", got["value"])
+	}
+}
+
+// 没声明的名字必须被拒绝，不能因为它恰好存在就放行——
+// 否则「写了 secret.use」就等于「能读整个 plugin scope」。
+func TestSecretGetRejectsUndeclared(t *testing.T) {
+	rt := secretTestRuntime()
+	in := invokeInput{Secrets: map[string]bool{"erp_token": true}}
+
+	if _, err := rt.secretGet(context.Background(), in, json.RawMessage(`{"name":"other_token"}`)); err == nil {
+		t.Fatal("未声明的凭证名应该被拒绝")
+	}
+}
+
+// 声明了但凭证不存在：报错要能定位，而不是返回空串让请求带着半个凭证出去。
+func TestSecretGetMissingValue(t *testing.T) {
+	rt := secretTestRuntime()
+	in := invokeInput{Secrets: map[string]bool{"absent": true}}
+
+	if _, err := rt.secretGet(context.Background(), in, json.RawMessage(`{"name":"absent"}`)); err == nil {
+		t.Fatal("不存在的凭证应该报错")
 	}
 }

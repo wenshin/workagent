@@ -20,6 +20,7 @@ import (
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
+	"github.com/workagent/auto-agent/internal/securityscan"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
@@ -51,6 +52,16 @@ type Options struct {
 	Sources *search.Registry
 	// OnChange 在安装/启停/卸载/本地启用状态变化后触发，宿主用来重建空间索引。
 	OnChange func(ctx context.Context, spaceID string)
+	// Scanner 是发布前的安全扫描器（docs/插件安全基线.md）。为 nil 时不扫描，
+	// 也不落扫描记录——「没配」必须和「扫过且干净」区分开。
+	Scanner *securityscan.Engine
+	// ProcIdle 是插件常驻进程的空闲回收时间，<=0 用 DefaultProcIdle。
+	ProcIdle time.Duration
+	// ProcMax 是常驻进程上限，<=0 用 DefaultProcMax。
+	ProcMax int
+	// Evals 用于跑插件自带的 agent 类黄金用例；为 nil 时这类用例跳过并记入报告，
+	// 不阻塞发布——发布门禁不能依赖外部模型可用。
+	Evals EvalRunner
 }
 
 // Manager 管理四类插件的完整生命周期。
@@ -77,7 +88,6 @@ type instance struct {
 	Dir         string
 	Risk        int
 	SideEffects string
-	Guard       *search.Guard
 	Tools       []tool.Tool
 	MCP         *mcpRuntime
 	// Source 是 kind=source 的搜索源执行体；其它类型为 nil。
@@ -108,6 +118,12 @@ type Item struct {
 	BaselineVersion string   `json:"baseline_version,omitempty"`
 	LocalModified   bool     `json:"local_modified"`
 	Tools           []string `json:"tools,omitempty"`
+	// Permissions 是清单声明的权限（人类可读），安装确认时展示给用户看。
+	// 文案由 Manifest.Permissions 统一生成，前端不自己拼。
+	Permissions []string `json:"permissions,omitempty"`
+	// LatestPermissions 是待升级版本的权限：升级同样要让人看见权限变化，
+	// 否则「加一个 fs.write 再发版」就是静默提权。
+	LatestPermissions []string `json:"latest_permissions,omitempty"`
 }
 
 // DryRunResult 是试运行的回执：给作者看「它到底干了什么」。
@@ -153,8 +169,40 @@ func New(o Options) (*Manager, error) {
 	m.rt = &toolRuntime{
 		runner: o.Runner, deno: deno, runtimeDir: o.RuntimeDir,
 		secrets: o.Secrets, fs: o.Storage, logger: o.Logger,
+		egress: newEgressPool(o.Logger),
 	}
+	// 每个插件一个常驻进程：安装/停用/卸载/重载都会把对应进程关掉，
+	// 保证「跑着的代码 = 现在磁盘上的代码」。
+	m.rt.pool = newResidentPool(o.ProcIdle, o.ProcMax, o.Logger)
 	return m, nil
+}
+
+// Close 关闭所有插件常驻进程。服务退出时调用；不调用也不会泄漏文件，
+// 但会留下一堆孤儿 deno 进程，直到父进程回收。
+func (m *Manager) Close() {
+	if m.rt != nil && m.rt.pool != nil {
+		m.rt.pool.CloseAll()
+	}
+	if m.rt != nil && m.rt.egress != nil {
+		m.rt.egress.Close()
+	}
+}
+
+// closeSlugProcs 关闭某个插件的常驻进程。
+//
+// 安装、升级、停用、卸载、草稿变更都要调用：常驻进程里跑的是**启动那一刻**的代码，
+// 不关掉就会出现「文件改了、发布的也是新版本，但实际执行还是旧的」。
+func (m *Manager) closeSlugProcs(spaceID, slug string) {
+	if m.rt != nil && m.rt.pool != nil {
+		m.rt.pool.closePrefix(spaceID + "|" + slug + "|")
+	}
+}
+
+// closeSpaceProcs 关闭整个空间的常驻进程（空间重载 / 卸载）。
+func (m *Manager) closeSpaceProcs(spaceID string) {
+	if m.rt != nil && m.rt.pool != nil {
+		m.rt.pool.closePrefix(spaceID + "|")
+	}
 }
 
 // ---------------------------------------------------------------- 读取与索引
@@ -192,7 +240,7 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 			Slug: d.Slug, Kind: string(d.Kind), Name: d.Name, Description: d.Description,
 			Status: status, Origin: store.PluginOriginInternal, Local: true,
 			Enabled: enabled, Mutable: true, HasDraft: true, Extensible: d.IsExtensible(),
-			Risk: riskOf(d), Tools: d.ExposedTools(),
+			Risk: riskOf(d), Tools: d.ExposedTools(), Permissions: d.Permissions(),
 		}
 		if d.DerivedFrom != nil {
 			item.BaselineVersion = d.DerivedFrom.Version
@@ -236,6 +284,20 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 			}
 			item.Origin = p.Origin
 			item.LatestVersion = p.LatestVersion
+			// 权限从已安装的版本快照读：用户要看到的是「这个版本实际会拿到什么」。
+			if ver, verr := m.o.Store.GetPluginVersion(ctx, in.PluginID, in.Version); verr == nil {
+				if mm, perr := Parse(ver.Manifest, true); perr == nil {
+					item.Permissions = mm.Permissions()
+				}
+			}
+			// 升级目标版本的权限也要给出来：版本之间权限可以变。
+			if p.LatestVersion != "" && p.LatestVersion != in.Version {
+				if lv, verr := m.o.Store.GetPluginVersion(ctx, p.ID, p.LatestVersion); verr == nil {
+					if mm, perr := Parse(lv.Manifest, true); perr == nil {
+						item.LatestPermissions = mm.Permissions()
+					}
+				}
+			}
 			// 安装副本只读，不再有「本地改动/基线合并」的概念，只提示上游版本。
 			item.UpdateAvailable = p.LatestVersion != "" && p.LatestVersion != in.Version
 		}
@@ -334,22 +396,23 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 	if err != nil {
 		return DryRunResult{}, err
 	}
-	risk, effects := Derive(b.Meta)
+	risk, _ := Derive(b.Meta)
 	start := time.Now()
 	res := DryRunResult{Kind: b.Meta.Kind, Risk: risk}
 
 	switch b.Meta.Kind {
 	case KindTool:
-		inst := &instance{
-			SpaceID: spaceID, Slug: slug, Manifest: b.Meta, Dir: b.Dir,
-			Risk: risk, SideEffects: effects,
-			Guard: search.NewGuard(b.Meta.Hosts()),
+		allow, verbs, secrets := b.Meta.HostAllow()
+		fs, spaceDir, err := m.sandboxFS(spaceID, b.Dir, b.Meta)
+		if err != nil {
+			return res, err
 		}
-		allow, verbs, hasSecret := b.Meta.HostAllow()
 		out, err := m.rt.Call(ctx, invokeInput{
-			Dir: b.Dir, Entry: b.Meta.Runtime.Entry, Guard: inst.Guard,
+			Dir: b.Dir, Entry: b.Meta.Runtime.Entry,
 			Limits: b.Meta.Limits, SpaceID: spaceID, UserID: userID, Slug: slug,
-			Allow: allow, Verbs: verbs, HasSecret: hasSecret,
+			FS: fs, SpaceRoot: spaceDir, NetHosts: b.Meta.NetHosts(),
+			WSHosts: b.Meta.WSNetHosts(), OneShot: true,
+			Allow: allow, Verbs: verbs, Secrets: secrets,
 		}, input)
 		if err != nil {
 			return res, err
@@ -407,7 +470,7 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 		if query == "" {
 			return res, fmt.Errorf("搜索源试跑需要提供 query（拿一个真实检索词跑一次）")
 		}
-		src, err := m.buildSource(ctx, slug, b.Dir, b.Meta)
+		src, err := m.buildSource(ctx, spaceID, slug, b.Dir, b.Meta)
 		if err != nil {
 			return res, err
 		}
@@ -517,6 +580,38 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 		version = nextVersion(latest)
 	}
 	b.Meta.Version = version
+
+	// 安全扫描在写任何数据之前：被阻断时不产生任何副作用，
+	// 草稿、候选状态、插件记录都保持原样。
+	scan, blocked := m.scanDraft(ctx, b, version)
+	if blocked {
+		m.recordAudit(ctx, userID, "plugin.publish.blocked", slug, version, map[string]any{
+			"rules":        scan.RulesVersion,
+			"status":       scan.Status,
+			"max_severity": string(scan.MaxSeverity),
+			"space":        spaceID,
+		})
+		return store.PluginVersion{}, &ScanBlockedError{Report: scan}
+	}
+
+	// 黄金用例在落库之前跑：作者声明了「这个插件该怎么用」，
+	// 发布就是把这份声明变成对所有人的承诺，没跑通就不该发。
+	evals, evalErr := m.evalDraft(ctx, b, spaceID, slug, userID)
+	if evalErr != nil {
+		m.recordAudit(ctx, userID, "plugin.publish.eval_failed", slug, version, map[string]any{
+			"space":    spaceID,
+			"evals":    evals.Summary(),
+			"failures": strings.Join(evals.Failures, "；"),
+		})
+		return store.PluginVersion{}, evalErr
+	}
+	if evals.Present {
+		m.recordAudit(ctx, userID, "plugin.publish.eval_passed", slug, version, map[string]any{
+			"space": spaceID,
+			"evals": evals.Summary(),
+		})
+	}
+
 	manifestRaw, err := json.Marshal(b.Meta)
 	if err != nil {
 		return store.PluginVersion{}, err
@@ -546,6 +641,9 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 	if err != nil {
 		return store.PluginVersion{}, err
 	}
+	// 扫描结论是元数据：落库失败只告警，不回滚已经完成的发布。
+	m.saveScan(ctx, p.ID, b.Hash, scan, userID)
+
 	cand.ManifestHash = b.Hash
 	cand.Status = store.PluginCandidateEnabled
 	if _, err := m.o.Store.UpsertPluginCandidate(ctx, cand); err != nil {
@@ -677,6 +775,9 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 		return store.PluginInstall{}, err
 	}
 
+	// 升级会换掉实例：旧进程必须关掉，否则新版本装上了、跑的还是旧代码。
+	m.closeSlugProcs(in.SpaceID, in.Slug)
+
 	m.mu.Lock()
 	if m.inst[in.SpaceID] == nil {
 		m.inst[in.SpaceID] = map[string]*instance{}
@@ -714,6 +815,7 @@ func (m *Manager) Uninstall(ctx context.Context, userID, spaceID, slug string) e
 	if err := m.o.Store.DeletePluginInstall(ctx, spaceID, in.PluginID); err != nil {
 		return err
 	}
+	m.closeSlugProcs(spaceID, slug)
 	m.mu.Lock()
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)
@@ -753,6 +855,8 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 	if _, err := m.o.Store.UpsertPluginInstall(ctx, in); err != nil {
 		return err
 	}
+	// 停用是 kill switch：进程必须立刻杀掉，不能等空闲回收。
+	m.closeSlugProcs(spaceID, slug)
 	m.mu.Lock()
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)
@@ -956,7 +1060,6 @@ func (m *Manager) buildInstance(ctx context.Context, spaceID, pluginID, slug, ve
 	inst := &instance{
 		SpaceID: spaceID, PluginID: pluginID, Slug: slug, Version: version,
 		Manifest: meta, Dir: dir, Risk: risk, SideEffects: effects,
-		Guard: search.NewGuard(meta.Hosts()),
 	}
 	switch meta.Kind {
 	case KindTool, KindMCP:
@@ -977,7 +1080,7 @@ func (m *Manager) buildInstance(ctx context.Context, spaceID, pluginID, slug, ve
 	case KindSource:
 		// 源的构造失败不应该让整个空间加载失败：其余插件与内置能力照常可用，
 		// 这个源在 web_search 里表现为「没有可用源」或缺失，日志里有原因。
-		src, err := m.buildSource(ctx, slug, dir, meta)
+		src, err := m.buildSource(ctx, spaceID, slug, dir, meta)
 		if err != nil {
 			m.o.Logger.Warn("搜索源初始化失败", "slug", slug, "space", spaceID, "err", err)
 			break
@@ -1040,12 +1143,19 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 }
 
 func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawMessage, env tool.Env) (string, error) {
-	allow, verbs, hasSecret := inst.Manifest.HostAllow()
+	allow, verbs, secrets := inst.Manifest.HostAllow()
+	fs, spaceDir, fsErr := m.sandboxFS(inst.SpaceID, inst.Dir, inst.Manifest)
+	if fsErr != nil {
+		return "", fsErr
+	}
 	out, err := m.rt.Call(ctx, invokeInput{
-		Dir: inst.Dir, Entry: inst.Manifest.Runtime.Entry, Guard: inst.Guard,
+		Dir: inst.Dir, Entry: inst.Manifest.Runtime.Entry,
 		Limits: inst.Manifest.Limits, SpaceID: inst.SpaceID,
-		UserID: env.UserID, Slug: inst.Slug,
-		Allow: allow, Verbs: verbs, HasSecret: hasSecret,
+		UserID: env.UserID, Slug: inst.Slug, FS: fs, SpaceRoot: spaceDir,
+		NetHosts: inst.Manifest.NetHosts(), WSHosts: inst.Manifest.WSNetHosts(),
+		Allow: allow, Verbs: verbs, Secrets: secrets,
+		// 默认一次性：跑完即退，不占常驻池。声明 runtime.resident 才复用进程。
+		OneShot: !inst.Manifest.Runtime.Resident,
 	}, args)
 	if err != nil {
 		return "", err
@@ -1120,7 +1230,6 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 			inst = &instance{
 				SpaceID: spaceID, PluginID: p.ID, Slug: in.Slug, Version: in.Version,
 				Manifest: meta, Dir: v.ArtifactPath, Risk: in.Risk,
-				Guard: search.NewGuard(meta.Hosts()),
 			}
 		}
 		inst.Global = global

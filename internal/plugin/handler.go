@@ -322,6 +322,8 @@ type catalogItem struct {
 	Author        string `json:"author,omitempty"`
 	Published     bool   `json:"published"`
 	PublishedSlug string `json:"published_slug,omitempty"`
+	// Permissions 是清单声明的权限，安装前给用户看「装完它会拿到什么」。
+	Permissions []string `json:"permissions,omitempty"`
 }
 
 func catalogCategory(origin string) string {
@@ -357,8 +359,12 @@ func (h *Handler) catalog(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		risk := 0
+		var permissions []string
 		if v, err := h.store.GetPluginVersion(r.Context(), p.ID, p.LatestVersion); err == nil {
 			risk = v.Risk
+			if mm, perr := Parse(v.Manifest, true); perr == nil {
+				permissions = mm.Permissions()
+			}
 		}
 		sourceSpace := ""
 		if p.OwnerSpaceID != "" {
@@ -375,6 +381,7 @@ func (h *Handler) catalog(w http.ResponseWriter, r *http.Request) {
 			// 平台内置件默认对所有空间可用，没有「安装」这个动作。
 			Installable: p.Origin != store.PluginOriginSystem, Published: true,
 			SourceSpaceID: p.OwnerSpaceID, SourceSpace: sourceSpace,
+			Permissions: permissions,
 		})
 	}
 

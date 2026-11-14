@@ -8,15 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/sandbox"
-	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
@@ -42,6 +39,9 @@ type localPathStore interface {
 }
 
 // toolRuntime 执行 kind=tool 的插件：deno 进程 + NDJSON 双向协议。
+//
+// 默认一次性：每次调用起一个进程，跑完即退。
+// 只有清单声明 runtime.resident 的插件才进常驻池，按键（空间 + slug + 目录）复用。
 type toolRuntime struct {
 	runner     sandbox.Runner
 	deno       string
@@ -49,20 +49,42 @@ type toolRuntime struct {
 	secrets    Secrets
 	fs         storage.Storage
 	logger     *slog.Logger
+	pool       *residentPool
+	// egress 给每个插件实例一条独立出网通道（SOCKS5 over unix socket）。
+	// 没有声明 http.request 的插件拿不到 socket，也就完全没有出网。
+	egress *egressPool
 }
 
 type invokeInput struct {
 	Dir     string
 	Entry   string
-	Guard   *search.Guard
 	Limits  Limits
 	SpaceID string
 	UserID  string
 	Slug    string
+	// FS 是文件访问白名单（空间工作区 + 清单 fs 收紧后的结果）。
+	// 它同时喂给沙箱挂载和 deno 的 --allow-read/--allow-write：
+	// 挂载决定「路径存不存在」，权限决定「deno 允不允许读」，缺一层都算没管。
+	FS sandbox.FS
+	// NetHosts 是清单声明的出网域名，用来建该插件的代理白名单。
+	NetHosts []string
+	// SpaceRoot 是空间工作区的绝对路径，以 WA_SPACE_DIR 注入：
+	// 文件改直连后，脚本得知道自己的相对路径挂在哪。
+	SpaceRoot string
+	// OneShot 为 true 时不起常驻进程：试运行必须跑完就退，
+	// 否则草稿代码会一直挂在池里，改一次就要等空闲回收。
+	OneShot bool
+	// WSHosts 是 ws.connect 声明的域名：非空才注入 HTTPS_PROXY 并放行 CONNECT。
+	WSHosts []string
 	// 能力清单是审批对象：脚本能调到哪些宿主方法由 plugin.json 决定。
-	Allow     map[string]bool
-	Verbs     map[string]bool
-	HasSecret bool
+	Allow   map[string]bool
+	Verbs   map[string]bool
+	Secrets map[string]bool
+}
+
+// residentKey 是常驻进程的复用键：目录变化就是另一份代码，不能复用。
+func residentKey(spaceID, slug, dir string) string {
+	return spaceID + "|" + slug + "|" + dir
 }
 
 type rpcFrame struct {
@@ -82,43 +104,178 @@ type rpcReply struct {
 	Error string `json:"error,omitempty"`
 }
 
-// Call 执行一次插件调用。进程一次一启：冷启动约 100ms，换来的是
-// 「一次调用失败不会污染下一次」以及超时语义干净。
+// Call 执行一次插件调用。
+//
+// 声明了 runtime.resident 的插件复用常驻进程：冷启动约 50–180ms，
+// 连接、缓存、模块级状态跨调用保留，代价是常占内存与一个池名额。
+// OneShot 走一次性执行，用于试运行与不方便持有进程的场景。
 func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
 	if r.deno == "" {
 		return "", errors.New("当前环境没有 deno，无法执行脚本插件")
 	}
+	if in.OneShot || r.pool == nil {
+		return r.callOnce(ctx, in, input)
+	}
+	key := residentKey(in.SpaceID, in.Slug, in.Dir)
+	rp, err := r.pool.acquire(key, r, func() (*sandbox.Proc, error) {
+		return r.startProc(ctx, in, true)
+	})
+	if err != nil {
+		return "", err
+	}
+	out, err := rp.invoke(ctx, in, input)
+	if err != nil && rp.dead() {
+		// 进程已经死了就从池里摘掉，下一次调用重新起一个，
+		// 否则每个后续调用都会先撞一次「进程已退出」。
+		r.pool.drop(key, rp)
+	}
+	return out, err
+}
+
+// procSpec 是启动插件进程的静态参数，一次性与常驻共用。
+func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, error) {
 	lp, ok := r.fs.(localPathStore)
 	if !ok {
-		return "", errors.New("当前存储不支持插件执行（需要本地文件系统）")
+		return sandbox.Spec{}, errors.New("当前存储不支持插件执行（需要本地文件系统）")
 	}
 	abs, err := lp.LocalPath(in.Dir)
 	if err != nil {
-		return "", fmt.Errorf("解析插件目录失败: %w", err)
+		return sandbox.Spec{}, fmt.Errorf("解析插件目录失败: %w", err)
 	}
 	entry := filepath.Join(abs, filepath.FromSlash(in.Entry))
 	entryURL := (&url.URL{Scheme: "file", Path: entry}).String()
 	bootstrap := filepath.Join(r.runtimeDir, "bootstrap.ts")
 
-	timeout := time.Duration(in.Limits.TimeoutMS) * time.Millisecond
-	proc, err := r.runner.Start(ctx, sandbox.Spec{
-		Cmd: []string{
-			r.deno, "run",
-			"--quiet", "--no-prompt",
-			// 沙箱里没有可写工作目录，锁文件与配置会变成噪音甚至失败
-			"--no-lock", "--no-config",
-			bootstrap, entryURL,
-		},
+	// 出网：声明了 http.request 或 ws.connect 才有通道。两张名单都空就没有代理，
+	// 沙箱又保持 --unshare-net，等于完全断网。
+	var proxy string
+	if r.egress != nil && (len(in.NetHosts) > 0 || len(in.WSHosts) > 0) {
+		p, err := r.egress.proxyFor(in.SpaceID, in.Slug, in.NetHosts, in.WSHosts, in.Verbs)
+		if err != nil {
+			return sandbox.Spec{}, fmt.Errorf("建立出网通道失败: %w", err)
+		}
+		proxy = p
+	}
+
+	// 运行时要可读：bootstrap.ts 与 host_sdk.ts 都在 runtimeDir 里，
+	// 不在挂载白名单里的话连启动都做不到（exec 直接 ENOENT）。
+	fs := in.FS
+	fs.Read = dedupePaths(append(append([]string{}, fs.Read...), r.runtimeDir))
+
+	spec := sandbox.Spec{
+		Cmd: append(
+			[]string{
+				r.deno, "run",
+				"--quiet", "--no-prompt",
+				// 沙箱里没有可写工作目录，锁文件与配置会变成噪音甚至失败
+				"--no-lock", "--no-config",
+			},
+			append(denoPermissionFlags(fs, proxy, len(in.WSHosts) > 0),
+				bootstrap, entryURL)...,
+		),
 		Dir:       abs,
-		Mode:      sandbox.ModeReadOnly,
+		Mode:      sandbox.ModeWorkspaceWrite,
+		FS:        fs,
 		Network:   false,
-		Timeout:   timeout,
+		Proxy:     proxy,
+		Timeout:   time.Duration(in.Limits.TimeoutMS) * time.Millisecond,
+		Resident:  resident,
 		MaxOutput: maxFrameBytes * 4,
-	})
+	}
+	// 进程环境被 --clearenv 清空过，只有这里列出来的变量能进沙箱。
+	if in.SpaceRoot != "" {
+		spec.Env = append(spec.Env, "WA_SPACE_DIR="+in.SpaceRoot)
+	}
+	if proxy != "" {
+		spec.Env = append(spec.Env, "WA_EGRESS_PROXY="+proxy)
+	}
+	// wss:// 只能靠 Deno 自己的代理支持：它读 HTTPS_PROXY，
+	// 且认 unix:/path 这种写法（实测 2.9.4）。
+	// 不声明 ws.connect 就不注入，插件连 new WebSocket 都会直连失败。
+	if proxy != "" && len(in.WSHosts) > 0 {
+		spec.Env = append(spec.Env, "HTTPS_PROXY=unix:"+proxy)
+	}
+	return spec, nil
+}
+
+// denoPermissionFlags 把同一份 fs 白名单翻译成 deno 的权限参数。
+//
+// 沙箱挂载决定「路径存不存在」，这里决定「deno 允不允许读」。只做挂载的话，
+// 一个 --allow-read 全开就能读到挂载进来的所有东西；只做权限的话，
+// 挂载层漏掉的路径又会被 deno 放出去。两层都要，才是同一份声明的两个执行点。
+func denoPermissionFlags(fs sandbox.FS, proxy string, allowWS bool) []string {
+	read := append([]string{}, fs.Read...)
+	write := append([]string{}, fs.Write...)
+	if proxy != "" {
+		// Deno 对 unix socket 的检查是「读 + 写 + net」三件套，
+		// 少一个就是 NotCapable，而不是「连不上」这种能猜到的错。
+		read = append(read, proxy)
+		write = append(write, proxy)
+	}
+	flags := make([]string, 0, 4)
+	if len(read) > 0 {
+		flags = append(flags, "--allow-read="+strings.Join(read, ","))
+	}
+	if len(write) > 0 {
+		flags = append(flags, "--allow-write="+strings.Join(write, ","))
+	}
+	envs := []string{"WA_SPACE_DIR"}
+	if proxy != "" {
+		envs = append(envs, "WA_EGRESS_PROXY")
+		if allowWS {
+			envs = append(envs, "HTTPS_PROXY")
+		}
+		// 放开 --allow-net 不会变成直连：沙箱是 --unshare-net，
+		// 除了挂进来的 socket 没有第二个出口。
+		flags = append(flags, "--allow-net")
+	}
+	return append(flags, "--allow-env="+strings.Join(envs, ","))
+}
+
+func dedupePaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+func (r *toolRuntime) startProc(ctx context.Context, in invokeInput, resident bool) (*sandbox.Proc, error) {
+	spec, err := r.procSpec(in, resident)
 	if err != nil {
-		return "", fmt.Errorf("启动插件失败: %w", err)
+		return nil, err
+	}
+	// 常驻进程的父 ctx 必须是长生命周期的：用调用方的 ctx 会在请求结束时
+	// 把插件连根拔掉，常驻就名存实亡了。
+	if resident {
+		ctx = context.Background()
+	}
+	proc, err := r.runner.Start(ctx, spec)
+	if err != nil {
+		return nil, fmt.Errorf("启动插件失败: %w", err)
+	}
+	return proc, nil
+}
+
+// callOnce 是一次性执行：起进程、跑一次、关闭。
+func (r *toolRuntime) callOnce(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
+	if r.deno == "" {
+		return "", errors.New("当前环境没有 deno，无法执行脚本插件")
+	}
+	proc, err := r.startProc(ctx, in, false)
+	if err != nil {
+		return "", err
 	}
 	defer proc.Close()
+	timeout := time.Duration(in.Limits.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = defaultInvokeTimeout
+	}
 
 	if err := writeFrame(proc, map[string]any{
 		"op":   "invoke",
@@ -193,10 +350,25 @@ func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMe
 	}
 }
 
+// removedMethods 记录已下线的宿主方法及替代方案。
+// 存在的意义只是报错可读：这些名字在 allow 表里永远不出现。
+var removedMethods = map[string]string{
+	"fs.read":      "文件用 Deno.readTextFile(wa.path(\"data/x\"))，范围由清单的 fs 段决定",
+	"fs.list":      "目录用 Deno.readDir(wa.path(\"data/\"))",
+	"fs.write":     "文件用 Deno.writeTextFile(wa.path(\"data/x\"))，写权限要在 fs 段声明",
+	"http.request": "出网用 wa.fetch；凭证用 host.secret(名称) 取明文自己拼 header",
+}
+
 // hostCall 实现宿主系统调用表。每一条都对应已有的一份策略实现。
 func (r *toolRuntime) hostCall(ctx context.Context, in invokeInput, frame rpcFrame) (any, error) {
 	callCtx, cancel := context.WithTimeout(ctx, hostCallTimeout)
 	defer cancel()
+
+	// 已经从宿主 ABI 里删掉的方法先说清楚去哪：走到下面那条通用报错，
+	// 作者会以为「补进 capabilities 就能用」，而补进去是解析失败。
+	if hint, ok := removedMethods[frame.Method]; ok {
+		return nil, fmt.Errorf("%s 已从宿主 ABI 移除：%s", frame.Method, hint)
+	}
 
 	// 未在 plugin.json 里声明的宿主能力直接拒绝：审批看到的是清单，
 	// 脚本不能靠「写一行 host.http」把未授权的调用拿到手。
@@ -205,33 +377,8 @@ func (r *toolRuntime) hostCall(ctx context.Context, in invokeInput, frame rpcFra
 	}
 
 	switch frame.Method {
-	case MethodHTTP:
-		return r.httpRequest(callCtx, in, frame.Args)
-	case MethodFSRead:
-		var a struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal(frame.Args, &a); err != nil {
-			return nil, fmt.Errorf("fs.read 参数非法: %w", err)
-		}
-		return r.readFile(callCtx, in.SpaceID, a.Path)
-	case MethodFSList:
-		var a struct {
-			Path string `json:"path"`
-		}
-		if err := json.Unmarshal(frame.Args, &a); err != nil {
-			return nil, fmt.Errorf("fs.list 参数非法: %w", err)
-		}
-		return r.listFiles(callCtx, in.SpaceID, a.Path)
-	case MethodFSWr:
-		var a struct {
-			Path    string `json:"path"`
-			Content string `json:"content"`
-		}
-		if err := json.Unmarshal(frame.Args, &a); err != nil {
-			return nil, fmt.Errorf("fs.write 参数非法: %w", err)
-		}
-		return r.writeFile(callCtx, in.SpaceID, a.Path, a.Content)
+	case MethodSecretGet:
+		return r.secretGet(callCtx, in, frame.Args)
 	case MethodLog:
 		var a struct {
 			Level   string `json:"level"`
@@ -245,196 +392,35 @@ func (r *toolRuntime) hostCall(ctx context.Context, in invokeInput, frame rpcFra
 	}
 }
 
-func (r *toolRuntime) httpRequest(ctx context.Context, in invokeInput, raw json.RawMessage) (any, error) {
+// secretGet 是插件唯一能拿到凭证明文的地方。
+//
+// 只认清单里逐个声明过的名字（capabilities 里 {"method":"secret.use","name":"x"}）：
+// 只说「有 secret.use」不等于「能读整个 plugin scope」，否则一个通用插件就能把
+// 平台上所有插件的凭证都取走。
+func (r *toolRuntime) secretGet(ctx context.Context, in invokeInput, raw json.RawMessage) (any, error) {
 	var a struct {
-		URL     string            `json:"url"`
-		Method  string            `json:"method"`
-		Headers map[string]string `json:"headers"`
-		Body    string            `json:"body"`
+		Name string `json:"name"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil {
-		return nil, fmt.Errorf("http.request 参数非法: %w", err)
+		return nil, fmt.Errorf("secret.get 参数非法: %w", err)
 	}
-	method := strings.ToUpper(strings.TrimSpace(a.Method))
-	if method == "" {
-		method = http.MethodGet
+	name := strings.TrimSpace(a.Name)
+	if name == "" {
+		return nil, errors.New("secret.get 需要 name")
 	}
-	if !in.Verbs[method] {
-		return nil, fmt.Errorf("插件未声明 HTTP 动词 %s（capabilities.verbs）", method)
+	if !in.Secrets[name] {
+		return nil, fmt.Errorf("未在清单声明凭证 %q：请加一条 {\"method\":\"secret.use\",\"name\":%q}", name, name)
 	}
-	// URL 也要做密钥替换：钉钉 / 企业微信这类机器人把 token 放在 query 里，
-	// 只替换 headers 会逼着模型把明文写进插件文件
-	target := r.resolveURLSecrets(ctx, a.URL, in.HasSecret)
-	req, err := http.NewRequestWithContext(ctx, method, target, strings.NewReader(a.Body))
+	if r.secrets == nil {
+		return nil, errors.New("凭证存储未启用（缺少 SECRET_KEK）")
+	}
+	value, err := r.secrets.Get(ctx, "plugin", name)
 	if err != nil {
-		return nil, fmt.Errorf("请求地址非法: %w", err)
+		return nil, fmt.Errorf("凭证 %s 不存在或读取失败", name)
 	}
-	for k, v := range a.Headers {
-		// 密钥只在出网这一步被替换，插件进程内存里从来没有明文。
-		req.Header.Set(k, r.resolveSecrets(ctx, v, in.HasSecret))
-	}
-	resp, err := in.Guard.DoRaw(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody))
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	headers := make(map[string]string, len(resp.Header))
-	for k := range resp.Header {
-		headers[k] = resp.Header.Get(k)
-	}
-	return map[string]any{
-		"status":    resp.StatusCode,
-		"body":      string(body),
-		"headers":   headers,
-		"truncated": resp.ContentLength > maxHTTPBody,
-	}, nil
-}
-
-// secretPrefix 是密钥引用的固定写法：secret:<名称>。
-// 规则是「整个值必须等于 secret:name」，不做子串替换——
-// 否则 "Bearer secret:token" 这类拼接会被误替换，普通文本里的 secret: 也会被当成引用。
-const secretPrefix = "secret:"
-
-// lookupSecret 取一次密钥明文。未声明 secret.use、名字为空或不存在的，一律返回空，
-// 让请求在目标侧失败得明显，而不是带着半个凭证跑出去。
-func (r *toolRuntime) lookupSecret(ctx context.Context, name string, allowed bool) (string, bool) {
-	if !allowed {
-		r.logger.Warn("插件未声明 secret.use，密钥引用被忽略", "name", name)
-		return "", false
-	}
-	if name == "" || r.secrets == nil {
-		return "", false
-	}
-	secret, err := r.secrets.Get(ctx, "plugin", name)
-	if err != nil {
-		r.logger.Warn("插件引用的密钥不存在", "name", name, "error", err)
-		return "", false
-	}
-	return secret, true
-}
-
-// resolveSecrets 处理整值引用（主要用于 header 值）：值必须整体是 secret:name。
-func (r *toolRuntime) resolveSecrets(ctx context.Context, value string, allowed bool) string {
-	if !strings.HasPrefix(value, secretPrefix) {
-		return value
-	}
-	secret, _ := r.lookupSecret(ctx, strings.TrimSpace(strings.TrimPrefix(value, secretPrefix)), allowed)
-	return secret
-}
-
-// resolveURLSecrets 只替换 query 参数值里的 secret:name，其它部分原样保留。
-// URL 不能走整值规则（整段 URL 不会以 secret: 开头），也不能做全串替换：
-// 路径、host、参数名里出现的 secret: 一律不动，避免把普通文本误当引用。
-func (r *toolRuntime) resolveURLSecrets(ctx context.Context, raw string, allowed bool) string {
-	return replaceURLSecrets(raw, func(name string) (string, bool) {
-		return r.lookupSecret(ctx, name, allowed)
-	})
-}
-
-// replaceURLSecrets 是可单测的纯函数版本：只认「参数值整体是 secret:name」。
-// 命中时用 url.Values 重新编码，密钥里的 + / = 等字符不会破坏 URL 结构。
-// 注意：重编码会按参数名排序，带签名（参数顺序敏感）的 URL 不要用这种引用方式。
-func replaceURLSecrets(raw string, lookup func(name string) (string, bool)) string {
-	if !strings.Contains(raw, secretPrefix) {
-		return raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.RawQuery == "" {
-		return raw
-	}
-	q := u.Query()
-	changed := false
-	for _, vs := range q {
-		for i, v := range vs {
-			if !strings.HasPrefix(v, secretPrefix) {
-				continue
-			}
-			secret, _ := lookup(strings.TrimSpace(strings.TrimPrefix(v, secretPrefix)))
-			vs[i] = secret
-			changed = true
-		}
-	}
-	if !changed {
-		return raw
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func (r *toolRuntime) spaceFilePath(spaceID, p string) (string, string, error) {
-	clean := path.Clean(strings.TrimPrefix(strings.TrimSpace(p), "/"))
-	if clean == "." || clean == "" {
-		clean = ""
-	}
-	if strings.Contains(clean, "..") {
-		return "", "", errors.New("路径不能包含 ..")
-	}
-	key := path.Join(r.fs.SpaceKey(spaceID), "files", clean)
-	return key, clean, nil
-}
-
-func (r *toolRuntime) readFile(ctx context.Context, spaceID, p string) (any, error) {
-	key, clean, err := r.spaceFilePath(spaceID, p)
-	if err != nil {
-		return nil, err
-	}
-	f, err := r.fs.Get(ctx, key)
-	if err != nil {
-		return nil, fmt.Errorf("读取 %s 失败: %w", clean, err)
-	}
-	defer func() { _ = f.Close() }()
-	body, err := io.ReadAll(io.LimitReader(f, maxBundleBytes))
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"path": clean, "content": string(body)}, nil
-}
-
-func (r *toolRuntime) listFiles(ctx context.Context, spaceID, p string) (any, error) {
-	key, _, err := r.spaceFilePath(spaceID, p)
-	if err != nil {
-		return nil, err
-	}
-	entries, err := r.fs.List(ctx, key)
-	if err != nil {
-		return nil, fmt.Errorf("列目录失败: %w", err)
-	}
-	out := make([]map[string]any, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, map[string]any{
-			"name":   path.Base(e.Key),
-			"is_dir": e.IsDir,
-			"size":   e.Size,
-		})
-		if len(out) >= 200 {
-			break
-		}
-	}
-	return map[string]any{"entries": out}, nil
-}
-
-func (r *toolRuntime) writeFile(ctx context.Context, spaceID, p, content string) (any, error) {
-	if len(content) > maxBundleBytes {
-		return nil, errors.New("写入内容超过 5MB")
-	}
-	key, clean, err := r.spaceFilePath(spaceID, p)
-	if err != nil {
-		return nil, err
-	}
-	if clean == "" {
-		return nil, errors.New("必须给出文件路径")
-	}
-	if err := r.fs.EnsureDir(ctx, path.Dir(key)); err != nil {
-		return nil, err
-	}
-	if _, err := r.fs.Put(ctx, key, strings.NewReader(content), int64(len(content))); err != nil {
-		return nil, fmt.Errorf("写入 %s 失败: %w", clean, err)
-	}
-	return map[string]any{"path": clean, "bytes": len(content)}, nil
+	// 只记名字，不记值：审计日志本身也是会被导出的一份文件。
+	r.logger.Info("插件读取凭证", "plugin", in.Slug, "space", in.SpaceID, "name", name)
+	return map[string]any{"name": name, "value": value}, nil
 }
 
 func writeFrame(proc *sandbox.Proc, v any) error {

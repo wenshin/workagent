@@ -305,6 +305,10 @@ export interface PluginItem {
   baseline_version?: string;
   local_modified: boolean;
   tools?: string[];
+  /** 清单声明的权限（人类可读），安装确认时展示 */
+  permissions?: string[];
+  /** 待升级版本的权限：升级确认时展示，避免权限静默变化 */
+  latest_permissions?: string[];
 }
 
 export interface PluginsResponse {
@@ -343,6 +347,8 @@ export interface PluginCatalogItem {
   author?: string;
   published: boolean;
   published_slug?: string;
+  /** 清单声明的权限（人类可读），安装前给用户看 */
+  permissions?: string[];
 }
 
 export interface PluginCatalogResponse {
@@ -377,11 +383,13 @@ export interface PluginManifest {
   description: string;
   capability?: string;
   input_schema?: Record<string, unknown>;
-  capabilities?: Array<{ method: string; hosts?: string[]; verbs?: string[]; paths?: string[] }>;
+  capabilities?: Array<{ method: string; hosts?: string[]; verbs?: string[]; name?: string }>;
   limits?: { timeout_ms?: number; max_rpc?: number; max_result_bytes?: number };
   extensible?: boolean;
   derived_from?: { plugin_id: string; version: string; sha256: string };
   runtime?: { entry?: string; timeout_ms?: number; max_rpc?: number };
+  /** 文件范围：读默认整个空间，写必须显式声明子目录 */
+  fs?: { read?: string[]; write?: string[]; read_only?: boolean };
   transport?: { type: string; url: string };
   tools?: { allow: string[]; deny?: string[] };
   ui?: { entry: string };

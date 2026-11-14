@@ -629,7 +629,7 @@ func draftScaffold(kind, slug, name, desc string) (map[string]string, error) {
 	case draftKindSkill:
 		manifest["capability"] = "skill.use"
 		manifest["skill"] = map[string]string{"entry": "SKILL.md"}
-		// 正文骨架先落一份：UI 建完就有东西可编辑，Agent 创建时会被 skill_create 覆盖。
+		// 正文骨架先落一份：建完就有东西可编辑，不用从空文件开始。
 		files["SKILL.md"] = "# " + name + "\n\n## 何时使用\n\n- 待补充：用户说什么话、处在什么场景时触发。\n\n## 步骤\n\n1. 待补充。\n"
 
 	case draftKindTool:
@@ -640,11 +640,15 @@ func draftScaffold(kind, slug, name, desc string) (map[string]string, error) {
 			"properties":           map[string]any{},
 			"additionalProperties": false,
 		}
-		files["main.ts"] = `/** 工具入口：input 已被 input_schema 校验，返回值就是模型拿到的结果。 */
+		files["main.ts"] = `/** 工具入口：input 已被 input_schema 校验，返回值就是模型拿到的结果。
+ * 默认每次调用都是新进程；需要跨调用保留连接/缓存时在 plugin.json 写
+ * "runtime": {"entry": "main.ts", "resident": true}，否则不要依赖模块级变量。 */
+// host 与 wa 由平台挂在全局，不需要 import。
 export default async function (input: Record<string, unknown>) {
-  // 需要出网/读文件时，先在 plugin.json 的 capabilities 里声明，再用 host.call：
-  //   import { host } from "./host_sdk.ts";
-  //   const res = await host.call("http.request", { url: "...", method: "GET" });
+  // 出网：先在 plugin.json 的 capabilities 里声明 hosts，再用 wa.fetch（走宿主代理）
+  //   const res = await wa.fetch("https://api.example.com/x");
+  // 读文件：沙箱里已经按 fs 段挂载，直接读
+  //   const text = await Deno.readTextFile(wa.path("data/x.json"));
   return { ok: true, input };
 }
 `

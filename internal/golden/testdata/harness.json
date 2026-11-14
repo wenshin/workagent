@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "一次工具调用后正常作答",
+      "kind": "agent",
+      "query": "读一下 a.md 的前几行",
+      "tools": [
+        {"name": "file_read", "result": "第一行\n第二行\n第三行"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "file_read", "args": {"path": "a.md"}}]},
+        {"content": "读完了，一共 3 行。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["file_read"],
+        "max_rounds": 2,
+        "content_contains": ["3 行"]
+      }
+    },
+    {
+      "name": "相同工具与参数反复调用会被拦截",
+      "kind": "agent",
+      "query": "看看目录里有什么",
+      "tools": [
+        {"name": "file_list", "result": "a.md, b.md"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "file_list", "args": {"path": ""}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": ""}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": ""}}]},
+        {"content": "目录里有 a.md 和 b.md。"}
+      ],
+      "expect": {
+        "stop_reason": "stalled",
+        "blocked_at_least": 1,
+        "tool_sequence": ["file_list", "file_list"],
+        "max_rounds": 4,
+        "content_contains": ["a.md"]
+      }
+    },
+    {
+      "name": "连续两轮空结果判定停滞并强制收尾",
+      "kind": "agent",
+      "query": "把规范里关于发布流程的部分找出来",
+      "tools": [
+        {"name": "resource_search", "result": ""}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "resource_search", "args": {"query": "发布流程"}}]},
+        {"tool_calls": [{"name": "resource_search", "args": {"query": "发布 规范"}}]},
+        {"tool_calls": [{"name": "resource_search", "args": {"query": "上线流程"}}]},
+        {"content": "没有找到与发布流程相关的规范，需要你确认是哪一份文档。"}
+      ],
+      "expect": {
+        "stop_reason": "stalled",
+        "content_contains": ["没有找到"],
+        "max_rounds": 4
+      }
+    },
+    {
+      "name": "工具次数用尽时强制给出结论",
+      "kind": "agent",
+      "query": "并行查三个文件然后再总结",
+      "limits": {"max_tool_calls": 2},
+      "tools": [
+        {"name": "file_read", "result": "内容 A"},
+        {"name": "file_list", "result": "a.md"}
+      ],
+      "script": [
+        {"tool_calls": [
+          {"name": "file_read", "args": {"path": "a.md"}},
+          {"name": "file_list", "args": {"path": ""}}
+        ]},
+        {"tool_calls": [{"name": "file_read", "args": {"path": "b.md"}}]},
+        {"content": "根据已获得的内容总结：只有一份文件。"}
+      ],
+      "expect": {
+        "stop_reason": "budget",
+        "max_tool_calls": 2,
+        "content_contains": ["只有一份文件"]
+      }
+    },
+    {
+      "name": "子 Agent 独立完成后只回填结论",
+      "kind": "agent",
+      "query": "统计空间里的文件，给个总数",
+      "tools": [
+        {"name": "file_list", "result": "a.md, b.md"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "agent_dispatch", "args": {"task": "列出空间根目录的文件并给出总数", "tools": ["file_list"]}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": ""}}]},
+        {"content": "子结论：根目录有 2 个文件。"},
+        {"content": "最终答复：根目录有 2 个文件。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["agent_dispatch"],
+        "max_rounds": 4,
+        "content_contains": ["2 个文件"]
+      }
+    }
+  ]
+}

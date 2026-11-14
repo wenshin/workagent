@@ -31,25 +31,33 @@ type InvokeResult struct {
 	ToolName  string
 }
 
+// Recorder 是 Invoker 需要的最小落库能力：工具调用记录 + 审计。
+// 收窄成两个方法后，黄金用例与单元测试可以注入内存实现，
+// 不必为了跑一次工具循环伪造整个 Store。
+type Recorder interface {
+	RecordToolCall(ctx context.Context, r store.ToolCallRecord) error
+	AppendAuditLog(ctx context.Context, e store.AuditEntry) error
+}
+
 // Invoker 是 ToolInvoker（§5.7.7），把一次工具调用收敛成固定流程：
 //
 //	参数校验 → PDP 授权 → 审批检查 → 执行（超时保护）→ 脱敏 → 截断 → 审计
 type Invoker struct {
 	engine  policy.Engine
-	store   store.Store
+	rec     Recorder
 	log     *slog.Logger
 	timeout time.Duration
 }
 
-// NewInvoker 构造执行器；engine 为空时使用默认 RBAC 策略。
-func NewInvoker(engine policy.Engine, st store.Store, log *slog.Logger) *Invoker {
+// NewInvoker 构造执行器；engine 为空时使用默认 RBAC 策略，rec 为空时只告警不落库。
+func NewInvoker(engine policy.Engine, rec Recorder, log *slog.Logger) *Invoker {
 	if engine == nil {
 		engine = policy.RBACEngine{}
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Invoker{engine: engine, store: st, log: log, timeout: 30 * time.Second}
+	return &Invoker{engine: engine, rec: rec, log: log, timeout: 30 * time.Second}
 }
 
 // Invoke 执行一次工具调用。策略拒绝与需要审批不会中断对话，而是作为结果回喂模型。
@@ -134,7 +142,10 @@ func (i *Invoker) finish(
 	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
 
-	if err := i.store.RecordToolCall(recordCtx, store.ToolCallRecord{
+	if i.rec == nil {
+		return result
+	}
+	if err := i.rec.RecordToolCall(recordCtx, store.ToolCallRecord{
 		SessionID: env.SessionID,
 		RunID:     env.RunID,
 		ToolName:  result.ToolName,
@@ -152,7 +163,7 @@ func (i *Invoker) finish(
 		"latency_ms": result.LatencyMS,
 		"risk":       result.Risk,
 	})
-	if err := i.store.AppendAuditLog(recordCtx, store.AuditEntry{
+	if err := i.rec.AppendAuditLog(recordCtx, store.AuditEntry{
 		Actor:  env.UserID,
 		Action: "tool:invoke",
 		Object: result.ToolName,

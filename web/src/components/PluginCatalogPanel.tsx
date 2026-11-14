@@ -1,5 +1,5 @@
 import { IconRefresh } from '@douyinfe/semi-icons';
-import { Button, Card, Empty, Select, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui';
+import { Button, Card, Empty, Modal, Select, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { useMemo, useState } from 'react';
 
 import {
@@ -57,6 +57,8 @@ export default function PluginCatalogPanel({
   const targets = useMemo(() => spaces.filter((s) => s.perm === 'manage'), [spaces]);
   const [spaceId, setSpaceId] = useState(defaultSpaceId ?? '');
   const [kind, setKind] = useState<'all' | PluginKind>('all');
+  // 安装前先看权限：装完它能读什么、能不能写、能连哪些域名，必须先让用户看见。
+  const [pendingInstall, setPendingInstall] = useState<PluginCatalogItem | null>(null);
   const target = targets.find((s) => s.id === spaceId) ?? targets[0];
 
   const filtered = useMemo(
@@ -77,10 +79,21 @@ export default function PluginCatalogPanel({
     install.mutate(
       { spaceId: target.id, slug: item.slug, version: item.latest_version },
       {
-        onSuccess: () => Toast.success(`已安装到「${target.name}」，仅对该空间生效`),
+        onSuccess: () => {
+          setPendingInstall(null);
+          Toast.success(`已安装到「${target.name}」，仅对该空间生效`);
+        },
         onError: (e) => Toast.error(e instanceof Error ? e.message : '安装失败'),
       },
     );
+  };
+
+  const askInstall = (item: PluginCatalogItem) => {
+    if (!target) {
+      Toast.warning('请先选择一个有管理权限的空间');
+      return;
+    }
+    setPendingInstall(item);
   };
 
   const doPublish = (item: PluginCatalogItem) => {
@@ -219,7 +232,7 @@ export default function PluginCatalogPanel({
                       type="primary"
                       loading={install.isPending}
                       disabled={!target}
-                      onClick={() => doInstall(item)}
+                      onClick={() => askInstall(item)}
                     >
                       安装到「{target?.name ?? '未选择空间'}」
                     </Button>
@@ -239,6 +252,39 @@ export default function PluginCatalogPanel({
           你是系统管理员：待发布条目可以发布；安装仍需要目标空间的管理权限。
         </div>
       ) : null}
+
+      <Modal
+        title={`安装「${pendingInstall?.name || pendingInstall?.slug || ''}」`}
+        visible={Boolean(pendingInstall)}
+        onCancel={() => setPendingInstall(null)}
+        onOk={() => {
+          if (pendingInstall) doInstall(pendingInstall);
+        }}
+        okText={target ? `安装到「${target.name}」` : '安装'}
+        cancelText="取消"
+        okButtonProps={{ loading: install.isPending, disabled: !target }}
+      >
+        <p className="dialog-desc">
+          安装后只对「{target?.name ?? '未选择空间'}」生效，插件拿到的权限不会跨空间。
+        </p>
+        <div className="dialog-desc" style={{ marginTop: 8 }}>
+          插件声明的权限：
+        </div>
+        {pendingInstall?.permissions?.length ? (
+          <ul className="dialog-desc" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {pendingInstall.permissions.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="dialog-desc" style={{ margin: '6px 0 0' }}>
+            没有可列出的权限（纯声明型插件）。
+          </p>
+        )}
+        <p className="dialog-desc" style={{ marginTop: 10 }}>
+          风险等级：{riskLabel(pendingInstall?.risk ?? 0)}。权限由清单声明、平台计算，安装后可在空间插件面板随时停用或卸载。
+        </p>
+      </Modal>
     </div>
   );
 }

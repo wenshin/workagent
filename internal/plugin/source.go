@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 )
 
@@ -21,7 +22,7 @@ type sourceRuntime struct {
 
 // buildSource 构造搜索源适配器。产物缺失或配置非法时返回错误，
 // 由调用方决定是「跳过加载」还是「试跑失败」。
-func (m *Manager) buildSource(ctx context.Context, slug, dir string, meta Manifest) (*sourceRuntime, error) {
+func (m *Manager) buildSource(ctx context.Context, spaceID, slug, dir string, meta Manifest) (*sourceRuntime, error) {
 	if meta.Source == nil {
 		return nil, fmt.Errorf("source 插件缺少 source 段")
 	}
@@ -29,7 +30,7 @@ func (m *Manager) buildSource(ctx context.Context, slug, dir string, meta Manife
 	guard := search.NewSourceGuard(meta.Hosts(), s.AllowPrivate)
 	key := m.sourceKeyFunc(s.Secret)
 
-	provider, err := m.newSourceProvider(ctx, slug, dir, s, key, guard)
+	provider, err := m.newSourceProvider(ctx, spaceID, slug, dir, s, key, guard)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +48,7 @@ func (m *Manager) buildSource(ctx context.Context, slug, dir string, meta Manife
 }
 
 // newSourceProvider 按协议构造适配器：spec 走声明式解释器，script 走两段式脚本。
-func (m *Manager) newSourceProvider(ctx context.Context, slug, dir string, s *SourceSpec, key search.KeyFunc, guard *search.Guard) (search.Provider, error) {
+func (m *Manager) newSourceProvider(ctx context.Context, spaceID, slug, dir string, s *SourceSpec, key search.KeyFunc, guard *search.Guard) (search.Provider, error) {
 	switch s.Protocol {
 	case SourceProtocolSpec:
 		raw, err := ReadFile(ctx, m.o.Storage, dir, s.Entry)
@@ -71,7 +72,13 @@ func (m *Manager) newSourceProvider(ctx context.Context, slug, dir string, s *So
 		if err != nil {
 			return nil, fmt.Errorf("解析插件目录失败: %w", err)
 		}
-		return search.NewDeno(slug, filepath.Join(root, s.Entry), s.Endpoint, key, guard, m.o.Runner)
+		// 脚本源只需要读自己的目录：不把整个空间工作区挂进去，
+		// 它本来也没有 fs.* 能力，多一份可读范围只是多一份风险。
+		d, err := search.NewDeno(slug, filepath.Join(root, s.Entry), s.Endpoint, key, guard, m.o.Runner)
+		if err != nil {
+			return nil, err
+		}
+		return d.WithFS(sandbox.FS{Read: []string{root}}), nil
 	default:
 		return nil, fmt.Errorf("未知的 source.protocol %q", s.Protocol)
 	}
@@ -129,6 +136,8 @@ func (m *Manager) DryRunJSON(ctx context.Context, spaceID, slug, userID string, 
 // 搜索源是「装完即生效」的：启用/停用后如果不能立刻反映到 web_search，
 // 用户会觉得开关没用。重载只影响当前空间，不碰其它空间的实例。
 func (m *Manager) reloadSpace(ctx context.Context, spaceID string) error {
+	// 重载意味着磁盘上的内容可能变了：常驻进程必须一起换掉。
+	m.closeSpaceProcs(spaceID)
 	m.mu.Lock()
 	delete(m.inst, spaceID)
 	for key := range m.mcpCs {

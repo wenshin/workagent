@@ -382,7 +382,7 @@ autoagent/                                 # 存储根
 | --- | --- |
 | 组件模型 | 每个组件 = `plugin.json`（slug、名称、描述、`data_sources` 声明）+ `ui.json`（`wa-ui/1` 声明式 DSL）；引用已安装插件工具取数，DSL 里不出现工具名、URL 与凭据 |
 | 构建 | **无构建**：两份 JSON 直接存 `Storage`（**MVP 本地 FS**），按 `slug@版本` 不可变寻址；DSL 在 dry-run / 发布 / 读取时校验 |
-| **生成方式** | 组件由平台内置 Skill `builtin_ui` 对话式生成（追问 → 生成 `plugin.json` + `ui.json` → dry-run 校验 → 预览 → 发布 → 安装）。**Skill 有版本、可升级**；生成规则变了发新版 Skill，渲染节点变了发新版平台 |
+| **生成方式** | 组件由平台内置 Skill `builtin_plugin_dev`（组件子手册）对话式生成（追问 → 生成 `plugin.json` + `ui.json` → dry-run 校验 → 预览 → 发布 → 安装）。**Skill 有版本、可升级**；生成规则变了发新版 Skill，渲染节点变了发新版平台 |
 | **渲染协议** | 消息内容为**结构化内容块数组**，组件以 `ui` 块表达，**不在正文里写版本号**：<br>`{"type":"text","text":"本月销售情况如下："}`<br>`{"type":"ui","component":"sales-dashboard","version":"1.2.0","props":{"period":"month"},"fallback":"[销售看板]"}` |
 | **版本由后端注入（本期确认项）** | 模型只输出组件 slug；服务端在持久化消息前解析版本并写入 `version` 字段：优先取「会话创建时锁定的组件版本」，无锁定时取当前 published 版本。**禁止模型自行书写版本号**；模型输出中的组件引用块会被服务端覆写为解析结果 |
 | **版本快照落库** | `message.component_refs` 固化 `{component, version, props, resolved_at}`，作为会话历史的一部分永久保留；历史消息永远按当时版本渲染，组件升级或下架都不影响既有消息 |

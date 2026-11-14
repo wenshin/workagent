@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"time"
+
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/tool"
 )
@@ -117,6 +119,19 @@ type RunInput struct {
 	DirPlugin *DirPlugin
 	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后
 	AgentPrompt string
+
+	// Depth 是嵌套深度：0 表示用户发起的一轮，>0 表示由 agent_dispatch 派生的子 Agent。
+	// 实现必须据此限制派发层级，否则子 Agent 可以无限递归。
+	Depth int
+	// RoundLimit 非零时覆盖实现自身的轮次上限，用于把父任务的剩余预算传给子 Agent。
+	RoundLimit int
+	// Deadline 非零时作为本次运行的截止时间（父任务预算继承）；
+	// 实现取它与自身墙钟预算中更早的一个。
+	Deadline time.Time
+	// AllowDispatch 表示本轮允许把 agent_dispatch 暴露给模型。
+	AllowDispatch bool
+	// SubAgentPrompt 是子 Agent 专属的追加提示词（由派发方给出，同样只能追加）。
+	SubAgentPrompt string
 }
 
 // ActiveSkill 是会话选中的技能。
@@ -144,4 +159,7 @@ type Result struct {
 	Provider     string
 	Model        string
 	Usage        llm.Usage
+	// StopReason 是循环的收尾原因：done（正常作答）/ budget（预算用尽，已强制收尾）
+	// / stalled（判定再走一步也不会有新进展）。写入 run.budget 与日志，便于事后归因。
+	StopReason string
 }

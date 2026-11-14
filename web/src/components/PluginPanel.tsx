@@ -54,6 +54,8 @@ export default function PluginPanel({ space }: Props) {
   const [runResult, setRunResult] = useState<PluginDryRunResult | null>(null);
   const [pendingUninstall, setPendingUninstall] = useState<PluginItem | null>(null);
   const [configTarget, setConfigTarget] = useState<PluginItem | null>(null);
+  // 升级同样要确认：新版本可能多出写文件、连新域名这类权限。
+  const [pendingUpgrade, setPendingUpgrade] = useState<PluginItem | null>(null);
 
   const writable = space.perm === 'write' || space.perm === 'manage';
   const canManage = space.perm === 'manage';
@@ -225,15 +227,7 @@ export default function PluginPanel({ space }: Props) {
                       size="small"
                       theme="borderless"
                       loading={install.isPending}
-                      onClick={() =>
-                        install.mutate(
-                          { spaceId: space.id, slug: item.slug, version: item.latest_version },
-                          {
-                            onSuccess: () => Toast.success(`已升级到 v${item.latest_version}`),
-                            onError: (e) => Toast.error(e instanceof Error ? e.message : '升级失败'),
-                          },
-                        )
-                      }
+                      onClick={() => setPendingUpgrade(item)}
                     >
                       升级到 v{item.latest_version}
                     </Button>
@@ -332,6 +326,49 @@ export default function PluginPanel({ space }: Props) {
         name={configTarget?.name}
         onClose={() => setConfigTarget(null)}
       />
+
+      <Modal
+        title={`升级到 v${pendingUpgrade?.latest_version ?? ''}`}
+        visible={Boolean(pendingUpgrade)}
+        onCancel={() => setPendingUpgrade(null)}
+        onOk={() => {
+          if (!pendingUpgrade) return;
+          install.mutate(
+            { spaceId: space.id, slug: pendingUpgrade.slug, version: pendingUpgrade.latest_version },
+            {
+              onSuccess: () => {
+                Toast.success(`已升级到 v${pendingUpgrade.latest_version}`);
+                setPendingUpgrade(null);
+              },
+              onError: (e) => Toast.error(e instanceof Error ? e.message : '升级失败'),
+            },
+          );
+        }}
+        okText="确认升级"
+        cancelText="取消"
+        okButtonProps={{ loading: install.isPending }}
+      >
+        <p className="dialog-desc">
+          升级会替换本空间的只读副本并重启插件进程；正在进行的调用会失败，稍后重试即可。
+        </p>
+        <p className="dialog-desc" style={{ marginTop: 8 }}>
+          新版本声明的权限：
+        </p>
+        {pendingUpgrade?.latest_permissions?.length ? (
+          <ul className="dialog-desc" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {pendingUpgrade.latest_permissions.map((p) => (
+              <li key={p}>{p}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="dialog-desc" style={{ margin: '6px 0 0' }}>
+            没有可列出的权限（纯声明型插件）。
+          </p>
+        )}
+        <p className="dialog-desc" style={{ marginTop: 10 }}>
+          当前版本权限：{pendingUpgrade?.permissions?.join('；') || '无'}
+        </p>
+      </Modal>
 
       <Modal
         title="卸载插件"

@@ -48,10 +48,6 @@ type Env struct {
 	Storage storage.Storage
 	Log     *slog.Logger
 
-	// CreateSkill 由会话层注入「在当前空间创建技能目录」的实现（space.Service.CreateSkill），
-	// 工具包不依赖 space 包，避免循环依赖；为 nil 时 skill_create 不可用。
-	CreateSkill func(ctx context.Context, name, description string) (dir string, err error)
-
 	// Sources 是「当前空间 + 系统空间」合并后的能力源视图，为 nil 时相关工具不可用。
 	Sources SourceLoader
 

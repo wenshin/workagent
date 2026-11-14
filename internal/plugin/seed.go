@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"path"
 
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -27,7 +28,9 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 		ownerID, sysID = sys.ID, sys.ID
 	}
 
+	keep := map[string]bool{}
 	for _, sk := range space.BuiltinSkills() {
+		keep[sk.Slug] = true
 		files := map[string]string{"SKILL.md": sk.Doc}
 		for name, content := range sk.Files {
 			files[name] = content
@@ -48,6 +51,7 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 	}
 
 	for _, ag := range builtinAgents() {
+		keep[ag.Slug] = true
 		meta := Manifest{
 			Protocol:    Protocol,
 			Kind:        KindAgent,
@@ -64,16 +68,19 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 	}
 
 	for _, bm := range tool.BuiltinManifests() {
+		keep[builtinToolSlug(bm.Name)] = true
 		meta := Manifest{
-			Protocol:     Protocol,
-			Kind:         KindTool,
-			Slug:         builtinToolSlug(bm.Name),
-			Name:         builtinToolLabel(bm.Name),
-			Description:  bm.Description,
-			Capability:   builtinToolCapability(bm.Name),
-			Extensible:   boolPtr(false),
-			Builtin:      true,
-			Capabilities: builtinToolRisk(bm.Name),
+			Protocol:    Protocol,
+			Kind:        KindTool,
+			Slug:        builtinToolSlug(bm.Name),
+			Name:        builtinToolLabel(bm.Name),
+			Description: bm.Description,
+			Capability:  builtinToolCapability(bm.Name),
+			Extensible:  boolPtr(false),
+			Builtin:     true,
+			// 内置工具没有清单可推导副作用：风险直接取 Go 侧实现的那份声明。
+			DeriveRisk:    bm.Risk,
+			DeriveEffects: bm.SideEffects,
 		}
 		if err := m.seedBuiltin(ctx, ownerID, sysID, meta, nil); err != nil {
 			return fmt.Errorf("发布内置工具 %s 失败: %w", bm.Name, err)
@@ -84,6 +91,7 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 	// 预置的意义是「新部署装完就有搜索能力」，而不是给平台留一条绕开插件体系的旁路——
 	// 它在市场里可见、可停用、可被用户自己的源按 priority 顶掉。
 	for _, src := range builtinSources() {
+		keep[src.Slug] = true
 		spec := src.Source
 		meta := Manifest{
 			Protocol:    Protocol,
@@ -98,6 +106,51 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 		if err := m.seedBuiltin(ctx, ownerID, sysID, meta, src.Files); err != nil {
 			return fmt.Errorf("发布内置搜索源 %s 失败: %w", src.Slug, err)
 		}
+	}
+
+	// 最后清理已经从代码里下线的内置件（例如 builtin_ui 合并进 builtin_plugin_dev）。
+	// 失败只告警：多留一条市场记录不影响服务启动，下次启动还会再试一次。
+	if err := m.pruneBuiltins(ctx, sysID, keep); err != nil {
+		m.o.Logger.Warn("清理下线的内置件失败", "err", err)
+	}
+	return nil
+}
+
+// pruneBuiltins 删掉再也没有发布源的内置件。
+//
+// seed 只做「发布 + 全局安装」，从不删除：一个内置技能被合并进另一个之后，
+// plugin 记录、安装记录、空间目录、发布产物都还在，市场里会多出一条点不开的
+// 「平台内置」。这里按 origin=system 且不在当前保留集合里来清理——
+// 用户自己发布的插件 origin 不是 system，不会被误删。
+func (m *Manager) pruneBuiltins(ctx context.Context, sysID string, keep map[string]bool) error {
+	list, err := m.o.Store.ListPlugins(ctx)
+	if err != nil {
+		return err
+	}
+	for _, p := range list {
+		if p.Origin != store.PluginOriginSystem || keep[p.Slug] {
+			continue
+		}
+		// 先清它注册的能力与工具绑定，再删 plugin（版本、安装、扫描记录级联删）。
+		if err := m.o.Store.DeletePluginToolRecords(ctx, p.Slug); err != nil {
+			m.o.Logger.Warn("清理下线内置件的能力记录失败", "slug", p.Slug, "err", err)
+			continue
+		}
+		if err := m.o.Store.DeletePlugin(ctx, p.ID); err != nil {
+			m.o.Logger.Warn("删除下线内置件失败", "slug", p.Slug, "err", err)
+			continue
+		}
+		if sysID != "" {
+			dir := path.Join(m.o.Storage.SpaceKey(sysID), "files", DraftDir, p.Slug)
+			if err := m.o.Storage.Delete(ctx, dir); err != nil {
+				m.o.Logger.Warn("删除下线内置件的空间目录失败", "slug", p.Slug, "err", err)
+			}
+		}
+		// 发布产物按 plugin_id 分目录，跟着记录一起清掉。
+		if err := m.o.Storage.Delete(ctx, path.Join(publishedRoot, p.ID)); err != nil {
+			m.o.Logger.Warn("删除下线内置件的发布产物失败", "slug", p.Slug, "err", err)
+		}
+		m.o.Logger.Info("已下线内置件", "slug", p.Slug)
 	}
 	return nil
 }
@@ -198,7 +251,6 @@ var builtinToolLabels = map[string]string{
 	"file_list":       "列目录",
 	"file_read":       "读文件",
 	"file_write":      "写文件",
-	"skill_create":    "创建技能",
 	"web_search":      "联网搜索",
 	"shell_exec":      "执行命令",
 	"secret_request":  "录入凭证",
@@ -218,7 +270,7 @@ func builtinToolLabel(name string) string {
 // builtinToolCapability 是插件层的单一能力标签（决定默认权限口径）。
 func builtinToolCapability(name string) string {
 	switch name {
-	case "file_write", "skill_create", "wiki_write":
+	case "file_write", "wiki_write":
 		return CapFSWrite
 	case "wiki_list", "wiki_read", "wiki_search":
 		// wiki 是跨空间共享区，但读写仍是文件语义：按 fs 能力口径归类，
@@ -230,26 +282,6 @@ func builtinToolCapability(name string) string {
 		return CapSearchQuery
 	}
 	return CapPluginInvok
-}
-
-// builtinToolRisk 用能力声明表达真实副作用，风险由 Derive 推导，不在清单里写死。
-func builtinToolRisk(name string) []Capability {
-	switch name {
-	case "file_write", "skill_create":
-		return []Capability{{Method: MethodFSWr, Paths: []string{"plugins/"}}}
-	case "wiki_write":
-		// 共享区写：毒性由 Derive 推成 L3 + workspace 副作用，
-		// 与运行时 tool.SideEffectsShared 的口径一致（按空间写权限放行）
-		return []Capability{{Method: MethodFSWr, Paths: []string{"wiki/"}}}
-	case "wiki_list", "wiki_read", "wiki_search":
-		// 只读页：Derive 对 fs.read 不抬风险，市场里显示为只读能力
-		return []Capability{{Method: MethodFSRead, Paths: []string{"wiki/"}}}
-	case "shell_exec":
-		return []Capability{{Method: MethodShell}}
-	case "web_search":
-		return []Capability{{Method: MethodSearch}}
-	}
-	return nil
 }
 
 func boolPtr(b bool) *bool { return &b }

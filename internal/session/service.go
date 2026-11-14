@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"path"
@@ -58,6 +57,9 @@ const (
 	ReasonWallClockExceeded = "wall_clock_exceeded"
 	// ReasonBudgetExceeded 实现自己的预算（墙钟 / 工具次数 / 轮次）用尽
 	ReasonBudgetExceeded = "budget_exceeded"
+	// ReasonStalled 循环守卫判定「再做也不会产生新进展」而提前收尾。
+	// 与 budget_exceeded 分开记：前者说明任务还有活没干完，后者说明方法本身没效。
+	ReasonStalled = "stalled"
 )
 
 // RunBudgetExceededMessage 是墙钟上限到点时的用户可见文案。
@@ -68,7 +70,7 @@ func cancelDetail(reason string, runErr error) string {
 	if reason == "" {
 		return ""
 	}
-	if errors.Is(runErr, agent.ErrBudgetExceeded) {
+	if errors.Is(runErr, agent.ErrBudgetExceeded) || errors.Is(runErr, agent.ErrStalled) {
 		return runErr.Error()
 	}
 	return reason
@@ -583,25 +585,15 @@ func (s *Service) Chat(
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
 			Secrets:         s.secrets,
 			CanWriteSecrets: s.canWriteSecrets(ctx, userID),
-			// 技能目录由 space 服务创建（名字校验、.meta.json、冲突处理与 UI 一致），
-			// 这里把「当前用户在当前空间」固化进闭包，工具侧不接受 space_id 参数。
-			CreateSkill: func(ctx context.Context, name, description string) (string, error) {
-				dir, err := s.spaces.CreateSkill(ctx, userID, sess.SpaceID, name, description)
-				if err != nil {
-					if errors.Is(err, space.ErrDirExists) {
-						return "", fmt.Errorf("同名目录已存在：%s；如需修改现有技能，请用 file_write 编辑 %s/SKILL.md", name, name)
-					}
-					return "", err
-				}
-				return dir.Path, nil
-			},
 		},
-		History:     contextMessages,
-		Query:       text,
-		ActiveSkill: activeSkill,
-		Dir:         sess.Dir,
-		DirPlugin:   s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
-		AgentPrompt: agentPrompt,
+		History: contextMessages,
+		Query:   text,
+		// 顶层会话允许派生子 Agent；子 Agent 的深度与预算由实现自己管
+		AllowDispatch: true,
+		ActiveSkill:   activeSkill,
+		Dir:           sess.Dir,
+		DirPlugin:     s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
+		AgentPrompt:   agentPrompt,
 	}, emitEvent)
 
 	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来
@@ -616,6 +608,9 @@ func (s *Service) Chat(
 	switch {
 	case ctx.Err() != nil:
 		reason = ReasonClientDisconnected
+	case errors.Is(runErr, agent.ErrStalled):
+		// 循环守卫判定停滞：已经强制收尾并给出结论，重试同样不会更好
+		reason = ReasonStalled
 	case errors.Is(runErr, agent.ErrBudgetExceeded):
 		// 实现自己声明的预算用尽（builtin 的墙钟与工具次数上限）
 		reason = ReasonBudgetExceeded
@@ -699,6 +694,9 @@ func (s *Service) Chat(
 		"reasoning_chars": utf8.RuneCountInString(res.Reasoning),
 		"tools":           len(res.Steps),
 		"need_approval":   res.NeedApproval,
+		// 循环是怎么收尾的：done / budget / stalled。
+		// 与 reason 分开记——「答案被逼出来但可用」和「运行被打断」是两件事。
+		"stop_reason": res.StopReason,
 	})
 	// cancelled 也写原因，便于事后区分「用户停止」与「服务端到点」
 	finish(cancelDetail(reason, runErr))

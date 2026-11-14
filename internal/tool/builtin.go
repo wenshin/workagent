@@ -30,7 +30,6 @@ func builtinTools() []Tool {
 		wikiRead(),
 		wikiWrite(),
 		wikiSearch(),
-		skillCreate(),
 		resourceSearch(),
 		resourceRead(),
 		webSearch(),
@@ -42,11 +41,14 @@ func builtinTools() []Tool {
 
 // Manifest 是内置工具的声明式定义，写入系统空间的 tools/ 目录，作为全局搜索源。
 type Manifest struct {
-	Name        string          `json:"name"`
-	Capability  string          `json:"capability"`
-	Description string          `json:"description"`
-	Runtime     string          `json:"runtime"`
-	Risk        int             `json:"risk_level"`
+	Name        string `json:"name"`
+	Capability  string `json:"capability"`
+	Description string `json:"description"`
+	Runtime     string `json:"runtime"`
+	Risk        int    `json:"risk_level"`
+	// SideEffects 与 Tool.SideEffects 同义：内置工具的风险要能传到插件体系那边，
+	// 否则市场里会把「写空间文件」的工具显示成只读。
+	SideEffects string          `json:"side_effects"`
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
@@ -61,6 +63,7 @@ func BuiltinManifests() []Manifest {
 			Description: t.Description,
 			Runtime:     t.Runtime,
 			Risk:        t.Risk,
+			SideEffects: t.SideEffects,
 			Parameters:  t.Parameters,
 		})
 	}
