@@ -289,13 +289,34 @@ const pluginDevMCPDoc = `# MCP 插件（kind=mcp）
 }
 ~~~
 
+## 鉴权：static 与 jwt
+
+static 是默认模式：auth.secret 只写凭证名（如 crm_token），值由用户用 secret_request（scope=mcp）自己录，
+**不要向用户索要 Token 明文**，用户贴了就提醒他作废重签，再走 secret_request。
+
+如果 MCP Server 要认识「当前是谁在调用」，改用 jwt 模式，不要写 auth.secret：
+
+~~~json
+"auth": { "in": "header", "name": "Authorization", "mode": "jwt", "app": "crm_mcp" }
+~~~
+
+- app 是应用名（1-64 位字母数字与 _-），留空回落到 slug。平台为每个应用生成一把独立的 HS256 密钥，
+  同一应用在多个空间安装时共用这一把。
+- 每次 tools/call 平台按当前用户现签一个 5 分钟令牌，header 值是 Bearer <jwt>，claims 为：
+  sub / user_id（用户 ID）、email、job_number、iss=workagent、aud=应用名、iat、exp。
+  握手与 tools/list 没有用户上下文，用的是服务令牌（sub=app:<app>、act=platform）。
+- jwt 模式不允许再写 auth.secret：两种来源并存时平台无法判断该信哪个。
+- 密钥怎么给到 Server 侧：发布响应里的 jwt 字段，或 GET /spaces/{id}/plugins/{slug}/jwt-key
+  （空间 manage 权限）。部署者把它配到 MCP Server 的密钥配置里，服务端用同一把密钥验签。
+- 服务端验签口径：HS256，密钥原样作为 HMAC key，校验 iss=workagent、aud=应用名、exp 未过期，
+  然后从 user_id / email / job_number 取用户信息。**密钥是应用级的，不能跨应用复用。**
+- 凭证存储没启用（未配 SECRET_KEK）时签发不了令牌：这类插件会明确不可用，不会退回无鉴权调用。
+
 ## 规则
 - transport.url 只允许 https（本机 http 放行）。
 - tools.allow 必填且非空：默认不信任远端全部工具；支持尾部 * 前缀匹配，deny 优先。
 - MCP 默认按 L3 处理（远端工具可能写数据）；同时用到密钥时按 L4 走系统管理员。
 - 安装后服务地址、鉴权 Header 名、凭证名可按空间覆盖（空间插件面板的「配置」），发布快照不动。
-- auth.secret 只写凭证名（如 crm_token），值用 secret_request（scope=mcp）让用户在会话里自己录；
-  **不要向用户索要 Token 明文**，用户贴了就提醒他作废重签，再走 secret_request。
 - 远端暂不可用不会让空间失去其他工具：连接失败只影响这个 MCP。`
 
 const pluginDevComponentDoc = `# 组件插件（kind=component）

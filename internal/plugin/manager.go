@@ -419,11 +419,14 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 		}
 		res.Output = out
 	case KindMCP:
-		rt, err := newMCPRuntime(ctx, b.Meta, m.o.Secrets, m.o.Logger, m.mcpCachePath(b.Meta.Slug))
+		rt, err := newMCPRuntime(ctx, b.Meta, m.o.Secrets, m.o.Store, m.o.Logger, m.mcpCachePath(b.Meta.Slug))
 		if err != nil {
 			return res, err
 		}
 		res.Detail = fmt.Sprintf("连接成功，可用工具 %d 个：%s", len(rt.tools), strings.Join(rt.names(), ", "))
+		if b.Meta.Auth.JWT() {
+			res.Detail += fmt.Sprintf("；鉴权方式 jwt（应用 %s，调用时按用户现签）", b.Meta.Auth.AppName(b.Meta.Slug))
+		}
 	case KindSkill:
 		body, err := ReadFile(ctx, m.o.Storage, b.Dir, b.Meta.Skill.Entry)
 		if err != nil {
@@ -580,6 +583,14 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 		version = nextVersion(latest)
 	}
 	b.Meta.Version = version
+
+	// jwt 模式的 MCP 插件没有密钥就等于装不上：在写任何数据之前就生成，
+	// 失败则拒绝发布，避免出现「发布成功但调用必然 401」的版本。
+	if b.Meta.Kind == KindMCP && b.Meta.Auth.JWT() {
+		if _, err := ensureAppKey(ctx, m.o.Secrets, b.Meta.Auth.AppName(b.Meta.Slug)); err != nil {
+			return store.PluginVersion{}, err
+		}
+	}
 
 	// 安全扫描在写任何数据之前：被阻断时不产生任何副作用，
 	// 草稿、候选状态、插件记录都保持原样。
@@ -1068,7 +1079,7 @@ func (m *Manager) buildInstance(ctx context.Context, spaceID, pluginID, slug, ve
 			break
 		}
 		if meta.Kind == KindMCP {
-			rt, err := newMCPRuntime(ctx, meta, m.o.Secrets, m.o.Logger, m.mcpCachePath(meta.Slug))
+			rt, err := newMCPRuntime(ctx, meta, m.o.Secrets, m.o.Store, m.o.Logger, m.mcpCachePath(meta.Slug))
 			if err != nil {
 				return nil, err
 			}
@@ -1111,6 +1122,28 @@ func (m *Manager) toolTools(inst *instance) []tool.Tool {
 	}}
 }
 
+// MCPAppKey 返回插件绑定的应用名与该应用的 JWT 签名密钥（明文）。
+//
+// 只对 auth.mode=jwt 的 MCP 插件有效。密钥已存在就复用：应用名是密钥的
+// 唯一标识，重新发布不会让已经配好的 MCP Server 突然验签失败。
+//
+// 这是给部署者配置到 MCP Server 侧的物料，不进模型上下文，也不写审计详情。
+func (m *Manager) MCPAppKey(ctx context.Context, spaceID, slug string) (app, key string, err error) {
+	_, meta, err := m.Detail(ctx, spaceID, slug)
+	if err != nil {
+		return "", "", err
+	}
+	if meta.Kind != KindMCP || !meta.Auth.JWT() {
+		return "", "", fmt.Errorf("%w：该插件没有声明 auth.mode=jwt", ErrConflict)
+	}
+	app = meta.Auth.AppName(meta.Slug)
+	key, err = ensureAppKey(ctx, m.o.Secrets, app)
+	if err != nil {
+		return "", "", err
+	}
+	return app, key, nil
+}
+
 func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 	if inst.MCP == nil {
 		return nil
@@ -1135,7 +1168,7 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 			ServerID:    inst.PluginID,
 			ServerName:  inst.Slug,
 			Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
-				return inst.MCP.call(ctx, remote, args)
+				return inst.MCP.call(ctx, remote, args, env)
 			},
 		})
 	}

@@ -166,7 +166,88 @@ type Auth struct {
 	In     string `json:"in,omitempty"`
 	Name   string `json:"name,omitempty"`
 	Secret string `json:"secret,omitempty"`
-	Mode   string `json:"mode,omitempty"`
+	// Mode 决定凭证来源：static（默认，引用 auth.secret 指向的预置凭证）
+	// 或 jwt（平台按用户身份现签，无需用户录入凭证）。
+	Mode string `json:"mode,omitempty"`
+	// App 是应用名：mode=jwt 时平台以它为粒度生成独立的签名密钥，
+	// 同一个应用在多个空间装同一个插件时共用一把密钥。留空回落到 slug。
+	App string `json:"app,omitempty"`
+}
+
+// MCP 鉴权模式。
+const (
+	// AuthModeStatic 用 auth.secret 引用一条预置凭证（用户在会话里录入）。
+	AuthModeStatic = "static"
+	// AuthModeJWT 由平台签发含用户身份的 JWT，MCP Server 用应用密钥验签。
+	AuthModeJWT = "jwt"
+)
+
+// appNameRe 与凭证名规则一致：应用名会直接作为凭证存储里的键。
+var appNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+
+// JWT 判断该 MCP 是否由平台签发用户令牌。
+func (a *Auth) JWT() bool {
+	return a != nil && strings.EqualFold(strings.TrimSpace(a.Mode), AuthModeJWT)
+}
+
+// AppName 返回应用名：未显式声明 auth.app 时回落到插件 slug。
+func (a *Auth) AppName(slug string) string {
+	if a == nil {
+		return slug
+	}
+	if app := strings.TrimSpace(a.App); app != "" {
+		return app
+	}
+	return slug
+}
+
+// HeaderName 返回携带令牌的 header 名。
+func (a *Auth) HeaderName() string {
+	if a == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(a.Name); name != "" {
+		return name
+	}
+	if a.JWT() {
+		return "Authorization"
+	}
+	return ""
+}
+
+// normalizeAuth 归一化并校验 MCP 鉴权声明。
+//
+// jwt 模式禁止同时写 secret：两种来源并存时无法判断该信哪个，
+// 而且会让「平台签发」被静默降级成「用户录入」。
+func (m *Manifest) normalizeAuth() error {
+	a := m.Auth
+	if a == nil {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(a.Mode))
+	switch mode {
+	case "", AuthModeStatic:
+		a.Mode = AuthModeStatic
+	case AuthModeJWT:
+		a.Mode = AuthModeJWT
+		if strings.TrimSpace(a.Secret) != "" {
+			return fmt.Errorf("auth.mode=jwt 不能同时声明 auth.secret：前者由平台签发，后者是用户录入的预置凭证")
+		}
+		app := strings.TrimSpace(a.App)
+		if app == "" {
+			app = m.Slug
+		}
+		if !appNameRe.MatchString(app) {
+			return fmt.Errorf("auth.app 必须是 1-64 位字母数字与 _-，收到 %q", app)
+		}
+		a.App = app
+		if strings.TrimSpace(a.Name) == "" {
+			a.Name = "Authorization"
+		}
+	default:
+		return fmt.Errorf("auth.mode 只能是 static / jwt，收到 %q", a.Mode)
+	}
+	return nil
 }
 
 // AllowedTools 是 mcp 的工具白名单。空清单视为非法：等价于开放全部。
@@ -451,7 +532,9 @@ func (m Manifest) Permissions() []string {
 			}
 			out = append(out, line)
 		}
-		if m.Auth != nil && m.Auth.Secret != "" {
+		if m.Auth.JWT() {
+			out = append(out, "以调用者身份签发 JWT：应用 "+m.Auth.AppName(m.Slug))
+		} else if m.Auth != nil && m.Auth.Secret != "" {
 			out = append(out, "使用凭证："+m.Auth.Secret+"（明文不进插件）")
 		}
 	case KindSource:
@@ -785,6 +868,9 @@ func (m *Manifest) Validate(publishing bool) error {
 		}
 		if m.Tools == nil || len(m.Tools.Allow) == 0 {
 			return fmt.Errorf("tools.allow 必填且非空：默认不信任 MCP Server 的全部工具")
+		}
+		if err := m.normalizeAuth(); err != nil {
+			return err
 		}
 	case KindComponent:
 		if m.UI == nil {

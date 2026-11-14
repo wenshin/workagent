@@ -3,7 +3,7 @@ GO ?= go
 NPM ?= npm
 NPM_REGISTRY ?= https://registry.npmmirror.com
 
-.PHONY: help tidy pg-up pg-down run build web fmt vet test
+.PHONY: help tidy pg-up pg-down run build web fmt vet test mock-dc
 
 help:
 	@echo "tidy      拉齐依赖并生成 go.sum（首次必须执行）"
@@ -13,6 +13,7 @@ help:
 	@echo "web       构建前端到 web/dist（上传 CDN）"
 	@echo "build     编译 API 到 bin/server"
 	@echo "test      运行单元测试"
+	@echo "mock-dc   启动 mock 大数据平台（127.0.0.1:8322，联调数仓类智能体）"
 
 tidy:
 	$(GO) mod tidy
@@ -41,3 +42,6 @@ vet:
 
 test:
 	$(GO) test ./...
+
+mock-dc:
+	$(GO) run ./cmd/mock-datacenter

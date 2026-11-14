@@ -80,6 +80,18 @@ func (c *Client) ListTools(ctx context.Context) ([]ToolDef, error) {
 
 // CallTool 调用远端工具，返回拼接后的文本结果。
 func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	return c.callTool(ctx, name, authOverride{}, args)
+}
+
+// CallToolWithAuth 用本次调用专属的鉴权头覆盖构造时的静态凭证。
+//
+// MCP 插件的 auth.mode=jwt 走这里：每次调用都按当前用户现签一个短寿命
+// 令牌，连接本身仍复用（session 已经握过手），只有这一个请求换成用户身份。
+func (c *Client) CallToolWithAuth(ctx context.Context, name, header, value string, args json.RawMessage) (string, error) {
+	return c.callTool(ctx, name, authOverride{header: header, value: value}, args)
+}
+
+func (c *Client) callTool(ctx context.Context, name string, auth authOverride, args json.RawMessage) (string, error) {
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
@@ -88,7 +100,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage
 		return "", fmt.Errorf("工具参数不是合法 JSON 对象: %w", err)
 	}
 
-	raw, err := c.do(ctx, "tools/call", map[string]any{"name": name, "arguments": arguments})
+	raw, err := c.doWith(ctx, "tools/call", map[string]any{"name": name, "arguments": arguments}, auth)
 	if err != nil {
 		return "", err
 	}
@@ -121,6 +133,10 @@ func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage
 }
 
 func (c *Client) do(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	return c.doWith(ctx, method, params, authOverride{})
+}
+
+func (c *Client) doWith(ctx context.Context, method string, params any, auth authOverride) (json.RawMessage, error) {
 	id := int(c.nextID.Add(1))
 	payload := map[string]any{
 		"jsonrpc": "2.0",
@@ -128,7 +144,7 @@ func (c *Client) do(ctx context.Context, method string, params any) (json.RawMes
 		"method":  method,
 		"params":  params,
 	}
-	resp, err := c.post(ctx, payload)
+	resp, err := c.postWith(ctx, payload, auth)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +202,16 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 }
 
 func (c *Client) post(ctx context.Context, payload any) (*http.Response, error) {
+	return c.postWith(ctx, payload, authOverride{})
+}
+
+// authOverride 是单次请求的鉴权覆盖；两个字段都为空时沿用构造时的静态凭证。
+type authOverride struct {
+	header string
+	value  string
+}
+
+func (c *Client) postWith(ctx context.Context, payload any, auth authOverride) (*http.Response, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -198,6 +224,10 @@ func (c *Client) post(ctx context.Context, payload any) (*http.Response, error) 
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if c.authHeader != "" && c.secret != "" {
 		req.Header.Set(c.authHeader, c.secret)
+	}
+	// 覆盖必须放在静态凭证之后：同一 header 名以本次调用的身份为准。
+	if auth.header != "" && auth.value != "" {
+		req.Header.Set(auth.header, auth.value)
 	}
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)

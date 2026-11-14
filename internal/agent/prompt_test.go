@@ -59,9 +59,9 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 		Doc:  doc,
 	}})
 
-	// 预算只约束技能正文本身；固定基础规则大约占 800 tokens，
-	// 因此这里给的是「正文预算 + 基础规则」的余量，改基础规则时不用同步调数字。
-	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+900 {
+	// 预算只约束技能正文本身；固定基础规则大约占 1000 tokens（含检索与编程任务判断规则），
+	// 因此这里给的是「正文预算 + 基础规则」的余量，微调措辞时不用同步调数字。
+	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1100 {
 		t.Fatalf("技能正文超预算：%d tokens", got)
 	}
 	for _, want := range []string{"本轮选中的技能：长技能", "已截断", "resource_read"} {

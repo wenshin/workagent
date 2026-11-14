@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -52,6 +53,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/uninstall", h.uninstall)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/enable", h.enable)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/disable", h.disable)
+	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/jwt-key", h.jwtKey)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/baseline", h.baseline)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/reset", h.resetBaseline)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/dismiss", h.dismissUpdate)
@@ -135,8 +137,34 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	out := map[string]any{"version": v.Version, "sha256": v.SHA256, "risk": v.Risk}
+	// jwt 模式的 MCP 插件：发布直接回显应用名与密钥，省掉一次往返。
+	// 非 jwt 插件会返回 ErrConflict（这条路径是常态，不记日志）。
+	if app, key, err := h.mgr.MCPAppKey(r.Context(), r.PathValue("id"), r.PathValue("slug")); err == nil {
+		out["jwt"] = map[string]any{"app": app, "key": key, "scope": mcp.MCPJWTScope}
+	} else if !errors.Is(err, ErrConflict) {
+		h.log.Warn("导出 MCP 应用密钥失败", "slug", r.PathValue("slug"), "err", err)
+	}
+	platform.WriteJSON(w, http.StatusOK, out)
+}
+
+// jwtKey 返回 MCP 应用的签名密钥，供部署者配置到 MCP Server 侧验签。
+//
+// 这是少数会吐出明文密钥的接口：权限按管理的「空间 manage」收口，
+// 返回体不进模型上下文，也不写进审计详情。
+func (h *Handler) jwtKey(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.guard(w, r, "manage"); !ok {
+		return
+	}
+	app, key, err := h.mgr.MCPAppKey(r.Context(), r.PathValue("id"), r.PathValue("slug"))
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{
-		"version": v.Version, "sha256": v.SHA256, "risk": v.Risk,
+		"app": app, "key": key, "scope": mcp.MCPJWTScope, "algorithm": "HS256",
+		"header": "Authorization", "ttl_seconds": int(mcp.UserTokenTTL.Seconds()),
+		"claims": []string{"sub", "user_id", "email", "job_number", "iss", "aud", "iat", "exp"},
 	})
 }
 

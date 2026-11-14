@@ -69,6 +69,7 @@
 make pg-up   # 起 Postgres（docker）
 make run     # 后端 :8321，启动时自动执行迁移
 make web     # 前端 :5173
+make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务，联调数仓类智能体）
 ```
 
 # 系统空间（system）
@@ -111,7 +112,7 @@ make web     # 前端 :5173
 - **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。
 - 配置项：`PLUGIN_DEFAULT_INSTALL`（逗号分隔 slug，新空间首次初始化时安装一次）；没有「是否允许安装」开关，安装权固定为空间 `manage`（L4 另需系统管理员）。
 - 接口：`GET /spaces/{id}/plugins`、`GET|POST .../{slug}/{dry-run,publish,install,uninstall,enable,disable,baseline,baseline/reset,baseline/dismiss,data,ui}`、`GET /plugins`（市场目录，含待发布元数据与 `is_admin`）、`GET|PUT /spaces/{id}/plugins/{slug}/config`（安装级配置）。`publish` 现在只允许系统管理员；组件产物不再对外暴露静态路由。
-- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能只有 `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）。
+- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能：`builtin_space` / `builtin_files` / `builtin_sessions` / `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）/ `builtin_coding`（编程实践：实现/调试/重构/审查四本子手册，正文以 `internal/space/coding_docs/` 下的 markdown 文件 embed 维护）。
 
 # 能力索引与会话技能
 

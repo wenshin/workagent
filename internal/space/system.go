@@ -200,6 +200,7 @@ var builtinSkills = []BuiltinSkill{
 		),
 	},
 	pluginDevSkill(),
+	codingSkill(),
 }
 
 func joinDoc(lines ...string) string {
