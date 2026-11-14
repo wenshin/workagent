@@ -32,12 +32,17 @@ func scanSession(row pgx.Row) (store.Session, error) {
 
 // CreateSession 在指定空间（或空间内某个目录）下创建聊天会话。
 func (d *DB) CreateSession(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string) (store.Session, error) {
+	return d.CreateSessionTitled(ctx, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt, true)
+}
+
+// CreateSessionTitled 与 CreateSession 相同，但可以关掉「首条消息改写标题」。
+func (d *DB) CreateSessionTitled(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string, titleAuto bool) (store.Session, error) {
 	const q = `
-insert into session (space_id, dir, title, created_by, agent_id, agent_version, agent_prompt)
-values ($1::uuid, nullif($2, ''), $3, $4::uuid, nullif($5, ''), $6, $7)
+insert into session (space_id, dir, title, title_auto, created_by, agent_id, agent_version, agent_prompt)
+values ($1::uuid, nullif($2, ''), $3, $4, $5::uuid, nullif($6, ''), $7, $8)
 returning ` + sessionColumns
 
-	return scanSession(d.pool.QueryRow(ctx, q, spaceID, dir, title, userID, agentID, agentVersion, agentPrompt))
+	return scanSession(d.pool.QueryRow(ctx, q, spaceID, dir, title, titleAuto, userID, agentID, agentVersion, agentPrompt))
 }
 
 // UpdateSessionAgent 重新绑定智能体，并把当时的提示词一起固化。

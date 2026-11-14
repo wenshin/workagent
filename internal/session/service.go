@@ -625,8 +625,9 @@ func (s *Service) chat(
 		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
 	}
 
-	// 首条消息决定会话名：标题只取用户写的话，引用清单不进标题
-	if sess.TitleAuto {
+	// 首条消息决定会话名：标题只取用户写的话，引用清单不进标题。
+	// 系统触发的轮次（回执回填等）不能改名：那不是用户说的话。
+	if sess.TitleAuto && !opt.skipUser {
 		if title := summarize(referenceFree(text)); title != "" {
 			if err := s.store.RenameSession(ctx, sessionID, title, false); err != nil {
 				s.log.Warn("会话标题自动生成失败", "session_id", sessionID, "err", err)

@@ -121,8 +121,9 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 	brief := strings.TrimSpace(in.Brief)
 	// dir 传空：父会话的目录是相对父空间 files/ 的路径，跨到个人空间后没有意义。
 	// 智能体不继承：用平台默认的通用助理，提示词与版本都留空，由运行时按 B 的空间解析。
-	child, err := s.store.CreateSession(ctx, personalSpaceID, assignee.ID,
-		truncate(title, 60), "", baseAgentID, "", "")
+	// titleAuto=false：会话名就是任务内容，不能被对方回的第一句「好的」改掉。
+	child, err := s.store.CreateSessionTitled(ctx, personalSpaceID, assignee.ID,
+		truncate(title, 60), "", baseAgentID, "", "", false)
 	if err != nil {
 		return tool.TaskInfo{}, err
 	}

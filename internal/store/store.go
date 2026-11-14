@@ -312,7 +312,11 @@ type Store interface {
 	DeleteSpaceTree(ctx context.Context, id string) ([]Space, error)
 
 	// CreateSession 创建会话；agent 参数是创建时固化的智能体绑定（id / 版本 / 追加提示词）。
+	// 标题按「自动」处理：用户发第一条消息时会被改写。
 	CreateSession(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string) (Session, error)
+	// CreateSessionTitled 创建会话并指定标题是否自动改写。
+	// 派发出来的任务会话传 false：标题是任务内容，不能被对方的第一句「好的」覆盖。
+	CreateSessionTitled(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string, titleAuto bool) (Session, error)
 	ListSessions(ctx context.Context, spaceID string) ([]Session, error)
 	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
 	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
