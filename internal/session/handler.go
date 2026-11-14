@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/agent"
@@ -47,6 +48,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{id}/chat", h.chat)
 	// 绑定/清除会话技能：空的 path 表示清除
 	mux.HandleFunc("PUT /sessions/{id}/skill", h.setSkill)
+	// run 级端点：刷新后据此判断状态、续上与停止。断开连接不再等于停止（§15.12.1）。
+	mux.HandleFunc("GET /runs/{id}", h.runState)
+	mux.HandleFunc("GET /runs/{id}/stream", h.runStream)
+	mux.HandleFunc("POST /runs/{id}/cancel", h.cancelRun)
 }
 
 type sessionDTO struct {
@@ -343,23 +348,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stream.Close()
 
-	emit := func(ev agent.Event) error {
-		switch ev.Type {
-		case agent.EventRunStarted:
-			return stream.Send(ev.Type, map[string]string{"run_id": ev.RunID})
-		case agent.EventMessageDelta:
-			// 思考过程与正文共用 message.delta，用字段区分，保持会话顺序不乱
-			if ev.Reasoning {
-				return stream.Send(ev.Type, map[string]string{"role": ev.Role, "reasoning": ev.Delta})
-			}
-			return stream.Send(ev.Type, map[string]string{"role": ev.Role, "content": ev.Delta})
-		case agent.EventToolCall, agent.EventToolResult:
-			return stream.Send(ev.Type, ev.Tool.Payload())
-		case agent.EventApprovalReq:
-			return stream.Send(ev.Type, ev.Approval)
-		default:
-			return nil
-		}
+	emit := func(ev agent.Event, offset int) error {
+		return sendRunEvent(stream, ev, offset)
 	}
 
 	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, content, emit)
@@ -402,6 +392,147 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		finished["reason"] = out.Reason
 	}
 	_ = stream.Send(agent.EventRunFinished, finished)
+}
+
+// sendRunEvent 把一条 run 事件写成 SSE。
+//
+// chat 与 /runs/{id}/stream 共用同一份实现：前端重连后收到的载荷形状与首次
+// 一致，不需要区分数据来自哪条链路。offset 是这条事件之后的累计字符数，
+// 客户端把它带回 after_offset 即可精确续传。
+func sendRunEvent(stream *platform.Stream, ev agent.Event, offset int) error {
+	switch ev.Type {
+	case agent.EventRunStarted:
+		return stream.Send(ev.Type, map[string]any{"run_id": ev.RunID, "offset": offset})
+	case agent.EventMessageDelta:
+		// 思考过程与正文共用 message.delta，用字段区分，保持会话顺序不乱
+		payload := map[string]any{"role": ev.Role, "offset": offset}
+		if ev.Reasoning {
+			payload["reasoning"] = ev.Delta
+		} else {
+			payload["content"] = ev.Delta
+		}
+		return stream.Send(ev.Type, payload)
+	case agent.EventToolCall, agent.EventToolResult:
+		payload := ev.Tool.Payload()
+		payload["offset"] = offset
+		return stream.Send(ev.Type, payload)
+	case agent.EventApprovalReq:
+		return stream.Send(ev.Type, ev.Approval)
+	default:
+		return nil
+	}
+}
+
+type runDTO struct {
+	ID        string          `json:"id"`
+	SessionID string          `json:"session_id"`
+	Status    string          `json:"status"`
+	Provider  string          `json:"provider,omitempty"`
+	Model     string          `json:"model,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Usage     json.RawMessage `json:"usage"`
+	StartedAt string          `json:"started_at"`
+	EndedAt   *string         `json:"ended_at"`
+}
+
+func toRunDTO(r store.Run) runDTO {
+	usage := json.RawMessage(r.Usage)
+	if len(usage) == 0 {
+		usage = json.RawMessage("{}")
+	}
+	dto := runDTO{
+		ID: r.ID, SessionID: r.SessionID, Status: r.Status,
+		Provider: r.Provider, Model: r.Model, Error: r.Error,
+		Usage:     usage,
+		StartedAt: r.StartedAt.In(time.Local).Format(timeLayout),
+	}
+	if r.EndedAt != nil {
+		v := r.EndedAt.In(time.Local).Format(timeLayout)
+		dto.EndedAt = &v
+	}
+	return dto
+}
+
+// runState 返回一次执行的状态：刷新后先问「还在不在跑」，再决定是否续流。
+func (h *Handler) runState(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	run, err := h.svc.RunState(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, toRunDTO(run))
+}
+
+// cancelRun 是唯一能停掉一轮执行的入口。
+func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	runID := r.PathValue("id")
+	if err := h.svc.CancelRun(r.Context(), user.ID, runID); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]string{"run_id": runID, "status": store.RunCancelled})
+}
+
+// runStream 续传一次执行的事件流：先补发缓冲，再跟着直播走。
+//
+// 客户端断开只结束这一次订阅，run 继续跑（§15.12.1）；再次连上来时
+// 用最后一帧的 offset 作为 after_offset，就能从断开处接着往下看。
+func (h *Handler) runStream(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	runID := r.PathValue("id")
+	after, _ := strconv.Atoi(r.URL.Query().Get("after_offset"))
+	if after < 0 {
+		after = 0
+	}
+
+	feed, err := h.svc.SubscribeRun(r.Context(), user.ID, runID, after)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	defer feed.Close()
+
+	stream := platform.NewStream(w)
+	if err := stream.Start(); err != nil {
+		h.log.Warn("SSE 初始化失败",
+			"run_id", runID, "request_id", platform.RequestIDFrom(r.Context()), "err", err)
+		return
+	}
+	defer stream.Close()
+
+	for _, f := range feed.Backlog {
+		if err := sendRunEvent(stream, f.Event, f.Offset); err != nil {
+			return
+		}
+	}
+	if feed.Frames == nil {
+		// run 已经不在本进程：让客户端去取状态与消息，而不是干等一条不会再来的流
+		_ = stream.Send(agent.EventRunFinished, map[string]any{"run_id": runID, "detached": true})
+		return
+	}
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-feed.Done:
+			return
+		case f := <-feed.Frames:
+			if err := sendRunEvent(stream, f.Event, f.Offset); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // userFacingCancelError 说明一次中断的原因，避免前端把它当成「失败，请重试」。
@@ -458,6 +589,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", "没有该空间的权限")
 	case errors.Is(err, ErrLastSession):
 		platform.WriteError(w, r, http.StatusConflict, "last_session", err.Error())
+	case errors.Is(err, ErrRunFinished):
+		platform.WriteError(w, r, http.StatusConflict, "run_finished", err.Error())
 	case errors.Is(err, ErrAgentUnavailable):
 		platform.WriteError(w, r, http.StatusServiceUnavailable, "agent_unavailable", err.Error())
 	case errors.Is(err, space.ErrDirNotFound):

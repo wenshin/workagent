@@ -33,6 +33,7 @@ var (
 	ErrMessageTooLong   = errors.New("单条消息不能超过 8000 字")
 	ErrLastSession      = errors.New("每个空间至少要保留一个会话")
 	ErrAgentUnavailable = errors.New("模型服务未配置，请联系管理员配置 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL")
+	ErrRunFinished      = errors.New("任务已经结束，无法继续操作")
 )
 
 const (
@@ -59,8 +60,13 @@ const (
 
 // 中断原因（§7.3 run.finished.reason）：一次被掐断的流要能区分「用户停止」与「服务端到点」。
 const (
-	// ReasonClientDisconnected 客户端断开或服务端关闭，事件已经写不出去
+	// ReasonClientDisconnected 客户端断开或服务端关闭，事件已经写不出去。
+	//
+	// Deprecated: run 已不再随请求上下文结束，断开只解绑流（§15.12.1）。
+	// 保留常量是为了让历史数据与旧前端仍能渲染。
 	ReasonClientDisconnected = "client_disconnected"
+	// ReasonUserCancelled 用户显式取消（POST /runs/{id}/cancel）或关掉任务
+	ReasonUserCancelled = "user_cancelled"
 	// ReasonWallClockExceeded 本服务的墙钟上限到点，连接仍可用，会补发 run.finished
 	ReasonWallClockExceeded = "wall_clock_exceeded"
 	// ReasonBudgetExceeded 实现自己的预算（墙钟 / 工具次数 / 轮次）用尽
@@ -106,7 +112,10 @@ type Service struct {
 	secrets secret.Store
 	// platform 是平台部署事实（租户 / IM 接入），每轮注入系统提示词
 	platform agent.PlatformFacts
-	log      *slog.Logger
+	// runs 是进程内正在执行的 run：既提供显式取消，也提供断流续传的缓冲。
+	// 它不持久化——run 的权威状态在库里，这里只是「还活着」的那一份视图。
+	runs *liveRuns
+	log  *slog.Logger
 }
 
 // NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
@@ -118,7 +127,7 @@ func NewService(st store.Store, spaces *space.Service, resources *resource.Servi
 	return &Service{
 		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
-		runBudget: wallClock + runBudgetBackstopMargin, log: log,
+		runBudget: wallClock + runBudgetBackstopMargin, runs: newLiveRuns(), log: log,
 	}
 }
 
@@ -179,7 +188,18 @@ func (s *Service) List(ctx context.Context, userID, spaceID string) ([]store.Ses
 	if _, err := s.spaces.Get(ctx, userID, spaceID); err != nil {
 		return nil, err
 	}
-	return s.store.ListSessions(ctx, spaceID)
+	all, err := s.store.ListSessions(ctx, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	// 列表也必须过滤：只藏详情、不藏列表等于没藏（§15.12.3）
+	out := make([]store.Session, 0, len(all))
+	for _, sess := range all {
+		if sess.CreatedBy == "" || sess.CreatedBy == userID {
+			out = append(out, sess)
+		}
+	}
+	return out, nil
 }
 
 // ListMine 返回当前用户可见的全部会话（左侧树一次取数）。
@@ -533,7 +553,7 @@ type ChatOutcome struct {
 func (s *Service) Chat(
 	ctx context.Context,
 	userID, sessionID, content string,
-	emit func(agent.Event) error,
+	emit func(agent.Event, int) error,
 ) (ChatOutcome, error) {
 	out := ChatOutcome{}
 
@@ -623,9 +643,22 @@ func (s *Service) Chat(
 		}
 	}
 
-	// run.started 由会话层补发：此时 run 已落库，前端可以据此做断线重连与取消
-	_ = emit(agent.Event{Type: agent.EventRunStarted, RunID: run.ID})
+	// runCtx 剥离了请求的取消信号：客户端刷新、切页、断网都只解绑流，
+	// 任务照旧跑完（§15.12.1）。只有显式取消或墙钟能停它。
+	//
+	// 前置准备（读历史、落用户消息、建 run）仍然跟着请求走——客户端已经
+	// 断开时没必要再为一个没人收的结果起任务，那才是真的浪费。
+	runCtx, cancelRun := context.WithTimeout(context.WithoutCancel(ctx), s.runBudget)
+	defer cancelRun()
+	live := s.runs.add(run.ID, userID, cancelRun)
+	defer func() {
+		live.finish()
+		s.runs.remove(run.ID, live)
+	}()
 
+	// 事件先落内存缓冲再推客户端：客户端断了写入会失败，但缓冲还在，
+	// 重连后按 offset 补齐（§15.12.2）。因此这里的错误一律吞掉——
+	// 让「写不出去」去中断 Agent，正是刷新丢任务的老问题。
 	emitEvent := func(ev agent.Event) error {
 		switch ev.Type {
 		case agent.EventToolCall, agent.EventToolResult:
@@ -633,8 +666,15 @@ func (s *Service) Chat(
 		case agent.EventApprovalReq:
 			appendStep(ev.Type, ev.Approval)
 		}
-		return emit(ev)
+		offset := live.broadcast(ev)
+		if emit != nil {
+			_ = emit(ev, offset)
+		}
+		return nil
 	}
+
+	// run.started 由会话层补发：此时 run 已落库，前端可以据此做断线重连与取消
+	emitEvent(agent.Event{Type: agent.EventRunStarted, RunID: run.ID})
 
 	// 技能：不再常驻索引，只有会话绑定的技能正文直接注入
 	var activeSkill *agent.ActiveSkill
@@ -657,11 +697,6 @@ func (s *Service) Chat(
 			s.log.Warn("智能体设定加载失败", "session_id", sessionID, "agent_id", sess.AgentID, "err", err)
 		}
 	}
-
-	// 流的生命周期上限由应用自己定，不依赖任何中间件超时；
-	// 实现内部还有自己的墙钟预算（builtin 会自己计时），这里多留余量做兜底
-	runCtx, cancel := context.WithTimeout(ctx, s.runBudget)
-	defer cancel()
 
 	// 整轮墙钟：从进入实现到回答落库，含所有工具轮次与思考时间。
 	// 用应用侧时钟而不是 run.started_at，避免与应用、数据库的时钟差导致耗时失真。
@@ -709,18 +744,16 @@ func (s *Service) Chat(
 		Platform: s.platformFacts(user, sp),
 	}, emitEvent)
 
-	// 客户端主动停止或连接断开时，仍要把已生成的部分保存下来
-	saveCtx := ctx
-	if ctx.Err() != nil {
-		saveCtx = context.WithoutCancel(ctx)
-	}
+	// 落库不跟着请求走：run 已经跑完，客户端在不在都要把结果写进去
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancelSave()
 
-	// 中断原因：请求 ctx 结束 = 客户端断开或服务端关闭；runCtx 结束 = 本服务的墙钟上限到点。
-	// 少了这一步，被自己掐断的 run 会被记成 succeeded，事后完全看不出是截断的。
-	reason := ""
+	// 中断原因：只有「用户显式取消」与「本服务的墙钟到点」两种。
+	// 少了这一步，被掐断的 run 会被记成 succeeded，事后完全看不出是截断的。
+	reason := live.cancelledReason()
 	switch {
-	case ctx.Err() != nil:
-		reason = ReasonClientDisconnected
+	case reason != "":
+		// 已经在 live 上记过，不再覆盖
 	case errors.Is(runErr, agent.ErrStalled):
 		// 循环守卫判定停滞：已经强制收尾并给出结论，重试同样不会更好
 		reason = ReasonStalled
@@ -846,6 +879,69 @@ func (s *Service) Chat(
 	return out, runErr
 }
 
+// RunState 返回一次执行的状态。刷新页面后前端靠它判断「还在不在跑」，
+// 再决定是续流、还是直接取最终消息。
+func (s *Service) RunState(ctx context.Context, userID, runID string) (store.Run, error) {
+	return s.loadRun(ctx, userID, runID)
+}
+
+// CancelRun 是唯一能停掉一轮执行的入口。
+//
+// 客户端断开不再等于停止（§15.12.1），所以必须有一个显式动作，
+// 否则用户没有任何办法中止一个跑偏的任务。
+func (s *Service) CancelRun(ctx context.Context, userID, runID string) error {
+	run, err := s.loadRun(ctx, userID, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status != store.RunRunning && run.Status != store.RunWaitingApproval {
+		return ErrRunFinished
+	}
+	live := s.runs.get(runID)
+	if live == nil || !live.markCancelled(ReasonUserCancelled) {
+		// 不在本进程（换了副本）或已经收尾：库里的状态才是权威
+		return ErrRunFinished
+	}
+	s.log.Info("任务被用户取消", "run_id", runID, "by", userID)
+	return nil
+}
+
+// SubscribeRun 订阅一次执行的事件流，afterOffset 是客户端已收到的最大偏移。
+// Live 为 false 表示 run 已不在本进程，调用方应改走「拉 run_step + 最终消息」。
+func (s *Service) SubscribeRun(ctx context.Context, userID, runID string, afterOffset int) (*runFeed, error) {
+	if _, err := s.loadRun(ctx, userID, runID); err != nil {
+		return nil, err
+	}
+	live := s.runs.get(runID)
+	if live == nil {
+		return &runFeed{Done: closedCh, Live: false}, nil
+	}
+	return live.subscribe(afterOffset), nil
+}
+
+// loadRun 读 run 并校验归属：run 的可见性跟随会话，只对会话创建者开放。
+func (s *Service) loadRun(ctx context.Context, userID, runID string) (store.Run, error) {
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	sess, err := s.store.GetSession(ctx, run.SessionID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if sess.CreatedBy != userID {
+		return store.Run{}, ErrForbidden
+	}
+	// 会话还在，但人可能已经被移出空间：两道校验都要过
+	if _, err := s.spaces.Get(ctx, userID, sess.SpaceID); err != nil {
+		if errors.Is(err, space.ErrForbidden) {
+			return store.Run{}, ErrForbidden
+		}
+		return store.Run{}, err
+	}
+	return run, nil
+}
+
 // Messages 返回会话消息。
 func (s *Service) Messages(ctx context.Context, userID, sessionID string) ([]store.Message, error) {
 	if _, _, err := s.load(ctx, userID, sessionID); err != nil {
@@ -904,6 +1000,13 @@ func (s *Service) load(ctx context.Context, userID, sessionID string) (store.Ses
 	sess, err := s.store.GetSession(ctx, sessionID)
 	if err != nil {
 		return store.Session{}, store.Space{}, err
+	}
+
+	// 会话只对创建者可见（§15.12.3）：同空间的其他成员也看不到。
+	// 跨用户的内容流动只允许走「显式派发」——代建的子会话归属被咨询人，
+	// 所以两边各自看到的都是自己的会话，不需要会话级 ACL。
+	if sess.CreatedBy != "" && sess.CreatedBy != userID {
+		return store.Session{}, store.Space{}, ErrForbidden
 	}
 
 	sp, err := s.spaces.Get(ctx, userID, sess.SpaceID)

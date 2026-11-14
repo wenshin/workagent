@@ -112,7 +112,9 @@ func TestDeriveRiskFromCapabilities(t *testing.T) {
 	}
 }
 
-func TestMCPIsAlwaysWriteRisk(t *testing.T) {
+// MCP 调的是外部系统，对平台内数据没有读写权限；平台不替远端判断副作用。
+// 因此它按「只读有成本」参与策略：有绑定即放行，不该默认挂审批。
+func TestMCPIsExternalNotWrite(t *testing.T) {
 	raw := `{
   "protocol": "wa-plugin/1",
   "kind": "mcp",
@@ -127,8 +129,15 @@ func TestMCPIsAlwaysWriteRisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	if risk, _ := Derive(m); risk < policy.RiskWrite {
-		t.Fatalf("MCP 工具集由远端决定，风险不能低于写: %d", risk)
+	risk, effects := Derive(m)
+	if risk >= policy.RiskWrite {
+		t.Fatalf("MCP 不应被判为写风险: %d", risk)
+	}
+	if risk > policy.RiskReadCost {
+		t.Fatalf("MCP 至多按「只读有成本」处理: %d", risk)
+	}
+	if effects != policy.SideEffectsExternal {
+		t.Fatalf("MCP 必须标记外部影响，实际 = %s", effects)
 	}
 }
 

@@ -1,3 +1,4 @@
+import { cancelRun } from './client';
 import { streamChat } from './stream';
 import type { StreamItem } from './types';
 
@@ -27,6 +28,8 @@ type Listener = () => void;
 
 let current: LiveRunView | null = null;
 let controller: AbortController | null = null;
+/** 当前轮次的服务端 run_id：取消与续流都靠它定位 */
+let currentRunId: string | null = null;
 const listeners = new Set<Listener>();
 
 function emit() {
@@ -51,9 +54,20 @@ export function isLiveRunning(sessionId?: string): boolean {
   return sessionId ? current.sessionId === sessionId : true;
 }
 
-/** 停止当前轮次：用户点停止，或切到了另一个会话。 */
+/**
+ * 用户点「停止」：显式取消服务端的那一轮。
+ *
+ * 断开 SSE 只是解绑这一条流，服务端仍在继续跑（§15.12.1），所以必须
+ * 单独发一次取消请求，否则按钮看起来生效、任务其实还在后台烧钱。
+ */
 export function stopLiveRun(): void {
+  const runId = currentRunId;
   controller?.abort();
+  if (runId) {
+    void cancelRun(runId).catch(() => {
+      // 已经结束或不在本进程：服务端返回 409，这里不需要打扰用户
+    });
+  }
 }
 
 export interface LiveRunOptions {
@@ -78,6 +92,8 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   // 别的会话还在跑：接管。旧轮次可能正卡在工具调用上，abort 让它尽快收尾；
   // 它的 finally 会按 controller 比对，不会清掉这一轮的视图
   controller?.abort();
+  // 旧轮次交给服务端跑完：这里只解绑流，不取消它
+  currentRunId = null;
 
   const ctrl = new AbortController();
   controller = ctrl;
@@ -108,6 +124,9 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
         opts.content,
         opts.references ?? [],
         {
+          onRunStarted: (runId) => {
+            if (controller === ctrl) currentRunId = runId || null;
+          },
           // 连续增量合并进同一段：每个 token 单独成段会把 Markdown 切碎，
           // 思考也会碎成几十个折叠块。中间插了工具或正文时，再开新的一段。
           onReasoning: (delta) =>
@@ -167,6 +186,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       if (controller === ctrl) {
         current = null;
         controller = null;
+        currentRunId = null;
         emit();
       }
       // 收尾回调对每一轮都要触发：被接管的旧会话同样要把已生成的内容刷进列表

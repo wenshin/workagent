@@ -1210,8 +1210,8 @@ func (m *Manager) registerTools(ctx context.Context, inst *instance) error {
 		}); err != nil {
 			return err
 		}
-		// 安装即授权：只读插件直接可用；写类插件保留 allow_write=false，
-		// 需要管理员在绑定上显式放开（策略层会拒绝）。
+		// 安装即授权：只读与外部调用（如 MCP）直接可用；只有会写平台数据的
+		// 能力才保留 allow_write=false，需要管理员在绑定上显式放开。
 		constraints, _ := json.Marshal(policy.Constraints{AllowWrite: t.Risk < policy.RiskWrite})
 		if _, err := m.o.Store.UpsertToolBinding(ctx, store.ToolBinding{
 			ToolName: t.Name, SpaceID: inst.SpaceID, Constraints: constraints,

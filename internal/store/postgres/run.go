@@ -78,6 +78,24 @@ where id = $1::uuid`
 	return err
 }
 
+// GetRun 读一次执行的状态。刷新页面后前端靠它判断「这一轮还在不在跑」，
+// 因此只取状态相关的列，不触碰 run_step。
+func (d *DB) GetRun(ctx context.Context, id string) (store.Run, error) {
+	const q = `
+select id::text, session_id::text, status, budget, usage, provider, model, error, started_at, ended_at
+from run
+where id = $1::uuid`
+
+	var r store.Run
+	if err := d.pool.QueryRow(ctx, q, id).Scan(
+		&r.ID, &r.SessionID, &r.Status, &r.Budget, &r.Usage,
+		&r.Provider, &r.Model, &r.Error, &r.StartedAt, &r.EndedAt,
+	); err != nil {
+		return store.Run{}, err
+	}
+	return r, nil
+}
+
 // ListRunSteps 按 seq 返回一次执行的全部 checkpoint，恢复时据此重放。
 func (d *DB) ListRunSteps(ctx context.Context, runID string) ([]store.RunStep, error) {
 	const q = `

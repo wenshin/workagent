@@ -152,11 +152,15 @@ func sessionList() Tool {
 			if err != nil {
 				return "", err
 			}
-			if len(sessions) > in.Limit {
-				sessions = sessions[:in.Limit]
-			}
-			out := make([]map[string]any, 0, len(sessions))
+			out := make([]map[string]any, 0, in.Limit)
 			for _, sess := range sessions {
+				// 会话只对创建者可见（§15.12.3）：这个工具不能成为看别人会话的口子
+				if sess.CreatedBy != "" && sess.CreatedBy != env.UserID {
+					continue
+				}
+				if len(out) >= in.Limit {
+					break
+				}
 				item := map[string]any{"title": sess.Title}
 				if sess.LastMessageAt != nil {
 					item["last_message_at"] = sess.LastMessageAt.Format(time.RFC3339)

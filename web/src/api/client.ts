@@ -75,6 +75,16 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
 }
 
 /**
+ * 显式停止一轮执行。
+ *
+ * 服务端的 run 已经与 HTTP 请求解耦（§15.12.1），断开连接不再等于停止，
+ * 所以「停止」必须发这个请求，不能只 abort 本地 fetch。
+ */
+export async function cancelRun(runId: string): Promise<void> {
+  await api<{ run_id: string; status: string }>(`/runs/${runId}/cancel`, { method: 'POST' });
+}
+
+/**
  * 上传文件到空间：multipart/form-data，字段名 files，dir 是相对空间 files/ 的目录。
  * 单独一个函数是因为 api() 只会发 JSON，而上传必须让浏览器自己带 boundary。
  */

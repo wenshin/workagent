@@ -1163,9 +1163,11 @@ func Derive(m Manifest) (int, string) {
 		}
 	}
 
-	// MCP 的工具集由远端决定，平台无法静态判断是否会写；按最保守处理。
+	// MCP 是外部系统调用：它对平台内数据没有任何读写权限，平台也不该替远端
+	// 判断「这次调用在它那边算不算写」。按「只读有成本」处理——有绑定即放行，
+	// 副作用由远端的鉴权、只读账号、限流与审计负责，平台只记调用与用量。
 	if m.Kind == KindMCP {
-		risk = maxRisk(risk, policy.RiskWrite)
+		risk = maxRisk(risk, policy.RiskReadCost)
 		if effects == policy.SideEffectsReadOnly {
 			effects = policy.SideEffectsExternal
 		}

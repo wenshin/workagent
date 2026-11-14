@@ -308,6 +308,8 @@ type Store interface {
 	AppendRunStep(ctx context.Context, s RunStep) (RunStep, error)
 	// FinishRun 落最终状态、用量与错误信息。
 	FinishRun(ctx context.Context, r Run) error
+	// GetRun 读一次执行的状态：前端刷新后据此判断「还在不在跑」。
+	GetRun(ctx context.Context, id string) (Run, error)
 	// ListRunSteps 按 seq 返回一次执行的全部 checkpoint，供恢复时重放。
 	ListRunSteps(ctx context.Context, runID string) ([]RunStep, error)
 
