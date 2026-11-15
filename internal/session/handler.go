@@ -58,6 +58,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// 刷新后的第一问：这个会话现在有没有在跑的 run
 	mux.HandleFunc("GET /sessions/{id}/active-run", h.activeRun)
+	// 停止按会话发起：前端不必先拿到 run_id，返回即代表这一轮已置终态
+	mux.HandleFunc("POST /sessions/{id}/cancel", h.cancelSessionRun)
 
 	// 任务派发：列表、取消、催办（§15.12.4）
 	mux.HandleFunc("GET /sessions/{id}/tasks", h.listTasks)
@@ -504,6 +506,26 @@ func (h *Handler) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"run_id": runID, "status": store.RunCancelled})
+}
+
+// cancelSessionRun 停掉这个会话当前的那一轮，幂等。
+//
+// 前端点「停止」时可能还没收到 run.started（思考阶段），拿不到 run_id；按会话发
+// 就不存在这个问题。成功返回即表示服务端已经把这一轮置为终态，客户端可以直接
+// 把本地视图收掉，不需要再轮询确认。
+func (h *Handler) cancelSessionRun(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	sessionID := r.PathValue("id")
+	if err := h.svc.CancelSessionRun(r.Context(), user.ID, sessionID); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]string{
+		"session_id": sessionID, "status": store.RunCancelled,
+	})
 }
 
 // runStream 续传一次执行的事件流：先补发缓冲，再跟着直播走。

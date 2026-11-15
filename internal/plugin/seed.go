@@ -281,6 +281,7 @@ var builtinToolLabels = map[string]string{
 	"web_search":     "联网搜索",
 	"shell_exec":     "执行命令",
 	"secret_request": "录入凭证",
+	"mcp_app_key":    "MCP 应用密钥",
 	"wiki_list":      "列知识页",
 	"wiki_read":      "读知识页",
 	"wiki_write":     "写知识页",

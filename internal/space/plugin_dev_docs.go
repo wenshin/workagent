@@ -306,8 +306,18 @@ static 是默认模式：auth.secret 只写凭证名（如 crm_token），值由
   sub / user_id（用户 ID）、email、job_number、iss=workagent、aud=应用名、iat、exp。
   握手与 tools/list 没有用户上下文，用的是服务令牌（sub=app:<app>、act=platform）。
 - jwt 模式不允许再写 auth.secret：两种来源并存时平台无法判断该信哪个。
-- 密钥怎么给到 Server 侧：发布响应里的 jwt 字段，或 GET /spaces/{id}/plugins/{slug}/jwt-key
-  （空间 manage 权限）。部署者把它配到 MCP Server 的密钥配置里，服务端用同一把密钥验签。
+- 密钥怎么给到 Server 侧（开发阶段就要拿到，不用等发布）：
+  1. 先调 mcp_app_key（可带 app，也可以留空），会话里会出现「MCP 应用密钥」卡片；
+  2. 用户在卡片里填应用名并点「生成密钥」：应用名不存在则**当场生成**并展示明文，
+     应用名已被别人创建则提示联系创建者（只有创建者能取回，不是谁都能看）；
+  3. 用户把密钥配到本地 MCP Server 的验签配置里（如 MCP_JWT_SECRET=...），
+     再把卡片里的应用名写进清单的 auth.app。
+  一个应用名只有一把密钥，**发布前后是同一把**，联调通了不用换。
+- 兜底与管理员：发布响应里的 jwt 字段、GET /spaces/{id}/plugins/{slug}/jwt-key 仍然可用，
+  但都按归属收口——只有该应用名的创建者能读，空间 manage 只是门槛；
+  没有创建人记录的老应用（这套流程之前生成的）找系统管理员确认归属。
+- 发布时如果 auth.app 不是你创建的应用名，发布框里必须填它的签名密钥确认归属
+  （等于创建者授权你发布）；你自己创建的应用名可以留空。没有密钥就换个应用名，不要硬发。
 - 服务端验签口径：HS256，密钥原样作为 HMAC key，校验 iss=workagent、aud=应用名、exp 未过期，
   然后从 user_id / email / job_number 取用户信息。**密钥是应用级的，不能跨应用复用。**
 - 凭证存储没启用（未配 SECRET_KEK）时签发不了令牌：这类插件会明确不可用，不会退回无鉴权调用。

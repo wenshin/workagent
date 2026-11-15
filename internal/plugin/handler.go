@@ -54,6 +54,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/enable", h.enable)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/disable", h.disable)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/jwt-key", h.jwtKey)
+	// 会话里的「应用密钥」卡片：按应用名生成或取回，只回给创建者本人。
+	mux.HandleFunc("POST /spaces/{id}/mcp-apps/{app}/key", h.mcpAppKey)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/baseline", h.baseline)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/reset", h.resetBaseline)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/dismiss", h.dismissUpdate)
@@ -135,10 +137,12 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Version string `json:"version"`
 		Notes   string `json:"notes"`
+		// AppKey 只在「应用名不属于自己」时需要：填它等于确认拿到过创建者的授权
+		AppKey string `json:"app_key"`
 	}
 	_ = platform.DecodeJSON(r, &body)
 	v, err := h.mgr.Publish(r.Context(), r.PathValue("id"), r.PathValue("slug"), user.ID,
-		body.Version, body.Notes, true)
+		body.Version, body.Notes, body.AppKey, true)
 	if err != nil {
 		h.fail(w, r, err)
 		return
@@ -156,10 +160,13 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 
 // jwtKey 返回 MCP 应用的签名密钥，供部署者配置到 MCP Server 侧验签。
 //
-// 这是少数会吐出明文密钥的接口：权限按管理的「空间 manage」收口，
-// 返回体不进模型上下文，也不写进审计详情。
+// 空间 manage 只是门槛，真正的判据是归属：应用名绑定了创建者时，只有创建者能取。
+// 否则任何空间管理员写一个 auth.app 指过来的草稿就能读到别人的生产密钥，
+// 按创建者收口的规则等于绕过去了。没有归属记录的老数据仍按 manage 放行，
+// 作为管理员兜底；发布时会补上归属，之后就走归属判定。
 func (h *Handler) jwtKey(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := h.guard(w, r, "manage"); !ok {
+	user, _, ok := h.guard(w, r, "manage")
+	if !ok {
 		return
 	}
 	app, key, err := h.mgr.MCPAppKey(r.Context(), r.PathValue("id"), r.PathValue("slug"))
@@ -167,11 +174,45 @@ func (h *Handler) jwtKey(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	if owner, err := h.mgr.MCPAppOwner(r.Context(), app); err == nil && owner != user.ID {
+		platform.WriteError(w, r, http.StatusForbidden, "forbidden",
+			"应用名 "+app+" 由创建者持有，密钥只能由创建者取回")
+		return
+	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{
 		"app": app, "key": key, "scope": mcp.MCPJWTScope, "algorithm": "HS256",
 		"header": "Authorization", "ttl_seconds": int(mcp.UserTokenTTL.Seconds()),
 		"claims": []string{"sub", "user_id", "email", "job_number", "iss", "aud", "iat", "exp"},
 	})
+}
+
+// mcpAppKey 是会话里「MCP 应用密钥」卡片的数据源：按应用名生成或取回签名密钥。
+//
+// 权限按「创建者」收口，不是空间权限：空间 write 权限的人可以随手把 auth.app
+// 写成别人的应用名，按空间放行等于把生产密钥交出去。除创建者外只回创建者姓名，
+// 明文只在创建者这一支上出现，且不进模型上下文（模型只看到工具回执里的状态）。
+func (h *Handler) mcpAppKey(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.guard(w, r, "read")
+	if !ok {
+		return
+	}
+	res, err := h.mgr.MCPAppKeyFor(r.Context(), user.ID, r.PathValue("id"), r.PathValue("app"))
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	// 明文密钥不进任何缓存：浏览器回退/代理缓存都不该留住它
+	w.Header().Set("Cache-Control", "no-store")
+	body := map[string]any{
+		"app": res.App, "status": res.Status, "owner_name": res.OwnerName,
+		"scope": mcp.MCPJWTScope, "algorithm": "HS256", "header": "Authorization",
+		"ttl_seconds": int(mcp.UserTokenTTL.Seconds()),
+		"claims":      []string{"sub", "user_id", "email", "job_number", "iss", "aud", "iat", "exp"},
+	}
+	if res.Key != "" {
+		body["key"] = res.Key
+	}
+	platform.WriteJSON(w, http.StatusOK, body)
 }
 
 func (h *Handler) install(w http.ResponseWriter, r *http.Request) {

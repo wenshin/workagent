@@ -40,6 +40,7 @@ func builtinTools() []Tool {
 		shellExec(),
 		pluginTry(),
 		secretRequest(),
+		mcpAppKey(),
 	}
 }
 

@@ -26,6 +26,7 @@ import {
   attachLiveRun,
   getLiveRun,
   isLiveRunning,
+  isStopping,
   startLiveRun,
   stopLiveRun,
   subscribeLiveRun,
@@ -210,7 +211,8 @@ export default function WorkspacePage() {
     });
   };
 
-  const stopGenerating = () => stopLiveRun();
+  // 带上会话 id：服务端按会话定位这一轮，前端不必等 run.started 拿到 run_id
+  const stopGenerating = () => stopLiveRun(selectedSession?.id);
 
   // 刷新/切页回来：先问服务端「这个会话还有没有在跑」，有就接着往下看。
   // run 已经和请求解耦（§15.12.1），所以断开只是解绑流，内容仍在内存缓冲里。
@@ -218,7 +220,11 @@ export default function WorkspacePage() {
   useEffect(() => {
     const session = selectedSession;
     if (!session) return;
-    if (isLiveRunning(session.id) || attachedRef.current.has(session.id)) return;
+    // isStopping：用户刚点过停止，服务端还在收尾。这时候 active-run 依然回答「在跑」，
+    // 挂上去只会把刚停下的气泡又拉回来（得点第二次停止）
+    if (isLiveRunning(session.id) || isStopping(session.id) || attachedRef.current.has(session.id)) {
+      return;
+    }
 
     let cancelled = false;
     // 只有真的发起续流才登记：StrictMode 会把 effect 跑两遍（挂载 → 清理 → 再挂载），
@@ -228,7 +234,8 @@ export default function WorkspacePage() {
       try {
         const res = await getActiveRun(session.id);
         if (cancelled || !res.active || !res.run) return;
-        if (isLiveRunning(session.id)) return;
+        // 请求在飞的时候用户点了停止：这一轮的「在跑」结论已经过期，不能再挂
+        if (isLiveRunning(session.id) || isStopping(session.id)) return;
         attached = true;
         attachedRef.current.add(session.id);
         await attachLiveRun({

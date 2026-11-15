@@ -424,6 +424,12 @@ type Store interface {
 	DeletePluginInstall(ctx context.Context, spaceID, pluginID string) error
 	// DeletePlugin 删掉插件及其版本与安装记录（外键级联），用于下线已合并的内置件。
 	DeletePlugin(ctx context.Context, id string) error
+	// ---- MCP 应用名归属：一个应用名一把签名密钥，明文只给创建者 ----
+	// GetMCPApp 按应用名取归属；没有记录返回 ErrNotFound。
+	GetMCPApp(ctx context.Context, app string) (MCPApp, error)
+	// ClaimMCPApp 幂等抢占应用名：created=true 表示这次抢到的，
+	// false 表示别人已经占着（返回已有归属，调用方据此提示找创建人）。
+	ClaimMCPApp(ctx context.Context, app, userID, spaceID string) (MCPApp, bool, error)
 	// ---- 插件候选：空间本地插件「已启用、未发布」的市场元数据 ----
 	UpsertPluginCandidate(ctx context.Context, c PluginCandidate) (PluginCandidate, error)
 	GetPluginCandidate(ctx context.Context, spaceID, slug string) (PluginCandidate, error)
@@ -559,6 +565,18 @@ type PluginInstall struct {
 	DismissedVersion string
 	// Config 是空间级配置（连接地址、鉴权头、凭证名），空对象表示沿用清单。
 	Config json.RawMessage
+}
+
+// MCPApp 是 MCP 应用名（清单里的 auth.app）的归属。
+//
+// 一个应用名只有一把签名密钥，密钥按应用名存在凭证存储里；归属记录回答的是
+// 「这把密钥是谁生成的」——只有创建者能从会话界面取回明文，其他人只能看到
+// 创建者姓名并线下要。应用名是全局的，不随空间复制。
+type MCPApp struct {
+	App          string
+	OwnerUserID  string
+	OwnerSpaceID string
+	CreatedAt    time.Time
 }
 
 // PluginScan 是一次发布扫描的结论（docs/插件安全基线.md §1.5）。

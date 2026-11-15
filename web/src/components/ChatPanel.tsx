@@ -20,6 +20,7 @@ import type {
   ToolCallRecord,
 } from '../api/types';
 import MarkdownView from './Markdown';
+import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
 import { PluginIcon } from './PluginVisual';
 import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
 
@@ -249,31 +250,200 @@ function parseSecretRequest(tool: ToolCallRecord): SecretRequestData | null {
   return null;
 }
 
-function ToolCard({ tool, onSend }: { tool: ToolCallRecord; onSend?: (content: string) => void }) {
+/** mcp_app_key 的回执同样是 JSON：交给应用密钥卡片，卡片自己取明文 */
+function parseMCPAppRequest(tool: ToolCallRecord): MCPAppKeyData | null {
+  if (tool.name !== 'mcp_app_key') return null;
+
+  if (tool.result) {
+    try {
+      const parsed = JSON.parse(tool.result) as { mcp_app?: MCPAppKeyData };
+      if (parsed.mcp_app) return { ...parsed.mcp_app, pending: false };
+    } catch {
+      // 回执被截断时退回参数兜底，不要因此丢掉整张卡片
+    }
+  }
+
+  // 回执还没到：卡片先出来，用户可以先看清要做什么
+  let app = '';
+  let hint = '';
+  if (tool.args) {
+    try {
+      const args = JSON.parse(tool.args) as { app?: string; purpose?: string };
+      app = args.app ?? '';
+      hint = args.purpose ?? '';
+    } catch {
+      // 参数不合法时按「待填应用名」展示
+    }
+  }
+  return { app, hint, state: app ? 'checking' : 'needs_app', available: true, pending: true };
+}
+
+/** 需要用户动手的卡片（凭证、应用密钥）必须整块露出，不能折进工具组 */
+function isStandaloneTool(tool: ToolCallRecord): boolean {
+  return parseSecretRequest(tool) !== null || parseMCPAppRequest(tool) !== null;
+}
+
+function ToolCard({
+  tool,
+  spaceId,
+  onSend,
+  flat,
+}: {
+  tool: ToolCallRecord;
+  spaceId?: string;
+  onSend?: (content: string) => void;
+  /** flat：已在工具组的折叠区内，不要再套一层折叠 */
+  flat?: boolean;
+}) {
   const secret = parseSecretRequest(tool);
   // 需要用户动手的卡片不能塞进折叠区：折叠起来等于没提示
   if (secret) {
     return <SecretRequestCard data={secret} onContinue={onSend} />;
   }
+  const appKey = parseMCPAppRequest(tool);
+  if (appKey) {
+    return <MCPAppKeyCard data={appKey} spaceId={spaceId} onContinue={onSend} />;
+  }
+  const head = (
+    <>
+      <span className="msg-tool-name">{tool.name}</span>
+      <span className="msg-tool-status">{statusLabel(tool.status)}</span>
+      {tool.duration_ms !== undefined ? <span className="msg-tool-time">{tool.duration_ms}ms</span> : null}
+    </>
+  );
+  const body = (
+    <div className="msg-tool-body">
+      <div className="msg-tool-label">参数</div>
+      <pre className="msg-tool-pre">{prettyJSON(tool.args) || '{}'}</pre>
+      {tool.result ? (
+        <>
+          <div className="msg-tool-label">结果</div>
+          <pre className="msg-tool-pre">{tool.result}</pre>
+        </>
+      ) : null}
+    </div>
+  );
+
+  if (flat) {
+    return (
+      <div className={`msg-tool msg-tool-flat msg-tool-${tool.status}`}>
+        <div className="msg-tool-head">{head}</div>
+        {body}
+      </div>
+    );
+  }
   return (
     <details className={`msg-tool msg-tool-${tool.status}`} open={tool.status === 'running'}>
-      <summary className="msg-tool-head">
-        <span className="msg-tool-name">{tool.name}</span>
-        <span className="msg-tool-status">{statusLabel(tool.status)}</span>
-        {tool.duration_ms !== undefined ? <span className="msg-tool-time">{tool.duration_ms}ms</span> : null}
+      <summary className="msg-tool-head">{head}</summary>
+      {body}
+    </details>
+  );
+}
+
+/**
+ * 连续的工具调用折成一组，默认收起，只留一行提示（§ D.2 消息区）。
+ *
+ * 一轮里工具常常连着来好几条（列目录 → 读文件 → 再读），每张卡都占一行，
+ * 长回答会被过程信息淹没。折起来之后时间线只剩「思考 → 工具组 → 正文」，
+ * 需要查参数或结果再点开；和思考块一样属于过程信息，样式也保持一致。
+ */
+function ToolGroup({
+  tools,
+  spaceId,
+  onSend,
+}: {
+  tools: ToolCallRecord[];
+  spaceId?: string;
+  onSend?: (content: string) => void;
+}) {
+  const running = tools.some((t) => t.status === 'running');
+  const failed = tools.filter((t) => t.status === 'error' || t.status === 'denied').length;
+  return (
+    <details className="msg-tools">
+      <summary className="msg-tools-head">
+        <span>调用了 {tools.length} 个工具</span>
+        {running ? <span className="msg-tools-live">执行中…</span> : null}
+        {failed > 0 ? <span className="msg-tools-fail">{failed} 个失败</span> : null}
+        {/* 收起时靠名字一眼看出调过什么，不用点开 */}
+        <span className="msg-tools-names">{tools.map((t) => t.name).join(' · ')}</span>
       </summary>
-      <div className="msg-tool-body">
-        <div className="msg-tool-label">参数</div>
-        <pre className="msg-tool-pre">{prettyJSON(tool.args) || '{}'}</pre>
-        {tool.result ? (
-          <>
-            <div className="msg-tool-label">结果</div>
-            <pre className="msg-tool-pre">{tool.result}</pre>
-          </>
-        ) : null}
+      <div className="msg-tools-body">
+        {tools.map((tool) => (
+          <ToolCard key={tool.id} tool={tool} spaceId={spaceId} onSend={onSend} flat />
+        ))}
       </div>
     </details>
   );
+}
+
+/** 按「是否必须独立展示」切分一串工具调用：两条以上才折叠 */
+function groupTools(tools: ToolCallRecord[]): ToolCallRecord[][] {
+  const groups: ToolCallRecord[][] = [];
+  for (const tool of tools) {
+    const last = groups[groups.length - 1];
+    if (last && !isStandaloneTool(tool) && !isStandaloneTool(last[0])) {
+      last.push(tool);
+      continue;
+    }
+    groups.push([tool]);
+  }
+  return groups;
+}
+
+/** 工具序列的唯一渲染入口：单条照旧是一张卡，连续多条折成一组 */
+function ToolRun({
+  tools,
+  spaceId,
+  onSend,
+}: {
+  tools: ToolCallRecord[];
+  spaceId?: string;
+  onSend?: (content: string) => void;
+}) {
+  return (
+    <>
+      {groupTools(tools).map((group) =>
+        group.length > 1 ? (
+          <ToolGroup key={`group-${group[0].id}`} tools={group} spaceId={spaceId} onSend={onSend} />
+        ) : (
+          <ToolCard key={group[0].id} tool={group[0]} spaceId={spaceId} onSend={onSend} />
+        ),
+      )}
+    </>
+  );
+}
+
+/** 时间线折成渲染块的产物：连续工具调用已并成一块 */
+type TurnBlock =
+  | { kind: 'reasoning'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tools'; tools: ToolCallRecord[] };
+
+/**
+ * 把流式片段折成渲染块：只合并工具调用，思考与正文保持原样。
+ *
+ * 正文是回答本身、思考是过程旁白，两者必须直接可读；工具调用往往一连好几条，
+ * 占地方又没有阅读价值，交给 ToolGroup 折起来。
+ */
+function toBlocks(items: StreamItem[]): TurnBlock[] {
+  const blocks: TurnBlock[] = [];
+  for (const item of items) {
+    if (item.kind === 'reasoning') {
+      blocks.push({ kind: 'reasoning', text: item.text });
+      continue;
+    }
+    if (item.kind === 'text') {
+      blocks.push({ kind: 'text', text: item.text });
+      continue;
+    }
+    const last = blocks[blocks.length - 1];
+    if (last && last.kind === 'tools') {
+      last.tools.push(item.tool);
+      continue;
+    }
+    blocks.push({ kind: 'tools', tools: [item.tool] });
+  }
+  return blocks;
 }
 
 function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
@@ -299,44 +469,51 @@ function AssistantBody({
   content?: string;
   reasoning?: string;
   tools?: ToolCallRecord[];
-  /** 流式过程中的有序片段；有值时按它渲染，不做分组 */
+  /** 流式过程中的有序片段；有值时按它渲染（仅连续工具调用会被并组） */
   items?: StreamItem[];
   live?: boolean;
   spaceId?: string;
   onSend?: (content: string) => void;
 }) {
-  const hasBody = items ? items.length > 0 : Boolean(content) || tools.length > 0;
+  const blocks = items ? toBlocks(items) : null;
+  const hasBody = blocks ? blocks.length > 0 : Boolean(content) || tools.length > 0;
   return (
     <>
       {reasoning ? <ReasoningBlock text={reasoning} live={live && !hasBody} /> : null}
-      {items ? (
-        // 流式：思考、正文与工具卡按实际到达顺序交错，
+      {blocks ? (
+        // 流式：思考、正文与工具按实际到达顺序交错，
         // 而不是「思考钉在顶部、工具全在上、正文全在下」
-        items.map((item, index) => {
-          if (item.kind === 'reasoning') {
+        blocks.map((block, index) => {
+          if (block.kind === 'reasoning') {
             return (
               <ReasoningBlock
                 key={`reasoning-${index}`}
-                text={item.text}
+                text={block.text}
                 // 只有最后一段思考才是「正在想」，前面的都已结束
-                live={live && index === items.length - 1}
+                live={live && index === blocks.length - 1}
               />
             );
           }
-          if (item.kind === 'text') {
+          if (block.kind === 'text') {
             return (
               <div key={`text-${index}`} className="chat-msg-content chat-msg-markdown">
-                <MarkdownView content={item.text} spaceId={spaceId} />
+                <MarkdownView content={block.text} spaceId={spaceId} />
               </div>
             );
           }
-          return <ToolCard key={`tool-${item.tool.id}`} tool={item.tool} onSend={onSend} />;
+          return (
+            <ToolRun
+              key={`tools-${block.tools[0].id}`}
+              tools={block.tools}
+              spaceId={spaceId}
+              onSend={onSend}
+            />
+          );
         })
       ) : (
         <>
-          {tools.map((tool) => (
-            <ToolCard key={tool.id} tool={tool} onSend={onSend} />
-          ))}
+          {/* 历史消息没有时间位置，工具统一落在正文之前，连续调用同样折成一组 */}
+          <ToolRun tools={tools} spaceId={spaceId} onSend={onSend} />
           {content ? (
             <div className="chat-msg-content chat-msg-markdown">
               <MarkdownView content={content} spaceId={spaceId} />

@@ -516,3 +516,17 @@ export interface PluginBaselineStatus {
   local_modified: boolean;
   dismissed: boolean;
 }
+
+/** 会话里「MCP 应用密钥」卡片的取数结果：key 只在创建者本人这一支上出现 */
+export interface MCPAppKeyResponse {
+  app: string;
+  /** created 本次生成 / owned 自己的 / taken 别人的 / unowned 无归属 / disabled 没配 KEK */
+  status: 'created' | 'owned' | 'taken' | 'unowned' | 'disabled';
+  key?: string;
+  owner_name?: string;
+  scope?: string;
+  algorithm?: string;
+  header?: string;
+  ttl_seconds?: number;
+  claims?: string[];
+}

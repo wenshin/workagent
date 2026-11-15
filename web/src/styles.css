@@ -909,6 +909,27 @@ body[theme-mode='dark'] {
   gap: 8px;
 }
 
+/* MCP 应用密钥：明文只在创建者的浏览器里出现，展示上要能一键复制、也能一键遮回 */
+.mcp-key-box {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 8px;
+  background: var(--semi-color-fill-0);
+}
+
+.mcp-key-value {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  user-select: all;
+}
+
 .msg-tool {
   overflow: hidden;
   border: 1px solid var(--semi-color-border);
@@ -976,6 +997,62 @@ body[theme-mode='dark'] {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* ---- 连续工具调用：折成一组 ---- */
+/* 与思考块同一套观感：过程信息，收起时只留一行提示 */
+.msg-tools {
+  padding: 8px 12px;
+  border: 1px dashed var(--semi-color-border);
+  border-radius: 10px;
+  background: var(--semi-color-fill-0);
+  font-size: 13px;
+}
+
+.msg-tools-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--semi-color-text-2);
+  cursor: pointer;
+  user-select: none;
+}
+
+.msg-tools-live {
+  font-size: 11px;
+  color: var(--semi-color-primary);
+}
+
+.msg-tools-fail {
+  font-size: 11px;
+  color: var(--semi-color-danger);
+}
+
+/* 名字靠右并截断：收起时一眼看出调过什么，又不把这一行撑开 */
+.msg-tools-names {
+  margin-left: auto;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.msg-tools-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* 组内的卡片不再自带底色，避免和组的底色叠成两层 */
+.msg-tool-flat {
+  background: var(--semi-color-bg-2);
+}
+
+.msg-tool-flat .msg-tool-head {
+  cursor: default;
 }
 
 .chat-input {

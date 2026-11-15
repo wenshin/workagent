@@ -347,16 +347,21 @@ MOCK_DC_TLS_KEY=./127.0.0.1+localhost-key.pem make mock-dc
 `capabilities` 对 MCP 只影响风险等级，不影响能不能连：MCP 的连接由平台自己的客户端直连 `transport.url`，
 不走脚本插件那套域名白名单。所以本 mock 不写 `capabilities` 也能正常调用。
 
-`mode: jwt` 时平台为应用 `mock_dc` 生成密钥并按用户现签令牌，**不需要**在会话里录入凭证。把这个密钥配到本服务：
+`mode: jwt` 时平台为应用 `mock_dc` 生成密钥并按用户现签令牌，**不需要**在会话里录入凭证（也不走 `secret_request`）。把这个密钥配到本服务：
 
 ```bash
-MOCK_DC_JWT_SECRET=<发布响应里的 jwt.key> \
+MOCK_DC_JWT_SECRET=<MCP 应用密钥卡片里的密钥> \
 MOCK_DC_JWT_AUD=mock_dc \
 MOCK_DC_JWT_ISS=workagent \
 make mock-dc
 ```
 
-密钥获取：发布响应里的 `jwt.key`，或 `GET /spaces/{id}/plugins/{slug}/jwt-key`（空间 manage 权限）。
+密钥获取（一个应用名只有一把，发布前后同一把）：
+
+1. **开发阶段，未发布也能拿**：让 Agent 调 `mcp_app_key`，会话里出现「MCP 应用密钥」卡片，填应用名 → 生成或取回。
+   应用名不存在则当场生成并把创建者记下来；已被别人创建则只显示创建者姓名——明文只回创建者本人。
+2. **发布响应**里的 `jwt.key`。应用名不是发布者创建时，发布框必须先填这把密钥确认归属，否则拒绝发布。
+3. `GET /spaces/{id}/plugins/{slug}/jwt-key` 仍可用，但**只有该应用名的创建者**能读（空间 `manage` 只是门槛）。
 
 用静态凭证调试（不走平台签发）：
 

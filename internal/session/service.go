@@ -863,6 +863,9 @@ func (s *Service) chat(
 		if reason == "" {
 			status = store.RunFailed
 		}
+		// 状态要跟着带出去：思考阶段就被叫停时这里是唯一出口，不写的话 handler 会按
+		// 「失败」广播 run.finished（reason 为空），前端弹一个本不该有的错误
+		out.Status = status
 		err := runErr
 		if err == nil {
 			err = errors.New("模型没有返回内容，请重试")
@@ -989,6 +992,38 @@ func (s *Service) CancelRun(ctx context.Context, userID, runID string) error {
 		return ErrRunFinished
 	}
 	s.log.Info("任务被用户取消", "run_id", runID, "by", userID)
+	return nil
+}
+
+// CancelSessionRun 按会话停止当前这一轮，给「停止」按钮一个不用先知道 run_id 的入口。
+//
+// 前端只知道会话 id：思考阶段 run.started 还没到达，用 run_id 取消就得多一步「先问
+// 一次 active-run 再取消」，中间那一步正是「点了停止没反应、要点两次」的来源。
+// 这里由服务端定位这一轮，并且**在返回前就把 run 置为终态**——客户端拿到的 200
+// 就是「已经停了」，不必再轮询确认，也不会在空窗期被断流自愈挂回来。
+//
+// 幂等：这一轮已经结束（或压根没在跑）时返回 nil，重复点击不是错误。
+func (s *Service) CancelSessionRun(ctx context.Context, userID, sessionID string) error {
+	run, found, err := s.ActiveRun(ctx, userID, sessionID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	live := s.runs.get(run.ID)
+	if live == nil || !live.markCancelled(ReasonUserCancelled) {
+		// 不在本进程（换了副本）或刚好收尾：库里的状态由跑它的节点负责写，这里不越权
+		return nil
+	}
+	// 立刻落终态：active-run 从此回答「没在跑」，前端刷新/续流的判断不会再有空窗
+	run.Status = store.RunCancelled
+	run.Error = ReasonUserCancelled
+	if err := s.store.FinishRun(context.WithoutCancel(ctx), run); err != nil {
+		// 写失败不影响取消本身：agent 收尾时还会再写一次
+		s.log.Warn("取消时写入 run 状态失败", "run_id", run.ID, "err", err)
+	}
+	s.log.Info("任务被用户取消", "run_id", run.ID, "session_id", sessionID, "by", userID)
 	return nil
 }
 

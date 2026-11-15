@@ -93,6 +93,18 @@ export async function cancelRun(runId: string): Promise<void> {
   await api<{ run_id: string; status: string }>(`/runs/${runId}/cancel`, { method: 'POST' });
 }
 
+/**
+ * 按会话停止当前这一轮（幂等）。
+ *
+ * 「停止」按钮不该依赖 run_id：思考阶段 `run.started` 还没到，前端手里没有 id。
+ * 返回即代表服务端已把这一轮置为终态，调用方可以直接收视图，不用再确认。
+ */
+export async function cancelSessionRun(sessionId: string): Promise<void> {
+  await api<{ session_id: string; status: string }>(`/sessions/${sessionId}/cancel`, {
+    method: 'POST',
+  });
+}
+
 /** 刷新后的第一问：这个会话有没有在跑的 run，有就续流。 */
 export function getActiveRun(sessionId: string): Promise<ActiveRunResponse> {
   return api<ActiveRunResponse>(`/sessions/${sessionId}/active-run`);

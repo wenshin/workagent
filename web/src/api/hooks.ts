@@ -13,6 +13,7 @@ import type {
   FilesResponse,
   MeResponse,
   MessagesResponse,
+  MCPAppKeyResponse,
   PluginBaselineStatus,
   PluginCatalogResponse,
   PluginConfigView,
@@ -433,6 +434,22 @@ export function useDeleteSecret() {
   });
 }
 
+/**
+ * 取 MCP 应用密钥：一个应用名一把密钥，只有创建者能拿到明文。
+ *
+ * 走 POST 而不是 GET：应用名不存在时会顺手生成一把——这正是「第一次创建」
+ * 的语义，也让卡片只需要一个按钮。明文只回到浏览器，不进对话与模型上下文。
+ */
+export function useMCPAppKey() {
+  return useMutation({
+    mutationFn: (input: { spaceId: string; app: string }) =>
+      api<MCPAppKeyResponse>(
+        `/spaces/${input.spaceId}/mcp-apps/${encodeURIComponent(input.app)}/key`,
+        { method: 'POST' },
+      ),
+  });
+}
+
 /* ---- 插件：开发 → 发布 → 安装 → 运行 → 卸载 ---- */
 
 /**
@@ -511,10 +528,24 @@ export function useDryRunPlugin() {
 export function usePublishPlugin() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (input: { spaceId: string; slug: string; version?: string; notes?: string }) =>
+    mutationFn: (input: {
+      spaceId: string;
+      slug: string;
+      version?: string;
+      notes?: string;
+      /** MCP jwt 插件：应用名不属于发布者时必填，等于出示创建者的授权 */
+      appKey?: string;
+    }) =>
       api<{ version: string; sha256: string; risk: number }>(
         `/spaces/${input.spaceId}/plugins/${input.slug}/publish`,
-        { method: 'POST', body: { version: input.version ?? '', notes: input.notes ?? '' } },
+        {
+          method: 'POST',
+          body: {
+            version: input.version ?? '',
+            notes: input.notes ?? '',
+            app_key: input.appKey ?? '',
+          },
+        },
       ),
     onSuccess: (_d, vars) => {
       qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });

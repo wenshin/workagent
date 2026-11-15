@@ -571,7 +571,11 @@ func validateBundleDSL(b *Bundle) error {
 //
 // 发布权只在系统管理员：空间管理员只能启用本地插件，让其成为市场的
 // 「待发布」候选。发布前要求候选仍启用、内容 hash 与启用时一致。
-func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, notes string, isAdmin bool) (store.PluginVersion, error) {
+//
+// jwt 模式的 MCP 插件还要确认应用名归属（见 confirmAppKey）：应用名不是
+// 发布者创建时，appKey 必须对得上已存的签名密钥，否则拒绝——发布响应会
+// 回显密钥，不确认等于把别人的生产密钥直接交出去。
+func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, notes, appKey string, isAdmin bool) (store.PluginVersion, error) {
 	if !isAdmin {
 		return store.PluginVersion{}, fmt.Errorf("%w：只有系统管理员可以发布插件", ErrForbidden)
 	}
@@ -633,8 +637,19 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 	// jwt 模式的 MCP 插件没有密钥就等于装不上：在写任何数据之前就生成，
 	// 失败则拒绝发布，避免出现「发布成功但调用必然 401」的版本。
 	if b.Meta.Kind == KindMCP && b.Meta.Auth.JWT() {
-		if _, err := ensureAppKey(ctx, m.o.Secrets, b.Meta.Auth.AppName(b.Meta.Slug)); err != nil {
+		app := b.Meta.Auth.AppName(b.Meta.Slug)
+		// 先确认归属：别人的应用名必须出示密钥，否则发布响应等于把他们的
+		// 生产密钥交出去，前面按创建者收口的规则也就白做了。
+		if err := m.confirmAppKey(ctx, userID, spaceID, app, appKey); err != nil {
 			return store.PluginVersion{}, err
+		}
+		if _, err := ensureAppKey(ctx, m.o.Secrets, app); err != nil {
+			return store.PluginVersion{}, err
+		}
+		// 顺手记下归属：应用名是全局唯一的，发布是「认领」它的自然时点。
+		// 已经归属别人的不会被改写（ClaimMCPApp 不覆盖），这里只补历史的空记录。
+		if _, _, err := m.o.Store.ClaimMCPApp(ctx, app, userID, spaceID); err != nil {
+			m.o.Logger.Warn("记录 MCP 应用归属失败", "app", app, "err", err)
 		}
 	}
 

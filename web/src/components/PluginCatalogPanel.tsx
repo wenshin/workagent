@@ -1,5 +1,5 @@
 import { IconRefresh } from '@douyinfe/semi-icons';
-import { Button, Card, Empty, Modal, Select, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui';
+import { Button, Card, Empty, Input, Modal, Select, Spin, Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { useMemo, useState } from 'react';
 
 import {
@@ -59,6 +59,9 @@ export default function PluginCatalogPanel({
   const [kind, setKind] = useState<'all' | PluginKind>('all');
   // 安装前先看权限：装完它能读什么、能不能写、能连哪些域名，必须先让用户看见。
   const [pendingInstall, setPendingInstall] = useState<PluginCatalogItem | null>(null);
+  // 发布确认：MCP 插件绑定的应用名可能不是发布者的，必须能出示密钥
+  const [pendingPublish, setPendingPublish] = useState<PluginCatalogItem | null>(null);
+  const [appKey, setAppKey] = useState('');
   const target = targets.find((s) => s.id === spaceId) ?? targets[0];
 
   const filtered = useMemo(
@@ -101,10 +104,20 @@ export default function PluginCatalogPanel({
       Toast.error('缺少来源空间，无法发布');
       return;
     }
+    // 先打开确认：MCP 插件可能绑定在别人的应用名上，发布前必须出示密钥
+    setPendingPublish(item);
+    setAppKey('');
+  };
+
+  const submitPublish = (item: PluginCatalogItem) => {
+    if (!item.source_space_id) return;
     publish.mutate(
-      { spaceId: item.source_space_id, slug: item.slug },
+      { spaceId: item.source_space_id, slug: item.slug, appKey },
       {
-        onSuccess: (r) => Toast.success(`已发布 v${r.version}，其他空间可以安装`),
+        onSuccess: (r) => {
+          setPendingPublish(null);
+          Toast.success(`已发布 v${r.version}，其他空间可以安装`);
+        },
         onError: (e) => Toast.error(e instanceof Error ? e.message : '发布失败'),
       },
     );
@@ -284,6 +297,34 @@ export default function PluginCatalogPanel({
         <p className="dialog-desc" style={{ marginTop: 10 }}>
           风险等级：{riskLabel(pendingInstall?.risk ?? 0)}。权限由清单声明、平台计算，安装后可在空间插件面板随时停用或卸载。
         </p>
+      </Modal>
+
+      <Modal
+        title={`发布「${pendingPublish?.name || pendingPublish?.slug || ''}」到组织`}
+        visible={Boolean(pendingPublish)}
+        onCancel={() => setPendingPublish(null)}
+        onOk={() => {
+          if (pendingPublish) submitPublish(pendingPublish);
+        }}
+        okText="发布"
+        cancelText="取消"
+        okButtonProps={{ loading: publish.isPending }}
+      >
+        <p className="dialog-desc">发布后其他空间可以安装，版本内容不可再改。</p>
+        {pendingPublish?.kind === 'mcp' ? (
+          <div style={{ marginTop: 12 }}>
+            <p className="dialog-desc">
+              MCP 插件绑定在应用名（auth.app）上，一个应用名只有一把密钥。如果这个应用名不是你创建的，
+              需要填写它的签名密钥确认归属——密钥在会话里通过「MCP 应用密钥」卡片获取；你自己创建的应用名可以留空。
+            </p>
+            <Input
+              mode="password"
+              value={appKey}
+              onChange={setAppKey}
+              placeholder="应用签名密钥（非必填，仅当应用名属于别人）"
+            />
+          </div>
+        ) : null}
       </Modal>
     </div>
   );

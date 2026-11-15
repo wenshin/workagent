@@ -1,4 +1,4 @@
-import { cancelRun, getActiveRun } from './client';
+import { cancelSessionRun, getActiveRun } from './client';
 import { streamChat, streamRun, type StreamHandlers } from './stream';
 import type { ActiveRunResponse, StreamItem } from './types';
 
@@ -38,8 +38,15 @@ const RESUME_DELAYS_MS = [300, 800, 1500, 3000, 5000];
 
 let current: LiveRunView | null = null;
 let controller: AbortController | null = null;
-/** 当前轮次的服务端 run_id：取消与续流都靠它定位 */
-let currentRunId: string | null = null;
+/**
+ * 正在发「停止」请求的会话，只在这一次请求在途时有效。
+ *
+ * 挡的是同一个空窗：`abort` 已经解绑本地流，但服务端还没把这一轮置终态，
+ * 此刻 `active-run` 仍然回答「在跑」，「刷新后接着看」的自愈就会把刚停下的
+ * 气泡重新挂回来——表现就是点了停止没反应、得点两次。服务端在取消请求返回
+ * 之前就把 run 落了终态，所以这里只需覆盖「这一个请求在路上」的时间。
+ */
+const stoppingSessions = new Set<string>();
 const listeners = new Set<Listener>();
 
 function emit() {
@@ -64,19 +71,39 @@ export function isLiveRunning(sessionId?: string): boolean {
   return sessionId ? current.sessionId === sessionId : true;
 }
 
+/** 这个会话是不是刚被停过、服务端还没确认收尾：续流要绕开它。 */
+export function isStopping(sessionId: string): boolean {
+  return stoppingSessions.has(sessionId);
+}
+
 /**
- * 用户点「停止」：显式取消服务端的那一轮。
+ * 用户点「停止」：本地解绑 + 服务端停这一轮，一次请求，没有轮询。
  *
- * 断开 SSE 只是解绑这一条流，服务端仍在继续跑（§15.12.1），所以必须
- * 单独发一次取消请求，否则按钮看起来生效、任务其实还在后台烧钱。
+ * 断开 SSE 只是解绑这一条流，服务端仍在继续跑（§15.12.1），所以必须显式取消；
+ * 但取消按**会话**发——思考阶段 `run.started` 还没到，前端手里没有 run_id，
+ * 靠 run_id 取消就得多一步「先问再取消」，那一步正是「要点两次」的来源。
+ *
+ * 服务端在返回前就把 run 置终态，所以这里的 200 就是「已经停了」：
+ * 不用再问 active-run 确认，也就不会在确认的空窗里被断流自愈挂回来。
  */
-export function stopLiveRun(): void {
-  const runId = currentRunId;
+export async function stopLiveRun(sessionId?: string): Promise<void> {
+  const sid = sessionId ?? current?.sessionId ?? '';
+  if (!sid) {
+    // 连会话都定位不到：至少把本地这条流停住
+    controller?.abort();
+    return;
+  }
+  // 连点两下不必发两条取消；在途期间也不让续流把这个会话抢回去
+  if (stoppingSessions.has(sid)) return;
+  stoppingSessions.add(sid);
   controller?.abort();
-  if (runId) {
-    void cancelRun(runId).catch(() => {
-      // 已经结束或不在本进程：服务端返回 409，这里不需要打扰用户
-    });
+  try {
+    await cancelSessionRun(sid);
+  } catch {
+    // 网络抖动不影响本地已经停下：服务端没收到取消的话这一轮还在跑，
+    // 下一次 active-run 会如实回答「在跑」，那就让它显示出来，而不是假装停住
+  } finally {
+    stoppingSessions.delete(sid);
   }
 }
 
@@ -91,15 +118,11 @@ export interface LiveRunOptions {
 
 /** 事件 → 视图的唯一映射，首发与续流共用，避免两条链路渲染不一致。 */
 function buildHandlers(
-  ctrl: AbortController,
   patch: (fn: (view: LiveRunView) => LiveRunView) => void,
   markWrote: () => void,
   onError?: (message: string) => void,
 ): StreamHandlers {
   return {
-    onRunStarted: (runId) => {
-      if (controller === ctrl) currentRunId = runId || null;
-    },
     // 连续增量合并进同一段：每个 token 单独成段会把 Markdown 切碎，
     // 思考也会碎成几十个折叠块。中间插了工具或正文时，再开新的一段。
     onReasoning: (delta) =>
@@ -167,8 +190,6 @@ async function resumeStream(
   ctrl: AbortController,
   reset: () => void,
   handlers: StreamHandlers,
-  /** 挂上之后回报 run_id：断了重连时「停止」按钮仍要能找到这一轮 */
-  claim: (runId: string) => void,
 ): Promise<boolean> {
   for (const delayMs of RESUME_DELAYS_MS) {
     if (ctrl.signal.aborted) return false;
@@ -184,7 +205,6 @@ async function resumeStream(
     if (!active.active || !active.run) return false;
 
     reset();
-    claim(active.run.id);
     try {
       const outcome = await streamRun(active.run.id, 0, handlers, ctrl.signal);
       if (outcome.finished) return true;
@@ -206,11 +226,11 @@ async function resumeStream(
 export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   // 同一会话重复触发（连点发送）：忽略，避免两路事件写进同一份视图
   if (current && current.sessionId === opts.sessionId) return Promise.resolve();
+  // 用户在这个会话里重新发消息：上一轮的停止请求已经没意义了，撤掉这道闸
+  stoppingSessions.delete(opts.sessionId);
   // 别的会话还在跑：接管。旧轮次可能正卡在工具调用上，abort 让它尽快收尾；
   // 它的 finally 会按 controller 比对，不会清掉这一轮的视图
   controller?.abort();
-  // 旧轮次交给服务端跑完：这里只解绑流，不取消它
-  currentRunId = null;
 
   const ctrl = new AbortController();
   controller = ctrl;
@@ -236,11 +256,8 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
     emit();
   };
 
-  const handlers = buildHandlers(ctrl, patch, markWrote, opts.onError);
+  const handlers = buildHandlers(patch, markWrote, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
-  const claim = (runId: string) => {
-    if (controller === ctrl) currentRunId = runId;
-  };
 
   return (async () => {
     let aborted = false;
@@ -254,14 +271,14 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       );
       // 没有终态事件就是断了（切页、代理掐连接、热更新……）：run 还在服务端跑，续上
       if (!outcome.finished) {
-        await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+        await resumeStream(opts.sessionId, ctrl, reset, handlers);
       }
     } catch (e) {
       // 用户主动停止不算错误
       aborted = e instanceof DOMException && e.name === 'AbortError';
       if (!aborted) {
         // 连接中途被掐断也是「流断了」：先试着重挂，真的续不上再报错
-        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers);
         if (!resumed) opts.onError?.(e instanceof Error ? e.message : '发送失败，请重试');
       }
     } finally {
@@ -269,7 +286,6 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       if (controller === ctrl) {
         current = null;
         controller = null;
-        currentRunId = null;
         emit();
       }
       // 收尾回调对每一轮都要触发：被接管的旧会话同样要把已生成的内容刷进列表
@@ -295,8 +311,10 @@ export interface AttachRunOptions {
  */
 export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
   if (current && current.sessionId === opts.sessionId) return Promise.resolve();
+  // 刚被用户停掉的会话不允许自动重挂：服务端还没收尾时它看起来「还在跑」，
+  // 挂上去就是「点了停止、气泡又回来」
+  if (stoppingSessions.has(opts.sessionId)) return Promise.resolve();
   controller?.abort();
-  currentRunId = opts.runId;
 
   const ctrl = new AbortController();
   controller = ctrl;
@@ -320,28 +338,24 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
     emit();
   };
 
-  const handlers = buildHandlers(ctrl, patch, markWrote, opts.onError);
+  const handlers = buildHandlers(patch, markWrote, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
-  const claim = (runId: string) => {
-    if (controller === ctrl) currentRunId = runId;
-  };
 
   return (async () => {
     let aborted = false;
     try {
       const outcome = await streamRun(opts.runId, opts.afterOffset ?? 0, handlers, ctrl.signal);
-      if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+      if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers);
     } catch (e) {
       aborted = e instanceof DOMException && e.name === 'AbortError';
       if (!aborted) {
-        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers);
         if (!resumed) opts.onError?.(e instanceof Error ? e.message : '续接失败，请重试');
       }
     } finally {
       if (controller === ctrl) {
         current = null;
         controller = null;
-        currentRunId = null;
         emit();
       }
       opts.onSettled?.({ sessionId: opts.sessionId, wroteFiles: wrote, aborted });
