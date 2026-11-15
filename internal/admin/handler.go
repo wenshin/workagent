@@ -6,9 +6,11 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -49,19 +51,27 @@ type SecretItem struct {
 	InUse       bool      `json:"in_use"`
 }
 
+// Usage 返回「当前正在使用中」的凭证，键为 scope/name。
+//
+// 引用关系是运行期状态（装一个搜索源 / 停用一个工具就会变），所以不做静态表，
+// 由调用方每次现算；传 nil 表示平台无法判断，此时不做使用中标记。
+type Usage func(ctx context.Context) map[string]bool
+
 // Handler 提供 /admin 下的接口。
 type Handler struct {
 	spaces  *space.Service
 	secrets secret.Store
 	refs    []SecretRef
+	usage   Usage
 	resolve func(*http.Request) (store.User, error)
 	log     *slog.Logger
 }
 
-// NewHandler 构造管理接口；secrets 允许为 nil（未配置 SECRET_KEK）。
-func NewHandler(spaces *space.Service, secrets secret.Store, refs []SecretRef,
+// NewHandler 构造管理接口；secrets 允许为 nil（未配置 SECRET_KEK），
+// refs 允许为空（凭证的引用关系由插件清单在运行期声明），usage 允许为 nil。
+func NewHandler(spaces *space.Service, secrets secret.Store, refs []SecretRef, usage Usage,
 	resolve func(*http.Request) (store.User, error), log *slog.Logger) *Handler {
-	return &Handler{spaces: spaces, secrets: secrets, refs: refs, resolve: resolve, log: log}
+	return &Handler{spaces: spaces, secrets: secrets, refs: refs, usage: usage, resolve: resolve, log: log}
 }
 
 // Register 注册路由。全部要求系统管理员（按工号白名单）。
@@ -84,24 +94,25 @@ func (h *Handler) settings(w http.ResponseWriter, r *http.Request) {
 	enabled := h.secrets != nil && h.secrets.Enabled()
 	items := make([]SecretItem, 0, len(refs))
 	if enabled {
-		seen := make(map[string]bool, len(refs))
-		for _, ref := range refs {
-			if seen[ref.Scope] {
-				continue
-			}
-			seen[ref.Scope] = true
-			list, err := h.secrets.Status(r.Context(), ref.Scope)
+		usage := map[string]bool{}
+		if h.usage != nil {
+			usage = h.usage(r.Context())
+		}
+		// 列举的口径是「存储里有哪些 scope」，不是「refs 里有哪些 scope」：
+		// 搜索源与插件声明的凭证都是运行期状态，只按 refs 列会让已经配好的密钥消失。
+		for _, scope := range h.scopes(r.Context()) {
+			list, err := h.secrets.Status(r.Context(), scope)
 			if err != nil {
-				h.log.Warn("读取凭证状态失败", "scope", ref.Scope, "err", err)
+				h.log.Warn("读取凭证状态失败", "scope", scope, "err", err)
 				continue
 			}
 			for _, it := range list {
 				items = append(items, SecretItem{
-					Scope:       ref.Scope,
+					Scope:       scope,
 					Name:        it.Name,
 					Fingerprint: it.Fingerprint,
 					UpdatedAt:   it.UpdatedAt,
-					InUse:       h.inUse(ref.Scope, it.Name),
+					InUse:       h.inUse(refs, usage, scope, it.Name),
 				})
 			}
 		}
@@ -115,9 +126,44 @@ func (h *Handler) settings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// inUse 判断某个 scope/name 是否被平台引用。
-func (h *Handler) inUse(scope, name string) bool {
+// scopes 汇总要列举的 scope：refs 声明的 + 存储里实际存在的（去重、稳定排序）。
+func (h *Handler) scopes(ctx context.Context) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(h.refs)+1)
+	add := func(scope string) {
+		scope = strings.TrimSpace(scope)
+		if scope == "" || seen[scope] {
+			return
+		}
+		seen[scope] = true
+		out = append(out, scope)
+	}
 	for _, ref := range h.refs {
+		add(ref.Scope)
+	}
+	// 存储实现能列举 scope 时一并列出：否则「配过但没人引用」的条目不显示，
+	// 管理员会以为密钥丢了（实际是 refs 传空了）。
+	if lister, ok := h.secrets.(interface {
+		Scopes() ([]string, error)
+	}); ok {
+		scopes, err := lister.Scopes()
+		if err != nil {
+			h.log.Warn("列举凭证 scope 失败", "err", err)
+		}
+		for _, scope := range scopes {
+			add(scope)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// inUse 判断某个 scope/name 是否正被使用：静态 refs 或运行期统计命中即可。
+func (h *Handler) inUse(refs []SecretRef, usage map[string]bool, scope, name string) bool {
+	if usage[scope+"/"+name] {
+		return true
+	}
+	for _, ref := range refs {
 		if ref.Scope == scope && ref.Name == name {
 			return true
 		}

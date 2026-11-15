@@ -53,7 +53,8 @@ function toToolRecord(payload: StreamPayload): ToolCallRecord {
   };
 }
 
-function handleEvent(event: string, payload: StreamPayload, handlers: StreamHandlers) {
+/** 处理一条事件；返回 true 表示这是这一轮的终态事件（之后不会再有任何增量）。 */
+function handleEvent(event: string, payload: StreamPayload, handlers: StreamHandlers): boolean {
   switch (event) {
     case 'run.started':
       handlers.onRunStarted?.(payload.run_id ?? '');
@@ -81,7 +82,7 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
       if (typeof payload.message === 'object' && payload.message && payload.session) {
         handlers.onDone?.({ message: payload.message, session: payload.session });
       }
-      break;
+      return true;
     case 'run.finished':
       // 失败与中断都以 run.finished 收尾（成功时由 message.done 更新界面）
       if (payload.status && payload.status !== 'succeeded') {
@@ -89,23 +90,39 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
           payload.status === 'cancelled' ? '回答已中断，已保留已生成的内容' : '生成失败，请重试';
         handlers.onError?.(payload.error || fallback);
       }
-      break;
+      return true;
     case 'error':
       handlers.onError?.(typeof payload.message === 'string' ? payload.message : '生成失败，请重试');
       break;
   }
+  return false;
+}
+
+/**
+ * 一条流的结局。
+ *
+ * 「流结束」不等于「这一轮结束」：代理掐连接、切页、dev 热更新都会让 body 提前
+ * 关闭，而服务端的 run 还在跑（§15.12.1）。调用方必须看 finished 才能决定
+ * 是收尾还是重新挂回 /runs/{id}/stream 续传（§15.12.2）。
+ */
+export interface StreamOutcome {
+  /** 收到了 message.done / run.finished：这一轮真的结束了 */
+  finished: boolean;
+  /** 是否收到过任何一帧：false 说明请求根本没建立起来，重连没有意义 */
+  received: boolean;
 }
 
 /**
  * 读取一条 SSE 流。chat 与 run 续流共用同一份解析，保证两条链路行为一致。
  */
-async function readSSE(res: Response, handlers: StreamHandlers): Promise<void> {
+async function readSSE(res: Response, handlers: StreamHandlers): Promise<StreamOutcome> {
   if (!res.body) {
     throw new ApiError('当前浏览器不支持流式响应', 0, 'stream_unsupported');
   }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
+  const outcome: StreamOutcome = { finished: false, received: false };
   let buffer = '';
 
   const handleBlock = (block: string) => {
@@ -125,7 +142,8 @@ async function readSSE(res: Response, handlers: StreamHandlers): Promise<void> {
     } catch {
       return;
     }
-    handleEvent(event, payload, handlers);
+    outcome.received = true;
+    if (handleEvent(event, payload, handlers)) outcome.finished = true;
   };
 
   for (;;) {
@@ -142,6 +160,7 @@ async function readSSE(res: Response, handlers: StreamHandlers): Promise<void> {
   }
 
   if (buffer.trim()) handleBlock(buffer);
+  return outcome;
 }
 
 async function ensureOK(res: Response): Promise<void> {
@@ -166,7 +185,7 @@ export async function streamChat(
   references: string[],
   handlers: StreamHandlers,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<StreamOutcome> {
   let res: Response;
   try {
     res = await fetch(`/sessions/${sessionId}/chat`, {
@@ -182,7 +201,7 @@ export async function streamChat(
   }
 
   await ensureOK(res);
-  await readSSE(res, handlers);
+  return readSSE(res, handlers);
 }
 
 /**
@@ -196,7 +215,7 @@ export async function streamRun(
   afterOffset: number,
   handlers: StreamHandlers,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<StreamOutcome> {
   let res: Response;
   try {
     res = await fetch(`/runs/${runId}/stream?after_offset=${afterOffset}`, { signal });
@@ -206,5 +225,5 @@ export async function streamRun(
   }
 
   await ensureOK(res);
-  await readSSE(res, handlers);
+  return readSSE(res, handlers);
 }

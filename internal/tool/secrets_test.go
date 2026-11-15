@@ -28,6 +28,14 @@ func (f fakeSecrets) Status(ctx context.Context, scope string) ([]secret.Item, e
 	return f.items[scope], nil
 }
 
+func (f fakeSecrets) SecretNames(ctx context.Context, scope string) ([]string, error) {
+	out := make([]string, 0, len(f.items[scope]))
+	for _, it := range f.items[scope] {
+		out = append(out, it.Name)
+	}
+	return out, nil
+}
+
 func (f fakeSecrets) Delete(ctx context.Context, scope, name string) error { return nil }
 
 func callSecretRequest(t *testing.T, env Env, args string) secretRequestResult {

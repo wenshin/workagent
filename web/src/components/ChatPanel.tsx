@@ -8,7 +8,7 @@ import {
   IconTick,
 } from '@douyinfe/semi-icons';
 import { Button, Empty, Input, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   ChatMessage,
@@ -384,10 +384,63 @@ export default function ChatPanel({
   const [inputMinHeight, setInputMinHeight] = useState(0);
   const startedAtRef = useRef<number | null>(null);
   const composerRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  // 滚动容器与「是否贴底」：用户往上翻过之后就不再把他拽回底部
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+  // 最后一份流内容：流结束到回复落库之间的空窗期用它顶住列表（见下方 heldStream）
+  const handoverRef = useRef<{
+    sessionId: string;
+    view: StreamView;
+    /** 流刚结束时列表里的可见条数：超过它且末尾是已落库的 assistant，说明这一轮回复到了 */
+    baseCount: number;
+    armed: boolean;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const busy = sending || Boolean(stream);
+
+  // 容差 40px 仍算贴底，避免像素级误差把用户判成「已经上滚了」
+  const handleBodyScroll = () => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  // 换会话：同步重置贴底与交接状态（必须在 layout 阶段的滚动之前生效）
+  const sessionKeyRef = useRef(session.id);
+  if (sessionKeyRef.current !== session.id) {
+    sessionKeyRef.current = session.id;
+    stickRef.current = true;
+    handoverRef.current = null;
+  }
+
+  // 列表里可见的消息：流式的空占位（后端在首个正文增量时创建）由下面的实时气泡接管
+  const visibleMessages = messages.filter((m) => !(m.streaming && !m.content));
+  const lastVisible = visibleMessages[visibleMessages.length - 1];
+
+  // 流结束的瞬间 stream 变 null，而这一轮回复还没落库：此时若立刻卸载实时气泡，列表高度
+  // 会先塌回去、等消息拉回来再长出来，滚动条看上去就是「先跳到顶、再回到底」。
+  // 所以把最后一份流内容按住，等回复真的进了列表；有回复时不再渲染按住的那份，
+  // 两者在同一次渲染里交接，既不会重复也不会出现空窗。
+  if (stream) {
+    handoverRef.current = { sessionId: session.id, view: stream, baseCount: 0, armed: false };
+  } else if (handoverRef.current && handoverRef.current.sessionId === session.id && !handoverRef.current.armed) {
+    handoverRef.current = { ...handoverRef.current, baseCount: visibleMessages.length, armed: true };
+  }
+  const handover = !stream && handoverRef.current?.sessionId === session.id ? handoverRef.current : null;
+  const replyLanded = Boolean(
+    handover &&
+      visibleMessages.length > handover.baseCount &&
+      lastVisible?.role === 'assistant' &&
+      !lastVisible.streaming,
+  );
+  // 只有真的写出了正文才顶住：失败或只有思考的空轮次不该留一个假气泡
+  const heldStream =
+    handover && !replyLanded && handover.view.items.some((item) => item.kind === 'text')
+      ? handover.view
+      : null;
+  /** 实际要画出来的实时内容：流式中是真流，交接空窗期是按住的那份 */
+  const liveView: StreamView | null = stream ?? heldStream;
 
   useEffect(() => {
     setValue('');
@@ -499,9 +552,14 @@ export default function ChatPanel({
     return () => window.removeEventListener('wa-ui-message', onUiMessage);
   }, []);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages.length, session.id, stream?.items, pendingUser]);
+  // 贴底时才跟随到底部。用 scrollTop 直接赋值，而不是 scrollIntoView({behavior:'smooth'})：
+  // 平滑动画会被每个增量重启，长度还在变化时看着就是「先跳到顶再回到底」。
+  // 放在 layout 阶段执行，避免先绘制出未贴底的帧。
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !stickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages, session.id, stream?.items, pendingUser, heldStream]);
 
   useEffect(() => {
     if (!busy) {
@@ -520,6 +578,8 @@ export default function ChatPanel({
     const text = value.trim();
     if (!text || sending) return;
     setError('');
+    // 自己发的消息一定跟到底部，哪怕之前往上翻着看
+    stickRef.current = true;
     try {
       await onSend(text, refs);
       setValue('');
@@ -529,6 +589,17 @@ export default function ChatPanel({
       setError(e instanceof Error ? e.message : '发送失败，请重试');
     }
   };
+
+  // 「继续」= 再发一条消息（凭证卡片录完/审批通过后接着跑）。同一会话不能并发，
+  // 正在生成时先不提供按钮——点了也只会被后端拒绝，白等一次；真失败要报出来，
+  // 别像以前那样吞成未捕获的 rejection。
+  const continueRun: ((content: string) => void) | undefined = busy
+    ? undefined
+    : (content: string) => {
+        onSend(content, []).catch((e) =>
+          setError(e instanceof Error ? e.message : '发送失败，请重试'),
+        );
+      };
 
   // 手柄在输入框上边框上：往上拖 = 变高，往下拖 = 变矮（最矮一行，双击恢复自动高度）
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -554,7 +625,7 @@ export default function ChatPanel({
 
   const resetInputHeight = () => setInputMinHeight(0);
 
-  const showEmpty = !loading && messages.length === 0 && !stream && !pendingUser;
+  const showEmpty = !loading && messages.length === 0 && !liveView && !pendingUser;
   const activeSkill = skills.find((s) => s.path === session.skill_path);
 
   const pickSkill = (path: string) => {
@@ -629,7 +700,7 @@ export default function ChatPanel({
         </Popover>
       </div>
 
-      <div className="chat-body">
+      <div className="chat-body" ref={bodyRef} onScroll={handleBodyScroll}>
         {loading ? (
           <div className="chat-empty">
             <Spin />
@@ -642,10 +713,7 @@ export default function ChatPanel({
             />
           </div>
         ) : (
-          messages
-            // 占位的空 streaming 消息由下面的实时视图接管，避免出现一条空气泡
-            .filter((m) => !(m.streaming && !m.content))
-            .map((m) => (
+          visibleMessages.map((m) => (
             <div key={m.id} className={`chat-msg chat-msg-${m.role}`}>
               <div className="chat-msg-meta">
                 <span>{m.role === 'user' ? '我' : m.role === 'assistant' ? 'Agent' : '系统'}</span>
@@ -674,7 +742,7 @@ export default function ChatPanel({
                   reasoning={m.reasoning}
                   tools={toRecords(m.parts)}
                   spaceId={session.space_id}
-                  onSend={(c) => void onSend(c, [])}
+                  onSend={continueRun}
                 />
               ) : (
                 <UserBody content={m.content} />
@@ -692,7 +760,8 @@ export default function ChatPanel({
           </div>
         ) : null}
 
-        {stream ? (
+        {/* 流式气泡：流结束后由 heldStream 继续顶住，直到这一轮回复进了上面的列表 */}
+        {liveView ? (
           <div className="chat-msg chat-msg-assistant">
             <div className="chat-msg-meta">
               <span>Agent</span>
@@ -702,20 +771,18 @@ export default function ChatPanel({
                 </span>
               ) : null}
             </div>
-            {stream.items.length === 0 ? (
+            {liveView.items.length === 0 ? (
               <div className="chat-msg-content chat-msg-pending">正在思考…</div>
             ) : (
               <AssistantBody
-                items={stream.items}
-                live
+                items={liveView.items}
+                live={Boolean(stream)}
                 spaceId={session.space_id}
-                onSend={(c) => void onSend(c, [])}
+                onSend={continueRun}
               />
             )}
           </div>
         ) : null}
-
-        <div ref={bottomRef} />
       </div>
 
       <div className="chat-input">

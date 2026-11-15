@@ -131,7 +131,7 @@ func newMCPRuntime(ctx context.Context, meta Manifest, secrets Secrets,
 			}
 			rt.svcIssued = time.Now()
 		} else if meta.Auth.Secret != "" && secrets != nil {
-			v, err := secrets.Get(ctx, "plugin", meta.Auth.Secret)
+			v, err := secrets.Get(ctx, SecretScope, meta.Auth.Secret)
 			if err != nil {
 				log.Warn("MCP 插件引用的密钥不存在", "slug", meta.Slug, "secret", meta.Auth.Secret, "err", err)
 			} else {

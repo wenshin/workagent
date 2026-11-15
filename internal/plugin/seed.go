@@ -89,7 +89,8 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 
 	// 预置搜索源放在最后：它实现的是 search.query，不依赖其它内置件。
 	// 预置的意义是「新部署装完就有搜索能力」，而不是给平台留一条绕开插件体系的旁路——
-	// 它在市场里可见、可停用、可被用户自己的源按 priority 顶掉。
+	// 它在市场里可见、可被用户自己的源按 priority 顶掉，也可以在系统空间的插件页停用
+	// （停用对全部空间生效，见 Manager.SetEnabled）。
 	for _, src := range builtinSources() {
 		keep[src.Slug] = true
 		spec := src.Source
@@ -162,8 +163,17 @@ func (m *Manager) seedBuiltin(ctx context.Context, ownerID, sysID string, meta M
 		files[name] = content
 	}
 	// 版本由内容指纹推导：内容没变版本不变，改了内容就发新版，旧版本继续可用。
+	//
+	// 清单本身也要进指纹：内置件的清单是代码生成的，字段增删（例如
+	// capabilities[].paths 下线）不产生新版本的话，库里会一直留着那份旧清单，
+	// 加载时按严格解析直接失败（unknown field），表现为「内置工具莫名其妙没了」。
+	rawManifest, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(meta.Slug + builtinSeedRevision))
+	_, _ = h.Write(rawManifest)
 	for _, name := range sortedKeys(files) {
 		_, _ = h.Write([]byte(name))
 		_, _ = h.Write([]byte(files[name]))
@@ -226,13 +236,29 @@ func (m *Manager) ensureGlobalInstall(ctx context.Context, sysID, slug, version 
 	if sysID == "" {
 		return nil
 	}
-	if in, err := m.o.Store.GetPluginInstall(ctx, sysID, slug); err == nil && in.Version == version {
+	prev, prevErr := m.o.Store.GetPluginInstall(ctx, sysID, slug)
+	if prevErr == nil && prev.Version == version {
 		return nil
 	}
 	if _, err := m.Install(ctx, InstallInput{
 		SpaceID: sysID, Slug: slug, Version: version, Perm: "manage", IsAdmin: true,
 	}); err != nil {
 		return err
+	}
+	// 升级不改变开关状态：内置搜索源的「停用」是系统管理员的一次显式决定，
+	// 平台换版只该换代码。Install 一律写成 enabled，这里按旧记录翻回去，
+	// 并把刚建好的运行时摘掉（停用态本来就不该被加载）。
+	if prevErr == nil && prev.Status == store.PluginInstallDisabled {
+		prev.Version, prev.Status = version, store.PluginInstallDisabled
+		if _, err := m.o.Store.UpsertPluginInstall(ctx, prev); err != nil {
+			return err
+		}
+		m.unregisterSource(sysID, slug, true)
+		m.closeSlugProcs(sysID, slug)
+		m.mu.Lock()
+		delete(m.inst[sysID], slug)
+		delete(m.mcpCs, sysID+"/"+slug)
+		m.mu.Unlock()
 	}
 	return nil
 }

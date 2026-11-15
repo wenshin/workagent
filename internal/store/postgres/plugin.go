@@ -231,6 +231,36 @@ order by p.slug`
 	return out, rows.Err()
 }
 
+// ListAllPluginInstalls 返回全部空间的安装记录：凭证是平台级的，
+// 判断「还有没有插件在用」不能只看某一个空间。
+func (d *DB) ListAllPluginInstalls(ctx context.Context) ([]store.PluginInstall, error) {
+	const q = `
+select i.space_id::text, i.plugin_id::text, p.slug, i.version, i.status, i.risk,
+       coalesce(i.installed_by::text, ''), i.installed_at, i.dismissed_version, i.config
+from plugin_install i
+join plugin p on p.id = i.plugin_id
+order by p.slug, i.space_id`
+
+	rows, err := d.pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]store.PluginInstall, 0, 16)
+	for rows.Next() {
+		var in store.PluginInstall
+		if err := rows.Scan(
+			&in.SpaceID, &in.PluginID, &in.Slug, &in.Version, &in.Status,
+			&in.Risk, &in.InstalledBy, &in.InstalledAt, &in.DismissedVersion, &in.Config,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, in)
+	}
+	return out, rows.Err()
+}
+
 // GetPluginInstall 按「空间 + slug」取安装记录。
 func (d *DB) GetPluginInstall(ctx context.Context, spaceID, slug string) (store.PluginInstall, error) {
 	const q = `

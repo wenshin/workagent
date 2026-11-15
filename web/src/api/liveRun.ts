@@ -1,6 +1,6 @@
-import { cancelRun } from './client';
+import { cancelRun, getActiveRun } from './client';
 import { streamChat, streamRun, type StreamHandlers } from './stream';
-import type { StreamItem } from './types';
+import type { ActiveRunResponse, StreamItem } from './types';
 
 /**
  * 正在进行的一轮对话。
@@ -25,6 +25,16 @@ export interface LiveRunView {
 }
 
 type Listener = () => void;
+
+/**
+ * 流被意外掐断后的重连间隔（次数即上限，失败后交给 onSettled 刷新消息）。
+ *
+ * 「流结束」不等于「这一轮结束」（§15.12.1）：切页、切标签、代理掐连接、dev 热更新
+ * 都只让这一条订阅断掉，run 还在服务端跑。这里按内存缓冲重新挂回
+ * `/runs/{id}/stream` 续上（§15.12.2），而不是把断开当成收尾——那正是
+ * 「切个页面回来回答就没了」的成因。
+ */
+const RESUME_DELAYS_MS = [300, 800, 1500, 3000, 5000];
 
 let current: LiveRunView | null = null;
 let controller: AbortController | null = null;
@@ -134,6 +144,61 @@ function buildHandlers(
   };
 }
 
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = window.setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/**
+ * 断流自愈：问一次「这一轮还在不在跑」，还在就挂回 `/runs/{id}/stream` 继续跟。
+ *
+ * 从 after_offset=0 补：服务端的内存缓冲留着这一轮的全部事件，先清掉已渲染的
+ * 片段再补一遍，内容不会重复也不会缺段；跟着直播继续走，直到收到终态。
+ *
+ * @returns true 表示重新挂上并跑到了终态；false 表示 run 已经结束或问不到状态，
+ *          调用方照常刷新消息即可。
+ */
+async function resumeStream(
+  sessionId: string,
+  ctrl: AbortController,
+  reset: () => void,
+  handlers: StreamHandlers,
+  /** 挂上之后回报 run_id：断了重连时「停止」按钮仍要能找到这一轮 */
+  claim: (runId: string) => void,
+): Promise<boolean> {
+  for (const delayMs of RESUME_DELAYS_MS) {
+    if (ctrl.signal.aborted) return false;
+    await sleep(delayMs, ctrl.signal);
+    if (ctrl.signal.aborted) return false;
+
+    let active: ActiveRunResponse;
+    try {
+      active = await getActiveRun(sessionId);
+    } catch {
+      return false;
+    }
+    if (!active.active || !active.run) return false;
+
+    reset();
+    claim(active.run.id);
+    try {
+      const outcome = await streamRun(active.run.id, 0, handlers, ctrl.signal);
+      if (outcome.finished) return true;
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return false;
+      // 续接本身失败：按下一档退避再来
+    }
+  }
+  return false;
+}
+
 /**
  * 启动一轮对话；同一时间只允许一轮。返回的 Promise 在轮次结束时 resolve，
  * 与组件生命周期无关。
@@ -174,20 +239,34 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
     emit();
   };
 
+  const handlers = buildHandlers(ctrl, patch, markWrote, opts.onError);
+  const reset = () => patch((v) => ({ ...v, items: [] }));
+  const claim = (runId: string) => {
+    if (controller === ctrl) currentRunId = runId;
+  };
+
   return (async () => {
     let aborted = false;
     try {
-      await streamChat(
+      const outcome = await streamChat(
         opts.sessionId,
         opts.content,
         opts.references ?? [],
-        buildHandlers(ctrl, patch, markWrote, opts.onError),
+        handlers,
         ctrl.signal,
       );
+      // 没有终态事件就是断了（切页、代理掐连接、热更新……）：run 还在服务端跑，续上
+      if (!outcome.finished) {
+        await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+      }
     } catch (e) {
       // 用户主动停止不算错误
       aborted = e instanceof DOMException && e.name === 'AbortError';
-      if (!aborted) opts.onError?.(e instanceof Error ? e.message : '发送失败，请重试');
+      if (!aborted) {
+        // 连接中途被掐断也是「流断了」：先试着重挂，真的续不上再报错
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+        if (!resumed) opts.onError?.(e instanceof Error ? e.message : '发送失败，请重试');
+      }
     } finally {
       // 只有自己仍是当前轮次才清空视图：被新会话接管时不能把新一轮抹掉
       if (controller === ctrl) {
@@ -244,18 +323,23 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
     emit();
   };
 
+  const handlers = buildHandlers(ctrl, patch, markWrote, opts.onError);
+  const reset = () => patch((v) => ({ ...v, items: [] }));
+  const claim = (runId: string) => {
+    if (controller === ctrl) currentRunId = runId;
+  };
+
   return (async () => {
     let aborted = false;
     try {
-      await streamRun(
-        opts.runId,
-        opts.afterOffset ?? 0,
-        buildHandlers(ctrl, patch, markWrote, opts.onError),
-        ctrl.signal,
-      );
+      const outcome = await streamRun(opts.runId, opts.afterOffset ?? 0, handlers, ctrl.signal);
+      if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
     } catch (e) {
       aborted = e instanceof DOMException && e.name === 'AbortError';
-      if (!aborted) opts.onError?.(e instanceof Error ? e.message : '续接失败，请重试');
+      if (!aborted) {
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, claim);
+        if (!resumed) opts.onError?.(e instanceof Error ? e.message : '续接失败，请重试');
+      }
     } finally {
       if (controller === ctrl) {
         current = null;

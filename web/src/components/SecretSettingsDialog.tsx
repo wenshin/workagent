@@ -10,6 +10,8 @@ const { Text } = Typography;
 interface Props {
   visible: boolean;
   onClose: () => void;
+  /** 从插件卡片进来时带上「缺的那条凭证」：直接展开录入表单，不用自己找名字 */
+  preset?: { scope: string; name: string } | null;
 }
 
 // 与后端 secret.validateName 一致，先在前端拦一次，避免白跑一趟
@@ -30,7 +32,7 @@ function formatTime(iso?: string) {
  * 名称对应 source 插件清单里的 source.secret，值改完立即生效；
  * 新增其他名称只是「待用条目」，只有被引用的那一条会真正生效。
  */
-export default function SecretSettingsDialog({ visible, onClose }: Props) {
+export default function SecretSettingsDialog({ visible, onClose, preset }: Props) {
   const { data, isLoading, error } = useAdminSettings(visible);
   const setSecret = useSetSecret();
   const deleteSecret = useDeleteSecret();
@@ -38,13 +40,15 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
   // 表单：editing 为正在更新的名称，null 表示新增
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
+  // scope 必须跟着条目走：搜索凭证在 search，插件 secret.use 在 plugin，
+  // 统一按 refs[0] 写会把更新落到另一个 scope 上，等于凭空多出一条。
+  const [formScope, setFormScope] = useState('search');
   const [name, setName] = useState('');
   const [value, setValue] = useState('');
 
   const refs = data?.refs ?? [];
   const items = data?.items ?? [];
   const enabled = data?.secrets_enabled ?? false;
-  const scope = refs[0]?.scope ?? 'search';
   // 环境变量提供的引用不在界面上管理：那里没有可录入的条目
   const envRefs = refs.filter((r) => r.source === 'env');
 
@@ -52,16 +56,29 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
     if (!visible) {
       setFormOpen(false);
       setEditing(null);
+      setFormScope('search');
       setName('');
       setValue('');
     }
   }, [visible]);
+
+  // 从插件卡片「配置密钥」进来：名称由清单固定（改了就引用不上），直接展开录入，
+  // 用户只需要粘贴值。名称框仍可改，但预填对了就不用动。
+  useEffect(() => {
+    if (!visible || !preset) return;
+    setFormScope(preset.scope);
+    setName(preset.name);
+    setValue('');
+    setEditing(null);
+    setFormOpen(true);
+  }, [visible, preset?.scope, preset?.name]);
 
   const openAdd = () => {
     // 平台引用的那条还没配过时直接带上名称（含 ${} 引用里的名字），
     // 这样即便当前靠环境变量在跑，新增一条同名凭证就能接管。
     const referenced = refs[0]?.name ?? '';
     const exists = items.some((it) => it.name === referenced);
+    setFormScope(refs[0]?.scope ?? 'search');
     setName(!referenced || exists ? '' : referenced);
     setValue('');
     setEditing(null);
@@ -69,6 +86,7 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
   };
 
   const openEdit = (item: SecretItem) => {
+    setFormScope(item.scope);
     setName(item.name);
     setValue('');
     setEditing(item.name);
@@ -94,13 +112,10 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
       return;
     }
     try {
-      await setSecret.mutateAsync({ scope, name: target, value: trimmedValue });
-      const referenced = refs.some((r) => r.name === target);
-      if (!referenced) {
-        Toast.warning('已保存，但该名称未被平台引用，不会生效');
-      } else {
-        Toast.success(editing ? '密钥已更新，下一次调用立即生效' : '密钥已添加，下一次调用立即生效');
-      }
+      await setSecret.mutateAsync({ scope: formScope, name: target, value: trimmedValue });
+      // 「会不会真正生效」以列表里的标记为准：引用关系由插件清单在运行期声明，
+      // 前端拿不到（refs 为空是常态），这里不猜。
+      Toast.success(editing ? '密钥已更新，下一次调用立即生效' : '密钥已添加，下一次调用立即生效');
       closeForm();
     } catch (err) {
       Toast.error(err instanceof Error ? err.message : '保存失败');
@@ -207,6 +222,9 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <Text strong>{item.name}</Text>
+                            <Tag size="small" color="blue">
+                              {item.scope}
+                            </Tag>
                             <Tag size="small" color={item.in_use ? 'green' : 'grey'}>
                               {item.in_use ? '使用中' : '未引用'}
                             </Tag>
@@ -218,7 +236,7 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                         <Button
                           theme="borderless"
                           size="small"
-                          disabled={formOpen && editing === item.name}
+                          disabled={formOpen && editing === item.name && formScope === item.scope}
                           onClick={() => openEdit(item)}
                         >
                           更新
@@ -240,13 +258,15 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
 
               {formOpen ? (
                 <section>
-                  <Text strong>{editing ? `更新 ${editing}` : '新增密钥'}</Text>
+                  <Text strong>
+                    {editing ? `更新 ${formScope}/${editing}` : '新增密钥'}
+                  </Text>
                   <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
                     <Input
                       value={name}
                       onChange={setName}
                       disabled={editing !== null}
-                      placeholder="名称，如 default"
+                      placeholder="名称，如 bocha"
                       style={{ width: 200 }}
                     />
                     <Input
@@ -262,8 +282,9 @@ export default function SecretSettingsDialog({ visible, onClose }: Props) {
                     <Button onClick={closeForm}>取消</Button>
                   </div>
                   <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 8 }}>
-                    搜索密钥统一用名称 <Text code>default</Text>
-                    ，只有与平台引用一致的那条才会生效；名称保存后不可改，换个名字等于新增一条。
+                    名称必须与插件清单声明的一致：搜索源看 <Text code>source.secret</Text>
+                    （如 <Text code>bocha</Text>），插件看 <Text code>secret.use</Text> 的 name。
+                    名称保存后不可改，换个名字等于新增一条。
                   </Text>
                 </section>
               ) : null}

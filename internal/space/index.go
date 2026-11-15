@@ -132,14 +132,64 @@ func (s *Service) MergedSources(ctx context.Context, spaceID string) IndexBundle
 
 	sys, err := s.store.GetSpaceByType(ctx, SpaceTypeSystem)
 	if err != nil || sys.ID == spaceID {
-		return out
+		return s.withoutDisabled(ctx, spaceID, out)
 	}
 	sysIdx := s.LoadIndex(ctx, sys.ID)
 	out.Skills = mergeByName(out.Skills, marked(sysIdx.Skills, SourceSystem))
 	out.Tools = mergeByName(out.Tools, marked(sysIdx.Tools, SourceSystem))
 	out.MCPS = mergeByName(out.MCPS, marked(sysIdx.MCPS, SourceSystem))
 	out.Components = mergeByName(out.Components, marked(sysIdx.Components, SourceSystem))
-	return out
+	return s.withoutDisabled(ctx, spaceID, out)
+}
+
+// withoutDisabled 摘掉已停用插件的条目。
+//
+// 停用是运行期状态，磁盘上的 plugins/<slug>/ 还在，索引（无论是文件现状还是
+// 已安装清单）照样会把它算进来。不在这里筛一遍，「停用」对靠索引进检索池的
+// 技能/组件就等于没生效。
+func (s *Service) withoutDisabled(ctx context.Context, spaceID string, b IndexBundle) IndexBundle {
+	if s.disabledPlugins == nil {
+		return b
+	}
+	off, err := s.disabledPlugins(ctx, spaceID)
+	if err != nil {
+		s.log.Warn("读取停用插件失败", "space_id", spaceID, "err", err)
+		return b
+	}
+	if len(off) == 0 {
+		return b
+	}
+	keep := func(list []IndexEntry) []IndexEntry {
+		if len(list) == 0 {
+			return list
+		}
+		out := make([]IndexEntry, 0, len(list))
+		for _, e := range list {
+			if off[slugOfSourcePath(e.Path)] {
+				continue
+			}
+			out = append(out, e)
+		}
+		return out
+	}
+	b.Skills = keep(b.Skills)
+	b.Tools = keep(b.Tools)
+	b.MCPS = keep(b.MCPS)
+	b.Components = keep(b.Components)
+	return b
+}
+
+// slugOfSourcePath 从索引路径反解插件 slug：
+// 空间副本是 plugins/<slug>/...，发布件是 published/<kind>/<slug>/<version>/...
+func slugOfSourcePath(rel string) string {
+	parts := strings.Split(rel, "/")
+	switch {
+	case len(parts) >= 2 && parts[0] == DraftDirName:
+		return parts[1]
+	case len(parts) >= 3 && parts[0] == "published":
+		return parts[2]
+	}
+	return ""
 }
 
 // isSystemCapabilityPath 判断相对路径是否落在可跨空间读取的能力目录内。

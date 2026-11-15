@@ -95,7 +95,8 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - **风险推导**：`Derive(manifest)` 由 `capabilities` 推导 `risk` 与 `side_effects`，清单里写 `risk` 直接解析失败；`secret.use` + 外部写 = L4，发布与安装都需要系统管理员。
 - **发布权 / 安装权分离**：空间管理员只能启用本地插件（写 `plugin_candidate`，市场出现「待发布」元数据）；**系统管理员**才能发布（不可变快照）。安装由**空间管理员**执行，只在本空间生效，落 `plugins/<slug>/` 只读副本（所有 kind 都复制，写 `.install.json`）。
 - **本地插件默认停用**：`plugin_candidate.status=enabled` 才进入检索/工具/MCP/组件；安装副本默认启用，可停用、卸载。同 slug 的本地目录与安装记录互斥：安装检查目录，本地启用检查安装记录。
-- **平台内置 = 系统空间的安装**：`origin=system` 的插件只允许安装到系统空间，那份 `plugin_install` + `plugins/<slug>/` 副本就是「全局安装」；其他空间加载时并入快照，天然进检索池与工具列表。普通空间对内置件 `install` / `uninstall` / `enable|disable` 一律拒绝；系统空间里也由平台统一种子化，不作为普通插件启停。
+- **平台内置 = 系统空间的安装**：`origin=system` 的插件只允许安装到系统空间，那份 `plugin_install` + `plugins/<slug>/` 副本就是「全局安装」；其他空间加载时并入快照，天然进检索池与工具列表。普通空间对内置件 `install` / `uninstall` / `enable|disable` 一律拒绝；**启停只在系统空间插件页做**（平台总开关），`uninstall` 仍不允许，`base` 智能体不允许停用（新建会话以它兜底）。
+- **停用必须是真停用**：`plugin_install.status=disabled` 要在每条读取路径上都生效，否则开关只是个标签。四条路各筛一次——加载快照 `ensureLoaded`（实例类：MCP / 组件 / 智能体 / 源）、检索合并 `space.MergedSources`（靠索引进池的技能，文件里的 `plugins/<slug>/` 副本还在，按 `Manager.DisabledSlugs` 摘）、Go 内置工具 `tool.Registry.Load`（执行体在 `internal/tool`，不查安装记录就停不掉）、搜索注册表（停用立即 `unregisterSource`）。系统空间的开关还带全局语义：缓存整片作废（`evictSpaces`，下次访问重建），`ensureLoaded` 的兜底也不会把「有停用记录」的内置件重新装回来。内置件换版重装时保留停用状态。
 - **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.extends` 指父智能体（最多 4 层、禁止成环，可指向旧版 `base`），`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体没有执行器，不允许写 `capabilities`；它不进 `resource_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
 - **运行以空间副本为准**：已安装插件从发布件起 runtime，但空间 `plugins/<slug>/` 是只读展示副本；本地插件从 `plugins/<slug>/` 起 runtime。`extensible` 不再意味着安装后可编辑。
 - **组件是声明式 DSL，不是代码**：`ui.json`（`wa-ui/1`）只描述节点、绑定与动作，由前端 `UiView` 按白名单原生渲染——没有 JS/HTML/CSS 注入点，因此不用 iframe、也不用 Shadow DOM。节点/字段/绑定/动作在 dry-run、发布、读取时各校验一次（`internal/plugin/dsl.go`）。
@@ -109,10 +110,10 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - **文件权限**：默认只能**读**自己所在空间的工作区（`spaces/<id>/files`），**不能写**；空间之外不可见。写权限必须显式声明 `fs.write`，`fs.read` / `fs.write` 的每一项都必须是空间工作区下的**子目录**（`.`、绝对路径、`..` 一律拒绝），`fs.read_only` 覆盖 `fs.write`。文件权限只由 `fs` 段声明：`capabilities` 里写 `fs.read` / `fs.list` / `fs.write` 直接解析失败（宿主 RPC 不再有这三个 method），写文件由 `Derive` 抬到 L3。同一份 `sandbox.FS` 落到两个执行点——挂载决定「路径在沙箱里存不存在」，`--allow-read` / `--allow-write` 决定「deno 允不允许读」，缺一层就等于没管。`capabilities[].paths` 与 `runtime.timeout_ms` 已废弃（从未生效），写了直接解析失败。运行时装在非标准位置要用 `SANDBOX_READ_EXTRA`。
 - **权限展示**：`Manifest.Permissions()` 是权限文案的唯一定义点（文件 / 网络 / 凭证 / 命令 / 远端工具），市场目录（`permissions`）与空间列表（`permissions` / `latest_permissions`）都读它；安装与升级都要先弹确认展示，新增权限类别只改这一个函数。
 - **审计永久保留**：`plugin.publish` / `install` / `uninstall` / `enable` / `reset_baseline` 都写 `audit_log`，卸载不删审计。
-- **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。
+- **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。内置件版本指纹 = `builtinSeedRevision` + **清单 JSON** + 文件内容：只按文件算指纹的话，改清单字段（例如下线 `capabilities[].paths`）不会发新版，库里那份旧清单会在加载时严格解析失败，表现为内置件「自己没了」。
 - 配置项：`PLUGIN_DEFAULT_INSTALL`（逗号分隔 slug，新空间首次初始化时安装一次）；没有「是否允许安装」开关，安装权固定为空间 `manage`（L4 另需系统管理员）。
 - 接口：`GET /spaces/{id}/plugins`、`GET|POST .../{slug}/{dry-run,publish,install,uninstall,enable,disable,baseline,baseline/reset,baseline/dismiss,data,ui}`、`GET /plugins`（市场目录，含待发布元数据与 `is_admin`）、`GET|PUT /spaces/{id}/plugins/{slug}/config`（安装级配置）。`publish` 现在只允许系统管理员；组件产物不再对外暴露静态路由。
-- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能：`builtin_space` / `builtin_files` / `builtin_sessions` / `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）/ `builtin_coding`（编程实践：实现/调试/重构/审查四本子手册，正文以 `internal/space/coding_docs/` 下的 markdown 文件 embed 维护）。
+- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场。清单声明了凭证但存储里还没配时，卡片显示「未启用 + 缺少凭证 scope/name」，并给「配置密钥」按钮直接打开 `SecretSettingsDialog` 预填那一条——凭证是平台级资源，按钮只对系统管理员生效，其他人得到「转给管理员」提示）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能：`builtin_space` / `builtin_files` / `builtin_sessions` / `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）/ `builtin_coding`（编程实践：实现/调试/重构/审查四本子手册，正文以 `internal/space/coding_docs/` 下的 markdown 文件 embed 维护）。
 
 # 能力索引与会话技能
 
@@ -166,7 +167,7 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - 出网唯一通道是 `internal/search.Guard`：只允许 https、域名边界白名单（`bocha.com.evil.com` 不命中）、dial 期拒绝私网 / 回环 / 链路本地 IP（含 `169.254.169.254`）、不跟随 30x、响应体上限 4MB。
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
 - **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。插件清单里存的只是凭证名，不是密钥。
-- 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示指纹与更新时间。`refs` 传空——搜索凭证的引用关系由 `kind=source` 插件清单声明，属于运行期状态（随安装/卸载变化），启动时无法静态列出。
+- 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示 scope、指纹与更新时间。`refs` 传空——搜索凭证的引用关系由 `kind=source` 插件清单声明，属于运行期状态（随安装/卸载变化），启动时无法静态列出。因此列表口径是「**凭证存储里实际存在的 scope**」（`secret.FileStore.Scopes()`），不是 refs；「使用中」也是每次现算（搜索源看 `search.Registry`，插件声明看已启用安装件的清单，`admin.Usage`），不缓存静态表，否则界面上的密钥会「消失」或长期标错。
 - **会话内录入**（`secret_request`，能力 `system.secret.request`，L1）：模型只提供 `scope` / `name` / `label` / `hint`，前端在消息里渲染录入卡片（`SecretRequestCard`，不折叠），明文由浏览器直接 `PUT /admin/secrets/{scope}/{name}`，**不进工具参数、不进模型上下文、不进 `run_step` 审计**；模型回读到的只有「是否已配置 + 指纹」，`can_write` 由 `space.IsAdmin` 判定，非管理员只拿到「转给管理员」的指引。密钥存储没启用（无 `SECRET_KEK`）时工具直接说明，不引导填写，避免变相索要明文。平台基础规则与 `builtin_plugin_dev`（总纲 + `references/source.md` + `references/mcp.md`）都写明：需要凭证时用它，禁止向用户索要明文。
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）。插件安装/启用即注册进 `search.Registry`，停用/卸载立即移除，不需要重启。
 - 新增搜索源：写一个 `kind=source` 插件（`plugin.json` 的 `source.endpoint` / `scope` / `priority` / `secret` + `search.json` 或 `main.ts`），发布、安装。**没有「改 Go 代码注册 provider」这条路了**，`internal/search` 不再持有任何厂商实现。

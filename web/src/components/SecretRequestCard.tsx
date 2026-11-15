@@ -1,7 +1,7 @@
 import { Button, Input, Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { useState } from 'react';
 
-import { useSetSecret } from '../api/hooks';
+import { useAdminSettings, useSetSecret } from '../api/hooks';
 
 const { Text } = Typography;
 
@@ -46,8 +46,15 @@ export default function SecretRequestCard({ data, onContinue }: Props) {
   // 回执未到时不知道配没配：一律按「检查中」展示，避免让用户白填一遍。
   // 只认前端标注的 pending，不看 state：历史消息的回执里没有 state 字段。
   const pending = Boolean(data.pending);
-  const configured = !pending && (data.configured || Boolean(saved));
-  const fingerprint = saved || data.fingerprint || '';
+  // 回执是「发起这次调用那一刻」的快照：用户完全可能在 agent 还在思考时就把密钥
+  // 录完了，落库后重新渲染的卡片如果只认快照，就会把刚填的凭证当成没配、要人再填一遍。
+  // 所以管理员额外读一次密钥配置列表（与弹窗共用缓存，写完一起刷新），拿实时状态；
+  // 非管理员没有该接口的读权限，退回快照即可（他们本来就只看到「转给管理员」）。
+  const { data: settings } = useAdminSettings(!pending && data.can_write && data.available);
+  const live = settings?.items.find((it) => it.scope === data.scope && it.name === data.name);
+  // 拿到实时列表就以它为准（可能已经被人删掉），否则退回快照；刚保存的这条永远算已配置。
+  const configured = !pending && (Boolean(saved) || (settings ? Boolean(live) : data.configured));
+  const fingerprint = saved || live?.fingerprint || data.fingerprint || '';
   const showInput = !pending && data.can_write && data.available && (!configured || editing);
 
   const save = async () => {

@@ -473,7 +473,11 @@ export function useSetSecret() {
         `/admin/secrets/${encodeURIComponent(input.scope)}/${encodeURIComponent(input.name)}`,
         { method: 'PUT', body: { value: input.value } },
       ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.adminSettings }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.adminSettings });
+      // 插件卡片上的「未启用（缺凭证）」要跟着消失，否则得手动刷新
+      qc.invalidateQueries({ queryKey: ['plugins'] });
+    },
   });
 }
 
@@ -485,17 +489,24 @@ export function useDeleteSecret() {
         `/admin/secrets/${encodeURIComponent(input.scope)}/${encodeURIComponent(input.name)}`,
         { method: 'DELETE' },
       ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.adminSettings }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.adminSettings });
+      qc.invalidateQueries({ queryKey: ['plugins'] });
+    },
   });
 }
 
 /* ---- 插件：开发 → 发布 → 安装 → 运行 → 卸载 ---- */
 
-/** 空间内可见的插件（已安装 + 草稿），带基线升级提示 */
+/**
+ * 空间内可见的插件（已安装 + 草稿），带基线升级提示。
+ *
+ * 返回整包而不是只取 items：卡片要用 is_admin 决定「配置密钥」还是「转给管理员」。
+ */
 export function usePlugins(spaceId?: string) {
   return useQuery({
     queryKey: queryKeys.plugins(spaceId ?? ''),
-    queryFn: () => api<PluginsResponse>(`/spaces/${spaceId}/plugins`).then((r) => r.items),
+    queryFn: () => api<PluginsResponse>(`/spaces/${spaceId}/plugins`),
     enabled: Boolean(spaceId),
     staleTime: 10_000,
   });

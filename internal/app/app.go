@@ -192,6 +192,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	registry.SetPluginProvider(pluginSvc)
 	// 已安装插件（含未落副本的预置件）进检索池；published/... 路径由插件层解析。
 	spaceSvc.SetInstalledSource(pluginSvc.InstalledSources)
+	// 停用是运行期状态，文件里看不出来：索引合并时必须按它筛掉，
+	// 否则停在系统空间的内置技能照样能被 resource_search 搜到。
+	spaceSvc.SetDisabledPluginSource(pluginSvc.DisabledSlugs)
 	spaceSvc.SetPublishedReader(pluginSvc.ReadPublished)
 	// 本地插件必须启用才进检索池（未启用的草稿仍可在文件树里编辑）。
 	spaceSvc.SetLocalPluginSource(pluginSvc.LocalEnabledMap)
@@ -244,9 +247,33 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		pluginH:     plugin.NewHandler(pluginSvc, st, spaceSvc, authHandler.CurrentUser, log),
 		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
 		// refs 传空：搜索凭证由 source 插件清单里的 source.secret 声明，
-		// 属于运行期状态（随插件安装/卸载变化），启动时无法静态列出。
-		adminH: admin.NewHandler(spaceSvc, secretStore, nil, authHandler.CurrentUser, log),
+		// 属于运行期状态（随插件安装/卸载变化），启动时无法静态列出；
+		// 「使用中」标记因此也改成每次现算，而不是启动时定死。
+		adminH: admin.NewHandler(spaceSvc, secretStore, nil, secretUsage(searchReg, pluginSvc, log),
+			authHandler.CurrentUser, log),
 	}, nil
+}
+
+// secretUsage 现算「哪些凭证正在被使用」：搜索源看注册表（装/停即变），
+// 插件声明的 secret.use 看已启用安装件的清单。
+func secretUsage(reg *search.Registry, plugins *plugin.Manager, log *slog.Logger) admin.Usage {
+	return func(ctx context.Context) map[string]bool {
+		usage := map[string]bool{}
+		for _, src := range reg.Sources() {
+			if name := src.Secret; name != "" {
+				usage[search.SecretScope+"/"+name] = true
+			}
+		}
+		pluginUsage, err := plugins.SecretUsage(ctx)
+		if err != nil {
+			log.Warn("统计插件声明的凭证失败", "err", err)
+			return usage
+		}
+		for key := range pluginUsage {
+			usage[key] = true
+		}
+		return usage
+	}
 }
 
 // osvDir 决定本地漏洞库目录：显式配置优先，否则用存储根下的 osv/。

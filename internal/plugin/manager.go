@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
@@ -124,6 +125,13 @@ type Item struct {
 	// LatestPermissions 是待升级版本的权限：升级同样要让人看见权限变化，
 	// 否则「加一个 fs.write 再发版」就是静默提权。
 	LatestPermissions []string `json:"latest_permissions,omitempty"`
+	// Secrets 是清单声明的凭证与当前配置状态：缺凭证的插件装上也用不了，
+	// 卡片据此显示原因并给录入入口，而不是等调用时才发现。
+	Secrets []SecretState `json:"secrets,omitempty"`
+	// Blocked 表示声明的东西没齐（目前只有缺凭证），前端按「未启用」呈现。
+	Blocked bool `json:"blocked"`
+	// BlockedReason 是未启用原因（人类可读），空表示没有阻塞。
+	BlockedReason string `json:"blocked_reason,omitempty"`
 }
 
 // DryRunResult 是试运行的回执：给作者看「它到底干了什么」。
@@ -217,6 +225,9 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 	}
 
 	items := map[string]*Item{}
+	// metas 收集每个 slug「当前生效的那份清单」：草稿用草稿，已安装用安装版本快照。
+	// 凭证声明与权限都从这一份读，避免出现「面板说用 A 版本、实际跑 B 版本」。
+	metas := map[string]Manifest{}
 	cands, err := m.o.Store.ListPluginCandidatesBySpace(ctx, spaceID)
 	if err != nil {
 		m.o.Logger.Warn("读取本地插件状态失败", "space", spaceID, "err", err)
@@ -255,6 +266,7 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 			}
 		}
 		items[d.Slug] = item
+		metas[d.Slug] = d
 	}
 
 	installs, err := m.o.Store.ListPluginInstalls(ctx, spaceID)
@@ -277,6 +289,13 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 		if !item.Enabled {
 			item.Status = "disabled"
 		}
+		// 权限与凭证都从已安装的版本快照读：用户要看到的是「这个版本实际会拿到什么」。
+		if ver, verr := m.o.Store.GetPluginVersion(ctx, in.PluginID, in.Version); verr == nil {
+			if mm, perr := Parse(ver.Manifest, true); perr == nil {
+				metas[in.Slug] = mm
+				item.Permissions = mm.Permissions()
+			}
+		}
 		if p, err := m.o.Store.GetPluginBySlug(ctx, in.Slug); err == nil {
 			if item.Name == "" {
 				item.Name, item.Kind, item.Description = p.Name, p.Kind, p.Description
@@ -284,12 +303,6 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 			}
 			item.Origin = p.Origin
 			item.LatestVersion = p.LatestVersion
-			// 权限从已安装的版本快照读：用户要看到的是「这个版本实际会拿到什么」。
-			if ver, verr := m.o.Store.GetPluginVersion(ctx, in.PluginID, in.Version); verr == nil {
-				if mm, perr := Parse(ver.Manifest, true); perr == nil {
-					item.Permissions = mm.Permissions()
-				}
-			}
 			// 升级目标版本的权限也要给出来：版本之间权限可以变。
 			if p.LatestVersion != "" && p.LatestVersion != in.Version {
 				if lv, verr := m.o.Store.GetPluginVersion(ctx, p.ID, p.LatestVersion); verr == nil {
@@ -313,7 +326,40 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 		}
 		return out[i].Slug < out[j].Slug
 	})
+
+	// 缺凭证 = 装上也用不了：卡片要显示「未启用 + 原因」，并给出录入入口。
+	// 一次列表请求里每个 scope 只读一次凭证存储（cache 复用）。
+	cache := map[string]map[string]bool{}
+	secretsOff := m.secretsUnavailable()
+	for i := range out {
+		meta, ok := metas[out[i].Slug]
+		if !ok {
+			continue
+		}
+		states, missing := m.secretStates(ctx, meta, cache)
+		out[i].Secrets = states
+		if len(missing) == 0 {
+			continue
+		}
+		out[i].Blocked = true
+		out[i].BlockedReason = "缺少凭证 " + strings.Join(missing, "、") + "，配置后才会生效"
+		if secretsOff {
+			out[i].BlockedReason += "（凭证存储未启用：后端没读到 SECRET_KEK）"
+		}
+	}
 	return out, nil
+}
+
+// secretsUnavailable 判断凭证存储是不是根本不可用：不可用时声明的凭证全都算缺，
+// 但原因要写清是「没配 KEK」而不是「管理员忘了录」。
+func (m *Manager) secretsUnavailable() bool {
+	if m.o.Secrets == nil {
+		return true
+	}
+	if e, ok := m.o.Secrets.(interface{ Enabled() bool }); ok {
+		return !e.Enabled()
+	}
+	return false
 }
 
 // Detail 返回单个插件的清单；优先取草稿（作者正在改的那份）。
@@ -852,7 +898,18 @@ func (m *Manager) Uninstall(ctx context.Context, userID, spaceID, slug string) e
 // SetEnabled 是 kill switch：立即拒绝新调用，不改内容、不回滚版本。
 func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, enabled bool) error {
 	if p, err := m.o.Store.GetPluginBySlug(ctx, slug); err == nil && p.Origin == store.PluginOriginSystem {
-		return fmt.Errorf("%w：平台内置插件由平台统一提供，不能停用", ErrForbidden)
+		// 内置件只有一份安装（系统空间），停用就是全局停用：开关放在系统空间的
+		// 插件页，由系统管理员操作，不用重启。普通空间里的内置件是「并入」的，
+		// 不是自己的安装记录，改不了也不该改。
+		sysID, err := m.systemSpaceID(ctx)
+		if err != nil || sysID == "" || sysID != spaceID {
+			return fmt.Errorf("%w：平台内置插件只能在系统空间的插件页停用", ErrForbidden)
+		}
+		// base 是新建会话的兜底智能体：停掉它等于让之后的会话没有行为设定，
+		// 这不是「暂时关掉一个能力」，是把自己锁在门外，所以单独拦住。
+		if p.Kind == string(KindAgent) && slug == agentspec.BaseID {
+			return fmt.Errorf("%w：平台默认智能体 %s 不能停用（新建会话以它为兜底）", ErrForbidden, agentspec.BaseID)
+		}
 	}
 	in, err := m.installOf(ctx, spaceID, slug)
 	if err != nil {
@@ -872,6 +929,11 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)
 	m.mu.Unlock()
+	// 系统空间的开关是全局开关：内置件只有一份安装，停用/启用对每个空间都成立。
+	global := false
+	if sysID, err := m.systemSpaceID(ctx); err == nil && sysID != "" && sysID == spaceID {
+		global = true
+	}
 	if enabled {
 		// 启用即生效：重载本空间，让搜索源等运行时重新注册
 		if err := m.reloadSpace(ctx, spaceID); err != nil {
@@ -879,15 +941,73 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 		}
 	} else {
 		// 停用是 kill switch：先把源摘掉，不等下一次重载
-		global := false
-		if sysID, err := m.systemSpaceID(ctx); err == nil && sysID != "" && sysID == spaceID {
-			global = true
-		}
 		m.unregisterSource(spaceID, slug, global)
+	}
+	if global {
+		// 其它空间手里还攥着开关之前的实例：作废，下次访问自己重建。
+		m.evictSpaces(spaceID)
 	}
 	m.recordAudit(ctx, userID, "plugin.enable", slug, strconv.FormatBool(enabled), map[string]any{"space": spaceID})
 	m.notify(ctx, spaceID)
 	return nil
+}
+
+// DisabledSlugs 返回对该空间「已被停用」的插件 slug：本空间停用的安装
+// + 系统空间停用的全局安装（后者对所有空间生效）。
+//
+// 空间索引是按文件现状建的，停用之后 plugins/<slug>/ 副本仍然在树里；
+// 不在读取时筛一遍，停用对技能/组件这类「靠索引进检索池」的插件就等于没生效。
+func (m *Manager) DisabledSlugs(ctx context.Context, spaceID string) (map[string]bool, error) {
+	out := map[string]bool{}
+	collect := func(id string) error {
+		if id == "" {
+			return nil
+		}
+		installs, err := m.o.Store.ListPluginInstalls(ctx, id)
+		if err != nil {
+			return err
+		}
+		for _, in := range installs {
+			if in.Status == store.PluginInstallDisabled {
+				out[in.Slug] = true
+			}
+		}
+		return nil
+	}
+	if err := collect(spaceID); err != nil {
+		return nil, err
+	}
+	if sysID, err := m.systemSpaceID(ctx); err == nil && sysID != "" && sysID != spaceID {
+		if err := collect(sysID); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// evictSpaces 把除 keep 之外的空间运行时缓存全部作废，下次访问时按最新
+// 安装状态重建。全局开关只改一条记录却影响所有空间，逐个重载会把一次
+// 管理操作放大成 N 次初始化（还带 MCP 握手），所以只作废、不重建。
+func (m *Manager) evictSpaces(keep string) {
+	m.mu.Lock()
+	others := make([]string, 0, len(m.inst))
+	for id := range m.inst {
+		if id != keep {
+			others = append(others, id)
+		}
+	}
+	for _, id := range others {
+		delete(m.inst, id)
+		for key := range m.mcpCs {
+			if strings.HasPrefix(key, id+"/") {
+				delete(m.mcpCs, key)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range others {
+		m.closeSpaceProcs(id)
+	}
 }
 
 func (m *Manager) installOf(ctx context.Context, spaceID, slug string) (store.PluginInstall, error) {
@@ -1233,6 +1353,10 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 	}
 
 	loaded := map[string]*instance{}
+	// seen 记录「有明确安装记录」的 slug，不论启用还是停用。下面的兜底只补
+	// 「系统空间还没建好 / 安装记录还没写」那一段，不能把管理员刚停用的内置件
+	// 当成没装过又装回来——否则停用只是一个标签。
+	seen := map[string]bool{}
 	// loadInstall 把一个安装记录变成运行时实例。global 表示这条记录来自系统空间：
 	// 它对本空间是只读的全局能力，但同样进入检索池与工具列表。
 	loadInstall := func(in store.PluginInstall, global bool) {
@@ -1274,6 +1398,7 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 		return err
 	}
 	for _, in := range installs {
+		seen[in.Slug] = true
 		loadInstall(in, false)
 	}
 
@@ -1286,6 +1411,7 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 			m.o.Logger.Warn("读取全局安装失败", "space", spaceID, "err", err)
 		} else {
 			for _, in := range globals {
+				seen[in.Slug] = true
 				loadInstall(in, true)
 			}
 		}
@@ -1330,7 +1456,7 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 		if p.Origin != store.PluginOriginSystem || p.Status != store.PluginStatusEnabled {
 			continue
 		}
-		if _, exists := loaded[p.Slug]; exists || p.LatestVersion == "" {
+		if _, exists := loaded[p.Slug]; exists || seen[p.Slug] || p.LatestVersion == "" {
 			continue
 		}
 		loadInstall(store.PluginInstall{

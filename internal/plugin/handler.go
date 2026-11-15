@@ -64,7 +64,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
-	if _, _, ok := h.guard(w, r, "read"); !ok {
+	user, _, ok := h.guard(w, r, "read")
+	if !ok {
 		return
 	}
 	items, err := h.mgr.List(r.Context(), r.PathValue("id"))
@@ -72,7 +73,12 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
+	// is_admin：平台凭证只有系统管理员能写，前端据此决定卡片上给「配置密钥」
+	// 还是「转给管理员」（密钥是平台级资源，不是空间内容）。
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"items":    items,
+		"is_admin": h.spaces.IsAdmin(user),
+	})
 }
 
 func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {

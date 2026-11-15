@@ -208,6 +208,9 @@ func NewRegistry(st store.Store, mcp MCPProvider, log *slog.Logger) *Registry {
 // query 为用户本轮输入，仅在工具数量超过上限时用于相关性裁剪。
 func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, error) {
 	tools := builtinTools()
+	if off := r.disabledBuiltinTools(ctx); len(off) > 0 {
+		tools = withoutTools(tools, off)
+	}
 	if r.mcp != nil {
 		remote, err := r.mcp.Tools(ctx)
 		if err != nil {
@@ -247,6 +250,55 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 
 // RuntimeBuiltin 标记平台内置工具：随平台发版、代码受控，不随空间变化。
 const RuntimeBuiltin = "builtin"
+
+// builtinToolSlugPrefix 是内置工具在系统空间里的插件 slug 前缀（`tool_file_write`）。
+// slug 由 plugin.builtinToolSlug 生成、这里反解，两边必须一致。
+const builtinToolSlugPrefix = "tool_"
+
+// disabledBuiltinTools 返回「被系统管理员停用」的内置工具名。
+//
+// 内置工具的执行体是 Go 代码（见 builtin.go），安装记录只是元数据：不查这一下，
+// 系统空间里那个停用开关就只是标签，模型照样能调。停用只能在系统空间做，
+// 所以只看那一份全局安装；读取失败按「没停用」处理，不能让开关把对话打挂。
+func (r *Registry) disabledBuiltinTools(ctx context.Context) map[string]bool {
+	sys, err := r.store.GetSpaceByType(ctx, systemSpaceType)
+	if err != nil || sys.ID == "" {
+		return nil
+	}
+	installs, err := r.store.ListPluginInstalls(ctx, sys.ID)
+	if err != nil {
+		r.log.Warn("读取内置件启停状态失败", "err", err)
+		return nil
+	}
+	return disabledToolNames(installs)
+}
+
+// disabledToolNames 把系统空间的安装记录换算成「被停用的内置工具名」。
+// 只有 tool_* 的安装对应 Go 侧工具；其它 kind 的停用由各自的加载路径处理。
+func disabledToolNames(installs []store.PluginInstall) map[string]bool {
+	off := map[string]bool{}
+	for _, in := range installs {
+		if in.Status != store.PluginInstallDisabled {
+			continue
+		}
+		if name := strings.TrimPrefix(in.Slug, builtinToolSlugPrefix); name != in.Slug {
+			off[name] = true
+		}
+	}
+	return off
+}
+
+// withoutTools 摘掉被停用的内置工具：停用要真的看不见，不能只是卡片上换个颜色。
+func withoutTools(tools []Tool, off map[string]bool) []Tool {
+	out := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if off[t.Name] {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
 
 // applyBindings 把管理员的 tool_binding 贴到工具上。
 //

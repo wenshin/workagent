@@ -414,7 +414,7 @@ func (r *toolRuntime) secretGet(ctx context.Context, in invokeInput, raw json.Ra
 	if r.secrets == nil {
 		return nil, errors.New("凭证存储未启用（缺少 SECRET_KEK）")
 	}
-	value, err := r.secrets.Get(ctx, "plugin", name)
+	value, err := r.secrets.Get(ctx, SecretScope, name)
 	if err != nil {
 		return nil, fmt.Errorf("凭证 %s 不存在或读取失败", name)
 	}

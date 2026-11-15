@@ -223,14 +223,18 @@ export default function WorkspacePage() {
     const session = selectedSession;
     if (!session) return;
     if (isLiveRunning(session.id) || attachedRef.current.has(session.id)) return;
-    attachedRef.current.add(session.id);
 
     let cancelled = false;
+    // 只有真的发起续流才登记：StrictMode 会把 effect 跑两遍（挂载 → 清理 → 再挂载），
+    // 提前登记会让第二遍被 attachedRef 挡住，这一轮就再也续不上了。
+    let attached = false;
     void (async () => {
       try {
         const res = await getActiveRun(session.id);
         if (cancelled || !res.active || !res.run) return;
         if (isLiveRunning(session.id)) return;
+        attached = true;
+        attachedRef.current.add(session.id);
         await attachLiveRun({
           sessionId: session.id,
           runId: res.run.id,
@@ -247,6 +251,7 @@ export default function WorkspacePage() {
 
     return () => {
       cancelled = true;
+      if (!attached) attachedRef.current.delete(session.id);
     };
   }, [selectedSession, queryClient]);
 

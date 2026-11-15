@@ -434,6 +434,9 @@ type Store interface {
 	ListPluginVersions(ctx context.Context, pluginID string) ([]PluginVersion, error)
 	UpsertPluginInstall(ctx context.Context, in PluginInstall) (PluginInstall, error)
 	ListPluginInstalls(ctx context.Context, spaceID string) ([]PluginInstall, error)
+	// ListAllPluginInstalls 返回全部空间的安装记录（管理视角）：判断某个凭证
+	// 「是否还有插件在用」必须跨空间，凭证本身是平台级、不分空间的。
+	ListAllPluginInstalls(ctx context.Context) ([]PluginInstall, error)
 	// GetPluginInstall 按「空间 + slug」取安装记录，用于配置读写。
 	GetPluginInstall(ctx context.Context, spaceID, slug string) (PluginInstall, error)
 	// UpdatePluginInstallConfig 覆盖安装级配置；只改配置，不动版本与状态。

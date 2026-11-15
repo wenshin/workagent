@@ -22,7 +22,7 @@ func builtinSources() []builtinSource {
 	return []builtinSource{{
 		Slug:        "bocha",
 		Name:        "博查搜索",
-		Description: "通用网页搜索，需要博查 API Key；平台预置，可在市场停用",
+		Description: "通用网页搜索，需要博查 API Key；平台预置，默认全局可用",
 		Source: SourceSpec{
 			Protocol: SourceProtocolSpec,
 			Entry:    SourceSpecEntry,

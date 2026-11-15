@@ -379,10 +379,25 @@ export interface PluginItem {
   permissions?: string[];
   /** 待升级版本的权限：升级确认时展示，避免权限静默变化 */
   latest_permissions?: string[];
+  /** 清单声明的凭证与配置状态：缺凭证的插件装上也用不了 */
+  secrets?: PluginSecret[];
+  /** 声明的东西没齐（目前只有缺凭证），卡片按「未启用」呈现 */
+  blocked?: boolean;
+  /** 未启用原因（人类可读） */
+  blocked_reason?: string;
+}
+
+/** 插件声明的一处凭证：scope/name 就是密钥配置里的地址 */
+export interface PluginSecret {
+  scope: string;
+  name: string;
+  configured: boolean;
 }
 
 export interface PluginsResponse {
   items: PluginItem[];
+  /** 当前用户是否系统管理员：平台凭证只有他能录 */
+  is_admin: boolean;
 }
 
 /** 插件市场左侧二级菜单的分类 */

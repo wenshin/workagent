@@ -56,6 +56,9 @@ type Store interface {
 	Put(ctx context.Context, scope, name, value string) error
 	Get(ctx context.Context, scope, name string) (string, error)
 	Status(ctx context.Context, scope string) ([]Item, error)
+	// SecretNames 只回答某个 scope 里有哪些名字，不返回也不解密任何值。
+	// 「这个插件还差哪条凭证」是每次刷新列表都要问的问题，不能用 Get 去试。
+	SecretNames(ctx context.Context, scope string) ([]string, error)
 	Delete(ctx context.Context, scope, name string) error
 }
 
@@ -179,6 +182,40 @@ func (s *FileStore) Get(ctx context.Context, scope, name string) (string, error)
 	return string(plain), nil
 }
 
+// Scopes 列出存储里已有凭证的 scope（即 {root}/{scope}.json 的文件名前缀）。
+//
+// 密钥配置页靠它枚举「所有存过东西的 scope」：引用关系是运行期状态（随插件
+// 安装/卸载变化），按静态 refs 推导会让界面上只剩下 refs 里那一条。
+func (s *FileStore) Scopes() ([]string, error) {
+	if !s.Enabled() {
+		return nil, ErrDisabled
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		scope := strings.TrimSuffix(e.Name(), ".json")
+		if validateName(scope) != nil {
+			continue
+		}
+		out = append(out, scope)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // Status 返回某 scope 下全部凭证的元信息，按名称排序。
 func (s *FileStore) Status(ctx context.Context, scope string) ([]Item, error) {
 	if !s.Enabled() {
@@ -200,6 +237,30 @@ func (s *FileStore) Status(ctx context.Context, scope string) ([]Item, error) {
 		out = append(out, Item{Name: name, Fingerprint: rec.Fingerprint, UpdatedAt: rec.UpdatedAt})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// SecretNames 返回某 scope 下已配置的凭证名（不返回、不解密任何值）。
+func (s *FileStore) SecretNames(ctx context.Context, scope string) ([]string, error) {
+	if !s.Enabled() {
+		return nil, ErrDisabled
+	}
+	if err := validateName(scope); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc, err := s.load(scope)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(doc.Items))
+	for name := range doc.Items {
+		out = append(out, name)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 

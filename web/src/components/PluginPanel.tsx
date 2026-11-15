@@ -1,4 +1,4 @@
-import { IconLock, IconRefresh, IconSetting } from '@douyinfe/semi-icons';
+import { IconKey, IconLock, IconRefresh, IconSetting } from '@douyinfe/semi-icons';
 import {
   Button,
   Card,
@@ -22,6 +22,7 @@ import {
 import type { PluginDryRunResult, PluginItem, Space } from '../api/types';
 import PluginConfigDialog from './PluginConfigDialog';
 import { KIND_LABEL, PluginIcon, type PluginKind } from './PluginVisual';
+import SecretSettingsDialog from './SecretSettingsDialog';
 
 const { Text } = Typography;
 
@@ -43,7 +44,9 @@ interface Props {
  * - 发布是系统管理员在市场里做的，这里不提供发布入口。
  */
 export default function PluginPanel({ space }: Props) {
-  const { data: items = [], isLoading, refetch, isFetching } = usePlugins(space.id);
+  const { data, isLoading, refetch, isFetching } = usePlugins(space.id);
+  const items = data?.items ?? [];
+  const isAdmin = data?.is_admin ?? false;
   const dryRun = useDryRunPlugin();
   const toggle = useTogglePlugin();
   const uninstall = useUninstallPlugin();
@@ -56,9 +59,13 @@ export default function PluginPanel({ space }: Props) {
   const [configTarget, setConfigTarget] = useState<PluginItem | null>(null);
   // 升级同样要确认：新版本可能多出写文件、连新域名这类权限。
   const [pendingUpgrade, setPendingUpgrade] = useState<PluginItem | null>(null);
+  // 卡片上的「配置密钥」：带上缺的那条凭证，直接打开平台密钥配置弹窗
+  const [secretPreset, setSecretPreset] = useState<{ scope: string; name: string } | null>(null);
 
   const writable = space.perm === 'write' || space.perm === 'manage';
   const canManage = space.perm === 'manage';
+  // 系统空间是平台总开关：内置搜索源的启停在这里做，对全部空间生效
+  const isSystemSpace = space.type === 'system';
 
   const confirmDryRun = () => {
     if (!runTarget) return;
@@ -127,6 +134,11 @@ export default function PluginPanel({ space }: Props) {
           {items.map((item) => {
             const local = item.local;
             const enabled = item.enabled;
+            // 缺凭证的插件装上也用不了（搜索查不到 / secret.get 失败 / MCP 握手失败），
+            // 卡片按「未启用」呈现，并把缺的那条凭证指出来。
+            const missing = (item.secrets ?? []).filter((s) => !s.configured);
+            // 只有「本该在跑却跑不起来」才算被阻塞：已停用的插件不必再提示缺凭证
+            const blocked = enabled && (Boolean(item.blocked) || missing.length > 0);
             return (
               <Card key={item.slug} className="plugin-card" bodyStyle={{ padding: 16 }}>
                 <div className="plugin-card-head">
@@ -152,9 +164,15 @@ export default function PluginPanel({ space }: Props) {
                       只读
                     </Tag>
                   ) : null}
-                  <Tag size="small" color={enabled ? 'green' : 'orange'}>
-                    {enabled ? '已启用' : '已停用'}
-                  </Tag>
+                  {blocked ? (
+                    <Tag size="small" color="orange">
+                      未启用
+                    </Tag>
+                  ) : (
+                    <Tag size="small" color={enabled ? 'green' : 'orange'}>
+                      {enabled ? '已启用' : '已停用'}
+                    </Tag>
+                  )}
                   <Tag size="small" color={item.risk >= 3 ? 'red' : item.risk >= 2 ? 'orange' : 'grey'}>
                     {riskLabel(item.risk)}
                   </Tag>
@@ -177,6 +195,15 @@ export default function PluginPanel({ space }: Props) {
 
                 <div className="plugin-card-desc">{item.description || '（没有描述）'}</div>
 
+                {blocked ? (
+                  <div className="plugin-card-meta">
+                    <Text type="warning" size="small">
+                      {item.blocked_reason ||
+                        `缺少凭证 ${missing.map((s) => `${s.scope}/${s.name}`).join('、')}，配置后才会生效`}
+                    </Text>
+                  </div>
+                ) : null}
+
                 <div className="plugin-card-meta">
                   <span className="plugin-slug">{item.slug}</span>
                   {item.installed ? <span>当前 v{item.version || '-'}</span> : null}
@@ -185,13 +212,34 @@ export default function PluginPanel({ space }: Props) {
                 </div>
 
                 <div className="plugin-card-actions">
+                  {missing.length > 0 ? (
+                    <Button
+                      size="small"
+                      theme="solid"
+                      type="primary"
+                      icon={<IconKey />}
+                      onClick={() => {
+                        if (!isAdmin) {
+                          Toast.warning('平台凭证只有系统管理员能录入，把凭证名转给他即可');
+                          return;
+                        }
+                        // 缺的第一条就是最该先补的那条（多条时按清单顺序）
+                        setSecretPreset({ scope: missing[0].scope, name: missing[0].name });
+                      }}
+                    >
+                      配置密钥
+                    </Button>
+                  ) : null}
+
                   {local && writable ? (
                     <Button size="small" theme="borderless" onClick={() => setRunTarget(item)}>
                       试运行
                     </Button>
                   ) : null}
 
-                  {canManage && item.origin !== 'system' ? (
+                  {/* 停用只在空间插件页做：普通空间只能关自己的安装，系统空间是平台总开关。
+                      内置件只有一份安装（系统空间），在这里停用/启用对所有空间立即生效。 */}
+                  {canManage && (item.origin !== 'system' || isSystemSpace) ? (
                     <Button
                       size="small"
                       theme="borderless"
@@ -201,7 +249,15 @@ export default function PluginPanel({ space }: Props) {
                           { spaceId: space.id, slug: item.slug, enabled: !enabled },
                           {
                             onSuccess: () =>
-                              Toast.success(enabled ? '已停用，本空间不再检索/调用' : '已启用，本空间可用'),
+                              Toast.success(
+                                item.origin === 'system'
+                                  ? enabled
+                                    ? '已停用，全部空间立即不再加载它'
+                                    : '已启用，全部空间立即恢复'
+                                  : enabled
+                                    ? '已停用，本空间不再检索/调用'
+                                    : '已启用，本空间可用',
+                              ),
                             onError: (e) => Toast.error(e instanceof Error ? e.message : '操作失败'),
                           },
                         )
@@ -246,7 +302,9 @@ export default function PluginPanel({ space }: Props) {
 
                   {item.origin === 'system' ? (
                     <Text type="tertiary" size="small">
-                      平台内置，全部空间默认可用，不能停用或卸载
+                      {isSystemSpace
+                        ? '平台内置，全部空间默认可用；停用对全部空间生效，不可卸载'
+                        : '平台内置，全部空间默认可用，不能停用或卸载'}
                     </Text>
                   ) : null}
 
@@ -325,6 +383,13 @@ export default function PluginPanel({ space }: Props) {
         slug={configTarget?.slug}
         name={configTarget?.name}
         onClose={() => setConfigTarget(null)}
+      />
+
+      {/* 复用平台密钥配置弹窗：凭证是平台级的，空间内只提供入口与预填 */}
+      <SecretSettingsDialog
+        visible={Boolean(secretPreset)}
+        preset={secretPreset}
+        onClose={() => setSecretPreset(null)}
       />
 
       <Modal

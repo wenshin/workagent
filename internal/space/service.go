@@ -75,6 +75,9 @@ type Service struct {
 	onCreated func(ctx context.Context, spaceID string)
 	// installed 返回已安装插件的能力条目（未落副本的内置件也必须在检索池里）。
 	installed func(ctx context.Context, spaceID string) ([]IndexEntry, error)
+	// disabledPlugins 返回对该空间已停用的插件 slug。索引是「文件现状」，
+	// 停用后 plugins/<slug>/ 副本还在树里，合并时要按它摘掉。
+	disabledPlugins func(ctx context.Context, spaceID string) (map[string]bool, error)
 	// published 读取已发布件里的文件，供 resource_read 读 published/... 路径。
 	published func(ctx context.Context, spaceID, rel string) (string, error)
 	// localPlugins 返回空间内已启用的本地插件 slug；未启用的草稿不进检索池。
@@ -111,6 +114,12 @@ func (s *Service) SetSpaceCreated(fn func(ctx context.Context, spaceID string)) 
 // 与文件索引合并后返回，Agent 才能检索到未落副本的预置技能正文。
 func (s *Service) SetInstalledSource(fn func(ctx context.Context, spaceID string) ([]IndexEntry, error)) {
 	s.installed = fn
+}
+
+// SetDisabledPluginSource 注入「已停用插件」查询（plugin.Manager 实现）。
+// 停用是运行期状态，不体现为文件变化：索引必须读它，否则停用只改了标签。
+func (s *Service) SetDisabledPluginSource(fn func(ctx context.Context, spaceID string) (map[string]bool, error)) {
+	s.disabledPlugins = fn
 }
 
 // SetPublishedReader 注入已发布件读取器（plugin.Manager 实现）。
