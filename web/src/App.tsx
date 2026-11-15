@@ -52,8 +52,7 @@ export default function App() {
                 </RequireAuth>
               }
             />
-            {/* 工作空间与插件同级；插件下分「插件市场 / 已装插件」。
-                发布记录是工作空间的次级页，保留旧路径兼容。 */}
+            {/* 工作空间与插件市场同级；已装插件属于空间，入口在空间页。 */}
             <Route path="/plugins" element={<Navigate to="/plugins/market" replace />} />
             <Route
               path="/plugins/market"
@@ -73,15 +72,8 @@ export default function App() {
               }
             />
             <Route path="/plugins/installed" element={<Navigate to="/plugins/market" replace />} />
-            <Route path="/resources" element={<Navigate to="/plugins/market" replace />} />
-            <Route
-              path="/resources/snapshots"
-              element={
-                <RequireAuth>
-                  <WorkspacePage />
-                </RequireAuth>
-              }
-            />
+            {/* 旧「发布记录」入口已并入插件市场：保留跳转，避免老链接 404 */}
+            <Route path="/resources/*" element={<Navigate to="/plugins/market" replace />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>

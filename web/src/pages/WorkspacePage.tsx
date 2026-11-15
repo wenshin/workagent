@@ -6,6 +6,7 @@ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api, getActiveRun } from '../api/client';
 import {
+  invalidateAfterWrite,
   queryKeys,
   useAgentInfo,
   useCreateSession,
@@ -33,7 +34,6 @@ import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '..
 import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
 import PluginCatalogPanel, { PLUGIN_CATEGORY_LABEL } from '../components/PluginCatalogPanel';
-import ResourcePanel from '../components/ResourcePanel';
 import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
@@ -44,7 +44,6 @@ export default function WorkspacePage() {
   const location = useLocation();
   const navigate = useNavigate();
   // 一级入口：工作空间 / 插件市场。已装插件属于空间，入口在空间页里。
-  const isSnapshots = location.pathname.startsWith('/resources/snapshots');
   const isPlugins = location.pathname.startsWith('/plugins');
   // 市场分类由路径决定，左侧二级菜单只是同一份状态的入口
   const pluginCategory: PluginCategory = useMemo(() => {
@@ -112,10 +111,10 @@ export default function WorkspacePage() {
   }, [sessions, personalId]);
 
   useEffect(() => {
-    if (isPlugins || isSnapshots) return;
+    if (isPlugins) return;
     if (urlSessionId || urlSpaceId || spaces.length === 0) return;
     if (defaultSessionId) setSearchParams({ session: defaultSessionId }, { replace: true });
-  }, [isPlugins, isSnapshots, urlSessionId, urlSpaceId, defaultSessionId, spaces.length, setSearchParams]);
+  }, [isPlugins, urlSessionId, urlSpaceId, defaultSessionId, spaces.length, setSearchParams]);
 
   // 文件或它所在的目录被删掉后，URL 里还留着 ?file=<path>，内容面板会一直停在旧路径。
   // 等文件列表至少成功拉取过一次再判断，避免首屏还没加载完就误清。
@@ -206,10 +205,7 @@ export default function WorkspacePage() {
       onSettled: (info) => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-        if (info.wroteFiles) {
-          void queryClient.invalidateQueries({ queryKey: queryKeys.files });
-          void queryClient.invalidateQueries({ queryKey: ['file'] });
-        }
+        if (info.wroteFiles) invalidateAfterWrite(queryClient);
       },
     });
   };
@@ -239,9 +235,11 @@ export default function WorkspacePage() {
           sessionId: session.id,
           runId: res.run.id,
           onError: (message) => Toast.error(message),
-          onSettled: () => {
+          // 续流同样要刷树：这一轮可能在页面刷新期间写过文件（本轮事件是从 offset 0 重放的）
+          onSettled: (info) => {
             void queryClient.invalidateQueries({ queryKey: queryKeys.messages(session.id) });
             void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+            if (info.wroteFiles) invalidateAfterWrite(queryClient);
           },
         });
       } catch {
@@ -340,8 +338,8 @@ export default function WorkspacePage() {
           </div>
         ) : null}
 
-        {/* 中部：工作空间树（插件与发布记录下不展示树） */}
-        <div className="sider-main" hidden={isPlugins || isSnapshots}>
+        {/* 中部：工作空间树（插件市场下不展示树） */}
+        <div className="sider-main" hidden={isPlugins}>
           <div className="sider-head">
             <span className="sider-title">工作空间</span>
             <Button
@@ -376,16 +374,13 @@ export default function WorkspacePage() {
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
               onRenameDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'rename-dir', space, dir })}
               onDeleteDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'delete-dir', space, dir })}
+              onDeleteFile={(space: Space, file: SpaceFile) =>
+                setDialog({ kind: 'delete-file', space, file })
+              }
               onDeleteSession={setPendingDelete}
             />
           )}
         </div>
-
-        {isSnapshots ? (
-          <div className="sider-main sider-note">
-            发布记录是空间文件的版本快照：内容只读，可停用或删除；停用后 Agent 不再检索。
-          </div>
-        ) : null}
 
         {/* 底部：用户与退出 */}
         <div className="sider-user">
@@ -420,10 +415,8 @@ export default function WorkspacePage() {
       </Layout.Sider>
 
       <Layout.Content className="app-content">
-        {isSnapshots ? (
-          <ResourcePanel />
-        ) : isPlugins ? (
-          <div className="resource-panel">
+        {isPlugins ? (
+          <div className="plugin-market">
             <PluginCatalogPanel defaultSpaceId={selectedSpaceId} category={pluginCategory} />
           </div>
         ) : selectedFile ? (
@@ -475,7 +468,6 @@ export default function WorkspacePage() {
             onOpenSession={openSession}
             onAddSession={(agentId?: string) => selectedSpace && void addSession(selectedSpace.id, undefined, agentId)}
             onOpenPlatform={() => setPlatformOpen(true)}
-            onOpenPublishRecords={() => navigate('/resources/snapshots')}
           />
         )}
       </Layout.Content>

@@ -7,10 +7,12 @@ import (
 
 func TestNormalizeConfig(t *testing.T) {
 	cases := []struct {
-		name    string
-		values  map[string]string
-		wantErr bool
-		check   func(t *testing.T, got map[string]string)
+		name   string
+		values map[string]string
+		// 清单是否声明 allow_http：安装级配置不自己放宽这个决定
+		allowHTTP bool
+		wantErr   bool
+		check     func(t *testing.T, got map[string]string)
 	}{
 		{
 			name:   "空值表示沿用清单",
@@ -40,6 +42,16 @@ func TestNormalizeConfig(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:      "清单允许明文后内网 http 通过",
+			values:    map[string]string{ConfigURL: "http://crm.internal/mcp"},
+			allowHTTP: true,
+			check: func(t *testing.T, got map[string]string) {
+				if got[ConfigURL] != "http://crm.internal/mcp" {
+					t.Fatalf("配置未保留：%v", got)
+				}
+			},
+		},
+		{
 			name:    "带用户名密码拒绝",
 			values:  map[string]string{ConfigURL: "https://user:pass@mcp.example.com/mcp"},
 			wantErr: true,
@@ -57,7 +69,7 @@ func TestNormalizeConfig(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := normalizeConfig(tc.values)
+			got, err := normalizeConfig(tc.values, tc.allowHTTP)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("应当报错，得到 %v", got)

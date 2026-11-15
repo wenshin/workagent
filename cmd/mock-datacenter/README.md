@@ -3,10 +3,13 @@
 一个本地可跑的模拟数仓，用来联调「数据分析类智能体」。它提供两组等价的能力：
 
 - **MCP 工具**（推荐）：`search_tables` / `submit_query` / `get_query_status` / `get_query_result` / `download_query_result`
+  —— 下面是远端工具名；经平台 MCP 插件安装后，模型实际拿到的是带插件前缀的名字，如 `mock_datacenter__submit_query`
 - **REST 接口**：`/api/v1/tables`、`/api/v1/queries...`，语义与工具一一对应
 
 > **给智能体**：数据是模拟的。SQL 只做「找表 → 拼样例结果」的处理，**不执行聚合、过滤与列裁剪**。
 > 结论要说明数据来自 mock，不要把样例行当成真实统计值。
+>
+> 面向智能体的纯净版说明（只有 MCP 接口与工具用法，不含平台接入内容）见 [AGENT.md](./AGENT.md)。
 
 ---
 
@@ -179,6 +182,12 @@ download_query_result(task_id, format="csv")        # 3b. 要文件时用这个
 
 **省调用**：`submit_query` 带上 `wait_seconds` 能省掉一次 `get_query_status`；取数优先 `get_query_result`，用户明确要文件时才 `download_query_result`。不要为同一个问题反复提交相同 SQL。
 
+**平台侧硬限制（和本服务无关，但会先于本服务生效）**：
+
+- 经 MCP 插件调用时，**单次调用墙钟 20 秒**，写死在平台侧；`wait_seconds` 传 25 也是 20 秒断开。所以 `wait_seconds` 建议 ≤ 15（留出网络余量），更长的任务改成「提交拿 `task_id` → 下次调用再查」
+- 单次返回文本上限 32KB：`get_query_result` 一次取 50 行没问题，不要用 `limit 200` 拉全量再指望它不被截断
+- 单次调用超时或结果超限都表现为**这次调用失败/被截断**，不代表任务没提交成功——`task_id` 仍然有效，可以继续查
+
 ---
 
 ## 3. 可用的表（共 6 张）
@@ -246,7 +255,12 @@ MCP 侧的失败有两种形态，别混：
 
 ## 6. 身份与鉴权（智能体不用处理）
 
-平台以 MCP 插件形式接入时会自动注入身份，header 为 `Authorization: Bearer <jwt>`（HS256），claims 含 `sub` / `user_id` / `email` / `job_number` / `iss` / `aud` / `exp`。
+平台以 MCP 插件形式接入时会自动注入身份，header 为 `Authorization: Bearer <jwt>`（HS256）。令牌有两种：
+
+- `tools/call` 带的是**用户令牌**：按调用者现签，默认 5 分钟有效（清单 `auth.token_ttl_seconds` 可调，上限 1 小时），claims 含 `sub` / `user_id` / `email` / `job_number` / `iss=workagent` / `aud=<应用名>` / `iat` / `exp` / `jti`
+- 握手与 `tools/list` 没有用户上下文，带的是**服务令牌**：`sub=app:<应用名>`、`act=platform`，用户字段为空。这两个阶段读不到 `user_id` 是正常的，不要判成鉴权失败
+
+对智能体的要求：
 
 - 工具调用**不需要**模型提供任何 token、cookie 或账号参数
 - 不要向用户索要凭证，也不要在回答里复述 token
@@ -284,9 +298,16 @@ make mock-dc          # 127.0.0.1:8322，http
 | `MOCK_DC_ALLOW_TOKEN_ISSUE` | `true` | `false` 关闭 `/auth/token` |
 | `MOCK_DC_QUERY_DELAY_MS` | `1500` | 单任务模拟耗时 |
 | `MOCK_DC_PUBLIC_URL` | 空 | 下载链接前缀，默认按请求 Host 推导 |
-| `MOCK_DC_TLS_CERT` / `MOCK_DC_TLS_KEY` | 空 | 同时配置时以 https 监听（插件 `transport.url` 强制 https，需要这条） |
+| `MOCK_DC_TLS_CERT` / `MOCK_DC_TLS_KEY` | 空 | 同时配置时以 https 监听。只有对端要求 TLS 时才需要配 |
 
-本地 TLS：
+本地 TLS（**可选**）：
+
+平台对 `transport.url` 的规则是「默认 https，本机地址例外」：`localhost` / `127.0.0.1` / `::1` 可以直接用 `http://`，不必声明任何东西。所以本机联调**不需要折腾证书**，清单里写 `http://127.0.0.1:8322/mcp` 就能连。
+
+只有在下列情况才需要起 TLS：
+
+- 不是本机直连（如 mock 跑在另一台机器上），且不想在清单里声明 `transport.allow_http: true`
+- 想顺带验证「https 清单 + 证书」这条链路
 
 ```bash
 mkcert -install && mkcert 127.0.0.1 localhost
@@ -304,7 +325,7 @@ MOCK_DC_TLS_KEY=./127.0.0.1+localhost-key.pem make mock-dc
   "name": "Mock 大数据平台",
   "description": "表搜索、Spark SQL 异步任务、结果预览与下载",
   "capability": "http.request",
-  "transport": { "type": "http", "url": "https://127.0.0.1:8322/mcp" },
+  "transport": { "type": "http", "url": "http://127.0.0.1:8322/mcp" },
   "auth": { "in": "header", "name": "Authorization", "mode": "jwt", "app": "mock_dc" },
   "tools": {
     "allow": [
@@ -314,6 +335,17 @@ MOCK_DC_TLS_KEY=./127.0.0.1+localhost-key.pem make mock-dc
   }
 }
 ```
+
+`transport.type` 与 URL 的 scheme 是两件事：`type` 描述传输方式，平台只实现一种
+（JSON-RPC over HTTP POST，响应可以是 `application/json` 或 `text/event-stream`，即 streamable HTTP），
+填 `http` 即可，没有 SSE 长连接那一档。URL 的规则：
+
+- 本机地址（`localhost` / `127.0.0.1` / `::1`）可直接用 `http://`，不需要额外声明
+- 非本机的 `http://` 要在 transport 里声明 `"allow_http": true`，否则发布时报错；安装时的权限文案会标成「明文 http」
+- 外部服务用 `https://`，什么都不用加
+
+`capabilities` 对 MCP 只影响风险等级，不影响能不能连：MCP 的连接由平台自己的客户端直连 `transport.url`，
+不走脚本插件那套域名白名单。所以本 mock 不写 `capabilities` 也能正常调用。
 
 `mode: jwt` 时平台为应用 `mock_dc` 生成密钥并按用户现签令牌，**不需要**在会话里录入凭证。把这个密钥配到本服务：
 
@@ -331,7 +363,16 @@ make mock-dc
 ```bash
 curl -s -XPOST localhost:8322/auth/token -H 'Content-Type: application/json' \
   -d '{"ttl_seconds":2592000}' | jq -r .token
-# 再把 token 填进凭证（scope=mcp 的 secret_request，或管理员接口 PUT /admin/secrets/plugin/<name>）
+# 再把 token 填进凭证（MCP 静态凭证按 plugin scope 寻址：secret_request(scope=plugin)，
+# 或管理员接口 PUT /admin/secrets/plugin/<name>）
 ```
 
-注意 MCP 插件被 `Derive` 判为 `risk=write`，首次调用需要管理员绑定/审批；这与鉴权失败是两回事。
+MCP 插件的风险等级由清单里的能力推导，不是固定值：
+
+- 只写 `transport` + `tools`（本 mock 的配置）→ L2「只读有成本」：安装时平台自动建绑定，装完直接可调，
+  **不需要**再找管理员绑定或审批
+- 清单里声明了写方法（POST / PUT / PATCH / DELETE 的 `capabilities`）→ 升到 L3，需要显式授权
+- 写方法再叠加 `secret.use` 凭证 → L4，走管理员审批
+
+如果调用被拒并提示「需要管理员绑定」，说明插件没走安装流程（例如只把目录拷进 `plugins/` 没点安装），
+这与鉴权失败是两回事。

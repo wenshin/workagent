@@ -31,6 +31,10 @@ var (
 	ErrFileNotFound    = errors.New("文件不存在")
 	ErrFileUnsupported = errors.New("该文件类型不支持预览")
 	ErrFileTooLarge    = errors.New("文件超过单次上传大小上限")
+	// ErrPluginReadOnly：已安装插件的副本整棵只读，删除要走卸载
+	ErrPluginReadOnly = errors.New("已安装插件只能通过卸载删除，不能直接删目录或文件")
+	// ErrPluginRoot：整个插件区不能一把删掉，否则留下悬空的安装记录
+	ErrPluginRoot = errors.New("插件目录不能整体删除，请逐个卸载插件")
 )
 
 const (
@@ -78,7 +82,7 @@ type Service struct {
 	// disabledPlugins 返回对该空间已停用的插件 slug。索引是「文件现状」，
 	// 停用后 plugins/<slug>/ 副本还在树里，合并时要按它摘掉。
 	disabledPlugins func(ctx context.Context, spaceID string) (map[string]bool, error)
-	// published 读取已发布件里的文件，供 resource_read 读 published/... 路径。
+	// published 读取已发布件里的文件，供 plugin_read 读 published/... 路径。
 	published func(ctx context.Context, spaceID, rel string) (string, error)
 	// localPlugins 返回空间内已启用的本地插件 slug；未启用的草稿不进检索池。
 	localPlugins func(ctx context.Context, spaceID string) (map[string]bool, error)
@@ -156,7 +160,7 @@ func (s *Service) IsAdmin(user store.User) bool {
 }
 
 // SpacePerm 返回用户在该空间的权限，无权限返回空字符串。
-// 插件接口用它与 resource/session 保持同一套判定，不各自查表。
+// 插件接口用它与 session 保持同一套判定，不各自查表。
 func (s *Service) SpacePerm(ctx context.Context, spaceID, userID string) (string, error) {
 	return s.store.SpacePerm(ctx, spaceID, userID)
 }
@@ -887,11 +891,11 @@ func (s *Service) DeleteDir(ctx context.Context, userID, spaceID, rawPath string
 	}
 	// 整个插件区不能一把删掉：卸载要走插件接口，否则留下悬空的安装记录。
 	if rel == DraftDirName {
-		return errors.New("插件目录不能整体删除，请逐个卸载插件")
+		return ErrPluginRoot
 	}
 	// 已安装副本整棵子树只读：删子目录一样会破坏安装内容
 	if s.isInstalledSubtree(ctx, sp.ID, rel) {
-		return errors.New("已安装插件只能通过卸载删除，不能直接删目录或文件")
+		return ErrPluginReadOnly
 	}
 
 	key := path.Join(s.filesKey(sp.ID), rel)

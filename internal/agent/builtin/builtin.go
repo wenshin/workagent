@@ -34,7 +34,7 @@ func init() { agent.Register(Name, New) }
 const (
 	maxToolArgBytes = 8 * 1024
 	// maxToolFeedBytes 是工具结果回填给模型的默认上限；
-	// 读类工具通过 Tool.MaxResultBytes 申请更高额度（见 file_read / resource_read）。
+	// 读类工具通过 Tool.MaxResultBytes 申请更高额度（见 file_read / plugin_read）。
 	maxToolFeedBytes = 4 * 1024
 	// defaultRounds 是配置缺失时的轮次兜底：一轮 = 一次模型调用，
 	// 典型任务（检索 → 读正文 → 写文件）在 8 轮内可以做完。

@@ -327,7 +327,9 @@ func wikiWrite() Tool {
 	return Tool{
 		Name:       "wiki_write",
 		Capability: "wiki.write",
-		Description: "写入企业 wiki 页面（跨空间共享）。mode：create 仅新建 / overwrite 覆盖（默认）/ append 追加。" +
+		Description: "写入企业 wiki 页面（跨空间共享）。团队知识——分析口径、业务流程、结论纪要、可复用 SQL—— 用它沉淀，" +
+			"不要在当前空间用 file_write 自建 knowledge/ 之类的知识目录。" +
+			"mode：create 仅新建 / overwrite 覆盖（默认）/ append 追加。" +
 			"覆盖已有页面时务必带上 wiki_read 返回的 if_version，被他人改过会报冲突；" +
 			"日志类内容用 append 追加到按日期命名的页面，天生不冲突。",
 		Parameters: json.RawMessage(`{

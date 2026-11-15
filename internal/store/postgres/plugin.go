@@ -61,7 +61,7 @@ from plugin where slug = $1`
 	return p, err
 }
 
-// ListPlugins 返回全部已发布插件（资源管理视图）。
+// ListPlugins 返回全部已发布插件（插件市场视图）。
 func (d *DB) ListPlugins(ctx context.Context) ([]store.Plugin, error) {
 	const q = `
 select id::text, slug, kind, name, description, visibility, status,

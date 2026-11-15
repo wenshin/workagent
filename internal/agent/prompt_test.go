@@ -14,7 +14,7 @@ func TestSystemMessageHasNoSkillIndex(t *testing.T) {
 		t.Fatal("平台不再常驻技能索引，系统提示词里不应出现索引段")
 	}
 	// 索引删除后，判断规则必须写进系统提示词，否则模型不知道该检索
-	for _, want := range []string{"resource_search", "resource_read", "web_search"} {
+	for _, want := range []string{"plugin_search", "plugin_read", "web_search"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("系统提示词缺少检索规则 %q", want)
 		}
@@ -64,7 +64,7 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1100 {
 		t.Fatalf("技能正文超预算：%d tokens", got)
 	}
-	for _, want := range []string{"本轮选中的技能：长技能", "已截断", "resource_read"} {
+	for _, want := range []string{"本轮选中的技能：长技能", "已截断", "plugin_read"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("缺少 %q", want)
 		}
@@ -141,6 +141,22 @@ func TestBasePromptForbidsAskingForPlaintextSecrets(t *testing.T) {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("基础规则缺少凭证约束 %q", want)
 		}
+	}
+}
+
+// 知识沉淀必须改道 wiki_*：wiki 工具一直在工具列表里，但提示词不提它，
+// 模型就会用 file_write 在当前空间自建 knowledge/ 目录——那份知识只有本空间可见。
+func TestBasePromptRoutesKnowledgeToWiki(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{})
+
+	for _, want := range []string{"wiki_search", "wiki_list", "wiki_read", "wiki_write", "不要为「沉淀知识」"} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("基础规则缺少知识库指引 %q", want)
+		}
+	}
+	// 能力缺失（系统空间没初始化）时不能静默降级成写文件
+	if !strings.Contains(msg.Content, "系统空间未初始化") {
+		t.Fatal("基础规则缺少 wiki 不可用时的处理要求")
 	}
 }
 

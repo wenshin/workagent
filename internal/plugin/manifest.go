@@ -161,6 +161,16 @@ type RuntimeSpec struct {
 type Transport struct {
 	Type string `json:"type"`
 	URL  string `json:"url"`
+	// AllowHTTP 允许明文 http 连接。
+	//
+	// 默认要求 https：MCP 是宿主自己发 HTTP 出去（internal/mcp 用的是裸 http.Client，
+	// 不经 search.Guard 的白名单与私网拦截），URL 校验就是唯一的约束点。但企业内网
+	// 的 MCP Server 常常只有 http 一档，强制 https 等于把内网接不进来，所以留一个
+	// 显式口子：写出来才放行，权限文案也会标成「明文 http」，让安装的人看见代价。
+	//
+	// 它是「允许」而不是「必须」：清单可以写 https 地址同时声明 allow_http，
+	// 安装方才能在安装级配置里把它覆盖成内网 http。
+	AllowHTTP bool `json:"allow_http,omitempty"`
 }
 
 // Auth 是 mcp 的鉴权方式。
@@ -540,7 +550,13 @@ func (m Manifest) Permissions() []string {
 		out = append(out, m.capabilityLines()...)
 	case KindMCP:
 		if m.Transport != nil {
-			out = append(out, "连接外部服务："+hostOf(m.Transport.URL))
+			line := "连接外部服务：" + hostOf(m.Transport.URL)
+			// 明文连内网是允许的，但必须在安装确认里看得见：这条线只有作者能决定，
+			// 安装的人没法从 host 反推出「走的是不是 https」。
+			if strings.HasPrefix(m.Transport.URL, "http://") {
+				line += "（明文 http，不加密）"
+			}
+			out = append(out, line)
 		}
 		if m.Tools != nil {
 			line := "调用远端工具：" + strings.Join(m.Tools.Allow, "、")
@@ -628,6 +644,43 @@ func hostOf(raw string) string {
 		return u.Host
 	}
 	return raw
+}
+
+// validateMCPURL 校验 MCP 服务地址，清单与安装级配置共用这一份规则。
+//
+// 默认要求 https；http 只在两种情况下放行：目标是本机（调试用），或作者显式
+// 声明了 transport.allow_http（企业内网常见）。allowHTTP 由调用方决定：清单校验
+// 直接取 transport.allow_http，安装级配置取的是清单声明——发布方说「这个插件
+// 允许明文」，部署方才能在配置里填内网 http 地址。
+func validateMCPURL(raw string, allowHTTP bool) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("transport.url 不是合法 URL")
+	}
+	if u.User != nil {
+		return fmt.Errorf("transport.url 不能带用户名密码，请改用 auth.secret 引用凭证")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if allowHTTP || isLocalHost(u.Hostname()) {
+			return nil
+		}
+		// 报错里直接给写法：内网 http 是常态，别让人去翻文档猜怎么放开
+		return fmt.Errorf("transport.url 只允许 https；内网明文服务请显式声明 transport.allow_http: true")
+	default:
+		return fmt.Errorf("transport.url 只支持 http / https，收到 %q", u.Scheme)
+	}
+}
+
+// isLocalHost 判断是否本机：本机调试用 http 一直放行，不必为此声明 allow_http。
+func isLocalHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // AllowsTool 判断远端工具是否在白名单内：allow 支持尾部 `*` 前缀匹配，deny 优先。
@@ -880,8 +933,8 @@ func (m *Manifest) Validate(publishing bool) error {
 		if m.Transport == nil || m.Transport.URL == "" {
 			return fmt.Errorf("mcp 插件必须声明 transport.url")
 		}
-		if !strings.HasPrefix(m.Transport.URL, "https://") {
-			return fmt.Errorf("transport.url 只允许 https")
+		if err := validateMCPURL(m.Transport.URL, m.Transport.AllowHTTP); err != nil {
+			return err
 		}
 		if m.Tools == nil || len(m.Tools.Allow) == 0 {
 			return fmt.Errorf("tools.allow 必填且非空：默认不信任 MCP Server 的全部工具")

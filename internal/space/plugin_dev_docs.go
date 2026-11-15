@@ -32,7 +32,7 @@ const pluginDevSkillDoc = `# 技能插件（kind=skill）
 ## 正文（SKILL.md）
 - 第一段写「什么时候用 / 什么时候不用」，模型靠这句话决定是否检索与加载。
 - 再写输入、步骤、产出格式、示例；不要写成界面点击指南。
-- 需要模板或长表格时放独立文件（如 templates/weekly.md），正文里给相对路径，模型用 resource_read 读。
+- 需要模板或长表格时放独立文件（如 templates/weekly.md），正文里给相对路径，模型用 plugin_read 读。
 
 ## 创建方式
 没有「建技能」的专用工具：技能就是插件目录，用 file_write 写两个文件即可。
@@ -43,7 +43,7 @@ const pluginDevSkillDoc = `# 技能插件（kind=skill）
 界面上的「新建技能」只是这两步的快捷方式，建出来的结构完全一样；目录已存在时不要重建，直接编辑里面的文件。
 
 ## 生效方式
-- 启用后进能力索引，模型通过 resource_search 找到；
+- 启用后进能力索引，模型通过 plugin_search 找到；
 - 用户可以在会话里绑定它（PUT /sessions/{id}/skill），正文每轮注入；
 - 单次注入上限 4000 tokens，超出需分段读取。
 
@@ -83,10 +83,10 @@ const pluginDevEvalsDoc = `# 发布前自测（evals.json）
       "name": "检索不到时不会反复重试",
       "kind": "agent",
       "query": "按公司规范给这个订单退款",
-      "tools": [{ "name": "resource_search", "result": "" }],
+      "tools": [{ "name": "plugin_search", "result": "" }],
       "script": [
-        { "tool_calls": [{ "name": "resource_search", "args": { "query": "退款规范" } }] },
-        { "tool_calls": [{ "name": "resource_search", "args": { "query": "退款 流程" } }] },
+        { "tool_calls": [{ "name": "plugin_search", "args": { "query": "退款规范" } }] },
+        { "tool_calls": [{ "name": "plugin_search", "args": { "query": "退款 流程" } }] },
         { "content": "没有找到退款规范，需要你确认是哪一份。" }
       ],
       "expect": { "stop_reason": "stalled", "content_contains": ["没有找到"] }
@@ -313,7 +313,10 @@ static 是默认模式：auth.secret 只写凭证名（如 crm_token），值由
 - 凭证存储没启用（未配 SECRET_KEK）时签发不了令牌：这类插件会明确不可用，不会退回无鉴权调用。
 
 ## 规则
-- transport.url 只允许 https（本机 http 放行）。
+- transport.url 默认要求 https。内网 MCP Server 只有 http 时，显式写 transport.allow_http: true 即可，
+  权限文案会标成「明文 http」，安装的人看得见代价；本机（localhost / 127.0.0.1 / ::1）用 http 不必声明。
+- allow_http 是「允许」不是「必须」：清单写 https 地址同时声明 allow_http，安装方才能在「配置」里
+  把服务地址覆盖成内网 http（反过来不行，发布方没声明就不能靠改地址绕成明文）。
 - tools.allow 必填且非空：默认不信任远端全部工具；支持尾部 * 前缀匹配，deny 优先。
 - MCP 默认按 L3 处理（远端工具可能写数据）；同时用到密钥时按 L4 走系统管理员。
 - 安装后服务地址、鉴权 Header 名、凭证名可按空间覆盖（空间插件面板的「配置」），发布快照不动。

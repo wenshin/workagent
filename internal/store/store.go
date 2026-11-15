@@ -404,26 +404,6 @@ type Store interface {
 	SaveMessageEmbedding(ctx context.Context, r EmbeddingRecord) error
 	ListMessageEmbeddings(ctx context.Context, sessionID string, limit int) ([]EmbeddingRecord, error)
 
-	// ---- 资源发布（§5.6 资源管理）----
-	// CreateResource 在同一事务里写入资源与首个版本。
-	CreateResource(ctx context.Context, r Resource, v ResourceVersion) (Resource, error)
-	// FindResourceByName 按「发布者 + kind + name」查资源，用于判断是新增版本还是首次发布。
-	FindResourceByName(ctx context.Context, ownerID, kind, name string) (Resource, error)
-	GetResource(ctx context.Context, id string) (Resource, error)
-	// ListResources 返回对该用户可见的资源：全部 public + 自己的 private。
-	ListResources(ctx context.Context, userID string) ([]Resource, error)
-	// AddResourceVersion 追加一个不可变版本，并把 latest_version 指向最高版本。
-	AddResourceVersion(ctx context.Context, resourceID string, v ResourceVersion, latest string) error
-	ListResourceVersions(ctx context.Context, resourceID string) ([]ResourceVersion, error)
-	// GetResourceVersion 取指定版本；version 为空时取 latest_version。
-	GetResourceVersion(ctx context.Context, resourceID, version string) (ResourceVersion, error)
-	SetResourceStatus(ctx context.Context, id, status string) error
-	// UpdateResourceMeta 在再次发布时同步描述与可见性（版本快照本身不可变）。
-	UpdateResourceMeta(ctx context.Context, id, description, visibility string) error
-	DeleteResource(ctx context.Context, id string) error
-	// DeleteResourceVersion 删除一个版本；version 为空时删除 latest_version。
-	DeleteResourceVersion(ctx context.Context, resourceID, version string) error
-
 	// ---- 插件体系（docs/插件体系设计.md）----
 	// 内容以文件为准、状态以 DB 为准：草稿不落库，发布才写 plugin / plugin_version。
 	UpsertPlugin(ctx context.Context, p Plugin) (Plugin, error)
@@ -467,47 +447,6 @@ type Store interface {
 	// GetPluginScan 取某版本最近一次的扫描结论，按扫描时间倒序。
 	GetPluginScan(ctx context.Context, pluginID, version string) (PluginScan, error)
 }
-
-// Resource 是发布后的资源：独立于工作空间存储，只保留名称、版本、描述等最小信息。
-//
-// 原始定义（MCP 配置、tool 文件、DB 连接串）不在接口里暴露，避免发布后泄露密钥。
-type Resource struct {
-	ID          string
-	Kind        string // skill | tool | mcp | component | db
-	Name        string
-	Description string
-	Visibility  string // public | private
-	Status      string // enabled | disabled
-	OwnerID     string
-	OwnerName   string
-	// SourceSpaceID 是发布来源空间（草稿所在空间），用于追溯
-	SourceSpaceID string
-	// SourceSpaceName 是来源空间名，仅列表查询时填充
-	SourceSpaceName string
-	LatestVersion   string
-	VersionCount    int
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-}
-
-// ResourceVersion 是一个不可变的资源版本快照。
-type ResourceVersion struct {
-	Version     string
-	Notes       string
-	StoragePath string
-	FileCount   int
-	TotalBytes  int64
-	CreatedBy   string
-	CreatedAt   time.Time
-}
-
-// 资源可见性与状态取值。
-const (
-	ResourceVisibilityPublic  = "public"
-	ResourceVisibilityPrivate = "private"
-	ResourceStatusEnabled     = "enabled"
-	ResourceStatusDisabled    = "disabled"
-)
 
 // SessionSummary 是一段历史消息的滚动摘要。
 type SessionSummary struct {

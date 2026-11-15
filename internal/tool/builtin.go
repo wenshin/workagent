@@ -21,7 +21,7 @@ import (
 func builtinTools() []Tool {
 	return []Tool{
 		timeNow(),
-		resourceList(),
+		spaceList(),
 		sessionList(),
 		taskCreate(),
 		taskList(),
@@ -34,8 +34,8 @@ func builtinTools() []Tool {
 		wikiRead(),
 		wikiWrite(),
 		wikiSearch(),
-		resourceSearch(),
-		resourceRead(),
+		pluginSearch(),
+		pluginRead(),
 		webSearch(),
 		shellExec(),
 		pluginTry(),
@@ -92,10 +92,10 @@ func timeNow() Tool {
 	}
 }
 
-func resourceList() Tool {
+func spaceList() Tool {
 	return Tool{
-		Name:        "resource_list",
-		Capability:  "resource.list",
+		Name:        "space_list",
+		Capability:  "space.list",
 		Description: "列出当前用户可访问的工作空间（名称、类型、权限、层级路径）。用户提到某个空间但不确定名称时使用。",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 		Risk:        policy.RiskReadOnly,
@@ -176,18 +176,18 @@ func sessionList() Tool {
 	}
 }
 
-// resourceSearch 按关键词检索「当前空间 + 系统空间」的资源。
+// pluginSearch 按关键词检索「当前空间 + 系统空间」的插件。
 //
-// 资源总量没有上限，因此不提供「列出全部」的工具：模型按关键词检索，
+// 插件总量没有上限，因此不提供「列出全部」的工具：模型按关键词检索，
 // 命中同名多来源时必须在回答前让用户确认（约束写在系统提示词里）。
-func resourceSearch() Tool {
+func pluginSearch() Tool {
 	return Tool{
-		Name:       "resource_search",
-		Capability: "system.source.search",
-		Description: "按关键词检索可用的技能（skills）、工具（tools）、MCP 服务（mcps）与组件（components），返回最相关的若干条及读取路径。" +
-			"资源总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
-			"不确定有什么可用能力时，可以省略 query 只给 kind，按名称列出该类资源再挑。" +
-			"命中多个同名资源时先让用户选择，不要自行假设。",
+		Name:       "plugin_search",
+		Capability: "plugin.search",
+		Description: "按关键词检索可用的插件：技能（skills）、工具（tools）、MCP 服务（mcps）与组件（components），返回最相关的若干条及读取路径。" +
+			"插件总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
+			"不确定有什么可用能力时，可以省略 query 只给 kind，按名称列出该类插件再挑。" +
+			"命中多个同名插件时先让用户选择，不要自行假设。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -201,8 +201,8 @@ func resourceSearch() Tool {
 		SideEffects: policy.SideEffectsReadOnly,
 		Runtime:     "builtin",
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if env.Sources == nil {
-				return "", fmt.Errorf("能力源不可用")
+			if env.Plugins == nil {
+				return "", fmt.Errorf("插件目录不可用")
 			}
 			var in struct {
 				Query string `json:"query"`
@@ -213,13 +213,13 @@ func resourceSearch() Tool {
 				return "", fmt.Errorf("参数解析失败：%w", err)
 			}
 			query := strings.TrimSpace(in.Query)
-			kind := normalizeSourceKind(in.Kind)
+			kind := normalizePluginKind(in.Kind)
 			if in.Kind != "" && kind == "" {
 				return "", fmt.Errorf("kind 只能是 skills / tools / mcps / components")
 			}
 			// 不再常驻技能索引，所以允许「只给 kind」按名称拉取该类目录
 			if query == "" && kind == "" {
-				return "", fmt.Errorf("query 与 kind 至少提供一个：给关键词检索，或给 kind 列出该类资源")
+				return "", fmt.Errorf("query 与 kind 至少提供一个：给关键词检索，或给 kind 列出该类插件")
 			}
 			if in.Limit <= 0 {
 				in.Limit = 8
@@ -228,22 +228,22 @@ func resourceSearch() Tool {
 				in.Limit = 20
 			}
 
-			entries, err := env.Sources.Sources(ctx)
+			entries, err := env.Plugins.Plugins(ctx)
 			if err != nil {
 				return "", err
 			}
-			hits := make([]scoredSource, 0, len(entries))
+			hits := make([]scoredPlugin, 0, len(entries))
 			for _, e := range entries {
 				if kind != "" && e.Kind != kind {
 					continue
 				}
 				if query == "" {
 					// 只给 kind：按名称列目录，score 取相同值让排序退化为 kind + name
-					hits = append(hits, scoredSource{SourceEntry: e, Score: 1})
+					hits = append(hits, scoredPlugin{PluginEntry: e, Score: 1})
 					continue
 				}
-				if score := scoreSource(query, e); score > 0 {
-					hits = append(hits, scoredSource{SourceEntry: e, Score: score})
+				if score := scorePlugin(query, e); score > 0 {
+					hits = append(hits, scoredPlugin{PluginEntry: e, Score: score})
 				}
 			}
 			sort.SliceStable(hits, func(i, j int) bool {
@@ -256,7 +256,7 @@ func resourceSearch() Tool {
 				return hits[i].Name < hits[j].Name
 			})
 
-			res := sourceSearchResult{Query: query, Matched: len(hits), Items: []scoredSource{}}
+			res := pluginSearchResult{Query: query, Matched: len(hits), Items: []scoredPlugin{}}
 			if len(hits) > in.Limit {
 				hits = hits[:in.Limit]
 				res.Truncated = true
@@ -264,11 +264,11 @@ func resourceSearch() Tool {
 			res.Items = append(res.Items, hits...)
 			switch {
 			case res.Matched == 0:
-				res.Hint = "没有匹配的资源，可换关键词重试；当前空间的文件用 file_list 查看"
+				res.Hint = "没有匹配的插件，可换关键词重试；当前空间的文件用 file_list 查看"
 			case query == "":
 				res.Hint = "未按关键词过滤，按名称列出；用 query 可以缩小范围"
 			case looksAmbiguous(res.Items):
-				res.Hint = "存在同名资源（来源不同），使用前请让用户确认用哪一个"
+				res.Hint = "存在同名插件（来源不同），使用前请让用户确认用哪一个"
 			}
 			body, err := json.MarshalIndent(res, "", "  ")
 			if err != nil {
@@ -279,16 +279,16 @@ func resourceSearch() Tool {
 	}
 }
 
-// resourceRead 读取资源文件：当前空间优先，找不到再到系统空间找。
+// pluginRead 读取插件文件：当前空间优先，找不到再到系统空间找。
 //
-// 空间里的技能草稿（plugins/<技能slug>/SKILL.md）与内置件（published/skills/<slug>/<version>/SKILL.md）
-// 用同一个工具读取，模型不需要关心资源在哪一侧。
-func resourceRead() Tool {
+// 空间里的技能草稿（plugins/<技能slug>/SKILL.md）与已安装件（published/skills/<slug>/<version>/SKILL.md）
+// 用同一个工具读取，模型不需要关心插件在哪一侧。
+func pluginRead() Tool {
 	return Tool{
-		Name:       "resource_read",
-		Capability: "system.source.read",
-		Description: "读取资源文件正文（技能的 SKILL.md、工具定义或 MCP 快照 JSON）。" +
-			"路径取自 resource_search；当前空间存在同名文件时优先，否则读系统空间；长文档可用 offset / limit 分段读取。",
+		Name:       "plugin_read",
+		Capability: "plugin.read",
+		Description: "读取插件文件正文（技能的 SKILL.md、工具定义或 MCP 快照 JSON）。" +
+			"路径取自 plugin_search；当前空间存在同名文件时优先，否则读系统空间；长文档可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -305,8 +305,8 @@ func resourceRead() Tool {
 		// 读正文是明确的信息获取动作，允许比默认额度更大，减少分段次数
 		MaxResultBytes: 24 * 1024,
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if env.Sources == nil {
-				return "", fmt.Errorf("能力源不可用")
+			if env.Plugins == nil {
+				return "", fmt.Errorf("插件目录不可用")
 			}
 			var in struct {
 				Path   string `json:"path"`
@@ -316,7 +316,7 @@ func resourceRead() Tool {
 			if err := json.Unmarshal(args, &in); err != nil {
 				return "", fmt.Errorf("参数解析失败：%w", err)
 			}
-			text, err := env.Sources.ReadSource(ctx, in.Path)
+			text, err := env.Plugins.ReadPlugin(ctx, in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -325,22 +325,22 @@ func resourceRead() Tool {
 	}
 }
 
-// scoredSource 是带匹配分数的检索结果；Score 只在内部排序用，不返回给模型。
-type scoredSource struct {
-	SourceEntry
+// scoredPlugin 是带匹配分数的检索结果；Score 只在内部排序用，不返回给模型。
+type scoredPlugin struct {
+	PluginEntry
 	Score int `json:"-"`
 }
 
-type sourceSearchResult struct {
+type pluginSearchResult struct {
 	Query     string         `json:"query"`
 	Matched   int            `json:"matched"`
 	Truncated bool           `json:"truncated,omitempty"`
-	Items     []scoredSource `json:"items"`
+	Items     []scoredPlugin `json:"items"`
 	Hint      string         `json:"hint,omitempty"`
 }
 
-// normalizeSourceKind 兼容单复数写法，返回索引里使用的复数形式。
-func normalizeSourceKind(kind string) string {
+// normalizePluginKind 兼容单复数写法，返回索引里使用的复数形式。
+func normalizePluginKind(kind string) string {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case "":
 		return ""
@@ -357,10 +357,10 @@ func normalizeSourceKind(kind string) string {
 	}
 }
 
-// scoreSource 计算资源与关键词的相关度：名称命中权重最高，其次描述。
+// scorePlugin 计算插件与关键词的相关度：名称命中权重最高，其次描述。
 //
 // 中文查询通常不带空格，因此除整词匹配外，再按相邻两字（bigram）命中计分。
-func scoreSource(query string, e SourceEntry) int {
+func scorePlugin(query string, e PluginEntry) int {
 	name := strings.ToLower(e.Name)
 	desc := strings.ToLower(e.Description)
 	score := 0
@@ -391,8 +391,8 @@ func bigramScore(term, haystack string) int {
 	return score
 }
 
-// looksAmbiguous 判断结果里是否存在同名不同来源的资源。
-func looksAmbiguous(items []scoredSource) bool {
+// looksAmbiguous 判断结果里是否存在同名不同来源的插件。
+func looksAmbiguous(items []scoredPlugin) bool {
 	seen := make(map[string]string, len(items))
 	for _, it := range items {
 		key := it.Kind + "/" + it.Name

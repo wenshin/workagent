@@ -811,7 +811,7 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 
 	// 安装 = 在空间里生成派生副本（方案 A）：副本独立可改，不自动合并上游。
 	// 先落副本，再建运行时，保证运行时读到的就是用户将来编辑的那份内容。
-	// 不可扩展的内置件不落副本：它们只在资源管理可见，运行时直接读发布件，
+	// 不可扩展的内置件不落副本：它们只在插件市场可见，运行时直接读发布件，
 	// 避免每个空间都存一份不可改的内容、也避免用户以为改了会生效。
 	// 系统空间安装要落副本：`系统空间/plugins/<slug>/` 就是「全局安装目录」，
 	// 管理员在文件树里能直接看到全局装了哪些插件（内容仍只读）。
@@ -1086,7 +1086,7 @@ func (m *Manager) InstalledSources(ctx context.Context, spaceID string) ([]space
 			// 本地开发插件由空间文件索引负责，路径是 plugins/...，不走 published。
 			continue
 		}
-		// 智能体不是「可检索资源」：它由会话选择器使用，正文不该被 resource_search 暴出来。
+		// 智能体不是「可检索能力」：它由会话选择器使用，正文不该被 plugin_search 暴出来。
 		if inst.Manifest.Kind == KindAgent {
 			continue
 		}
@@ -1116,7 +1116,7 @@ func (m *Manager) InstalledSources(ctx context.Context, spaceID string) ([]space
 	return out, nil
 }
 
-// ReadPublished 读已发布件里的文件（resource_read 的 published/... 路径）。
+// ReadPublished 读已发布件里的文件（plugin_read 的 published/... 路径）。
 //
 // 访问控制：本空间已安装的插件，或 public 发布件。版本固定，内容不可变，
 // 所以不需要按草稿可见性再判一次。
@@ -1133,7 +1133,7 @@ func (m *Manager) ReadPublished(ctx context.Context, spaceID, rel string) (strin
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// 模型偶尔会照着 skill 只造路径：直接说清「路径要来自检索结果」
-			return "", fmt.Errorf("没有 slug 为 %s 的插件，路径请取自 resource_search 的结果，不要自行拼造", slug)
+			return "", fmt.Errorf("没有 slug 为 %s 的插件，路径请取自 plugin_search 的结果，不要自行拼造", slug)
 		}
 		return "", err
 	}
@@ -1150,7 +1150,7 @@ func (m *Manager) ReadPublished(ctx context.Context, spaceID, rel string) (strin
 	v, err := m.o.Store.GetPluginVersion(ctx, p.ID, version)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return "", fmt.Errorf("插件 %s 没有版本 %s（可能已升级），请重新 resource_search 取回最新路径", slug, version)
+			return "", fmt.Errorf("插件 %s 没有版本 %s（可能已升级），请重新 plugin_search 取回最新路径", slug, version)
 		}
 		return "", err
 	}

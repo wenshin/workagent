@@ -16,7 +16,6 @@ import (
 	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
-	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
@@ -92,12 +91,11 @@ func cancelDetail(reason string, runErr error) string {
 
 // Service 承载聊天会话的业务规则。
 type Service struct {
-	store     store.Store
-	spaces    *space.Service
-	resources *resource.Service
-	agent     agent.Agent
-	storage   storage.Storage
-	memory    *ctxmgr.Manager
+	store   store.Store
+	spaces  *space.Service
+	agent   agent.Agent
+	storage storage.Storage
+	memory  *ctxmgr.Manager
 	// runBudget 是单次回答的墙钟上限（ctx 兜底），由 LLM_MAX_WALL_CLOCK 加余量得到
 	runBudget time.Duration
 	// agentPlugins 是智能体来源（kind=agent 插件），为空时不注入追加提示词
@@ -120,14 +118,14 @@ type Service struct {
 	log        *slog.Logger
 }
 
-// NewService 构造会话服务；resources 为 nil 时只加载空间内的能力源，
+// NewService 构造会话服务；能力源（插件目录）由空间服务与插件层提供，
 // wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
-func NewService(st store.Store, spaces *space.Service, resources *resource.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
+func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
 	if wallClock <= 0 {
 		wallClock = defaultRunBudget
 	}
 	return &Service{
-		store: st, spaces: spaces, resources: resources, agent: agents, storage: fs,
+		store: st, spaces: spaces, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
 		runBudget: wallClock + runBudgetBackstopMargin, runs: newLiveRuns(),
 		autoBudget: newAutoRunBudget(), log: log,
@@ -779,9 +777,9 @@ func (s *Service) chat(
 			Store:       s.store,
 			Storage:     s.storage,
 			Log:         s.log,
-			// 能力源：当前空间 + 系统空间 + 已发布插件（发布件按需检索，不做同名覆盖）。
-			// published/... 路径也由空间服务转给插件层解析，这里不再单独持有资源服务。
-			Sources: sourceLoader{
+			// 插件目录：当前空间 + 系统空间 + 已安装插件（未安装的发布件按需检索，不做同名覆盖）。
+			// published/... 路径也由空间服务转给插件层解析。
+			Plugins: pluginLoader{
 				spaces:  s.spaces,
 				spaceID: sess.SpaceID,
 			},
@@ -791,7 +789,7 @@ func (s *Service) chat(
 			// 工具只拿到 Runner，无法自行降级到无隔离执行。
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
-			Plugins: s.pluginTry,
+			PluginTry: s.pluginTry,
 			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
 			Tasks: s,
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文

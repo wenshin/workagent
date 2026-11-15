@@ -139,12 +139,12 @@ export default function PluginCatalogPanel({
         </div>
       </div>
 
-      <div className="resource-tabs">
+      <div className="plugin-tabs">
         {KIND_FILTERS.map((k) => (
           <button
             key={k}
             type="button"
-            className={`resource-tab${kind === k ? ' active' : ''}`}
+            className={`plugin-tab${kind === k ? ' active' : ''}`}
             onClick={() => setKind(k)}
           >
             {k === 'all' ? '全部类型' : KIND_LABEL[k]}
@@ -168,15 +168,15 @@ export default function PluginCatalogPanel({
           <Empty title="这一类还没有插件" description="换个分类或类型看看。" />
         </div>
       ) : (
-        <div className="resource-grid">
+        <div className="plugin-grid">
           {filtered.map((item) => {
             const pending = item.pending;
             const builtin = item.category === 'system';
             return (
-              <Card key={`${item.pending ? 'p' : 'r'}-${item.slug}`} className="resource-card" bodyStyle={{ padding: 16 }}>
-                <div className="resource-card-head">
+              <Card key={`${item.pending ? 'p' : 'r'}-${item.slug}`} className="plugin-card" bodyStyle={{ padding: 16 }}>
+                <div className="plugin-card-head">
                   <PluginIcon kind={item.kind as PluginKind} />
-                  <span className="resource-card-name">{item.name || item.slug}</span>
+                  <span className="plugin-card-name">{item.name || item.slug}</span>
                   <span className="plugin-kind-label">{KIND_LABEL[item.kind as PluginKind]}</span>
                   {builtin ? (
                     <Tag size="small" color="purple">
@@ -195,16 +195,16 @@ export default function PluginCatalogPanel({
                   {item.visibility === 'private' ? <Tag size="small" color="grey">仅来源空间</Tag> : null}
                 </div>
 
-                <div className="resource-card-desc">{item.description || '（没有描述）'}</div>
+                <div className="plugin-card-desc">{item.description || '（没有描述）'}</div>
 
-                <div className="resource-card-meta">
+                <div className="plugin-card-meta">
                   <span className="plugin-slug">{item.slug}</span>
                   {item.source_space ? <span>来自「{item.source_space}」</span> : null}
                   {item.author ? <span>作者 {item.author}</span> : null}
                   <span>{pending ? '尚未发布' : `最新 v${item.latest_version || '-'}`}</span>
                 </div>
 
-                <div className="resource-card-actions">
+                <div className="plugin-card-actions">
                   {builtin ? (
                     <Text type="tertiary" size="small">
                       全部空间默认可用，无需安装

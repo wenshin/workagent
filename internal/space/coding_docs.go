@@ -5,7 +5,7 @@ import _ "embed"
 // 「编程实践」技能的子手册用嵌入文件：正文里有大量 markdown 反引号，
 // 写成 Go 原始字符串会互相打架（与 plugin_docs/source.md 同一处理）。
 //
-// 目录里的 SKILL.md 是总纲（Doc），其余是子手册（Files），模型按需 resource_read。
+// 目录里的 SKILL.md 是总纲（Doc），其余是子手册（Files），模型按需 plugin_read。
 
 //go:embed coding_docs/SKILL.md
 var codingSkillDoc string

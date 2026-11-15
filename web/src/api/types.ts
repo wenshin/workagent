@@ -284,45 +284,6 @@ export interface AppendMessageResponse {
   session: ChatSession;
 }
 
-/** 已发布资源：资源管理板块只展示名称、版本与描述，不提供原始 MCP / tool / DB 配置 */
-export interface PublishedResource {
-  id: string;
-  kind: 'skill' | 'tool' | 'mcp' | 'component' | 'db';
-  name: string;
-  description: string;
-  /** public 全部可见 / private 仅自己可见 */
-  visibility: 'public' | 'private';
-  /** enabled 可被 Agent 检索使用 / disabled 已停用 */
-  status: 'enabled' | 'disabled';
-  owner_id: string;
-  owner_name: string;
-  source_space_id?: string;
-  source_space_name?: string;
-  latest_version: string;
-  version_count: number;
-  created_at: string;
-  updated_at: string;
-}
-
-/** 一个不可变的发布版本；改内容必须发新版本 */
-export interface ResourceVersionInfo {
-  version: string;
-  notes: string;
-  file_count: number;
-  total_bytes: number;
-  created_by: string;
-  created_at: string;
-}
-
-export interface ResourcesResponse {
-  resources: PublishedResource[];
-}
-
-export interface ResourceDetailResponse {
-  resource: PublishedResource;
-  versions: ResourceVersionInfo[];
-}
-
 /** 平台引用的某条凭证：scope + name 用于寻址，label 是给管理员看的用途 */
 export interface SecretRef {
   scope: string;
@@ -412,7 +373,7 @@ export interface AgentSummary {
   extends?: string;
 }
 
-/** 资源管理里的已发布插件（只读） */
+/** 插件市场里的已发布插件（只读） */
 export interface PluginCatalogItem {
   slug: string;
   kind: PluginKind;

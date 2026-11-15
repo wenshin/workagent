@@ -66,7 +66,7 @@ func TestGuardTracksStall(t *testing.T) {
 
 func TestGuardEmptyResultsCountAsNoGain(t *testing.T) {
 	g := newProgressGuard(2)
-	rec := []callRecord{{Name: "resource_search", Args: `{"query":"x"}`, Status: "ok", Output: ""}}
+	rec := []callRecord{{Name: "plugin_search", Args: `{"query":"x"}`, Status: "ok", Output: ""}}
 	if hint := g.afterRound(rec); hint == "" {
 		t.Fatal("空结果不应算作进展")
 	}

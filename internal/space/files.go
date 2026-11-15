@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/storage"
+	"github.com/workagent/auto-agent/internal/store"
 )
 
 // DefaultUploadMaxBytes 是单文件上传的默认上限（4MB）。
@@ -255,6 +256,76 @@ func (s *Service) SaveFile(ctx context.Context, userID, spaceID, rawDir, rawName
 		Size:    entry.Size,
 		ModTime: entry.ModTime,
 	}, nil
+}
+
+// DeleteFile 删除单个文件；目录走 DeleteDir。
+//
+// 只读边界与 DeleteDir 一致：系统空间内置目录整棵只读，已安装插件的副本也只能卸载，
+// 允许逐文件删会让安装记录、发布快照与磁盘内容对不上（删掉 plugin.json 就是半个插件）。
+// 本地草稿（plugins/<slug>/，没有安装记录）可以删，删完要重载插件层与索引，
+// 否则运行时还在按旧清单提供工具。
+func (s *Service) DeleteFile(ctx context.Context, userID, spaceID, rawPath string) error {
+	rel, err := normalizeRelPath(rawPath)
+	if err != nil || rel == "" {
+		return ErrFileNotFound
+	}
+
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return err
+	}
+	if !canWrite(sp.Perm) {
+		return ErrForbidden
+	}
+	// 系统空间的内置目录是平台资产，里面的文件同样不允许单独删
+	if s.inBuiltinDir(sp, rel) {
+		return ErrReserved
+	}
+	if s.isInstalledSubtree(ctx, sp.ID, rel) {
+		return ErrPluginReadOnly
+	}
+
+	key := path.Join(s.filesKey(sp.ID), rel)
+	entry, err := s.storage.Stat(ctx, key)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrFileNotFound
+		}
+		return err
+	}
+	if entry.IsDir {
+		return errors.New("目标是目录，不能按文件删除")
+	}
+	if err := s.storage.Delete(ctx, key); err != nil {
+		return err
+	}
+
+	// 插件区里的文件就是插件内容：索引与运行时缓存都要跟着变
+	if rel == DraftDirName || strings.HasPrefix(rel, DraftDirName+"/") {
+		// 删掉清单等于插件失效：候选记录留着会在市场里挂一条打不开的「待发布」
+		if path.Base(rel) == "plugin.json" && path.Dir(path.Dir(rel)) == DraftDirName {
+			slug := path.Base(path.Dir(rel))
+			if err := s.store.DeletePluginCandidate(ctx, sp.ID, slug); err != nil {
+				s.log.Warn("清理插件候选失败", "space_id", sp.ID, "slug", slug, "err", err)
+			}
+		}
+		if s.pluginChanged != nil {
+			if err := s.pluginChanged(ctx, sp.ID); err != nil {
+				s.log.Warn("重载插件失败", "space_id", sp.ID, "path", rel, "err", err)
+			}
+		}
+		s.refreshIndex(ctx, sp.ID)
+	}
+	s.log.Info("文件已删除", "space_id", sp.ID, "file", rel, "by", userID)
+	return nil
+}
+
+// inBuiltinDir 判断 rel 是否落在系统空间的内置目录内（含目录自身）。
+func (s *Service) inBuiltinDir(sp store.Space, rel string) bool {
+	if sp.Type != SpaceTypeSystem {
+		return false
+	}
+	return isSystemBuiltinDir(strings.SplitN(strings.Trim(rel, "/"), "/", 2)[0])
 }
 
 // uniqueFilePath 为上传文件找一个不冲突的相对路径：name.ext → name-1.ext → name-2.ext。

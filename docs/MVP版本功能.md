@@ -212,7 +212,7 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 | `files/tools` | 内置工具定义（与运行时 `BuiltinManifests()` 同步，一个工具一个 JSON） | 同上 |
 | `files/mcps` | MCP 服务快照：`README.md` + 每个已注册服务一个 JSON | 同上 |
 
-- `skills` / `tools` / `mcps` 三个目录是 **Agent 默认全局可见的能力搜索源**：所有用户（不限空间）都可读取，Agent 通过 `resource_search` 检索、`resource_read` 读取具体文件（资源总量不设上限，不提供全量列举）。
+- `skills` / `tools` / `mcps` 三个目录是 **Agent 默认全局可见的能力搜索源**：所有用户（不限空间）都可读取，Agent 通过 `plugin_search` 检索、`plugin_read` 读取具体文件（插件总量不设上限，不提供全量列举）。
 - 内置内容只在文件缺失时写入，不覆盖管理员后续的修改。
 - 内置内容初始包含：空间管理、文件与目录操作、会话管理三个技能说明，以及全部内置工具（时间、资源列表、会话列表、文件列表、文件读写、全局能力源）的定义快照。`tools/` 属于平台托管内容，每次启动按运行时清单覆盖写入，保证与 `BuiltinManifests()` 一致。
 
@@ -360,11 +360,10 @@ autoagent/                                 # 存储根
 
 | 项 | 已实现 | 未实现 |
 | --- | --- | --- |
-| 发布 | 从空间草稿发布技能：指定版本号（`x.y.z`）、发布说明、**用户范围**（`public` 全部可见 / `private` 仅自己可见）；发布件存 `published/{kind}/{resource_id}/{version}/`，与工作空间独立 | 连接测试、回滚、发布审核、按空间定向发布 |
-| 发布记录 | 空间页头部的次级入口（`/resources/snapshots`）：列表、类型/范围/状态筛选、版本记录、启用/停用、删除资源、删除单个版本；与插件市场不再并列 | 被引用拦截、diff、授权成员、引用位置 |
+| 发布 | 只有插件一条发布链路：空间草稿启用后进市场「待发布」，系统管理员发布为不可变快照（`published/{kind}/{slug}/{version}/`），其他空间安装后才可用；旧的「资源发布」（`resource` 表 + `/resources` 接口 + 发布记录页）已下线 | 连接测试、回滚、发布审核、按空间定向发布 |
 | 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述与文件数/体积 | 版本级启停 |
-| 权限 | 发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除/启停仅发布者本人或系统管理员 | 资源管理角色表 |
-| Agent 侧 | 发布件作为独立一层进入 `resource_search`（`source=published`），`resource_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
+| 权限 | 发布仅系统管理员；安装 / 启停 / 卸载 / 安装级配置由空间管理员在目标空间执行，卸载不删审计 | 资源管理角色表 |
+| Agent 侧 | 未安装的发布件不进检索池；`plugin_search` 只返回已安装插件与空间草稿，`plugin_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
 
 ### FR-6 公共资源
 
@@ -409,7 +408,7 @@ autoagent/                                 # 存储根
 | └ 已知差距 | 该渲染器不支持嵌套列表（平铺成同级列表）、任务列表、斜体、图片与自动链接；需要完整 CommonMark 时按组件注释替换为 marked/markdown-it |
 | 编排实现可切换（2026-11） | 契约在 `internal/agent`（`Agent` 接口 + §7.3 事件协议），实现：`internal/agent/builtin`（ReAct，默认）、`internal/agent/direct`（无工具直答）；`AGENT_IMPL` 切换，未知实现回退 builtin，`GET /agent/info` 返回当前实现与能力，`run.budget.impl` 留痕。平台侧（审批判定、checkpoint、压缩、预算、SSE 契约）不因实现而变。差距：断点续跑（`Capabilities.Resume`）只声明未实现；审批只推 `approval.req`，没有审批记录与恢复入口；模型 failover 由 ModelRouter 提供，尚未按实现区分 |
 | 平台部署事实 | 租户（企业）名称、IM 接入方与登录是否已配置、当前用户（姓名/工号）与所在空间，由会话层填入系统提示词的 `## 平台（部署事实）` 段，**不做成工具**：这类信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具它会顺着猜而不调用，工具 schema 还要每轮常驻。任一字段拿不到时整段省略，模型如实说不知道；智能体设定只能排在其后，不能改写 |
-| 内置工具 | `time_now`、`resource_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`resource_search` / `resource_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`resource_search` 按关键词检索能力源（资源无上限，不提供全量列举），`resource_read` 读取正文并支持分页 |
+| 内置工具 | `time_now`、`space_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`plugin_search` / `plugin_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`plugin_search` 按关键词检索插件（无上限，不提供全量列举），`plugin_read` 读取正文并支持分页 |
 | Skill | MVP 内置 4 个：`创建数据库资源`、`创建 MCP 服务资源`、`find/创建工具资源`、`创建 UI 组件资源`；每个 Skill 定义询问参数清单与校验规则 |
 | **Skill 作为一等资产** | Skill 有独立版本，复用 Agent 的版本/发布/灰度/回滚机制；生成规则（组件白名单、禁止 API、追问话术、模板库）写在 Skill 里而非硬编码；**MVP 先交付可用版本，上线后直接在产品内迭代优化**，每轮优化产出新版本并对比“生成一次通过率” |
 | 搜索 | 空间内文件名搜索 + 会话标题搜索（MVP 不含全文检索） |
@@ -488,7 +487,6 @@ autoagent/                                 # 存储根
 | 空间 | `GET/POST /spaces`、`GET/PATCH/DELETE /spaces/{id}`、`GET /spaces/{id}/tree`、`POST /spaces/{id}/members`、`PATCH/DELETE /spaces/{id}/members/{userId}` |
 | 权限申请 | `POST /permission-requests`、`GET /permission-requests?role=applicant\|approver`、`POST /permission-requests/{id}/decision` |
 | 文件 | 已实现：`GET /spaces/files`（清单）、`GET /spaces/{id}/file?path=`（正文）、`POST /spaces/{id}/files`（上传，multipart + `dir`）。待实现：`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
-| 资源 | 已实现：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；待实现：`POST /resources/{id}/test`、`POST /resources/{id}/versions/{v}/rollback`、`POST /resources/{id}/publish`（从草稿发布即 `POST /resources`） |
 | 公共资源 | `GET /public-resources`、`POST /publish-requests`、`POST /publish-requests/{id}/decision` |
 | 组件 | `GET /plugins`、`GET /spaces/{id}/plugins/{slug}`、`POST .../plugins/{slug}/dry-run|publish|install`、`GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
 | 会话 | `GET/POST /sessions`、`PATCH/DELETE /sessions/{id}`、`GET /sessions/{id}/messages` |
@@ -544,7 +542,6 @@ autoagent/                                 # 存储根
 | 工作台 | `/` | 我的空间、最近会话、待我审批 |
 | 会话 | `/chat`、`/chat/:sessionId` | 三栏：会话列表 / 消息流 / 运行详情 |
 | 空间详情 | `/spaces/:id` | 文件树 + 资源列表 + 成员 |
-| 资源详情 | `/resources/:id` | 配置、连接测试、版本与回滚、授权、引用方 |
 | 公共资源 | `/public-resources` | 类型筛选 + 搜索 + 申请/使用 |
 | 权限申请 | `/requests` | 待我审批 / 我发起的 |
 | 组件管理 | `/components` | 列表、manifest 编辑、构建、发布 |

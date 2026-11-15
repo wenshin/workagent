@@ -157,6 +157,48 @@ func TestMCPRequiresToolAllowList(t *testing.T) {
 	}
 }
 
+// 内网 MCP 常常只有 http：协议默认卡 https，但作者显式声明 allow_http 就要放行，
+// 且必须在权限文案里写清「明文」，安装的人才知道代价。
+func TestMCPPlainHTTPNeedsExplicitAllow(t *testing.T) {
+	body := func(transport string) string {
+		return `{
+  "protocol": "wa-plugin/1",
+  "kind": "mcp",
+  "slug": "crm_mcp",
+  "name": "CRM MCP",
+  "description": "CRM 远端服务，查客户与订单时使用",
+  "capability": "plugin.invoke",
+  "transport": ` + transport + `,
+  "tools": {"allow": ["*"]}
+}`
+	}
+
+	// 内网 http + 未声明：拒绝，且报错要给出写法
+	_, err := Parse([]byte(body(`{"type":"http","url":"http://crm.internal/mcp"}`)), false)
+	if err == nil || !strings.Contains(err.Error(), "allow_http") {
+		t.Fatalf("未声明 allow_http 的内网 http 必须拒绝，实际: %v", err)
+	}
+
+	// 声明后放行
+	m, err := Parse([]byte(body(`{"type":"http","url":"http://crm.internal/mcp","allow_http":true}`)), false)
+	if err != nil {
+		t.Fatalf("声明 allow_http 后应放行: %v", err)
+	}
+	if !strings.Contains(strings.Join(m.Permissions(), "\n"), "明文 http") {
+		t.Fatalf("明文连接必须在权限文案里写清: %v", m.Permissions())
+	}
+
+	// 本机调试不必声明
+	if _, err := Parse([]byte(body(`{"type":"http","url":"http://127.0.0.1:3000/mcp"}`)), false); err != nil {
+		t.Fatalf("本机 http 应放行: %v", err)
+	}
+
+	// 非 http(s) 一律拒绝
+	if _, err := Parse([]byte(body(`{"type":"http","url":"ftp://crm.internal/mcp"}`)), false); err == nil {
+		t.Fatal("非 http/https 协议必须拒绝")
+	}
+}
+
 func TestExtensibleDefaultsTrue(t *testing.T) {
 	m, err := Parse([]byte(toolManifest("")), false)
 	if err != nil {

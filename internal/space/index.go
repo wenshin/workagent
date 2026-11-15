@@ -19,7 +19,7 @@ const spaceIndexFile = ".meta.json"
 
 const indexVersion = 2
 
-// IndexEntry 是索引中的一条资源。
+// IndexEntry 是插件索引里的一条能力（技能 / 工具 / MCP / 组件）。
 //
 // Source 只在合并系统空间时标记，落盘不写。
 type IndexEntry struct {
@@ -31,7 +31,7 @@ type IndexEntry struct {
 	Source string `json:"source,omitempty"`
 }
 
-// IndexBundle 是一次读取的三类资源。
+// IndexBundle 是一次读取的四类插件能力。
 type IndexBundle struct {
 	Skills     []IndexEntry
 	Tools      []IndexEntry
@@ -49,7 +49,7 @@ type spaceIndex struct {
 	Components []IndexEntry `json:"components"`
 }
 
-// 资源来源：同名时 current 优先于 system。
+// 插件来源：同名时 current 优先于 system。
 const (
 	SourceCurrent = "current"
 	SourceSystem  = "system"
@@ -57,7 +57,7 @@ const (
 
 // RebuildIndex 重新扫描空间文件区并覆盖写 files/.meta.json。
 //
-// 所有会改变资源集合的写操作都应调用它；读取侧另有兜底（LoadIndex 发现缺失会重建）。
+// 所有会改变插件集合的写操作都应调用它；读取侧另有兜底（LoadIndex 发现缺失会重建）。
 func (s *Service) RebuildIndex(ctx context.Context, spaceID string) error {
 	idx := s.buildIndex(ctx, spaceID)
 	data, err := json.MarshalIndent(idx, "", "  ")
@@ -90,7 +90,7 @@ func (s *Service) LoadIndex(ctx context.Context, spaceID string) IndexBundle {
 	return IndexBundle{Skills: idx.Skills, Tools: idx.Tools, MCPS: idx.MCPS, Components: idx.Components}
 }
 
-// MergedSources 返回「当前空间 + 系统空间」合并后的资源索引。
+// MergedSources 返回「当前空间 + 系统空间」合并后的插件索引。
 //
 // 去重键是 Name：同名时当前空间优先（用户在自建空间里定制的版本覆盖平台默认）。
 // 系统空间未初始化、或当前空间就是系统空间时自动降级，不依赖系统空间一定存在。
@@ -222,9 +222,9 @@ func (s *Service) Skills(ctx context.Context, userID, spaceID string) ([]IndexEn
 	return s.MergedSources(ctx, spaceID).Skills, nil
 }
 
-// ReadSourceFile 读取资源文件：先当前空间，再系统空间。
+// ReadSourceFile 读取插件文件：先当前空间，再系统空间。
 //
-// 这是 resource_read 与技能正文加载的统一入口，因此路径只做安全校验，
+// 这是 plugin_read 与技能正文加载的统一入口，因此路径只做安全校验，
 // 不限定在 skills / tools / mcps 目录下——普通空间的技能就在 files 根下。
 func (s *Service) ReadSourceFile(ctx context.Context, spaceID, rawPath string, limit int64) (string, error) {
 	rel, err := normalizeSourcePath(rawPath)
@@ -335,7 +335,7 @@ func (s *Service) refreshIndex(ctx context.Context, spaceID string) {
 	}
 }
 
-// normalizeSourcePath 校验资源文件相对路径：禁止越界、反斜杠与隐藏文件，限定可读类型。
+// normalizeSourcePath 校验插件文件相对路径：禁止越界、反斜杠与隐藏文件，限定可读类型。
 func normalizeSourcePath(raw string) (string, error) {
 	rel := strings.Trim(strings.TrimSpace(raw), "/")
 	if rel == "" || strings.Contains(rel, "..") || strings.Contains(rel, "\\") {
@@ -361,7 +361,7 @@ func marked(entries []IndexEntry, source string) []IndexEntry {
 	return out
 }
 
-// mergeByName 合并两批资源：base 优先，同名跳过。
+// mergeByName 合并两批插件：base 优先，同名跳过。
 func mergeByName(base, extra []IndexEntry) []IndexEntry {
 	seen := make(map[string]struct{}, len(base))
 	for _, e := range base {

@@ -13,88 +13,50 @@ import (
 )
 
 const (
-	// sourceReadLimit 是 resource_read 单次读取能力源文件的上限，与工具侧 24KB 上限一致
-	sourceReadLimit = 24 << 10
+	// pluginReadLimit 是 plugin_read 单次读取插件文件的上限，与工具侧 24KB 上限一致
+	pluginReadLimit = 24 << 10
 	// maxSkillDocBytes 是读取技能正文的上限；真正的注入预算按 token 控制（见 agent.systemMessage），
 	// 这里只防止把超大文件整体读进内存
 	maxSkillDocBytes = 64 << 10
 )
 
-// sourceLoader 把「当前空间 + 系统空间 + 已发布插件」适配成工具层接口。
+// pluginLoader 把「当前空间 + 系统空间 + 已安装插件」适配成工具层接口。
 //
 // 空间在构造时固定，工具侧不接受 space_id 参数，模型无法指定其他空间。
-type sourceLoader struct {
+type pluginLoader struct {
 	spaces  *space.Service
 	spaceID string
 }
 
-func (l sourceLoader) Sources(ctx context.Context) ([]tool.SourceEntry, error) {
+func (l pluginLoader) Plugins(ctx context.Context) ([]tool.PluginEntry, error) {
 	idx := l.spaces.MergedSources(ctx, l.spaceID)
-	out := make([]tool.SourceEntry, 0, len(idx.Skills)+len(idx.Tools)+len(idx.MCPS)+len(idx.Components))
-	out = appendSource(out, "skills", idx.Skills)
-	out = appendSource(out, "tools", idx.Tools)
-	out = appendSource(out, "mcps", idx.MCPS)
-	out = appendSource(out, "components", idx.Components)
+	out := make([]tool.PluginEntry, 0, len(idx.Skills)+len(idx.Tools)+len(idx.MCPS)+len(idx.Components))
+	out = appendPlugin(out, "skills", idx.Skills)
+	out = appendPlugin(out, "tools", idx.Tools)
+	out = appendPlugin(out, "mcps", idx.MCPS)
+	out = appendPlugin(out, "components", idx.Components)
 
-	// 发布件不再默认进检索池：只有安装到本空间的插件才可用。市场浏览走
-	// 插件接口；未安装的发布件不能被 resource_search 当成可用能力。
+	// 发布件不默认进检索池：只有安装到本空间的插件才可用。市场浏览走插件接口；
+	// 未安装的发布件不能被 plugin_search 当成可用能力。
 	return out, nil
 }
 
-// ReadSource 读能力源文件。
+// ReadPlugin 读插件文件。
 //
 // published/<kind>/<slug>/<version>/<file> 也交给空间服务转发：路径里的 slug 与版本
 // 只有插件层能映射到真实发布目录（artifact 以 plugin id 落盘），会话层不重复实现。
-// 曾经在这里直接用旧的 resource.Service 解析，把 slug 当成资源 uuid 查库，
-// 结果内置技能一读就报 invalid input syntax for type uuid。
-func (l sourceLoader) ReadSource(ctx context.Context, rel string) (string, error) {
-	return l.spaces.ReadSourceFile(ctx, l.spaceID, rel, sourceReadLimit)
+func (l pluginLoader) ReadPlugin(ctx context.Context, rel string) (string, error) {
+	return l.spaces.ReadSourceFile(ctx, l.spaceID, rel, pluginReadLimit)
 }
 
-func (l sourceLoader) RefreshIndex(ctx context.Context) error {
+func (l pluginLoader) RefreshIndex(ctx context.Context) error {
 	return l.spaces.RebuildIndex(ctx, l.spaceID)
 }
 
-func appendSource(out []tool.SourceEntry, kind string, entries []space.IndexEntry) []tool.SourceEntry {
+func appendPlugin(out []tool.PluginEntry, kind string, entries []space.IndexEntry) []tool.PluginEntry {
 	for _, e := range entries {
-		out = append(out, tool.SourceEntry{
+		out = append(out, tool.PluginEntry{
 			Kind:        kind,
-			Name:        e.Name,
-			Description: e.Description,
-			Path:        e.Path,
-			Source:      e.Source,
-		})
-	}
-	return out
-}
-
-// pluralKind 把资源类型转换成索引里使用的复数形式。
-func pluralKind(kind string) string {
-	switch kind {
-	case "skill":
-		return "skills"
-	case "tool":
-		return "tools"
-	case "mcp":
-		return "mcps"
-	case "component":
-		return "components"
-	case "db":
-		return "dbs"
-	default:
-		return kind + "s"
-	}
-}
-
-// skillIndex 返回注入系统提示词的技能索引（当前空间 + 系统空间，已去重）。
-//
-// 发布件不进常驻索引：它们是「按需检索」的资源，需要时由模型用 resource_search 找到。
-func (s *Service) skillIndex(ctx context.Context, spaceID string) []tool.SourceEntry {
-	idx := s.spaces.MergedSources(ctx, spaceID)
-	out := make([]tool.SourceEntry, 0, len(idx.Skills))
-	for _, e := range idx.Skills {
-		out = append(out, tool.SourceEntry{
-			Kind:        "skills",
 			Name:        e.Name,
 			Description: e.Description,
 			Path:        e.Path,

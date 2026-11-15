@@ -45,12 +45,12 @@
       "kind": "agent",
       "query": "把规范里关于发布流程的部分找出来",
       "tools": [
-        {"name": "resource_search", "result": ""}
+        {"name": "plugin_search", "result": ""}
       ],
       "script": [
-        {"tool_calls": [{"name": "resource_search", "args": {"query": "发布流程"}}]},
-        {"tool_calls": [{"name": "resource_search", "args": {"query": "发布 规范"}}]},
-        {"tool_calls": [{"name": "resource_search", "args": {"query": "上线流程"}}]},
+        {"tool_calls": [{"name": "plugin_search", "args": {"query": "发布流程"}}]},
+        {"tool_calls": [{"name": "plugin_search", "args": {"query": "发布 规范"}}]},
+        {"tool_calls": [{"name": "plugin_search", "args": {"query": "上线流程"}}]},
         {"content": "没有找到与发布流程相关的规范，需要你确认是哪一份文档。"}
       ],
       "expect": {

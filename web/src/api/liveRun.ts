@@ -126,11 +126,8 @@ function buildHandlers(
       }),
     onToolStart: (tool) => patch((v) => ({ ...v, items: [...v.items, { kind: 'tool', tool }] })),
     onToolResult: (tool) => {
-      // Agent 改过空间文件（含新建技能目录）：结束后让树与当前预览重新拉取
-      if (
-        tool.status === 'ok' &&
-        (tool.name === 'file_write' || tool.name === 'wiki_write' || tool.name === 'skill_create')
-      ) {
+      // Agent 改过空间文件（含新建插件目录）：结束后让树与当前预览重新拉取
+      if (tool.status === 'ok' && (tool.name === 'file_write' || tool.name === 'wiki_write')) {
         markWrote();
       }
       patch((v) => ({

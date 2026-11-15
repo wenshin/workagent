@@ -111,7 +111,7 @@ type BuiltinSkill struct {
 	Description string
 	Doc         string
 	// Files 是随包文件（子手册、模板），路径相对插件目录。
-	// 模型可以用 resource_read 读 published/skills/<slug>/<version>/<path>。
+	// 模型可以用 plugin_read 读 published/skills/<slug>/<version>/<path>。
 	Files map[string]string
 }
 
@@ -138,13 +138,13 @@ var builtinSkills = []BuiltinSkill{
 			"- 成员权限：`view` < `read` < `write` < `manage`；目录不单独授权，随所属空间。",
 			"- 只有 `write` / `manage` 才能写文件或建技能；权限不足时如实告知，不要换路径重试。",
 			"- 派发任务不要求对方是当前空间的成员：任务建在对方的个人空间，平台不写入成员关系、也不扩大他在本空间的权限。",
-			"- 系统空间是平台默认能力源，任何用户都可以用 `resource_search` 检索、`resource_read` 只读访问。",
+			"- 系统空间是平台默认能力源，任何用户都可以用 `plugin_search` 检索、`plugin_read` 只读访问。",
 			"",
 			"## 工具",
-			"- `resource_list`：列出当前用户可见的空间（名称、类型、权限、路径）。",
+			"- `space_list`：列出当前用户可见的空间（名称、类型、权限、路径）。",
 			"",
 			"## 回答要点",
-			"- 用户问「我有哪些空间」时调用 `resource_list`，不要依赖历史记忆。",
+			"- 用户问「我有哪些空间」时调用 `space_list`，不要依赖历史记忆。",
 			"- 创建、改名、删除空间尚未开放给 Agent，需要用户在界面操作，直接说明即可。",
 			"- 被问到「对方还没加入空间怎么派任务」时说明：不需要加入，任务会落在他自己的个人空间。",
 		),
@@ -310,7 +310,7 @@ func pluginDevSkill() BuiltinSkill {
 			"6. 安装后：技能进检索池（会话可绑定）、工具进模型工具列表、MCP 同步远端工具、组件可用 `ui-block` 引用、智能体出现在新建会话的选择器里。",
 			"",
 			"## 改已有插件",
-			"- 先 `resource_search` / `file_read` 看现有 `plugin.json` 与内容，不要在没看过清单的情况下重写。",
+			"- 先 `plugin_search` / `file_read` 看现有 `plugin.json` 与内容，不要在没看过清单的情况下重写。",
 			"- 已安装的插件目录是只读副本：改行为要在空间里新建同 slug 的草稿（先卸载或改名）并重新发布。",
 			"",
 			"## 子手册",

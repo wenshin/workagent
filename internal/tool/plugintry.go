@@ -42,7 +42,7 @@ func pluginTry() Tool {
 }
 
 func invokePluginTry(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-	if env.Plugins == nil {
+	if env.PluginTry == nil {
 		return "", fmt.Errorf("插件试跑不可用：当前会话没有接上插件服务")
 	}
 	var in struct {
@@ -69,7 +69,7 @@ func invokePluginTry(ctx context.Context, args json.RawMessage, env Env) (string
 		payload = json.RawMessage(s)
 	}
 
-	out, err := env.Plugins.DryRunJSON(ctx, env.SpaceID, slug, env.UserID, payload)
+	out, err := env.PluginTry.DryRunJSON(ctx, env.SpaceID, slug, env.UserID, payload)
 	if err != nil {
 		// 试跑失败时集群仍然有诊断价值：把回执一起带回去，让模型能看到 top_keys。
 		if strings.TrimSpace(out) != "" {

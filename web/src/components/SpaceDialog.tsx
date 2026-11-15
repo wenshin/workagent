@@ -8,11 +8,12 @@ import {
   useCreateSession,
   useCreateSpace,
   useDeleteDir,
+  useDeleteFile,
   useDeleteSpace,
   useRenameDir,
   useRenameSpace,
 } from '../api/hooks';
-import type { PluginKind, Space, SpaceDir } from '../api/types';
+import type { PluginKind, Space, SpaceDir, SpaceFile } from '../api/types';
 import { KIND_LABEL, PluginIcon } from './PluginVisual';
 
 export type DialogState =
@@ -23,7 +24,8 @@ export type DialogState =
   | { kind: 'rename'; target: Space }
   | { kind: 'delete'; target: Space }
   | { kind: 'rename-dir'; space: Space; dir: SpaceDir }
-  | { kind: 'delete-dir'; space: Space; dir: SpaceDir };
+  | { kind: 'delete-dir'; space: Space; dir: SpaceDir }
+  | { kind: 'delete-file'; space: Space; file: SpaceFile };
 
 // 可新建的插件类型，顺序与后端 DraftKinds 一致
 const DRAFT_KINDS: PluginKind[] = ['skill', 'tool', 'mcp', 'component', 'agent', 'source'];
@@ -106,6 +108,13 @@ function describe(state: DialogState) {
         ok: '删除',
       };
     }
+    case 'delete-file':
+      return {
+        title: '删除文件',
+        desc: `将删除「${state.file.path}」（不进入回收站）。删除后只能重新上传或重新生成，请输入文件名确认：${state.file.name}`,
+        placeholder: `输入 ${state.file.name} 以确认`,
+        ok: '删除',
+      };
     default:
       return { title: '', desc: '', placeholder: '', ok: '确定' };
   }
@@ -131,6 +140,7 @@ export default function SpaceDialog({ state, onClose, onOpenSession }: Props) {
   const createSession = useCreateSession();
   const renameDir = useRenameDir();
   const deleteDir = useDeleteDir();
+  const deleteFile = useDeleteFile();
 
   const pending =
     createSpace.isPending ||
@@ -140,7 +150,8 @@ export default function SpaceDialog({ state, onClose, onOpenSession }: Props) {
     createDraft.isPending ||
     createSession.isPending ||
     renameDir.isPending ||
-    deleteDir.isPending;
+    deleteDir.isPending ||
+    deleteFile.isPending;
 
   useEffect(() => {
     if (!open) return;
@@ -211,11 +222,15 @@ export default function SpaceDialog({ state, onClose, onOpenSession }: Props) {
           if (name !== state.dir.name) return setError('输入的名称与当前目录不一致');
           await deleteDir.mutateAsync({ spaceId: state.space.id, path: state.dir.path });
           break;
+        case 'delete-file':
+          if (name !== state.file.name) return setError('输入的文件名与当前文件不一致');
+          await deleteFile.mutateAsync({ spaceId: state.space.id, path: state.file.path });
+          break;
         default:
           return;
       }
       Toast.success(
-        state.kind === 'delete' || state.kind === 'delete-dir'
+        state.kind === 'delete' || state.kind === 'delete-dir' || state.kind === 'delete-file'
           ? '已删除'
           : state.kind === 'create-plugin'
             ? `${KIND_LABEL[pluginKind]}已创建`
@@ -228,7 +243,8 @@ export default function SpaceDialog({ state, onClose, onOpenSession }: Props) {
     }
   };
 
-  const danger = state.kind === 'delete' || state.kind === 'delete-dir';
+  const danger =
+    state.kind === 'delete' || state.kind === 'delete-dir' || state.kind === 'delete-file';
 
   return (
     <Modal

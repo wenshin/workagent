@@ -1631,18 +1631,9 @@ body[theme-mode='dark'] {
   color: var(--semi-color-text-0);
 }
 
-.installed-body .resource-grid {
+.installed-body .plugin-grid {
   overflow: visible;
   padding-top: 10px;
-}
-
-/* 发布记录下侧栏不展示空间树，只留一段说明 */
-.sider-note {
-  flex: 0 0 auto;
-  padding: 12px;
-  color: var(--semi-color-text-2);
-  font-size: 12px;
-  line-height: 1.7;
 }
 
 /* ---- 插件视觉标识：类型用固定图标 + 固定色，所有插件列表共用 ---- */
@@ -1720,8 +1711,8 @@ body[theme-mode='dark'] {
   color: var(--semi-color-text-3);
 }
 
-/* ---- 插件市场 / 已装插件 / 发布记录 ---- */
-.resource-panel {
+/* ---- 插件市场 / 已装插件 ---- */
+.plugin-market {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1744,14 +1735,7 @@ body[theme-mode='dark'] {
   gap: 8px;
 }
 
-.resource-filters {
-  display: flex;
-  gap: 10px;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--semi-color-border);
-}
-
-.resource-grid {
+.plugin-grid {
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -1765,7 +1749,7 @@ body[theme-mode='dark'] {
   align-content: start;
 }
 
-.resource-card {
+.plugin-card {
   border: 1px solid var(--semi-color-border);
   display: flex;
   flex-direction: column;
@@ -1775,26 +1759,26 @@ body[theme-mode='dark'] {
 }
 
 /* 让 body 撑满卡片，操作区用 margin-top:auto 贴底，卡片等高时不出现空洞 */
-.resource-card > .semi-card-body {
+.plugin-card > .semi-card-body {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
 }
 
-.resource-card-head {
+.plugin-card-head {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
 }
 
-.resource-card-name {
+.plugin-card-name {
   font-size: 15px;
   font-weight: 600;
 }
 
-.resource-card-desc {
+.plugin-card-desc {
   margin-top: 8px;
   color: var(--semi-color-text-1);
   font-size: 13px;
@@ -1807,7 +1791,7 @@ body[theme-mode='dark'] {
   min-height: 0;
 }
 
-.resource-card-meta {
+.plugin-card-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 12px;
@@ -1816,56 +1800,13 @@ body[theme-mode='dark'] {
   font-size: 12px;
 }
 
-.resource-card-actions {
+.plugin-card-actions {
   display: flex;
   align-items: center;
   gap: 4px;
   margin-top: auto;
   padding-top: 12px;
   border-top: 1px solid var(--semi-color-border);
-}
-
-/* ---- 版本记录 ---- */
-.resource-versions {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-height: 420px;
-  overflow: auto;
-}
-
-.resource-version-item {
-  padding: 10px 12px;
-  border: 1px solid var(--semi-color-border);
-  border-radius: 6px;
-}
-
-.resource-version-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.resource-version-no {
-  font-weight: 600;
-}
-
-.resource-version-time {
-  margin-left: auto;
-  color: var(--semi-color-text-2);
-  font-size: 12px;
-}
-
-.resource-version-desc {
-  margin-top: 6px;
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.resource-version-meta {
-  margin-top: 4px;
-  color: var(--semi-color-text-2);
-  font-size: 12px;
 }
 
 /* ---- 发布表单 ---- */
@@ -1891,14 +1832,14 @@ body[theme-mode='dark'] {
 }
 
 /* ---- 插件面板 ---- */
-.resource-tabs {
+.plugin-tabs {
   display: flex;
   gap: 4px;
   padding: 10px 20px 0;
   border-bottom: 1px solid var(--semi-color-border);
 }
 
-.resource-tab {
+.plugin-tab {
   border: 0;
   background: transparent;
   padding: 8px 14px;
@@ -1908,13 +1849,13 @@ body[theme-mode='dark'] {
   border-bottom: 2px solid transparent;
 }
 
-.resource-tab.active {
+.plugin-tab.active {
   color: var(--semi-color-primary);
   border-bottom-color: var(--semi-color-primary);
   font-weight: 600;
 }
 
-.resource-tab-count {
+.plugin-tab-count {
   margin-left: 6px;
   font-size: 11px;
   color: var(--semi-color-text-3);

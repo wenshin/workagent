@@ -22,7 +22,6 @@ import (
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/policy"
-	"github.com/workagent/auto-agent/internal/resource"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
@@ -36,19 +35,17 @@ import (
 
 // App 组装路由与服务。
 type App struct {
-	cfg         *config.Config
-	log         *slog.Logger
-	store       store.Store
-	auth        *auth.Handler
-	spaceSvc    *space.Service
-	spaceH      *space.Handler
-	resourceSvc *resource.Service
-	resourceH   *resource.Handler
-	sessionSvc  *session.Service
-	sessionH    *session.Handler
-	pluginSvc   *plugin.Manager
-	pluginH     *plugin.Handler
-	adminH      *admin.Handler
+	cfg        *config.Config
+	log        *slog.Logger
+	store      store.Store
+	auth       *auth.Handler
+	spaceSvc   *space.Service
+	spaceH     *space.Handler
+	sessionSvc *session.Service
+	sessionH   *session.Handler
+	pluginSvc  *plugin.Manager
+	pluginH    *plugin.Handler
+	adminH     *admin.Handler
 }
 
 // New 构造应用。
@@ -110,9 +107,6 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 上下文管理：摘要压缩 + 向量检索（§5.7.2 / §5.7.4）
 	memory := ctxmgr.New(st, router, log, ctxmgr.DefaultBudget())
-
-	// 资源发布：把空间草稿按版本快照发布到独立目录，供 Agent 按需检索
-	resourceSvc := resource.NewService(st, fs, spaceSvc, log)
 
 	// 凭证存储（§5.5.2 的 MVP 形态）：信封加密落盘，明文只在用到的那一刻取出
 	secretStore, err := secret.NewFileStore(filepath.Join(cfg.StorageRoot, "secrets"), cfg.SecretKEK)
@@ -193,7 +187,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 已安装插件（含未落副本的预置件）进检索池；published/... 路径由插件层解析。
 	spaceSvc.SetInstalledSource(pluginSvc.InstalledSources)
 	// 停用是运行期状态，文件里看不出来：索引合并时必须按它筛掉，
-	// 否则停在系统空间的内置技能照样能被 resource_search 搜到。
+	// 否则停在系统空间的内置技能照样能被 plugin_search 搜到。
 	spaceSvc.SetDisabledPluginSource(pluginSvc.DisabledSlugs)
 	spaceSvc.SetPublishedReader(pluginSvc.ReadPublished)
 	// 本地插件必须启用才进检索池（未启用的草稿仍可在文件树里编辑）。
@@ -217,7 +211,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 
-	sessionSvc := session.NewService(st, spaceSvc, resourceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
+	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
 	// 智能体也可以是插件（kind=agent）：系统空间安装的智能体对所有空间可选。
 	sessionSvc.SetAgentPlugins(pluginSvc)
 	// 插件试跑：会话里写完草稿直接验配置
@@ -233,18 +227,16 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	})
 
 	return &App{
-		cfg:         cfg,
-		log:         log,
-		store:       st,
-		auth:        authHandler,
-		spaceSvc:    spaceSvc,
-		spaceH:      space.NewHandler(spaceSvc, authHandler.CurrentUser, log),
-		resourceSvc: resourceSvc,
-		resourceH:   resource.NewHandler(resourceSvc, authHandler.CurrentUser, log),
-		sessionSvc:  sessionSvc,
-		sessionH:    session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
-		pluginSvc:   pluginSvc,
-		pluginH:     plugin.NewHandler(pluginSvc, st, spaceSvc, authHandler.CurrentUser, log),
+		cfg:        cfg,
+		log:        log,
+		store:      st,
+		auth:       authHandler,
+		spaceSvc:   spaceSvc,
+		spaceH:     space.NewHandler(spaceSvc, authHandler.CurrentUser, log),
+		sessionSvc: sessionSvc,
+		sessionH:   session.NewHandler(sessionSvc, authHandler.CurrentUser, log),
+		pluginSvc:  pluginSvc,
+		pluginH:    plugin.NewHandler(pluginSvc, st, spaceSvc, authHandler.CurrentUser, log),
 		// 平台管理：凭证写入 + 指纹回显。密钥只进不出。
 		// refs 传空：搜索凭证由 source 插件清单里的 source.secret 声明，
 		// 属于运行期状态（随插件安装/卸载变化），启动时无法静态列出；
@@ -312,7 +304,6 @@ func (a *App) Handler() http.Handler {
 
 	a.auth.Register(mux)
 	a.spaceH.Register(mux)
-	a.resourceH.Register(mux)
 	a.sessionH.Register(mux)
 	a.pluginH.Register(mux)
 	a.adminH.Register(mux)

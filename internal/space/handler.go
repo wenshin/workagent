@@ -59,6 +59,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /spaces/{id}/file", h.readFile)
 	// 上传只接受可预览的文本类型，落在空间 files/ 下（dir 可选，相对 files/）
 	mux.HandleFunc("POST /spaces/{id}/files", h.uploadFiles)
+	// 删除单个文件；目录走 /dirs，已安装插件与系统空间内置目录只读
+	mux.HandleFunc("DELETE /spaces/{id}/file", h.deleteFile)
 }
 
 type spaceDTO struct {
@@ -366,6 +368,19 @@ func (h *Handler) deleteDir(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (h *Handler) deleteFile(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	file := strings.TrimSpace(r.URL.Query().Get("path"))
+	if err := h.svc.DeleteFile(r.Context(), user.ID, r.PathValue("id"), file); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (h *Handler) deleteDirLegacy(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.current(w, r)
 	if !ok {
@@ -561,6 +576,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, ErrReserved):
 		platform.WriteError(w, r, http.StatusConflict, "reserved_space", err.Error())
+	case errors.Is(err, ErrPluginReadOnly), errors.Is(err, ErrPluginRoot):
+		platform.WriteError(w, r, http.StatusConflict, "plugin_readonly", err.Error())
 	case errors.Is(err, ErrDirNotFound), errors.Is(err, ErrFileNotFound):
 		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, ErrFileUnsupported):

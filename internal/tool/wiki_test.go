@@ -165,3 +165,17 @@ func TestFileToolsRejectWikiPath(t *testing.T) {
 		t.Fatalf("file_list 列 wiki/ 应改道提示，实际: %v", err)
 	}
 }
+
+// 工具描述是模型选工具的直接依据：wiki_write 必须点名「别用 file_write 自建知识目录」，
+// 只在提示词里写一条规则的话，工具被相关性裁剪时模型就没有任何对照了。
+func TestWikiWriteDescriptionRoutesAwayFromFileWrite(t *testing.T) {
+	desc := wikiWrite().Description
+	for _, want := range []string{"file_write", "knowledge/"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("wiki_write 描述缺少对照指引 %q: %s", want, desc)
+		}
+	}
+	if !strings.Contains(fileWrite().Description, "wiki_write") {
+		t.Fatal("file_write 描述应反向指向 wiki_write，避免模型默认拿它沉淀知识")
+	}
+}

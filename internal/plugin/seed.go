@@ -270,20 +270,21 @@ func builtinToolSlug(name string) string {
 
 // builtinToolLabel 是市场里展示的名称：工具名对业务用户没有意义。
 var builtinToolLabels = map[string]string{
-	"time_now":        "当前时间",
-	"resource_search": "检索资源",
-	"resource_read":   "读取资源",
-	"session_list":    "会话列表",
-	"file_list":       "列目录",
-	"file_read":       "读文件",
-	"file_write":      "写文件",
-	"web_search":      "联网搜索",
-	"shell_exec":      "执行命令",
-	"secret_request":  "录入凭证",
-	"wiki_list":       "列知识页",
-	"wiki_read":       "读知识页",
-	"wiki_write":      "写知识页",
-	"wiki_search":     "搜知识库",
+	"time_now":       "当前时间",
+	"space_list":     "空间列表",
+	"plugin_search":  "检索插件",
+	"plugin_read":    "读取插件",
+	"session_list":   "会话列表",
+	"file_list":      "列目录",
+	"file_read":      "读文件",
+	"file_write":     "写文件",
+	"web_search":     "联网搜索",
+	"shell_exec":     "执行命令",
+	"secret_request": "录入凭证",
+	"wiki_list":      "列知识页",
+	"wiki_read":      "读知识页",
+	"wiki_write":     "写知识页",
+	"wiki_search":    "搜知识库",
 }
 
 func builtinToolLabel(name string) string {

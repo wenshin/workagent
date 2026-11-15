@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 
@@ -46,10 +45,15 @@ func configFields(meta Manifest) []ConfigField {
 	if meta.Kind != KindMCP || meta.Transport == nil {
 		return nil
 	}
+	help := "安装级覆盖，不影响发布快照；只能填 https（本机调试可用 http://127.0.0.1）"
+	if meta.Transport.AllowHTTP {
+		// 清单允许明文，配置才跟着允许：这个开关由发布方持有，部署方只是用地址。
+		help = "安装级覆盖，不影响发布快照；清单已允许明文，内网 http 地址可以填"
+	}
 	fields := []ConfigField{{
 		Key: ConfigURL, Label: "服务地址", Type: "url", Required: true,
 		Placeholder: "https://mcp.example.com/mcp",
-		Help:        "安装级覆盖，不影响发布快照；只允许 https（本机调试可用 http://127.0.0.1）",
+		Help:        help,
 	}}
 	if meta.Auth != nil {
 		fields = append(fields, ConfigField{
@@ -114,7 +118,7 @@ func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string
 	if len(configFields(meta)) == 0 {
 		return ConfigView{}, fmt.Errorf("%w：该插件没有可配置项", ErrConflict)
 	}
-	clean, err := normalizeConfig(values)
+	clean, err := normalizeConfig(values, allowsPlainHTTP(meta))
 	if err != nil {
 		return ConfigView{}, err
 	}
@@ -206,8 +210,14 @@ func (m *Manager) applyInstallConfig(ctx context.Context, spaceID, slug string, 
 	return meta
 }
 
+// allowsPlainHTTP：清单是否允许明文连接。安装级配置不放宽这个决定——
+// 发布方没声明 allow_http，部署方就不能靠改地址把 https 绕成 http。
+func allowsPlainHTTP(meta Manifest) bool {
+	return meta.Transport != nil && meta.Transport.AllowHTTP
+}
+
 // normalizeConfig 校验并裁剪覆盖值：空值表示「沿用清单」，未知键直接拒绝。
-func normalizeConfig(values map[string]string) (map[string]string, error) {
+func normalizeConfig(values map[string]string, allowHTTP bool) (map[string]string, error) {
 	allowed := map[string]bool{ConfigURL: true, ConfigAuthName: true, ConfigSecret: true}
 	clean := map[string]string{}
 	for key, raw := range values {
@@ -220,7 +230,7 @@ func normalizeConfig(values map[string]string) (map[string]string, error) {
 			if v == "" {
 				continue
 			}
-			if err := validateMCPURL(v); err != nil {
+			if err := validateMCPURL(v, allowHTTP); err != nil {
 				return nil, err
 			}
 			clean[key] = v
@@ -235,27 +245,4 @@ func normalizeConfig(values map[string]string) (map[string]string, error) {
 		}
 	}
 	return clean, nil
-}
-
-// validateMCPURL：默认只允许 https；本机调试放行 http://localhost / 127.0.0.1。
-func validateMCPURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("服务地址不是合法 URL")
-	}
-	if u.User != nil {
-		return fmt.Errorf("服务地址不能带用户名密码，请改用凭证名称")
-	}
-	switch u.Scheme {
-	case "https":
-		return nil
-	case "http":
-		host := u.Hostname()
-		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-			return nil
-		}
-		return fmt.Errorf("服务地址必须使用 https（仅本机允许 http）")
-	default:
-		return fmt.Errorf("服务地址必须使用 https")
-	}
 }

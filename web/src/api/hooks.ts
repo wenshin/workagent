@@ -21,9 +21,7 @@ import type {
   PluginKind,
   PluginsResponse,
   ProviderResponse,
-  PublishedResource,
-  ResourceDetailResponse,
-  ResourcesResponse,
+
   SessionsResponse,
   SkillsResponse,
   Space,
@@ -43,14 +41,24 @@ export const queryKeys = {
   agents: (spaceId: string) => ['agents', spaceId] as const,
   messages: (sessionId: string) => ['messages', sessionId] as const,
   file: (spaceId: string, path: string) => ['file', spaceId, path] as const,
-  resources: ['resources'] as const,
-  resource: (id: string) => ['resource', id] as const,
   adminSettings: ['admin', 'settings'] as const,
   plugins: (spaceId: string) => ['plugins', spaceId] as const,
   pluginInstalled: (spaceId: string) => ['plugin', 'installed', spaceId] as const,
   pluginConfig: (spaceId: string, slug: string) => ['plugin', 'config', spaceId, slug] as const,
   pluginCatalog: ['plugin', 'catalog'] as const,
 };
+
+/**
+ * Agent 写过空间文件后要作废的缓存。
+ *
+ * 目录树有两份数据：`files` 只是可预览的文件，`dirs` 才是目录本身——新建的
+ * `plugins/<slug>/` 只出现在 `dirs` 里。只刷 files 就会出现「新插件目录要刷新
+ * 页面才看得到」，所以这里把这几类键绑在一起，避免各处只刷一半。
+ */
+export function invalidateAfterWrite(qc: QueryClient) {
+  const keys = [queryKeys.files, queryKeys.dirs, ['file'], ['plugins'], ['plugin']] as const;
+  for (const key of keys) void qc.invalidateQueries({ queryKey: key });
+}
 
 /**
  * 让会话右上角的技能选择器失效。
@@ -195,11 +203,7 @@ export function useUploadFiles() {
   return useMutation({
     mutationFn: (input: { spaceId: string; files: File[]; dir?: string }) =>
       uploadSpaceFiles(input.spaceId, input.files, input.dir),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.files });
-      // 目标目录可能刚被创建出来（会话目录被删后重传），树也要刷新
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
-    },
+    onSuccess: () => invalidateAfterWrite(qc),
   });
 }
 
@@ -211,7 +215,7 @@ export function useCreateDir() {
         method: 'POST',
         body: { name: input.name, parent: input.parent ?? '' },
       }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.dirs }),
+    onSuccess: () => invalidateAfterWrite(qc),
   });
 }
 
@@ -225,9 +229,7 @@ export function useCreateSkill() {
         body: { name: input.name, description: input.description ?? '' },
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
-      // 技能目录自带 SKILL.md，文件树里要立刻出现
-      qc.invalidateQueries({ queryKey: queryKeys.files });
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -246,9 +248,7 @@ export function useCreateDraft() {
         body: { kind: input.kind, name: input.name, description: input.description ?? '' },
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
-      // 草稿目录自带 plugin.json 与入口文件，文件树要立刻出现
-      qc.invalidateQueries({ queryKey: queryKeys.files });
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -263,12 +263,10 @@ export function useRenameDir() {
         body: { path: input.path, name: input.nextName },
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 目录改名会同步会话的 dir，树上的会话位置会变
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
       // 目录下的文件路径整体变了，文件树不刷新会留在旧路径下
-      qc.invalidateQueries({ queryKey: queryKeys.files });
-      qc.invalidateQueries({ queryKey: ['file'] });
+      invalidateAfterWrite(qc);
     },
   });
 }
@@ -281,13 +279,29 @@ export function useDeleteDir() {
         method: 'DELETE',
       }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
       // 目录内会话会移回空间根
       qc.invalidateQueries({ queryKey: queryKeys.sessions });
       // 目录里的文件是被磁盘递归删掉的，文件树必须一起失效，
       // 否则 15s 内左侧树还会显示已经不存在的文件。
-      qc.invalidateQueries({ queryKey: queryKeys.files });
-      qc.invalidateQueries({ queryKey: ['file'] });
+      invalidateAfterWrite(qc);
+      invalidateSkillLists(qc);
+    },
+  });
+}
+
+/**
+ * 删除单个文件。已安装插件的子树与系统空间内置目录由后端拒绝，
+ * 前端在这些位置不渲染入口。
+ */
+export function useDeleteFile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; path: string }) =>
+      api<{ ok: boolean }>(`/spaces/${input.spaceId}/file?path=${encodeURIComponent(input.path)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => {
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -376,83 +390,6 @@ export function useSendMessage() {
   });
 }
 
-/* ---- 资源管理：发布件与工作空间分离存储，只有用户范围（public / private） ---- */
-
-export function useResources() {
-  return useQuery({
-    queryKey: queryKeys.resources,
-    queryFn: () => api<ResourcesResponse>('/resources').then((r) => r.resources),
-    staleTime: 10_000,
-  });
-}
-
-/** 版本明细按需加载：列表不返回历史版本 */
-export function useResourceDetail(id?: string) {
-  return useQuery({
-    queryKey: queryKeys.resource(id ?? ''),
-    queryFn: () => api<ResourceDetailResponse>(`/resources/${id}`),
-    enabled: Boolean(id),
-  });
-}
-
-export function usePublishResource() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (input: {
-      spaceId: string;
-      path: string;
-      version: string;
-      notes?: string;
-      visibility: 'public' | 'private';
-    }) =>
-      api<{ resource: PublishedResource }>('/resources', {
-        method: 'POST',
-        body: {
-          space_id: input.spaceId,
-          path: input.path,
-          version: input.version,
-          notes: input.notes ?? '',
-          visibility: input.visibility,
-        },
-      }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.resources }),
-  });
-}
-
-export function useSetResourceStatus() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (input: { id: string; status: 'enabled' | 'disabled' }) =>
-      api<{ ok: boolean }>(`/resources/${input.id}`, { method: 'PATCH', body: { status: input.status } }),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.resources });
-      qc.invalidateQueries({ queryKey: queryKeys.resource(vars.id) });
-    },
-  });
-}
-
-export function useDeleteResource() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => api<{ ok: boolean }>(`/resources/${id}`, { method: 'DELETE' }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: queryKeys.resources }),
-  });
-}
-
-export function useDeleteResourceVersion() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (input: { id: string; version: string }) =>
-      api<{ ok: boolean }>(`/resources/${input.id}/versions/${encodeURIComponent(input.version)}`, {
-        method: 'DELETE',
-      }),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.resources });
-      qc.invalidateQueries({ queryKey: queryKeys.resource(vars.id) });
-    },
-  });
-}
-
 /** 平台配置：只有管理员能拿到；非管理员会 403，用 enabled 控制是否发起请求 */
 export function useAdminSettings(enabled: boolean) {
   return useQuery({
@@ -512,7 +449,7 @@ export function usePlugins(spaceId?: string) {
   });
 }
 
-/** 资源管理：全部已发布插件（只读目录），用于安装到空间 */
+/** 安装级配置：MCP 地址、鉴权 Header、凭证名，保存后整空间重载 */
 export function usePluginConfig(spaceId?: string, slug?: string, enabled = true) {
   return useQuery({
     queryKey: queryKeys.pluginConfig(spaceId ?? '', slug ?? ''),
@@ -595,9 +532,9 @@ export function useInstallPlugin() {
         method: 'POST',
         body: { version: input.version },
       }),
-    onSuccess: (_d, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
-      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    onSuccess: () => {
+      // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -608,9 +545,9 @@ export function useUninstallPlugin() {
   return useMutation({
     mutationFn: (input: { spaceId: string; slug: string }) =>
       api<null>(`/spaces/${input.spaceId}/plugins/${input.slug}/uninstall`, { method: 'POST' }),
-    onSuccess: (_d, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
-      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    onSuccess: () => {
+      // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -624,9 +561,9 @@ export function useTogglePlugin() {
         `/spaces/${input.spaceId}/plugins/${input.slug}/${input.enabled ? 'enable' : 'disable'}`,
         { method: 'POST' },
       ),
-    onSuccess: (_d, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
-      qc.invalidateQueries({ queryKey: queryKeys.pluginCatalog });
+    onSuccess: () => {
+      // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
+      invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
     },
   });
@@ -647,9 +584,9 @@ export function useResetPluginBaseline() {
   return useMutation({
     mutationFn: (input: { spaceId: string; slug: string }) =>
       api<null>(`/spaces/${input.spaceId}/plugins/${input.slug}/baseline/reset`, { method: 'POST' }),
-    onSuccess: (_d, vars) => {
-      qc.invalidateQueries({ queryKey: queryKeys.plugins(vars.spaceId) });
-      qc.invalidateQueries({ queryKey: queryKeys.dirs });
+    onSuccess: () => {
+      // 覆盖会重写本地副本里的文件，树与文件正文都要跟着刷新
+      invalidateAfterWrite(qc);
     },
   });
 }

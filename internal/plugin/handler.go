@@ -13,7 +13,7 @@ import (
 	"github.com/workagent/auto-agent/internal/store"
 )
 
-// UserResolver 从请求中解析当前登录用户（与 resource/session 保持一致）。
+// UserResolver 从请求中解析当前登录用户（与 session 保持一致）。
 type UserResolver func(r *http.Request) (store.User, error)
 
 // SpaceAccess 是插件接口需要的空间能力（space.Service 实现）。
@@ -59,7 +59,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/dismiss", h.dismissUpdate)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/data", h.data)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/ui", h.ui)
-	// 资源管理：全部已发布插件，只读。
+	// 插件市场：全部已发布插件，只读。
 	mux.HandleFunc("GET /plugins", h.catalog)
 }
 

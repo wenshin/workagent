@@ -57,11 +57,26 @@ interface Props {
   onDelete: (space: Space) => void;
   onRenameDir: (space: Space, dir: SpaceDir) => void;
   onDeleteDir: (space: Space, dir: SpaceDir) => void;
+  onDeleteFile: (space: Space, file: SpaceFile) => void;
   onDeleteSession: (session: ChatSession) => void;
 }
 
 function canWrite(space: Space) {
   return space.perm === 'write' || space.perm === 'manage';
+}
+
+/**
+ * 文件是否落在只读子树里：系统空间的内置目录（内置件本体）与已安装插件的副本。
+ *
+ * 这两类后端会拒绝删除，前端提前隐藏入口，不让人点了才收到 409。
+ */
+function fileReadOnly(file: SpaceFile, dirs: SpaceDir[]) {
+  return dirs.some(
+    (d) =>
+      d.space_id === file.space_id &&
+      (d.installed || d.builtin) &&
+      (file.path === d.path || file.path.startsWith(`${d.path}/`)),
+  );
 }
 
 // 排序基准：优先用最近消息时间，没有消息时用创建时间
@@ -115,6 +130,7 @@ export default function SpaceTree({
   onDelete,
   onRenameDir,
   onDeleteDir,
+  onDeleteFile,
   onDeleteSession,
 }: Props) {
   const spaceById = useMemo(() => new Map(spaces.map((s) => [s.id, s])), [spaces]);
@@ -401,14 +417,27 @@ export default function SpaceTree({
       );
     }
 
-    // 文件节点：只展示名称，点击后右侧切换到内容面板
+    // 文件节点：展示名称，点击后右侧切换到内容面板；删除入口按只读边界显示
     if (node.kind === 'file') {
       const file = fileByKey.get(node.key);
+      const owner = file ? spaceById.get(file.space_id) : undefined;
       return (
         <span className="space-row">
           <span className="space-row-name file-name" title={file?.path}>
             {file?.name ?? String(node.label ?? '')}
           </span>
+          {file && owner && canWrite(owner) && !fileReadOnly(file, dirs) ? (
+            <span className="space-row-actions" onClick={(e) => e.stopPropagation()}>
+              <Button
+                theme="borderless"
+                size="small"
+                type="danger"
+                icon={<IconDelete />}
+                aria-label="删除文件"
+                onClick={() => onDeleteFile(owner, file)}
+              />
+            </span>
+          ) : null}
         </span>
       );
     }

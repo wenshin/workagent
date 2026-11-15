@@ -49,8 +49,8 @@ type Env struct {
 	Storage storage.Storage
 	Log     *slog.Logger
 
-	// Sources 是「当前空间 + 系统空间」合并后的能力源视图，为 nil 时相关工具不可用。
-	Sources SourceLoader
+	// Plugins 是「当前空间 + 系统空间」合并后的插件目录，为 nil 时 plugin_search / plugin_read 不可用。
+	Plugins PluginLoader
 
 	// Search 是搜索 provider 注册表（internal/search），为 nil 时 web_search 不可用。
 	// 密钥与出网策略都在实现内部，不经由工具参数传递。
@@ -60,9 +60,9 @@ type Env struct {
 	// 隔离档位、超时与环境清理都由它的实现决定，工具只负责拼参数与格式化输出。
 	Shell sandbox.Runner
 
-	// Plugins 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
+	// PluginTry 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
 	// 「对话开发插件」如果没有试跑，就只能发布上线后才发现配置错。
-	Plugins PluginTry
+	PluginTry PluginTry
 
 	// Secrets 是凭证存储，只用于查询「这个凭证配过没有」（名字 + 指纹）。
 	// 值是平台内部资产：这里没有 Get 通道，工具也永远不该拿到明文。
@@ -110,7 +110,7 @@ type TaskDispatcher interface {
 type Tool struct {
 	// Name 是模型可见名，只允许 [a-zA-Z0-9_-]，因此能力名中的点号会转下划线
 	Name string
-	// Capability 是能力接口名，如 resource.list
+	// Capability 是能力接口名，如 space.list
 	Capability  string
 	Description string
 	Parameters  json.RawMessage
@@ -125,7 +125,7 @@ type Tool struct {
 	HasBinding  bool
 	Constraints policy.Constraints
 	// MaxResultBytes 是回填给模型的单次结果上限（默认 4KB）。
-	// 读类工具（file_read / resource_read）可申请更高额度，避免长文档被无谓截断。
+	// 读类工具（file_read / plugin_read）可申请更高额度，避免长文档被无谓截断。
 	MaxResultBytes int
 
 	Invoke func(ctx context.Context, args json.RawMessage, env Env) (string, error)

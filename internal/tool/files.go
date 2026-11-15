@@ -222,7 +222,8 @@ func fileWrite() Tool {
 		Capability: "fs.write",
 		Description: "写入当前空间内的文本文件（md / json / txt / csv / yaml / ts / js），path 相对空间文件根目录，" +
 			"父目录不存在时自动创建。mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
-			"修改已有文件前建议先用 file_read 读取现有内容。",
+			"修改已有文件前建议先用 file_read 读取现有内容。" +
+			"团队知识（口径、流程、结论）请用 wiki_write 沉淀，本工具只写当前空间的工作文件。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -311,8 +312,8 @@ func fileWrite() Tool {
 				return "", err
 			}
 			// 可能新增了技能目录或工具清单，刷新索引让 Agent 与本轮后续调用立刻可见
-			if env.Sources != nil {
-				if err := env.Sources.RefreshIndex(ctx); err != nil && env.Log != nil {
+			if env.Plugins != nil {
+				if err := env.Plugins.RefreshIndex(ctx); err != nil && env.Log != nil {
 					env.Log.Warn("刷新空间索引失败", "space_id", env.SpaceID, "path", rel, "err", err)
 				}
 			}

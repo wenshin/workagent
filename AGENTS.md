@@ -97,7 +97,7 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - **本地插件默认停用**：`plugin_candidate.status=enabled` 才进入检索/工具/MCP/组件；安装副本默认启用，可停用、卸载。同 slug 的本地目录与安装记录互斥：安装检查目录，本地启用检查安装记录。
 - **平台内置 = 系统空间的安装**：`origin=system` 的插件只允许安装到系统空间，那份 `plugin_install` + `plugins/<slug>/` 副本就是「全局安装」；其他空间加载时并入快照，天然进检索池与工具列表。普通空间对内置件 `install` / `uninstall` / `enable|disable` 一律拒绝；**启停只在系统空间插件页做**（平台总开关），`uninstall` 仍不允许，`base` 智能体不允许停用（新建会话以它兜底）。
 - **停用必须是真停用**：`plugin_install.status=disabled` 要在每条读取路径上都生效，否则开关只是个标签。四条路各筛一次——加载快照 `ensureLoaded`（实例类：MCP / 组件 / 智能体 / 源）、检索合并 `space.MergedSources`（靠索引进池的技能，文件里的 `plugins/<slug>/` 副本还在，按 `Manager.DisabledSlugs` 摘）、Go 内置工具 `tool.Registry.Load`（执行体在 `internal/tool`，不查安装记录就停不掉）、搜索注册表（停用立即 `unregisterSource`）。系统空间的开关还带全局语义：缓存整片作废（`evictSpaces`，下次访问重建），`ensureLoaded` 的兜底也不会把「有停用记录」的内置件重新装回来。内置件换版重装时保留停用状态。
-- **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.extends` 指父智能体（最多 4 层、禁止成环，可指向旧版 `base`），`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体没有执行器，不允许写 `capabilities`；它不进 `resource_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
+- **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.extends` 指父智能体（最多 4 层、禁止成环，可指向旧版 `base`），`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体没有执行器，不允许写 `capabilities`；它不进 `plugin_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
 - **运行以空间副本为准**：已安装插件从发布件起 runtime，但空间 `plugins/<slug>/` 是只读展示副本；本地插件从 `plugins/<slug>/` 起 runtime。`extensible` 不再意味着安装后可编辑。
 - **组件是声明式 DSL，不是代码**：`ui.json`（`wa-ui/1`）只描述节点、绑定与动作，由前端 `UiView` 按白名单原生渲染——没有 JS/HTML/CSS 注入点，因此不用 iframe、也不用 Shadow DOM。节点/字段/绑定/动作在 dry-run、发布、读取时各校验一次（`internal/plugin/dsl.go`）。
 - **组件不直连接口**：消息里的 ` ```ui-block {"slug","version","props"} ` 由 `UiBlock` 取 `GET /spaces/{id}/plugins/{slug}/ui` 渲染；数据请求 `POST /spaces/{id}/plugins/{slug}/data` 经宿主转成依赖插件的工具调用，仍走 `Invoker`。只有已安装到当前空间的组件才能渲染。
@@ -121,8 +121,8 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - Agent 的能力源 = **已安装插件 + 当前空间草稿 + 系统空间草稿**，同名（Name）优先级：已安装 > 当前空间 > 系统空间。已安装件即使没有落副本（`extensible: false`）也会进检索池。
 - 资源总量不设上限，**不提供全量列举，也不常驻技能索引**：
   1. 系统提示词只写「何时必须检索」的硬规则：闲聊 / 翻译 / 改写 / 计算 / 总结已有材料直接做；提到「我们的规范 / 流程 / 模板 / 制度」、产出正式文档、执行明确业务动作必须先检索；检索不到要明说，不得用常识冒充公司规定。
-  2. `resource_search`：`query` 可选，只给 `kind` 时按名称列出该类资源；`kind` ∈ `skills|tools|mcps|components`；默认 8 条、最多 20 条。
-  3. `resource_read` 读取正文：先当前空间，再系统空间；`published/{kind}/{slug}/{version}/...` 由插件层解析（已安装或 public 才可读），支持 `offset` / `limit`。
+  2. `plugin_search`：`query` 可选，只给 `kind` 时按名称列出该类插件；`kind` ∈ `skills|tools|mcps|components`；默认 8 条、最多 20 条。
+  3. `plugin_read` 读取正文：先当前空间，再系统空间；`published/{kind}/{slug}/{version}/...` 由插件层解析（已安装或 public 才可读），支持 `offset` / `limit`。
   4. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。路径是相对 `files/` 的 `plugins/<slug>/SKILL.md`，内置件是 `published/skills/<slug>/<version>/SKILL.md`。
 - 命中同名多来源资源时，必须让用户在候选中选择，不得自行假设。
 - 上下文按 token 控制（不按字节）：单技能正文 4000 tokens，超出截断并提示继续读取；工具结果回填默认 4KB，读类工具可申请 24KB。
@@ -184,20 +184,16 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - `shell_exec`（能力 `shell.exec`，risk=write，副作用限空间工作区）把命令跑在当前空间 `files/` 下，固定 `ModeWorkspaceWrite` + 无网、默认 15s / 最多 25s（Invoker 墙钟是 30s）。非零退出码、超时、输出超限都作为结果回给模型，只有「沙箱不可用 / 存储不是本地路径」才返回 error。后端降级到 `local` 时启动日志会显式告警。
 - **`SANDBOX_REQUIRE=true`（生产必须打开）**：启动阶段走 `sandbox.Ensure`，只有 `local` 就**启动失败**（`ErrNotIsolated`），把「以为有沙箱、其实在裸跑」挡在上线前。开发机默认 false，允许降级但一定留告警。后端名用常量 `sandbox.NameBwrap` / `NameSeatbelt` / `NameLocal` 比较，不要写字面量。
 
-# 资源发布、插件市场与发布记录
+# 插件市场与发布
 
 - **一级菜单只有两个**：工作空间 / **插件市场**。市场对全员可见，分类是**左侧二级菜单**（路由 `/plugins/market/{category}`）：组织内已发布、组织内待发布（全员见元数据，内容仅系统管理员）、平台内置、外部（内部可见）。没有独立「已装插件」页；已装插件属于空间，入口在空间页。
 - **待发布 -> 发布 -> 安装**：空间管理员启用本地插件后进入市场「待发布」；系统管理员发布后其他空间才可安装；安装只对目标空间生效，写只读副本。
-- **安装级配置**：MCP 的服务地址、鉴权 Header、凭证名可以按空间覆盖，存 `plugin_install.config`（`0020_plugin_install_config.sql`），发布快照不动；`GET|PUT /spaces/{id}/plugins/{slug}/config`，写需要 `manage`，保存后整空间重载并记 `plugin.config` 审计。只存凭证名不存密钥；地址只允许 https（本机 http 放行）。技能/工具/组件没有安装级配置——参数属于清单与内容，改行为要重新发布。
-- 「资源快照」不是并列能力，降级为空间页头部的「发布记录」次级页（`/resources/snapshots`），因为它本质是空间文件的发布结果。
-- 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 发布记录页 / Agent 按需检索**。发布范围只有用户范围：`public` 全部可见 / `private` 仅自己可见；没有「必须加载 / 可选加载」。
-- 存储与工作空间分离：`{STORAGE_ROOT}/published/{kind}/{resource_id}/{version}/`，含快照文件与 `.meta.json`（kind / name / version / visibility / resource_id / source_space_id / published_at）。目录用 `resource_id` 是因为名称只在「发布者 + kind」内唯一。
-- 数据表：`resource`（kind / name / description / visibility / status / owner_id / source_space_id / latest_version）+ `resource_version`（version / notes / storage_path / file_count / total_bytes），见 `0016_resource_publish.sql`。
-- 接口：`GET/POST /resources`、`GET/PATCH/DELETE /resources/{id}`、`DELETE /resources/{id}/versions/{version}`；实现在 `internal/resource`，装配在 `internal/app/app.go`。
-- 权限：发布需来源空间 `write`；`public` 发布需该空间 `manage` 或系统管理员；删除资源 / 删除版本 / 启停仅发布者本人或系统管理员。资源接口只返回名称、版本、描述与文件数/体积，**不返回发布目录与原始 MCP / tool / DB 配置**。
-- 约束：版本号 `x.y.z`；同版本重复发布 409；只剩一个版本时禁止删版本；快照 ≤ 200 文件 / 5MB；发布技能必须有 SKILL.md 正文。
-- Agent 侧：发布件是独立一层能力源（`source=published`），不做同名覆盖，命中同名多来源时 `resource_search` 返回 hint 要求先问用户；停用资源不进入检索；`resource_read` 支持 `published/{kind}/{id}/{version}/...` 路径并校验可见性。
-- 前端：`/plugins/market` 与 `/plugins/market/:category` 渲染插件市场（分类在左侧二级菜单，右侧只留类型筛选）；`/plugins/installed` 兼容跳转到市场；`/resources` 跳转到插件市场；`/resources/snapshots` 渲染 `ResourcePanel`（发布记录），入口在 `SpacePanel` 头部。所有路由复用 `WorkspacePage` 外壳。插件类型统一用 `PluginVisual` 的 `PluginIcon`；左侧空间树按 `Dir.PluginKind` 挂图标，安装副本额外显示锁，未启用本地插件置灰。
+- **只有一套发布模型**：发布件 = `plugin` + `plugin_version`，安装态 = `plugin_install`，快照在 `{STORAGE_ROOT}/published/{kind}/{slug}/{version}/`。历史那套「资源发布」已删除（`resource` / `resource_version` 表由 `0024_drop_resource.sql` 下线，`internal/resource`、`/resources` 接口、空间页「发布记录」页一并移除），不要再引入第二个发布/版本模型。
+- **安装级配置**：MCP 的服务地址、鉴权 Header、凭证名可以按空间覆盖，存 `plugin_install.config`（`0020_plugin_install_config.sql`），发布快照不动；`GET|PUT /spaces/{id}/plugins/{slug}/config`，写需要 `manage`，保存后整空间重载并记 `plugin.config` 审计。只存凭证名不存密钥；地址默认 https，本机（`localhost` / `127.0.0.1` / `::1`）放行 http，内网明文要清单显式声明 `transport.allow_http: true`（`Manifest.Permissions()` 会标「明文 http」），安装级配置不自行放宽——发布方没声明，部署方改地址也绕不过去。技能/工具/组件没有安装级配置——参数属于清单与内容，改行为要重新发布。
+- 生命周期：**空间草稿（可编辑）→ 发布（不可变版本快照）→ 安装到目标空间**。发布件不直接可用：只有安装到当前空间的插件才进检索池、工具列表与组件渲染。
+- 权限：**发布仅系统管理员**（不可变快照）；空间管理员只能启用本地插件（进「待发布」）与安装已发布件；安装 / 启停 / 卸载 / 配置都在空间内生效。
+- Agent 侧：能力源 = 已安装插件 + 当前空间草稿 + 系统空间草稿（同名已安装 > 当前空间 > 系统空间）；命中同名多来源时 `plugin_search` 返回 hint 要求先问用户；`plugin_read` 支持 `published/{kind}/{slug}/{version}/...` 路径并校验可见性。
+- 前端：`/plugins/market` 与 `/plugins/market/:category` 渲染插件市场（分类在左侧二级菜单，右侧只留类型筛选）；`/plugins/installed` 与旧路径 `/resources/*` 兼容跳转到市场。所有路由复用 `WorkspacePage` 外壳。插件类型统一用 `PluginVisual` 的 `PluginIcon`；左侧空间树按 `Dir.PluginKind` 挂图标，安装副本额外显示锁，未启用本地插件置灰。
 
 # 身份接入（登录）
 
