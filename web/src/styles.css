@@ -1056,6 +1056,11 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   color: var(--semi-color-text-1);
 }
 
+.msg-risk-2 {
+  background: var(--semi-color-info-light-default, #f0f5ff);
+  color: var(--semi-color-info);
+}
+
 .msg-risk-3 {
   background: var(--semi-color-warning-light-default, #fff8e6);
   color: var(--semi-color-warning);

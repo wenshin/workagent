@@ -196,6 +196,7 @@ function buildHandlers(
                   name: req.tool,
                   args: '',
                   status: 'approval',
+                  risk: req.risk || undefined,
                   approval,
                 },
               },
@@ -313,6 +314,7 @@ async function syncApprovals(
           name: a.tool,
           args: '',
           status: 'approval',
+          risk: a.risk || undefined,
           approval: toApprovalInfo(a, sessionId),
         },
       });

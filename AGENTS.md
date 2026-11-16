@@ -52,7 +52,7 @@
 1. 平台已经没有「资源」模型：数据库、MCP 服务、文件目录都不再抽象成可授权的 Resource，也没有 ResourceGrant / ToolBinding
 2. 授权只有一条路径——**插件安装（本地插件是启用）**：工具能出现在列表里，就说明所属插件已装好，不再有第二处授权记录
 3. 数据范围与鉴权在工具实现上：MCP 由远端 server 自己的凭证与 JWT 决定，脚本/内置工具在沙箱里按清单声明的 `fs` 与出网白名单执行
-4. 风险等级只用于展示，不决定是否审批：只有「出网非只读」与「命中需确认命令名单的 shell 命令」两类动作弹确认；fs 写与空间内删除直接放行（仍校验空间写权限）。「本轮都同意」只对当前一次 run 有效，下一轮重新确认，超时按拒绝
+4. 风险等级只用于展示（卡片头常驻 `L{n}`，历史回看也在），不决定是否审批：只有「会改动外部系统」与「命中需确认命令名单的 shell 命令」两类动作弹确认；fs 写与空间内删除直接放行（仍校验空间写权限）。「会改动外部系统」的判据按插件类型分两条——脚本工具看清单 `capabilities` 的 verbs（非 GET/HEAD），**MCP 看 `tools.writes` 声明**（远端工具是黑盒，没有动词可看，不声明按只读处理，声明后风险抬到 L3）。「本轮都同意」只对当前一次 run 有效，下一轮重新确认，超时按拒绝
 5. 审批记录落 `approval` 表（`0029`，`pending → approved / denied / expired`）：会话刷新按 `session_id` 补待办，`scope=turn` 的结论按 `run_id + action_key` 复用，`args_hash` 用于续跑时认「同一次调用」；进程内只保留唤醒用的 channel（另每 2s 轮询库兜底，跨实例决策靠它送达），run 结束统一 `ExpireRunApprovals`
 6. 审批等待是可恢复状态：等待期间 run 落 `waiting_approval` 并每 30s 续心跳（等人不是卡住）；进程没了由清扫收 `failed`，审批行留到过期。用户点批准 → 先试唤醒，没有执行体就问心跳，确认已死则 `Resume` 从断点续跑（HTTP `202`）
 7. Checkpoint 三条硬约束（`run_resume` + `RunInput.Checkpoint`）：批次发出 `tool_calls` 时先写快照（带 `pending`），每拿到一条回执再写一次；续跑先把 `pending` 补齐再问模型；已完成的调用靠 `tool_call.result` + `ArgsHash` 回放入 `Env.Replay`，副作用不重来。断点 7 天过期（`PurgeStaleResumes`）

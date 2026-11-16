@@ -62,6 +62,9 @@ function toToolRecord(payload: StreamPayload): ToolCallRecord {
     result: payload.summary,
     status: (payload.status as ToolCallRecord['status']) ?? 'running',
     duration_ms: payload.duration_ms,
+    // 风险等级随 tool.call / tool.result 一起下发：等着看审批结果的人，
+    // 看到「L4 外发」比看到「执行中」更有用
+    risk: payload.risk || undefined,
   };
 }
 

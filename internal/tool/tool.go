@@ -453,6 +453,10 @@ func mcpTool(item MCPTool, provider MCPProvider) Tool {
 		Parameters:  schema,
 		// 远端工具按「只读有成本」处理：数据范围与鉴权在远端 server 上，
 		// 注册/安装这个动作本身就是授权，策略层不再逐次核对绑定。
+		//
+		// 这条路径来自 mcp_server 注册表（旧注册方式），没有插件清单可声明
+		// tools.writes，所以无法判断远端是否会改数据，按只读处理、不弹确认。
+		// 需要审批的 MCP 请走 kind=mcp 插件并在清单里声明 tools.writes。
 		Risk:       policy.RiskReadCost,
 		Runtime:    "mcp",
 		ServerID:   serverID,

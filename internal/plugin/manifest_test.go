@@ -437,3 +437,50 @@ func TestResidentRejectsBuiltin(t *testing.T) {
 		t.Fatal("builtin 工具声明 resident 应该被拒绝")
 	}
 }
+
+// 远端写必须由作者显式声明：MCP 工具对平台是黑盒，没有 verbs 可推导，
+// 不声明就按只读处理（远端鉴权是第一道闸），声明了才要求逐次确认。
+func TestMCPWritesNeedsDeclaration(t *testing.T) {
+	body := func(extra string) string {
+		return `{
+  "protocol": "wa-plugin/1",
+  "kind": "mcp",
+  "slug": "crm_mcp",
+  "name": "CRM MCP",
+  "description": "CRM 远端服务，查客户与订单时使用",
+  "capability": "plugin.invoke",
+  "transport": {"type": "http", "url": "https://mcp.example.com/sse"},
+  "tools": {"allow": ["*"]` + extra + `}
+}`
+	}
+
+	readOnly, err := Parse([]byte(body("")), false)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if readOnly.WritesRemote() {
+		t.Fatal("未声明 tools.writes 时不应要求人工确认")
+	}
+	if risk, _ := Derive(readOnly); risk > policy.RiskReadCost {
+		t.Fatalf("未声明写入的 MCP 至多按只读有成本处理，实际 L%d", risk)
+	}
+
+	writes, err := Parse([]byte(body(`, "writes": true`)), false)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if !writes.WritesRemote() {
+		t.Fatal("声明 tools.writes 后必须走人工确认")
+	}
+	if risk, _ := Derive(writes); risk < policy.RiskWrite {
+		t.Fatalf("声明写入的 MCP 至少要 L%d，实际 L%d", policy.RiskWrite, risk)
+	}
+}
+
+// tools 段只属于 mcp：写在别的 kind 上会被静默忽略，作者却以为声明生效了。
+func TestToolsSectionOnlyForMCP(t *testing.T) {
+	_, err := Parse([]byte(toolManifest(`, "tools": {"allow": ["*"], "writes": true}`)), false)
+	if err == nil || !strings.Contains(err.Error(), "只对 mcp") {
+		t.Fatalf("非 mcp 声明 tools 段应报错，实际: %v", err)
+	}
+}

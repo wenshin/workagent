@@ -281,6 +281,13 @@ func (m *Manifest) normalizeAuth() error {
 type AllowedTools struct {
 	Allow []string `json:"allow"`
 	Deny  []string `json:"deny,omitempty"`
+	// Writes 声明这些远端工具会改动外部系统状态（建单、改状态、删数据）。
+	//
+	// 远端工具对平台是黑盒：除了 input_schema 之外没有语义，也看不到它到底发了
+	// 什么请求，所以「是不是写」不可能像脚本插件那样从出网 verbs 推导，只能由
+	// 作者声明。没声明按只读处理——远端鉴权与只读账号是第一道闸，平台不替它
+	// 猜；声明之后每次调用都要人工确认，与脚本插件的「出网非只读」同一个口径。
+	Writes bool `json:"writes,omitempty"`
 }
 
 // UISpec 是 component 的产物声明：入口是一份 DSL，不是可执行脚本。
@@ -433,11 +440,19 @@ func Parse(raw []byte, publishing bool) (Manifest, error) {
 	return m, nil
 }
 
-// WritesRemote 判断清单是否声明了非只读的出网动词。
+// WritesRemote 判断这个插件的工具调用会不会改动外部系统状态。
 //
-// 网关联调时平台无法区分「写 PG 的库」和「删远端资源」，所以只要不是 GET/HEAD
-// 就按需要确认处理；这条与该插件其余 fs 写的默认（不审批）是分开的。
+// 两条判据，因为两类插件的出网方式不同：
+//   - 脚本工具：请求由沙箱里的插件自己发，平台能看到动词，不是 GET/HEAD 就算写；
+//   - MCP：请求由远端 Server 发，平台只能看到调用了哪个工具，所以只能看
+//     tools.writes 声明。联网关时平台无法区分「写 PG 的库」和「删远端资源」，
+//     所以宁可让作者显式说一句，也不替远端猜。
+//
+// 命中这条判据的调用都要人工确认；与 fs 写的默认（不审批）是分开的。
 func (m Manifest) WritesRemote() bool {
+	if m.Kind == KindMCP {
+		return m.Tools != nil && m.Tools.Writes
+	}
 	_, verbs, _ := m.HostAllow()
 	for v := range verbs {
 		switch v {
@@ -771,6 +786,11 @@ func (m *Manifest) Validate(publishing bool) error {
 	}
 	if m.Builtin && m.Kind != KindTool {
 		return fmt.Errorf("builtin 只用于平台内置工具（kind=tool）")
+	}
+	// tools 段描述的是「远端 Server 暴露哪些工具」，只有 MCP 有这层间接性。
+	// 别的 kind 写了会被静默忽略，作者却以为声明生效了（尤其是 tools.writes）。
+	if m.Tools != nil && m.Kind != KindMCP {
+		return fmt.Errorf("tools 段只对 mcp 插件有效，%s 插件请用 capabilities 声明", m.Kind)
 	}
 	if err := checkSchema(m.InputSchema, "input_schema"); err != nil {
 		return err
@@ -1250,12 +1270,17 @@ func Derive(m Manifest) (int, string) {
 	}
 
 	// MCP 是外部系统调用：它对平台内数据没有任何读写权限，平台也不该替远端
-	// 判断「这次调用在它那边算不算写」。按「只读有成本」处理——有绑定即放行，
-	// 副作用由远端的鉴权、只读账号、限流与审计负责，平台只记调用与用量。
+	// 判断「这次调用在它那边算不算写」。默认按「只读有成本」处理——副作用由
+	// 远端的鉴权、只读账号、限流与审计负责。
+	// 作者声明 tools.writes 时才抬到 L3：这时卡片要能一眼看出「这一步会改远端」，
+	// 且每次调用都要过审批。
 	if m.Kind == KindMCP {
 		risk = maxRisk(risk, policy.RiskReadCost)
 		if effects == policy.SideEffectsReadOnly {
 			effects = policy.SideEffectsExternal
+		}
+		if m.Tools != nil && m.Tools.Writes {
+			risk = maxRisk(risk, policy.RiskWrite)
 		}
 	}
 	// 文件写权限由 fs 段声明：能写空间文件就是写操作，

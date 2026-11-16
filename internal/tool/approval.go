@@ -117,15 +117,23 @@ type ApprovalDecision struct {
 // ApprovalFor 返回这次调用是否需要人工确认；nil 表示直接执行。
 //
 // 只有两类动作会命中：
-//   - 声明了非 GET/HEAD 出网的工具（插件清单里的 capabilities）；
+//   - 会改动外部系统的调用：脚本插件按出网 verbs（非 GET/HEAD）判定，
+//     MCP 按清单里的 tools.writes 声明判定——远端工具对平台是黑盒，
+//     没有动词可看，只能由作者显式声明；
 //   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）。
 func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	if t.NetworkWrite {
+		// MCP 工具与脚本工具的出网方式不同，文案要说清「谁在改」：
+		// 脚本是插件自己发请求，MCP 是远端 Server 替它改，用户判断依据不一样。
+		reason := "这次调用会以非只读方法访问外部系统"
+		if t.ServerID != "" {
+			reason = "这次调用会改动远端系统（MCP 工具）"
+		}
 		return &policy.Action{
 			Kind:   policy.ActionNetwork,
 			Key:    policy.ActionNetwork,
 			Detail: argSummary(args),
-			Reason: "这次调用会以非只读方法访问外部系统",
+			Reason: reason,
 		}
 	}
 	if len(t.ShellApproval) == 0 {

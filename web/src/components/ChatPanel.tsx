@@ -340,10 +340,13 @@ function ToolCard({
     }
   };
 
+  // 风险等级常驻：不只出现在审批卡上。翻历史时「这一步是 L4 外发」比
+  // 「成功」有用得多，而且不审批的调用（fs 写、只读查询）同样需要这个标注。
+  const risk = approval?.risk || tool.risk || 0;
   const head = (
     <>
       <span className="msg-tool-name">{tool.name}</span>
-      {approval?.risk ? <span className={`msg-risk msg-risk-${approval.risk}`}>L{approval.risk}</span> : null}
+      {risk > 0 ? <span className={`msg-risk msg-risk-${risk}`}>L{risk}</span> : null}
       <span className="msg-tool-status">{statusLabel(tool.status)}</span>
       {tool.duration_ms !== undefined ? <span className="msg-tool-time">{tool.duration_ms}ms</span> : null}
     </>
@@ -543,6 +546,7 @@ function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
     result: p.result,
     status: p.status,
     duration_ms: p.duration_ms,
+    risk: p.risk,
   }));
 }
 

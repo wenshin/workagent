@@ -129,6 +129,8 @@ export interface ToolCallRecord {
   result?: string;
   status: ToolStatus;
   duration_ms?: number;
+  /** 风险等级（L1~L4），由工具声明给出；只用于展示，不决定是否审批 */
+  risk?: number;
   /** 命中审批规则时挂在卡片上，用户点按钮后由 tool.result 更新结局 */
   approval?: ApprovalInfo;
 }
@@ -142,6 +144,8 @@ export interface MessagePart {
   result?: string;
   status: ToolStatus;
   duration_ms?: number;
+  /** 风险等级：历史消息回看时也要能看出这一步改了什么 */
+  risk?: number;
 }
 
 /**
