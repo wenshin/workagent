@@ -1257,11 +1257,6 @@ func flattenTools(insts []*instance) []tool.Tool {
 	for _, inst := range insts {
 		out = append(out, inst.Tools...)
 	}
-	// 借用的工具按「已绑定」处理：来源空间的安装 + 启用就是授权，当前空间没有
-	// tool_binding 记录（也不该为一次派发写一条），否则 MCP 这类 L2 工具会被策略拦下。
-	for i := range out {
-		out[i].HasBinding = true
-	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
@@ -1374,6 +1369,7 @@ func (m *Manager) toolTools(inst *instance) []tool.Tool {
 		Risk:           inst.Risk,
 		SideEffects:    inst.SideEffects,
 		Runtime:        "plugin",
+		NetworkWrite:   meta.WritesRemote(),
 		MaxResultBytes: meta.Limits.MaxResultBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
 			return m.invokeTool(ctx, inst, args, env)
@@ -1417,15 +1413,16 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 			schema = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
 		out = append(out, tool.Tool{
-			Name:        name,
-			Capability:  exposed, // 远端工具名：绑定与组件 data_sources 都按它对齐
-			Description: fmt.Sprintf("[插件:%s] %s", inst.Manifest.Slug, def.Description),
-			Parameters:  schema,
-			Risk:        inst.Risk,
-			SideEffects: inst.SideEffects,
-			Runtime:     "plugin",
-			ServerID:    inst.PluginID,
-			ServerName:  inst.Slug,
+			Name:         name,
+			Capability:   exposed, // 远端工具名：组件 data_sources 与工具寻址都按它对齐
+			Description:  fmt.Sprintf("[插件:%s] %s", inst.Manifest.Slug, def.Description),
+			Parameters:   schema,
+			Risk:         inst.Risk,
+			SideEffects:  inst.SideEffects,
+			Runtime:      "plugin",
+			NetworkWrite: inst.Manifest.WritesRemote(),
+			ServerID:     inst.PluginID,
+			ServerName:   inst.Slug,
 			Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
 				return inst.MCP.call(ctx, remote, args, env)
 			},
@@ -1455,7 +1452,10 @@ func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawM
 	return truncate(out, inst.Manifest.Limits.MaxResultBytes), nil
 }
 
-// registerTools 把插件工具注册进能力/工具/绑定三层，让策略与 Invoker 自动生效。
+// registerTools 把插件工具注册进能力与工具两层，让策略与 Invoker 自动生效。
+//
+// 这里没有「绑定」这一步：工具能出现在列表里，就说明所属插件已安装/启用
+// （MCP 是已注册），安装动作本身就是授权。
 func (m *Manager) registerTools(ctx context.Context, inst *instance) error {
 	for _, t := range inst.Tools {
 		if err := m.o.Store.UpsertCapability(ctx, store.Capability{
@@ -1466,14 +1466,6 @@ func (m *Manager) registerTools(ctx context.Context, inst *instance) error {
 		}
 		if err := m.o.Store.UpsertTool(ctx, store.ToolRecord{
 			Name: t.Name, Capability: t.Name, Runtime: "plugin", RiskLevel: t.Risk,
-		}); err != nil {
-			return err
-		}
-		// 安装即授权：只读与外部调用（如 MCP）直接可用；只有会写平台数据的
-		// 能力才保留 allow_write=false，需要管理员在绑定上显式放开。
-		constraints, _ := json.Marshal(policy.Constraints{AllowWrite: t.Risk < policy.RiskWrite})
-		if _, err := m.o.Store.UpsertToolBinding(ctx, store.ToolBinding{
-			ToolName: t.Name, SpaceID: inst.SpaceID, Constraints: constraints,
 		}); err != nil {
 			return err
 		}

@@ -75,6 +75,16 @@ function invalidateSkillLists(qc: QueryClient) {
   qc.invalidateQueries({ queryKey: ['skills'] });
 }
 
+/**
+ * 让「新建会话」弹窗里的智能体清单失效。
+ *
+ * 启停 / 安装 / 卸载智能体都会改变这份清单，不清理的话弹窗要刷新整个页面才看得到。
+ * 用前缀匹配：系统空间里的启停对所有空间的清单都有效。
+ */
+function invalidateAgentLists(qc: QueryClient) {
+  qc.invalidateQueries({ queryKey: ['agents'] });
+}
+
 /** 当前 IdP 信息：切换钉钉/企微/飞书只改后端配置，前端文案自动跟随 */
 export function useProviderInfo() {
   return useQuery({
@@ -598,6 +608,7 @@ export function useInstallPlugin() {
       // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
       invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
+      invalidateAgentLists(qc);
     },
   });
 }
@@ -611,6 +622,7 @@ export function useUninstallPlugin() {
       // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
       invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
+      invalidateAgentLists(qc);
     },
   });
 }
@@ -623,10 +635,30 @@ export function useTogglePlugin() {
         `/spaces/${input.spaceId}/plugins/${input.slug}/${input.enabled ? 'enable' : 'disable'}`,
         { method: 'POST' },
       ),
-    onSuccess: () => {
+    // 启停只是本地状态翻转，界面不该等一次往返：先改缓存，失败再回滚。
+    // 服务端返回 204 后由 onSettled 重拉一次，确保与后端一致（权限、依赖校验可能拒绝）。
+    onMutate: async (input) => {
+      const key = queryKeys.plugins(input.spaceId);
+      await qc.cancelQueries({ queryKey: key });
+      const prev = qc.getQueryData<PluginsResponse>(key);
+      if (prev) {
+        qc.setQueryData<PluginsResponse>(key, {
+          ...prev,
+          items: prev.items.map((it) =>
+            it.slug === input.slug ? { ...it, enabled: input.enabled } : it,
+          ),
+        });
+      }
+      return { prev };
+    },
+    onError: (_err, input, ctx) => {
+      if (ctx?.prev) qc.setQueryData(queryKeys.plugins(input.spaceId), ctx.prev);
+    },
+    onSettled: () => {
       // 安装/卸载/启停都会动 plugins/<slug>/ 副本或树上的状态标记，树一起刷
       invalidateAfterWrite(qc);
       invalidateSkillLists(qc);
+      invalidateAgentLists(qc);
     },
   });
 }

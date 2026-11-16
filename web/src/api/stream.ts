@@ -7,7 +7,16 @@ export interface StreamHandlers {
   onText?: (delta: string) => void;
   onToolStart?: (tool: ToolCallRecord) => void;
   onToolResult?: (tool: ToolCallRecord) => void;
-  onApproval?: (request: { approvalId: string; callId: string; tool: string; timeoutS: number }) => void;
+  onApproval?: (request: {
+    approvalId: string;
+    callId: string;
+    tool: string;
+    kind: string;
+    detail: string;
+    reason: string;
+    risk: number;
+    timeoutS: number;
+  }) => void;
   onDone?: (payload: { message: ChatMessage; session: ChatSession }) => void;
   onError?: (message: string) => void;
 }
@@ -32,6 +41,9 @@ interface StreamPayload {
   duration_ms?: number;
   approval_id?: string;
   timeout_s?: number;
+  /** approval.req：动作类别与要确认的原文（命令 / 入参）；reason 与 run.finished 共用同一字段 */
+  kind?: string;
+  detail?: string;
   usage?: { in: number; out: number };
   /** message.done 携带落库后的消息与会话 */
   message?: ChatMessage | string;
@@ -75,6 +87,10 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
         approvalId: payload.approval_id ?? '',
         callId: payload.call_id ?? '',
         tool: payload.tool ?? '',
+        kind: payload.kind ?? '',
+        detail: payload.detail ?? '',
+        reason: payload.reason ?? '',
+        risk: payload.risk ?? 0,
         timeoutS: payload.timeout_s ?? 0,
       });
       break;

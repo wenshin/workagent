@@ -56,6 +56,8 @@ export default function PluginPanel({ space }: Props) {
   const [runInput, setRunInput] = useState('{}');
   const [runResult, setRunResult] = useState<PluginDryRunResult | null>(null);
   const [pendingUninstall, setPendingUninstall] = useState<PluginItem | null>(null);
+  // 启停是共享的一个 mutation：用 slug 记住「谁在转」，否则点一张卡片所有按钮一起闪
+  const [toggleSlug, setToggleSlug] = useState<string | null>(null);
   const [configTarget, setConfigTarget] = useState<PluginItem | null>(null);
   // 升级同样要确认：新版本可能多出写文件、连新域名这类权限。
   const [pendingUpgrade, setPendingUpgrade] = useState<PluginItem | null>(null);
@@ -243,8 +245,9 @@ export default function PluginPanel({ space }: Props) {
                     <Button
                       size="small"
                       theme="borderless"
-                      loading={toggle.isPending}
-                      onClick={() =>
+                      loading={toggleSlug === item.slug}
+                      onClick={() => {
+                        setToggleSlug(item.slug);
                         toggle.mutate(
                           { spaceId: space.id, slug: item.slug, enabled: !enabled },
                           {
@@ -259,9 +262,10 @@ export default function PluginPanel({ space }: Props) {
                                     : '已启用，本空间可用',
                               ),
                             onError: (e) => Toast.error(e instanceof Error ? e.message : '操作失败'),
+                            onSettled: () => setToggleSlug(null),
                           },
-                        )
-                      }
+                        );
+                      }}
                     >
                       {enabled ? '停用' : '启用'}
                     </Button>
@@ -282,7 +286,6 @@ export default function PluginPanel({ space }: Props) {
                     <Button
                       size="small"
                       theme="borderless"
-                      loading={install.isPending}
                       onClick={() => setPendingUpgrade(item)}
                     >
                       升级到 v{item.latest_version}

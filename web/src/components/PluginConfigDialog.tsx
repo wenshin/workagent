@@ -1,4 +1,4 @@
-import { Empty, Input, Modal, Spin, Toast, Typography } from '@douyinfe/semi-ui';
+import { Empty, Input, Modal, Spin, TextArea, Toast, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useState } from 'react';
 
 import { usePluginConfig, useUpdatePluginConfig } from '../api/hooks';
@@ -72,11 +72,20 @@ export default function PluginConfigDialog({ visible, spaceId, slug, name, onClo
                 {field.label}
                 {field.required ? <span className="publish-required"> *</span> : null}
               </label>
-              <Input
-                value={values[field.key] ?? ''}
-                placeholder={field.placeholder}
-                onChange={(v) => setValues((prev) => ({ ...prev, [field.key]: v }))}
-              />
+              {field.type === 'list' ? (
+                <TextArea
+                  rows={4}
+                  value={values[field.key] ?? ''}
+                  placeholder={field.placeholder}
+                  onChange={(v) => setValues((prev) => ({ ...prev, [field.key]: v }))}
+                />
+              ) : (
+                <Input
+                  value={values[field.key] ?? ''}
+                  placeholder={field.placeholder}
+                  onChange={(v) => setValues((prev) => ({ ...prev, [field.key]: v }))}
+                />
+              )}
               {field.help ? (
                 <Text type="tertiary" size="small">
                   {field.help}

@@ -196,18 +196,6 @@ type ToolRecord struct {
 	MCPServerID string
 }
 
-// ToolBinding 把工具约束在空间/用户上，并携带约束（§5.6.1 第三层）。
-type ToolBinding struct {
-	ID          string
-	ToolName    string
-	Runtime     string
-	MCPServerID string
-	SpaceID     string
-	UserID      string
-	Constraints []byte
-	RiskLevel   int
-}
-
 // MCPServer 是注册的 MCP Server（§5.3.1）。
 type MCPServer struct {
 	ID         string
@@ -274,7 +262,50 @@ type ToolCallRecord struct {
 	Status    string
 	LatencyMS int
 	RiskLevel int
+	// Result 是回给模型的那段内容（已按预算截断）。
+	//
+	// 写在这里而不是只进 run_step：续跑时要按「工具 + 参数」把结果原样回放，
+	// 事件流是按 seq 排的展示数据，不适合当查询源。
+	Result string
 }
+
+// Approval 是一次人工确认记录（§5.2）。
+//
+// 一行 = 一次「命中审批规则的调用」，从 pending 走到终态。
+// action_key 是记忆键（net / shell:rm）：同一 run 内同一键只应问一次，
+// 所以 scope=turn 的结论留在表里，run 结束统一置 expired。
+type Approval struct {
+	ID        string
+	SessionID string
+	RunID     string
+	CallID    string
+	Tool      string
+	Kind      string
+	ActionKey string
+	// ArgsHash 是「工具 + 规范化参数」的指纹：续跑时模型重新生成的 tool_call id
+	// 是新的，只有参数能证明「这就是刚才那次调用」。
+	ArgsHash  string
+	Detail    string
+	Reason    string
+	Risk      int
+	Status    string
+	Scope     string
+	DecidedBy string
+	DecidedAt *time.Time
+	CreatedAt time.Time
+	ExpireAt  time.Time
+}
+
+const (
+	// ApprovalPending 等待用户点击；这一轮的执行体阻塞在这里。
+	ApprovalPending = "pending"
+	// ApprovalApproved 用户同意（本次或本轮）。
+	ApprovalApproved = "approved"
+	// ApprovalDenied 用户拒绝，工具不执行，结果回给模型。
+	ApprovalDenied = "denied"
+	// ApprovalExpired 超时、run 结束或进程重启导致没人再等。
+	ApprovalExpired = "expired"
+)
 
 // AuthSession 是登录会话（注意：与聊天会话 session 表不是一回事）。
 type AuthSession struct {
@@ -356,10 +387,7 @@ type Store interface {
 	// ---- Tool 三层模型（§5.6.1）----
 	UpsertCapability(ctx context.Context, c Capability) error
 	UpsertTool(ctx context.Context, t ToolRecord) error
-	// ListToolBindings 返回空间维度与用户维度的有效绑定。
-	ListToolBindings(ctx context.Context, spaceID, userID string) ([]ToolBinding, error)
-	UpsertToolBinding(ctx context.Context, b ToolBinding) (ToolBinding, error)
-	// DeletePluginToolRecords 卸载插件时清掉它注册的能力/工具/绑定（审计与历史不计）。
+	// DeletePluginToolRecords 卸载插件时清掉它注册的能力/工具（审计与历史不计）。
 	DeletePluginToolRecords(ctx context.Context, slug string) error
 
 	// ---- MCP（§5.3.1 / §5.4）----
@@ -370,6 +398,10 @@ type Store interface {
 	// ---- 审计与调用记录（§8.2 / §6）----
 	AppendAuditLog(ctx context.Context, e AuditEntry) error
 	RecordToolCall(ctx context.Context, r ToolCallRecord) error
+	// ListToolResults 返回一次执行里已经产生结果的工具调用，供续跑回放。
+	//
+	// 只取有 result 的行：没有结果说明那次调用被中断在半路，必须重新执行。
+	ListToolResults(ctx context.Context, runID string) ([]ToolCallRecord, error)
 
 	// ---- Run 与 checkpoint（§5.7.5 / §6）----
 	// CreateRun 开启一次执行，初始状态为 running。
@@ -388,6 +420,15 @@ type Store interface {
 	// ListRunSteps 按 seq 返回一次执行的全部 checkpoint，供恢复时重放。
 	ListRunSteps(ctx context.Context, runID string) ([]RunStep, error)
 
+	// SetRunStatus 只改状态，不动 ended_at：用于 running ↔ waiting_approval 这类
+	// 「还在这一轮里」的迁移。终态仍走 FinishRun。
+	SetRunStatus(ctx context.Context, runID, status string) error
+	// PurgeStaleResumes 清掉过期断点，返回清理条数。
+	//
+	// 断点是有保质期的：接上一份一周前的快照，模型看到的是一个早就变了的文件树，
+	// 「继续」只会产出一份基于幻觉的结果。
+	PurgeStaleResumes(ctx context.Context, olderThan time.Duration) (int, error)
+
 	// TouchRun 刷新一次执行的心跳：跑它的进程还活着。
 	//
 	// 这是「在跑」的唯一凭据。用应用侧刷新而不是 started_at，是因为长任务本身就该跑很久，
@@ -403,8 +444,8 @@ type Store interface {
 	ResumableRun(ctx context.Context, sessionID string) (Run, bool, error)
 	// SweepStaleRuns 把心跳停了却还挂着 running 的执行置为 failed，返回收尾条数。
 	//
-	// 顺带把它们的流式占位消息标成中断——否则刷新后会一直显示「生成中」，
-	// 而那条消息永远不会有人来写完。
+	// 顺带结算它们的流式占位消息：run_step 里的工具轨迹还原进 parts 并标中断，
+	// 否则刷新后要么一直显示「生成中」，要么连中断前做过什么都看不到。
 	SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string) (int, error)
 	// AbandonRun 收尾一条「没人跑」的执行：置为 failed 并结算它的流式占位消息。
 	//
@@ -414,6 +455,36 @@ type Store interface {
 	// staleAfter > 0 时按心跳再挡一道：心跳还在跳说明执行在别处活着，本进程无权替它收尾。
 	// 断点（run_resume）不动：用户仍可以在会话里点「继续」。
 	AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration) error
+	// InterruptStreamingMessage 结算一条已被接替的执行留下的流式占位消息。
+	//
+	// 续跑接手一条中断的 run 时用它：那条 run 已经置了终态，不会再走 AbandonRun，
+	// 占位没人结算就会永远挂在「生成中」，而中断前的工具轨迹在界面上一条都看不到。
+	InterruptStreamingMessage(ctx context.Context, runID, sessionID string) error
+
+	// ---- 人工确认（§5.2）----
+	// CreateApproval 登记一条待确认记录；同 id 已存在时不覆盖（重放幂等）。
+	CreateApproval(ctx context.Context, a Approval) (Approval, error)
+	// DecideApproval 把 pending 改成 approved / denied；返回更新后的记录。
+	// 记录已不在 pending（超时、run 已结束、别人先点了）时返回 ok=false。
+	DecideApproval(ctx context.Context, id, status, scope, decidedBy string) (Approval, bool, error)
+	// GetApproval 按 id 读一条确认记录。
+	GetApproval(ctx context.Context, id string) (Approval, bool, error)
+	// FindApprovalGrant 返回同一 run 内可以直接复用的已决记录，没有则 ok=false。
+	//
+	// 命中两种：
+	//   - scope=turn 且 action_key 相同：本轮都同意/都拒绝；
+	//   - args_hash 相同：同一次调用的重放（续跑时模型重新生成调用，id 会变，参数不会）。
+	// 后者是恢复语义的关键——不认它，续跑就会把已经批过的命令再问一遍；
+	// 认错它也没关系，同一 run 内重复的同参调用本来就该被当作重复调用拦掉。
+	FindApprovalGrant(ctx context.Context, runID, actionKey, argsHash string) (Approval, bool, error)
+	// ListPendingApprovals 返回会话里所有未处理的确认，刷新后据此补卡片。
+	ListPendingApprovals(ctx context.Context, sessionID string) ([]Approval, error)
+	// ExpireRunApprovals 把一次执行留下的 pending 全部置 expired：
+	// run 已经结束，不会再有人被唤醒。
+	ExpireRunApprovals(ctx context.Context, runID string) error
+	// MarkApprovalExpired 把已决记录收回 expired：决策没能送达执行体
+	// （run 已经被重启或超时收尾），保持 approved 会误导审计。
+	MarkApprovalExpired(ctx context.Context, id string) error
 
 	// ---- 任务派发（§15.12.4）----
 	CreateTask(ctx context.Context, t Task) (Task, error)

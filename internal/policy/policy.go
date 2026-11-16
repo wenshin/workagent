@@ -3,23 +3,25 @@ package policy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 )
 
 // RiskLevel 与 capability.risk_level 对齐。
+//
+// 注意：风险等级**只用于展示**（卡片色块、事后 review），不参与审批判定。
+// 是否弹审批由 Action 与工具/插件配置决定，避免「等级 × 副作用」的二维矩阵。
 const (
-	// RiskReadOnly 只读无副作用（列目录、查时间），默认放行。
+	// RiskReadOnly 只读无副作用（列目录、查时间）。
 	RiskReadOnly = 1
-	// RiskReadCost 只读但消耗资源或涉及数据范围（检索、SQL 查询），需要显式绑定。
+	// RiskReadCost 只读但消耗资源或涉及数据范围（检索、SQL 查询、MCP 远端工具）。
 	RiskReadCost = 2
-	// RiskWrite 写操作，必须绑定且二次确认。
+	// RiskWrite 写操作（含空间工作区、共享区、外部系统）。
 	RiskWrite = 3
-	// RiskSensitive 高敏（凭证、外发），一律走审批。
+	// RiskSensitive 高敏（凭证、外发）。
 	RiskSensitive = 4
 )
 
-// SideEffects 描述一次调用的影响范围，决定写操作能否走「空间工作区」放行。
+// SideEffects 描述一次调用的影响范围，用于判定「能不能按空间权限直接放行」。
 const (
 	// SideEffectsReadOnly 无副作用。
 	SideEffectsReadOnly = "read-only"
@@ -27,43 +29,41 @@ const (
 	// 范围由工具自身约束，授权只看空间成员权限。
 	SideEffectsWorkspace = "write-workspace"
 	// SideEffectsShared 只改跨空间的共享区（如企业 wiki 固定在系统空间的 wiki/ 下）。
-	// 范围同样由工具锁死，授权沿用「在当前空间能否写」：
-	// 能写当前空间的成员，才有资格往共享区沉淀内容。
 	SideEffectsShared = "write-shared"
-	// SideEffectsExternal 会改动空间外的资源（外部系统、凭证等），一律走审批。
+	// SideEffectsExternal 会改动空间外的资源（外部系统、凭证等）。
 	SideEffectsExternal = "write-external"
 )
 
-// Constraints 是绑定上的执行约束。
-type Constraints struct {
-	MaxRows          int  `json:"max_rows,omitempty"`
-	MaxBytes         int  `json:"max_bytes,omitempty"`
-	ApprovalRequired bool `json:"approval_required,omitempty"`
-	AllowWrite       bool `json:"allow_write,omitempty"`
-}
+// 需要审批的动作类别。目前只有两类，都是「不可逆且平台无法替用户判断」的动作：
+const (
+	// ActionNetwork 出网且方法不是 GET/HEAD：外部系统可能已经收到这次改动。
+	ActionNetwork = "net.write"
+	// ActionShell 命中需审批命令名单的 shell 命令。
+	ActionShell = "shell"
+)
 
-// ParseConstraints 解析绑定上的 jsonb 约束；空值返回零值。
-func ParseConstraints(raw []byte) Constraints {
-	var c Constraints
-	if len(raw) == 0 {
-		return c
-	}
-	_ = json.Unmarshal(raw, &c)
-	return c
+// Action 是一次调用命中的审批动作，由 Invoker 按工具声明与实参算出。
+type Action struct {
+	Kind   string
+	Detail string
+	// Key 是本轮记忆的键：同一类动作（或同一条命令）在本轮内只问一次。
+	Key string
+	// Reason 是给用户看的一句话，说明为什么要确认。
+	Reason string
 }
 
 // Request 是一次授权判定的输入。
 type Request struct {
-	Actor     string
-	Action    string // 目前只有 tool:invoke
-	Tool      string
-	Risk      int
-	SpaceID   string
-	SpacePerm string // 调用方在该空间的权限，空表示不是成员
-	// SideEffects 来自工具声明，写操作据此区分「空间工作区」与「外部资源」
-	SideEffects string
-	HasBind     bool
-	Binding     Constraints
+	Actor       string
+	Action      string // 目前只有 tool:invoke
+	Tool        string
+	Plugin      string
+	Risk        int
+	SpaceID     string
+	SpacePerm   string // 调用方在该空间的权限，空表示不是成员
+	SideEffects string // 来自工具声明
+	// Approval 非空表示这次调用命中审批规则；为空表示直接执行（只做成员校验）。
+	Approval *Action
 }
 
 // Decision 是判定结果。
@@ -71,10 +71,12 @@ type Decision struct {
 	Allow        bool
 	NeedApproval bool
 	Reason       string
-	Constraints  Constraints
+	Action       *Action
+	// Risk 回传展示用等级，前端据此给卡片配色。
+	Risk int
 }
 
-// Engine 是 PDP 接口：默认实现为 RBAC + 风险分级，后续可替换为外部策略服务。
+// Engine 是 PDP 接口：默认实现为 RBAC + 动作审批，后续可替换为外部策略服务。
 type Engine interface {
 	Check(ctx context.Context, req Request) (Decision, error)
 }
@@ -89,12 +91,14 @@ type ErrNeedApproval struct{ Reason string }
 
 func (e *ErrNeedApproval) Error() string { return "需要审批：" + e.Reason }
 
-// RBACEngine 是默认策略引擎，规则按风险等级递进：
+// RBACEngine 是默认策略引擎。规则只有三条：
 //
-//	L1 只读无副作用 → 放行（仍需空间成员身份）
-//	L2 只读有成本   → 必须有显式绑定
-//	L3 写操作       → 绑定 + constraints.allow_write，否则转审批
-//	L4 高敏感       → 一律审批
+//  1. 非空间成员 → 拒绝（唯一硬拦）
+//  2. 空间内写（workspace / shared）且只有 view → 拒绝
+//  3. 命中审批动作 → 转审批；其余一律放行，只带风险等级供高亮
+//
+// fs 写不做审批：写入范围被工具锁死在当前空间，删错了也有回收站与审计；
+// 出网写与命中名单的命令才需要人看一眼。
 type RBACEngine struct{}
 
 var _ Engine = RBACEngine{}
@@ -110,40 +114,20 @@ func (RBACEngine) Check(_ context.Context, req Request) (Decision, error) {
 		return deny(fmt.Sprintf("不是空间成员，无法使用工具 %s", req.Tool))
 	}
 
-	constraints := req.Binding
-	if constraints.MaxRows <= 0 {
-		constraints.MaxRows = 200
-	}
-	if constraints.MaxBytes <= 0 {
-		constraints.MaxBytes = 32 * 1024
+	// 空间内写仍然按空间权限判定：view 成员不能借「不审批」把文件改掉。
+	if req.Risk >= RiskWrite &&
+		(req.SideEffects == SideEffectsWorkspace || req.SideEffects == SideEffectsShared) &&
+		req.SpacePerm != "write" && req.SpacePerm != "manage" {
+		return deny(fmt.Sprintf("你在该空间没有写权限，无法执行 %s", req.Tool))
 	}
 
-	switch {
-	case req.Risk >= RiskSensitive:
-		return Decision{NeedApproval: true, Reason: "高敏工具需审批", Constraints: constraints}, nil
-	case req.Risk >= RiskWrite:
-		// 工作区 / 共享区写入：范围已由工具限制死（前者当前空间根，后者固定前缀），
-		// 因此由空间权限直接决定，不再逐次要求绑定与人工审批。
-		if req.SideEffects == SideEffectsWorkspace || req.SideEffects == SideEffectsShared {
-			if req.SpacePerm == "write" || req.SpacePerm == "manage" {
-				reason := "空间工作区写入"
-				if req.SideEffects == SideEffectsShared {
-					reason = "共享知识区写入"
-				}
-				return Decision{Allow: true, Reason: reason, Constraints: constraints}, nil
-			}
-			return deny(fmt.Sprintf("你在该空间没有写权限，无法执行 %s", req.Tool))
+	if req.Approval != nil {
+		reason := req.Approval.Reason
+		if reason == "" {
+			reason = "该操作需要人工确认"
 		}
-		if !req.HasBind || !constraints.AllowWrite {
-			return Decision{NeedApproval: true, Reason: "写操作未授权", Constraints: constraints}, nil
-		}
-		return Decision{Allow: true, Reason: "写操作已授权", Constraints: constraints}, nil
-	case req.Risk >= RiskReadCost:
-		if !req.HasBind {
-			return deny(fmt.Sprintf("工具 %s 涉及数据范围，需要管理员绑定后才能使用", req.Tool))
-		}
-		return Decision{Allow: true, Reason: "只读能力已绑定", Constraints: constraints}, nil
-	default:
-		return Decision{Allow: true, Reason: "只读无副作用", Constraints: constraints}, nil
+		return Decision{NeedApproval: true, Reason: reason, Action: req.Approval, Risk: req.Risk}, nil
 	}
+
+	return Decision{Allow: true, Reason: "放行", Risk: req.Risk}, nil
 }

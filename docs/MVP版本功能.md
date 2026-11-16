@@ -49,7 +49,7 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 | 19 | **存储策略已定**：MVP 用本地 FS（不引 HDFS），统一走 `Storage` 接口；元数据始终在 PostgreSQL | §4.3 |
 | 21 | **组件生成是一个可升级的 Skill**，不是硬编码流水线；MVP 后在产品内持续优化 | FR-7、FR-8 |
 | 22 | **组件来源封闭 + 零 iframe**：只接受平台生成组件，声明式 DSL 由宿主渲染，数据源白名单取数 | FR-7 |
-| 20 | 补充并行提示：本 PRD 与技术方案的术语对齐（Capability / Tool / Resource / Binding） | §4.5 |
+| 20 | 补充并行提示：本 PRD 与技术方案的术语对齐（Capability / Tool / Plugin） | §4.5 |
 
 ---
 
@@ -240,14 +240,14 @@ MVP 实现 `localFS`（根目录可配 `STORAGE_ROOT`），后续加 `hdfs`、`s
 目录布局（`key` 前缀，与存储实现无关）：
 
 ```
-autoagent/                                 # 存储根
-├── spaces/{space_id}/                     # 空间物理目录用 ID，改名不影响路径
-│   ├── files/                             # 用户与 Agent 的文件区
-│   │   ├── 实验数据/                       # 「新建目录」直接落在这里，fs 中可见、名字即目录名
-│   │   └── 报表.xlsx                       # 文件
-│   └── resources/{resource_id}/{version}/ # 资源定义快照与产物
-├── public/{resource_id}/{version}/        # 公共资源产物（只读）
-└── trash/{ts}/{space_id}/                 # 回收站：只放被删除的空间目录
+autoagent/                                  # 存储根
+├── spaces/{space_id}/                      # 空间物理目录用 ID，改名不影响路径
+│   ├── files/                              # 用户与 Agent 的文件区
+│   │   ├── plugins/{slug}/                 # 插件草稿 / 安装副本
+│   │   ├── 实验数据/                        # 「新建目录」直接落在这里，fs 中可见、名字即目录名
+│   │   └── 报表.xlsx                        # 文件
+├── published/{kind}/{slug}/{version}/      # 发布件（只读、不可变）
+└── trash/{ts}/{space_id}/                  # 回收站：只放被删除的空间目录
 ```
 
 注意：`files/` 下的目录是**真实的 fs 目录**，可以在存储根目录直接看到、直接用系统工具操作；与 `space` 表中的空间不是一回事。技能目录额外包含隐藏文件 `.meta.json`（`type: "skill"`），普通目录没有。
@@ -257,28 +257,25 @@ autoagent/                                 # 存储根
 1. `key` 一律用正斜杠、禁止 `..` 与绝对路径，由 `localFS` 做路径规范化与越界校验，防止目录穿越。
 2. 单机多副本部署时本地 FS 不共享 → MVP 限定**单实例或共享卷（NFS/PVC）部署**；需要多副本时切对象存储，这是部署期必须触发切换的条件之一。
 
-### 4.4 资源模型
+### 4.4 插件模型
 
-资源类型（MVP 五类）：
+平台没有「资源」：数据库、MCP 服务、目录都不再抽象成可授权对象，也不再有自己的版本与公共区。所有可复用件统一成插件，六类 `kind`：
 
-| type | 说明 | 版本化对象 |
+| kind | 说明 | 版本化对象 |
 | --- | --- | --- |
-| `db` | 数据库资源（host/port/db/user/密码） | 连接配置 |
-| `mcp` | MCP 服务（名称/端口/路径/传输方式/认证） | 服务注册配置 |
-| `tool` | 工具（名称/类型/描述/参数 Schema/实现引用） | 工具定义 + 产物 |
-| `ui_component` | 前端组件（名称/描述/props/依赖数据源/构建产物） | 组件包 + manifest |
-| `llm_wiki` | 知识库（文档集、切片策略、向量配置） | 配置 + 索引版本 |
+| `skill` | 指令包（`SKILL.md` + 参考文件） | 文件快照 |
+| `tool` | 工具（清单 + 入口脚本 + `evals.json`） | 清单 + 脚本 |
+| `mcp` | MCP 服务（清单里的 `transport` + 工具列表） | 清单 |
+| `component` | 前端组件（`ui.json` 声明式 DSL） | 清单 + DSL |
+| `agent` | 智能体（`AGENT.md` 提示词 + 继承关系） | 清单 + 提示词 |
+| `source` | 搜索源（`search.json` 或 plan/map 脚本） | 清单 + 脚本 |
 
-> 目录不是资源（对照 §4.2）：它只是空间文件区里的 fs 目录，不参与版本化、不单独授权、不出现在公共资源区。
+生命周期：草稿（`files/plugins/<slug>/`，可编辑）→ 发布（系统管理员，`published/{kind}/{slug}/{version}/` 不可变快照）→ 安装到目标空间（写 `plugins/<slug>/` 只读副本）→ 启用。**安装/启用就是授权**，没有 `tool_binding`、没有 `resource_grant`。
 
-**版本与回滚的准确语义（补充澄清）**：
-
-- 版本化的是**资源定义（配置）与制品**，每个版本不可变、可 diff、可回滚。
-- **回滚不会、也无法回滚外部系统里的数据**。例如数据库资源回滚只是把连接配置恢复到旧版本，不会回滚业务表数据。
-- 回滚为**新建一个指向旧版本内容的新版本**（不破坏历史链路），生效后通知引用方。
-- LLM Wiki 的“索引版本”回滚较特殊：MVP 仅支持回滚配置，索引需重新构建（明确提示耗时）。
-
-资源状态机：`draft → published → deprecated`；`private`（空间内）与 `public`（公共区）两种归属。
+- 版本化的是**清单与文件内容**，每个版本不可变；回滚等于重新发布旧内容为新版本。
+- **发布不改动外部系统里的数据**：清单里的连接配置只是一段声明，改版本不会回滚远端库表。
+- 系统空间安装 = 全局可用；普通空间安装只对该空间生效。
+- 撤销 = 停用（`plugin_install.status=disabled`，四条读取路径同时生效）或卸载；审计永久保留。
 
 ### 4.5 术语对齐
 
@@ -286,10 +283,9 @@ autoagent/                                 # 存储根
 
 | PRD | 技术方案 |
 | --- | --- |
-| 资源（db/mcp/tool/ui_component/llm_wiki） | `Resource`（kind 对应） |
-| 资源被 Agent 使用 | `ToolBinding`（工具 × 资源 × 凭证 × 授权） |
-| Skill（创建数据库资源 Skill 等） | `Skill` |
-| 公共资源 | `Resource.visibility = public` + 发布审核 |
+| 技能 / 工具 / MCP / 组件 / 智能体 / 搜索源 | `Plugin`（`kind` 对应） |
+| 插件被 Agent 使用 | 插件安装/启用 → 工具进 `Tool.Registry`（无绑定层） |
+| 公共可见 | 系统空间安装（全局）或发布件对其他空间可见 |
 | 会话 | `session` / `run` |
 
 ---
@@ -335,46 +331,49 @@ autoagent/                                 # 存储根
 | 项 | 内容 |
 | --- | --- |
 | 会话列表 | 位于空间内，按所属目录展示在左侧树中；支持新建（空间根或指定目录）、重命名、删除、置顶；显示最后一条消息摘要与时间 |
-| 新建会话 | 选 Agent 模板（MVP 提供默认 Agent + 资源创建类 Skill 的 Agent）；创建后进入对话页 |
+| 新建会话 | 选智能体（MVP 提供 `base` 默认智能体 + 插件开发类智能体）；创建后进入对话页 |
 | 对话页布局 | 左会话列表 → 中消息流 → 右详情面板（默认显示“本次运行的调用详情”，可收起） |
 | 消息渲染 | Markdown + 代码高亮 + 表格；**思考过程**与正文分离呈现（可折叠，默认折叠/展开可配）；**工具调用卡片**：工具名 + 参数摘要 + 状态（执行中/成功/失败）+ 耗时 + 结果摘要（可展开，超长结果给“查看完整结果”）；错误用可读文案 + trace_id |
 | 流式 | 首 token 尽快出现；生成中可「停止」；断线自动重连并补齐已生成内容 |
 | 操作 | 停止、重新生成、复制、编辑用户消息后重发、删除消息、导出会话（Markdown） |
-| 高危确认（补充） | Agent 要执行写操作（写文件、创建/删除资源、执行写 SQL）时，消息流中出现确认卡片，用户点「确认执行」才继续；超时 5 分钟视为取消 |
+| 高危确认（补充） | 只有 Agent 出网写（非 GET/HEAD）或执行命中名单的命令时，工具卡片内出现确认条：本次同意 / 本轮都同意 / 本次拒绝 / 本轮都拒绝；「本轮」仅对当前一次执行有效，下一轮重新确认，超时 5 分钟按拒绝 |
 | 文件交互 | 当前实现：输入框可上传文件到当前空间 `files/`（会话挂在目录下时落在该目录），并可从当前空间文件里勾选引用；引用清单作为用户消息的一部分落库，Agent 先 `file_read` 再作答。未实现：独立附件目录 `attachments/{session_id}/`、拖拽上传、下载入口与大文件断点续传 |
 | 验收 | ① 场景 1–4 的对话过程能完整呈现思考、工具调用与结果；② 停止生成后状态正确、可继续对话；③ 未确认的高危操作不会被执行；④ 刷新页面后消息与工具卡片完整还原 |
 
-### FR-5 资源管理
+### FR-5 插件管理
 
 | 项 | 内容 |
 | --- | --- |
-| 创建方式 | ① 对话创建（Skill 询问参数后创建）② 页面表单创建。两者写入同一资源模型 |
-| 列表 | 空间内资源列表（按类型分组/筛选）；显示类型、名称、状态、版本、创建人、被引用次数 |
-| 详情 | 基本配置、连接测试（db/mcp 必做，tool/组件做可用性校验）、版本历史（列表 + diff + 回滚 + 发布）、授权成员、被引用位置、删除 |
-| 编辑 | 修改配置生成**新草稿版本**，需「发布」才对使用者生效；发布前必须通过连接测试 |
-| 删除 | 被 Agent / 组件 / 公共区引用时**禁止删除**，列出引用方并提供“先解除引用”指引 |
+| 创建方式 | ① 对话创建（`builtin_plugin_dev` 追问参数后产出 `plugin.json` + 入口文件）② 文件树里直接编辑草稿。两者都是 `files/plugins/<slug>/` 下的同一份草稿 |
+| 列表 | 空间内插件列表（按 kind 分组/筛选）；显示类型、名称、状态（草稿 / 已安装 / 已停用）、版本、创建人、权限清单 |
+| 试运行 | `plugin_try` 在沙箱里真实跑一次（脚本 / MCP / 搜索源同一入口），回执里的 `top_keys` 提示 `items` 路径怎么写 |
+| 发布 | 系统管理员把草稿发布为不可变快照（`published/{kind}/{slug}/{version}/`）；`kind=tool` / `kind=agent` 发布前跑 `evals.json` 断言 |
+| 安装 | 空间管理员安装到本空间（写 `plugins/<slug>/` 只读副本），**安装即授权**；系统空间安装 = 全局可用 |
+| 启停 | 空间管理员启用/停用；停用在四条读取路径上都生效（加载快照、检索合并、内置工具注册、搜索源注册） |
+| 审批设置 | 插件卡片可改「需确认命令」（仅 `shell.exec`）；出网非 GET/HEAD 固定确认，fs 写与空间内删除不确认 |
+| 卸载 | 只移除本空间的安装与工具注册，不删审计，不动发布件 |
 | 文件 | 空间内支持新建文件夹、上传、下载、重命名、移动、删除、在线预览（文本/图片）；单文件上限 100MB |
-| 验收 | ① 创建资源后自动出现在所在空间列表并可在会话中被 Agent 使用；② 连接测试失败时给出可读的失败原因（DNS/认证/超时区分）；③ 回滚后使用者拿到的是旧版本配置且历史版本仍可查；④ 被引用资源的删除被正确拦截 |
+| 验收 | ① 未安装的插件工具不出现在会话工具列表；② 安装后立即可用，不需要第二次授权；③ 停用后检索与调用同时失效；④ 卸载后审计仍可查 |
 
 **当前实现（阶段简化，2026-11）**
 
 | 项 | 已实现 | 未实现 |
 | --- | --- | --- |
-| 发布 | 只有插件一条发布链路：空间草稿启用后进市场「待发布」，系统管理员发布为不可变快照（`published/{kind}/{slug}/{version}/`），其他空间安装后才可用；旧的「资源发布」（`resource` 表 + `/resources` 接口 + 发布记录页）已下线 | 连接测试、回滚、发布审核、按空间定向发布 |
-| 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述与文件数/体积 | 版本级启停 |
-| 权限 | 发布仅系统管理员；安装 / 启停 / 卸载 / 安装级配置由空间管理员在目标空间执行，卸载不删审计 | 资源管理角色表 |
+| 发布 | 只有插件一条发布链路：空间草稿启用后进市场「待发布」，系统管理员发布为不可变快照，其他空间安装后才可用 | 回滚、按空间定向发布 |
+| 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述、权限与文件数/体积 | 版本级启停 |
+| 权限 | 发布仅系统管理员；安装 / 启停 / 卸载 / 安装级配置由空间管理员在目标空间执行，卸载不删审计 | 草稿创建者独立启停权（需先给草稿落作者记录） |
 | Agent 侧 | 未安装的发布件不进检索池；`plugin_search` 只返回已安装插件与空间草稿，`plugin_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
 
-### FR-6 公共资源
+### FR-6 插件市场
 
 | 项 | 内容 |
 | --- | --- |
-| 页面 | 独立页面，展示当前用户**有权限**的全部公共资源（数据库、MCP、工具、UI 组件），支持类型筛选与搜索 |
-| 使用 | 任何空间的会话均可使用被授权的公共资源；无权限时展示申请入口 |
-| 发布 | 资源所有者提交「发布到公共区」→ 填写说明与可见范围 → 平台管理员审核 → 发布；发布产生公共版本号 |
-| 版本 | 公共资源有独立版本与发布历史，支持回滚；回滚需给出“影响 N 个引用方”的提示 |
-| 下架 | 管理员或所有者可下架；下架不等于删除，已引用方按策略降级（MVP：立即不可用 + 通知引用方） |
-| 验收 | ① 无权限用户看不到未公开的公共资源；② 发布后其他空间会话能立即使用；③ 回滚后引用方拿到旧版本，且发布历史完整可追溯 |
+| 页面 | 独立页面，列出「组织内待发布 / 已发布」「平台内置」「外部内部可见」三类；支持 kind 筛选（技能 / 工具 / MCP / 组件 / 智能体 / 搜索源） |
+| 元数据 | 名称、版本、描述、权限清单（文件 / 网络 / 凭证 / 命令 / 远端工具）、体积与文件数；不暴露 MCP 原始配置、脚本内容、DB 配置 |
+| 发布权 | 只有系统管理员能发布（发布 = 不可变快照）；空间管理员启用本地草稿后，市场出现「待发布」元数据 |
+| 安装 | 由目标空间的管理员在自己的空间安装，安装后出现在空间插件页 |
+| 平台内置 | 以系统空间安装的形式存在，其他空间无需安装即可用，市场里不提供安装按钮 |
+| 验收 | ① 未安装用户只看到元数据，看不到内容；② 系统空间安装件在所有空间可用；③ 新版发布后已安装空间可升级，旧版本仍可读 |
 
 ### FR-7 前端组件加载服务与消息内渲染
 
@@ -467,10 +466,8 @@ autoagent/                                 # 存储根
 | `space` | id, name, type(personal/shared), parent_id, path, owner_id, is_system_reserved, depth, status, deleted_at |
 | `space_member` | space_id, user_id, perm(view/read/write/manage), source(manual/approved), expire_at, granted_by |
 | `permission_request` | id, space_id, object_type, object_id, applicant_id, requested_perm, reason, status, approver_id, expire_at |
-| `resource` | id, space_id, type(db/mcp/tool/ui_component/llm_wiki/dir), name, spec(jsonb), scope(private/public), current_version, status, created_by |
-| `resource_version` | id, resource_id, version, spec(jsonb), artifact_ref, changelog, status(draft/published/deprecated), published_at, published_by |
-| `resource_grant` | resource_id, subject_type(user/space), subject_id, actions[], expire_at |
-| `publish_request` | id, resource_id, version, scope(public), status, reviewer_id, comment |
+| `plugin` / `plugin_version` / `plugin_install` | 插件定义（slug, kind, origin, status）/ 不可变版本（manifest, artifact_path, sha256）/ 空间安装（space_id, version, status） |
+| `plugin_candidate` | 空间草稿的启用状态与作者（space_id, slug, status, author_id） |
 | `session` | id, space_id, title, agent_id, created_by, last_message_at, status |
 | `message` | id, session_id, seq, role, content(jsonb), thinking(jsonb), component_refs(jsonb), created_at |
 | `run` / `run_step` / `tool_call` | 与 `docs/技术方案.md` §6 一致 |
@@ -487,10 +484,10 @@ autoagent/                                 # 存储根
 | 空间 | `GET/POST /spaces`、`GET/PATCH/DELETE /spaces/{id}`、`GET /spaces/{id}/tree`、`POST /spaces/{id}/members`、`PATCH/DELETE /spaces/{id}/members/{userId}` |
 | 权限申请 | `POST /permission-requests`、`GET /permission-requests?role=applicant\|approver`、`POST /permission-requests/{id}/decision` |
 | 文件 | 已实现：`GET /spaces/files`（清单）、`GET /spaces/{id}/file?path=`（正文）、`POST /spaces/{id}/files`（上传，multipart + `dir`）。待实现：`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
-| 公共资源 | `GET /public-resources`、`POST /publish-requests`、`POST /publish-requests/{id}/decision` |
-| 组件 | `GET /plugins`、`GET /spaces/{id}/plugins/{slug}`、`POST .../plugins/{slug}/dry-run|publish|install`、`GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
+| 插件 | `GET /spaces/{id}/plugins`、`GET\|POST .../{slug}/dry-run\|publish\|install\|uninstall\|enable\|disable`、`GET /plugins`（市场）、`GET\|PUT .../{slug}/config`、`POST .../{slug}/try` |
+| 组件 | `GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
 | 会话 | `GET/POST /sessions`、`PATCH/DELETE /sessions/{id}`、`GET /sessions/{id}/messages` |
-| 运行 | `POST /sessions/{id}/runs`、`GET /runs/{id}/stream`(SSE)、`POST /runs/{id}/cancel`、`POST /runs/{id}/confirm`（高危确认） |
+| 运行 | `POST /sessions/{id}/runs`、`GET /runs/{id}/stream`(SSE)、`POST /runs/{id}/cancel`、`GET /sessions/{id}/approvals`（补回待办）、`POST /sessions/{id}/approvals/{aid}`（审批决策；执行体已中断时返回 202 并从断点续跑） |
 | 搜索 | `GET /search?q=&scope=space\|session` |
 
 ---
@@ -541,10 +538,10 @@ autoagent/                                 # 存储根
 | 登录 | `/login` | 仅钉钉登录入口 |
 | 工作台 | `/` | 我的空间、最近会话、待我审批 |
 | 会话 | `/chat`、`/chat/:sessionId` | 三栏：会话列表 / 消息流 / 运行详情 |
-| 空间详情 | `/spaces/:id` | 文件树 + 资源列表 + 成员 |
-| 公共资源 | `/public-resources` | 类型筛选 + 搜索 + 申请/使用 |
+| 空间详情 | `/spaces/:id` | 文件树 + 插件列表 + 成员 |
+| 插件市场 | `/plugins` | kind 筛选 + 搜索 + 安装；系统管理员可发布 |
 | 权限申请 | `/requests` | 待我审批 / 我发起的 |
-| 组件管理 | `/components` | 列表、manifest 编辑、构建、发布 |
+| 组件 | 会话内渲染 | `ui` 块由 `UiView` 渲染，无独立管理页 |
 
 ---
 

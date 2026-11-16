@@ -98,6 +98,29 @@ export type MessageRole = 'user' | 'assistant' | 'system';
 /** 工具调用结局：与后端 tool.InvokeStatus 一致 */
 export type ToolStatus = 'running' | 'ok' | 'denied' | 'approval' | 'error';
 
+/** 一次待确认的工具调用（approval.req） */
+export interface ApprovalInfo {
+  id: string;
+  sessionId: string;
+  kind: string;
+  detail: string;
+  reason: string;
+  risk: number;
+  timeoutS: number;
+}
+
+/** 服务端还没处理的确认（GET /sessions/{id}/approvals） */
+export interface PendingApproval {
+  approval_id: string;
+  call_id: string;
+  tool: string;
+  kind: string;
+  detail: string;
+  reason: string;
+  risk: number;
+  timeout_s: number;
+}
+
 /** 一次工具调用的完整状态 */
 export interface ToolCallRecord {
   id: string;
@@ -106,6 +129,8 @@ export interface ToolCallRecord {
   result?: string;
   status: ToolStatus;
   duration_ms?: number;
+  /** 命中审批规则时挂在卡片上，用户点按钮后由 tool.result 更新结局 */
+  approval?: ApprovalInfo;
 }
 
 /** 消息里的结构化执行轨迹 */
@@ -410,7 +435,7 @@ export interface PluginCatalogResponse {
 export interface PluginConfigField {
   key: string;
   label: string;
-  type: 'text' | 'url';
+  type: 'text' | 'url' | 'list';
   required: boolean;
   placeholder?: string;
   help?: string;

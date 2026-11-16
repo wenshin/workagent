@@ -65,6 +65,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/resume", h.resumeInfo)
 	mux.HandleFunc("POST /sessions/{id}/resume", h.resume)
 
+	// 审批：列表用于刷新后补回待办，POST 用于回传决策
+	mux.HandleFunc("GET /sessions/{id}/approvals", h.listApprovals)
+	mux.HandleFunc("POST /sessions/{id}/approvals/{aid}", h.decideApproval)
+
 	// 任务派发：列表、取消、催办（§15.12.4）
 	mux.HandleFunc("GET /sessions/{id}/tasks", h.listTasks)
 	mux.HandleFunc("POST /tasks/{id}/cancel", h.cancelTask)
@@ -75,6 +79,47 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /sessions/{id}/share", h.listShares)
 	mux.HandleFunc("DELETE /sessions/{id}/share/{shareID}", h.revokeShare)
 	mux.HandleFunc("GET /share/{token}", h.viewShared)
+}
+
+// listApprovals 返回会话里还没处理的确认。
+//
+// 前端刷新或换标签页后靠它把审批卡片补回来：approval.req 事件虽然也落 run_step，
+// 但重放只覆盖「请求发生过」，已被别人处理掉的那条不该再显示按钮。
+func (h *Handler) listApprovals(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	list, err := h.svc.PendingApprovals(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"approvals": list})
+}
+
+// decideApproval 收下审批决策：decision 为 approve / deny，scope 为 once / turn。
+// 「turn」只覆盖当前这一轮，下一轮对话会重新弹窗。
+func (h *Handler) decideApproval(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Decision string `json:"decision"`
+		Scope    string `json:"scope"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&in); err != nil {
+		h.writeErr(w, r, errors.New("请求体不合法"))
+		return
+	}
+	err := h.svc.ResolveApproval(r.Context(), user.ID,
+		r.PathValue("id"), r.PathValue("aid"), in.Decision, in.Scope)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type sessionDTO struct {
@@ -929,6 +974,15 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusConflict, "last_session", err.Error())
 	case errors.Is(err, ErrRunFinished):
 		platform.WriteError(w, r, http.StatusConflict, "run_finished", err.Error())
+	case errors.Is(err, ErrApprovalGone):
+		platform.WriteError(w, r, http.StatusConflict, "approval_gone", err.Error())
+	case errors.Is(err, ErrApprovalResumed):
+		// 202 而不是错误：决策已经被接受，只是这一轮需要从断点接着跑。
+		// 前端拿到它应当提示「正在继续」，并重新挂一次流。
+		platform.WriteJSON(w, http.StatusAccepted, map[string]any{
+			"resumed": true,
+			"message": err.Error(),
+		})
 	case errors.Is(err, ErrAgentUnavailable):
 		platform.WriteError(w, r, http.StatusServiceUnavailable, "agent_unavailable", err.Error())
 	case errors.Is(err, space.ErrDirNotFound):

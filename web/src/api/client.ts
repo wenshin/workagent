@@ -1,6 +1,7 @@
 import type {
   ActiveRunResponse,
   ChatMessage,
+  PendingApproval,
   SessionShare,
   SessionTask,
   SharesResponse,
@@ -66,6 +67,12 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
     throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
   }
 
+  // 204/205 是「成功但没有正文」：插件启停、删除一类接口都这么回，响应里既没有
+  // body 也没有 content-type，不能当成反代返回了静态页。
+  if (res.status === 204 || res.status === 205) {
+    return null as T;
+  }
+
   const contentType = res.headers.get('content-type') ?? '';
   const isJSON = contentType.includes('application/json');
   const data: unknown = isJSON ? await res.json().catch(() => ({})) : null;
@@ -103,6 +110,31 @@ export async function cancelSessionRun(sessionId: string): Promise<void> {
   await api<{ session_id: string; status: string }>(`/sessions/${sessionId}/cancel`, {
     method: 'POST',
   });
+}
+
+/** 会话里还没处理的确认：刷新后补卡片，已处理掉的不再显示按钮。 */
+export async function listPendingApprovals(sessionId: string): Promise<PendingApproval[]> {
+  const res = await api<{ approvals: PendingApproval[] }>(`/sessions/${sessionId}/approvals`);
+  return res.approvals ?? [];
+}
+
+/**
+ * 回一次审批。
+ *
+ * scope=turn 表示「本轮内同类动作都照这个结论」，run 结束即失效——下一轮重新确认。
+ */
+export async function decideApproval(
+  sessionId: string,
+  approvalId: string,
+  decision: 'approve' | 'deny',
+  scope: 'once' | 'turn',
+): Promise<{ resumed: boolean }> {
+  const res = await api<{ resumed?: boolean }>(`/sessions/${sessionId}/approvals/${approvalId}`, {
+    method: 'POST',
+    body: { decision, scope },
+  });
+  // 202 = 决策已落库，但当时没有执行体在等（这一轮中断过），服务端正在从断点续跑
+  return { resumed: Boolean(res?.resumed) };
 }
 
 /** 刷新后的第一问：这个会话有没有在跑的 run，有就续流。 */

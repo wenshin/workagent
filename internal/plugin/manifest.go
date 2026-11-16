@@ -433,6 +433,22 @@ func Parse(raw []byte, publishing bool) (Manifest, error) {
 	return m, nil
 }
 
+// WritesRemote 判断清单是否声明了非只读的出网动词。
+//
+// 网关联调时平台无法区分「写 PG 的库」和「删远端资源」，所以只要不是 GET/HEAD
+// 就按需要确认处理；这条与该插件其余 fs 写的默认（不审批）是分开的。
+func (m Manifest) WritesRemote() bool {
+	_, verbs, _ := m.HostAllow()
+	for v := range verbs {
+		switch v {
+		case "GET", "HEAD":
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // HostAllow 把能力清单翻译成三张表：
 //   - allow：脚本能调的宿主 RPC（只有 log 与 secret.get）；
 //   - verbs：出网代理放行的 HTTP 动词；
@@ -1174,7 +1190,7 @@ func validateHost(raw string) error {
 // Derive 由能力清单推导风险等级与副作用范围。
 //
 // 作者不能声明 risk：否则写一句 "risk": 1 就白拿了所有权限，
-// 和 tool_binding 里「不能自己降级」是同一个坑。
+// 自报风险永远不可信，只能从能力声明推导。
 func Derive(m Manifest) (int, string) {
 	// 平台内置工具没有脚本、也没有清单可推导的副作用：
 	// 它们的风险来自 Go 侧实现（tool.Manifest.Risk / SideEffects），

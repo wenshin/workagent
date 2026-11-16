@@ -35,7 +35,7 @@
         2. Management Service，MCP 注册、发现等功能
     3. Config Service
         1. 支持二次开发自定义实现
-    4. Resource Service
+    4. Plugin Service（插件清单、发布、按空间安装 / 启停）
     5. Tool Mangement
         1. 工具接口（Computer、CLI、Browser Use）
         2. 自定义工具
@@ -45,18 +45,22 @@
 
 # 权限管理
 1. 实现组织架构管理
-1. 实现 RBAC 权限管理，主要为资源管理使用
+1. 实现 RBAC 权限管理，用于空间访问与插件管理权：安装 / 卸载 / 启用 / 停用只认空间 `manage`，发布只认系统管理员
 2. 一套发起审批流程的接口，默认实现为 AI 给对应用户发送审批信息，并回收回复完成审批
 
-# 资源管理
-1. 什么是资源？数据库、MCP服务、文件目录或者文件都可以作为一个资源
-2. 每个资源可以配置对应的访问工具（工具参数）
-3. 每个资源可以配置多个授权账号和角色
+# 工具与插件授权
+1. 平台已经没有「资源」模型：数据库、MCP 服务、文件目录都不再抽象成可授权的 Resource，也没有 ResourceGrant / ToolBinding
+2. 授权只有一条路径——**插件安装（本地插件是启用）**：工具能出现在列表里，就说明所属插件已装好，不再有第二处授权记录
+3. 数据范围与鉴权在工具实现上：MCP 由远端 server 自己的凭证与 JWT 决定，脚本/内置工具在沙箱里按清单声明的 `fs` 与出网白名单执行
+4. 风险等级只用于展示，不决定是否审批：只有「出网非只读」与「命中需确认命令名单的 shell 命令」两类动作弹确认；fs 写与空间内删除直接放行（仍校验空间写权限）。「本轮都同意」只对当前一次 run 有效，下一轮重新确认，超时按拒绝
+5. 审批记录落 `approval` 表（`0029`，`pending → approved / denied / expired`）：会话刷新按 `session_id` 补待办，`scope=turn` 的结论按 `run_id + action_key` 复用，`args_hash` 用于续跑时认「同一次调用」；进程内只保留唤醒用的 channel（另每 2s 轮询库兜底，跨实例决策靠它送达），run 结束统一 `ExpireRunApprovals`
+6. 审批等待是可恢复状态：等待期间 run 落 `waiting_approval` 并每 30s 续心跳（等人不是卡住）；进程没了由清扫收 `failed`，审批行留到过期。用户点批准 → 先试唤醒，没有执行体就问心跳，确认已死则 `Resume` 从断点续跑（HTTP `202`）
+7. Checkpoint 三条硬约束（`run_resume` + `RunInput.Checkpoint`）：批次发出 `tool_calls` 时先写快照（带 `pending`），每拿到一条回执再写一次；续跑先把 `pending` 补齐再问模型；已完成的调用靠 `tool_call.result` + `ArgsHash` 回放入 `Env.Replay`，副作用不重来。断点 7 天过期（`PurgeStaleResumes`）
 
 # 工具设计
-1. 通用能力接口，是对通用能力抽象的接口，如 LLM wiki、Mysql、Redis、ES、Computer、FS、权限、资源 等
-2. 工具是能力接口的具体实现，一个能力接口可以实现多个工具，一个工具可以配置多个资源，每个资源可以配置授权账号
-3. 自定义工具，通过对话可以直接开发工具、安装工具、发布工具（其他同事可见，需要管理员审核）
+1. 通用能力接口，是对通用能力抽象的接口，如 LLM wiki、Mysql、Redis、ES、Computer、FS、权限 等
+2. 工具是能力接口的具体实现，一个能力接口可以实现多个工具；工具打包成插件，按空间安装后对该空间可见
+3. 自定义工具，通过对话可以直接开发工具、启用工具、发布工具（系统管理员发布，其他同事可见）
 
 # 关于 UI 客户端实现
 1. 统一的 UI 设计规范
@@ -135,8 +139,8 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：`extends: "base"` 表示继承它；平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。
 - **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
 - **平台部署事实进提示词，不做成工具**：租户（企业）名称、IM 接入、当前用户与空间由 `session` 层填入 `RunInput.Platform`，`BuildSystemMessage` 渲染成 `## 平台（部署事实）`。理由：这些信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具会顺着猜而不调用；工具 schema 还会每轮常驻。新增同类事实（版本号、配额）优先走这里，只有「量大 / 需按权限裁剪 / 需审计」的才考虑工具。
-- 智能体是行为设定，**不是权限**：可见工具仍由 `tool_binding` + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
-- **内置工具视为已绑定**：`tool_binding` 只用于给资源型工具（数据库 / MCP / 自定义工具）授权数据范围；内置件随发版走、没有按空间配置的入口，按已绑定处理（`internal/tool.applyBindings`）。豁免只放开「有没有绑定」：L2 放行，L3 仍需 `allow_write`（否则审批），L4 一律审批。`plugin_try` 是 L2，之前没有这条豁免对所有空间都判「需要管理员绑定」。
+- 智能体是行为设定，**不是权限**：可见工具由插件安装/启用 + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
+- **没有工具绑定**：`tool_binding` 表与 `Tool.HasBinding` 已删除（`0028_drop_tool_binding.sql`）。授权动作就是安装/启用插件（MCP 是注册），策略只做成员校验 + 空间写权限校验 + 命中审批动作时阻塞等确认。
 - 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
 
 # 通用搜索与凭证

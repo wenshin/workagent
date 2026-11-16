@@ -36,6 +36,7 @@ import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '..
 import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
 import MCPAppsDialog from '../components/MCPAppsDialog';
+import NewSessionDialog, { type NewSessionState } from '../components/NewSessionDialog';
 import PluginCatalogPanel, { PLUGIN_CATEGORY_LABEL } from '../components/PluginCatalogPanel';
 import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
@@ -75,6 +76,8 @@ export default function WorkspacePage() {
   const liveRun = useSyncExternalStore(subscribeLiveRun, getLiveRun);
 
   const createSession = useCreateSession();
+  // 新建会话统一走弹窗：树右键与空间面板都要能选智能体
+  const [newSession, setNewSession] = useState<NewSessionState | null>(null);
   const deleteSession = useDeleteSession();
   const setSessionSkill = useSetSessionSkill();
   const uploadFiles = useUploadFiles();
@@ -162,12 +165,14 @@ export default function WorkspacePage() {
   );
 
   const addSession = useCallback(
-    async (spaceId: string, dir?: string, agentId?: string) => {
+    async (spaceId: string, dir?: string, agentId?: string, title?: string) => {
       try {
-        const res = await createSession.mutateAsync({ spaceId, dir, agentId });
+        const res = await createSession.mutateAsync({ spaceId, dir, agentId, title });
         setSearchParams({ session: res.session.id });
+        return true;
       } catch (e) {
         Toast.error(e instanceof Error ? e.message : '新建会话失败');
+        return false;
       }
     },
     [createSession, setSearchParams],
@@ -228,6 +233,15 @@ export default function WorkspacePage() {
     staleTime: 0,
     retry: false,
   });
+
+  // 探测「有没有断点」时，服务端会顺手结算中断轮残留的占位消息（把 run_step 里的
+  // 工具轨迹写回消息）。所以探到断点后再拉一次消息，用户切页回来就能看到中断前
+  // 做过什么，而不是只剩一条问题、等下一次别的刷新才补上。
+  const resumeSessionId = selectedSession?.id ?? '';
+  useEffect(() => {
+    if (!resumeInfo?.resumable || !resumeSessionId) return;
+    void queryClient.invalidateQueries({ queryKey: queryKeys.messages(resumeSessionId) });
+  }, [resumeInfo?.resumable, resumeSessionId, queryClient]);
 
   const resume = async () => {
     if (!selectedSession) return;
@@ -408,7 +422,9 @@ export default function WorkspacePage() {
                 setDialog({ kind: 'create-dir', space, parent })
               }
               onAddSkill={(space: Space) => setDialog({ kind: 'create-plugin', space })}
-              onAddSession={(space: Space, dir?: SpaceDir) => void addSession(space.id, dir?.path)}
+              onAddSession={(space: Space, dir?: SpaceDir) =>
+                setNewSession({ space, dir: dir?.path })
+              }
               onRename={(space: Space) => setDialog({ kind: 'rename', target: space })}
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
               onRenameDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'rename-dir', space, dir })}
@@ -507,7 +523,9 @@ export default function WorkspacePage() {
             sessions={spaceSessions}
             loading={sessionsLoading}
             onOpenSession={openSession}
-            onAddSession={(agentId?: string) => selectedSpace && void addSession(selectedSpace.id, undefined, agentId)}
+            onAddSession={(agentId?: string) =>
+              selectedSpace && setNewSession({ space: selectedSpace, agentId })
+            }
             onOpenPlatform={() => setPlatformOpen(true)}
             onOpenMCPApps={() => setMcpAppsOpen(true)}
           />
@@ -518,6 +536,13 @@ export default function WorkspacePage() {
         state={dialog}
         onClose={() => setDialog({ kind: 'none' })}
         onOpenSession={openSession}
+      />
+      <NewSessionDialog
+        state={newSession}
+        onClose={() => setNewSession(null)}
+        onCreate={(input) =>
+          addSession(input.spaceId, input.dir, input.agentId, input.title)
+        }
       />
       <SecretSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
       <MCPAppsDialog visible={mcpAppsOpen} onClose={() => setMcpAppsOpen(false)} />

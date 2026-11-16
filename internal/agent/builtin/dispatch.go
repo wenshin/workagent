@@ -75,10 +75,8 @@ func (a *Agent) dispatchTool(parent agent.RunInput, parentTools []tool.Tool) too
 		// 派发本身不放大权限，因此按「只读但消耗资源」处理（L2）。
 		Risk:        policy.RiskReadCost,
 		SideEffects: policy.SideEffectsReadOnly,
-		// 与内置工具同口径：派发随平台发版、没有按空间配置的入口，按已绑定处理；
-		// 真正的权限判定发生在子 Agent 的每一次工具调用上。
-		HasBinding: true,
-		Runtime:    tool.RuntimeBuiltin,
+		// 派发本身不放大权限：真正的判定发生在子 Agent 的每一次工具调用上。
+		Runtime: tool.RuntimeBuiltin,
 		Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
 			return a.runSubAgent(ctx, env, parent, parentTools, args)
 		},

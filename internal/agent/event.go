@@ -38,10 +38,15 @@ type Event struct {
 
 // ApprovalState 是一条审批请求（§5.7.5 / §7.3 approval.req）。
 type ApprovalState struct {
-	ID       string `json:"approval_id"`
-	CallID   string `json:"call_id"`
-	Tool     string `json:"tool"`
+	ID     string `json:"approval_id"`
+	CallID string `json:"call_id"`
+	Tool   string `json:"tool"`
+	// Kind 是动作类别（net.write / shell），前端据此显示图标与文案。
+	Kind string `json:"kind,omitempty"`
+	// Detail 是命令原文或入参摘要，审批卡片要让人看清「确认什么」。
+	Detail   string `json:"detail,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+	Risk     int    `json:"risk,omitempty"`
 	TimeoutS int    `json:"timeout_s"`
 }
 
@@ -158,6 +163,19 @@ type ResumeState struct {
 	TotalTokens int `json:"total_tokens"`
 	// Query 是本次执行的用户输入：续跑时工具裁剪与系统提示词仍要按它来
 	Query string `json:"query"`
+	// Pending 是已经发给模型、却还没拿到回执的工具调用。
+	//
+	// 一批调用是并行的，中断可能落在这批的中途：消息序列里 assistant 有 3 个
+	// tool_call，tool 消息只有 1 条。直接拿去问模型，它会重新规划、把做过的
+	// 副作用再做一遍；所以恢复时要先把这里补齐，再继续循环。
+	Pending []PendingCall `json:"pending,omitempty"`
+}
+
+// PendingCall 是一条等待回执的工具调用。
+type PendingCall struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Args string `json:"args"`
 }
 
 // ActiveSkill 是会话选中的技能。

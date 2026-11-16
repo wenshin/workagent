@@ -35,10 +35,9 @@ func webSearch() Tool {
   "required": ["query"],
   "additionalProperties": false
 }`),
-		// 按语义应为 RiskReadCost(L2)，但当前策略对 L2 要求显式绑定（invoker 用的是
-		// Tool.HasBinding 静态字段），而绑定管理界面还没做，挂 L2 会让所有人都用不了。
-		// 这里先按只读放行，成本控制留给后续的配额（按空间计数），出网安全已由 Guard 收口。
-		Risk:           policy.RiskReadOnly,
+		// 只读但有成本：策略对 L2 已直接放行，成本控制留给后续配额（按空间计数），
+		// 出网安全由 Guard 收口。
+		Risk:           policy.RiskReadCost,
 		SideEffects:    policy.SideEffectsReadOnly,
 		Runtime:        "builtin",
 		MaxResultBytes: 16 << 10,

@@ -51,9 +51,11 @@ func shellExec() Tool {
   "required": ["command"],
   "additionalProperties": false
 }`),
-		Risk:        policy.RiskWrite,
-		SideEffects: policy.SideEffectsWorkspace,
-		Runtime:     "builtin",
+		Risk: policy.RiskWrite,
+		// 默认只有命中名单的命令才要确认，其余命令直接跑（沙箱已限定范围）。
+		ShellApproval: DefaultApprovalCommands,
+		SideEffects:   policy.SideEffectsWorkspace,
+		Runtime:       "builtin",
 		// 命令输出（尤其是测试日志）比文件内容更长，单独放宽回填额度
 		MaxResultBytes: shellMaxResultBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {

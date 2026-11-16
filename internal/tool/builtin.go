@@ -521,16 +521,21 @@ func taskCreate() Tool {
 		Description: "把一件需要他人确认或处理的事派发出去（例如请数据负责人确认口径）。" +
 			"任务落在对方的个人空间里，他不需要是当前空间的成员，没用过平台的人也会被自动开通个人空间。" +
 			"派发后本轮会正常结束，用户仍可继续对话；对方确认结论后回执会自动回到本会话。" +
-			"注意：对方看不到本空间的文件，brief 必须自包含，需要引用的内容直接写进正文。" +
+			"对方看不到本空间的文件，background / done 里需要引用的内容必须直接写出来。" +
+			"分段填：background 说清需求与口径，done 写已经做到哪一步，checks 列出要他逐条确认的点。" +
 			"assignee 传姓名、工号或用户 id，匹配到多人时工具会报错并要求用工号指定。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "title": {"type": "string", "description": "一句话说明要对方做什么，会作为子会话标题"},
-    "brief": {"type": "string", "description": "完整说明：背景、具体问题、期望的回复形式；对方看不到本空间文件，必须自包含"},
+    "background": {"type": "string", "description": "需求背景：为什么要、口径与范围是什么；不要只重复 title"},
+    "done": {"type": "string", "description": "已经完成的实现或初步结论，可贴 SQL/代码；对方看不到本空间文件，内容要自包含"},
+    "checks": {"type": "array", "items": {"type": "string"}, "description": "需要对方逐条确认的点，1-5 条，每条一句话"},
+    "after": {"type": "string", "description": "确认后打算怎么用（例如沉淀到知识库）；不写则默认把结论带回发起方会话"},
+    "brief": {"type": "string", "description": "其它补充说明；新调用优先用 background / done / checks"},
     "assignee": {"type": "string", "description": "被派发人的姓名、工号或用户 id"}
   },
-  "required": ["title", "brief", "assignee"],
+  "required": ["title", "assignee"],
   "additionalProperties": false
 }`),
 		Risk:        policy.RiskWrite,

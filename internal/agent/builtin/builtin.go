@@ -161,9 +161,11 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		return res, fmt.Errorf("%w：续跑时轮次预算已用尽（%d 轮）", agent.ErrBudgetExceeded, maxRounds)
 	}
 
-	// checkpoint 只记「已经完成的轮次」：一轮里的模型增量没有重放价值，
-	// 工具回执才是真的进展，也是重入时必须原样带回模型的东西。
-	checkpoint := func(round int) {
+	// checkpoint 记的是「已经走到哪」：消息序列 + 预算计数 + 还没拿到回执的调用。
+	//
+	// pending 非空表示这一批工具执行到一半：恢复器要先补齐它们再问模型，
+	// 否则模型对着「3 个 tool_call 只有 1 条回执」的消息会重新规划。
+	checkpoint := func(round int, pending []agent.PendingCall) {
 		if in.Checkpoint == nil {
 			return
 		}
@@ -173,8 +175,65 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			ToolCalls:   toolCalls,
 			TotalTokens: totalTokens,
 			Query:       in.Query,
+			Pending:     pending,
 		}
 		_ = in.Checkpoint(state)
+	}
+
+	// 续跑先补完中断时的半批调用，再进主循环。
+	//
+	// 已完成的调用会命中 Invoker 的回放缓存（同工具同参数），不会再产生一次副作用；
+	// 没完成的这次才真正执行——包括重新走审批，但已批准的结论会按参数复用。
+	if in.Resume != nil && len(in.Resume.Pending) > 0 {
+		for _, p := range in.Resume.Pending {
+			call := llm.ToolCall{
+				ID:       p.ID,
+				Type:     "function",
+				Function: llm.FunctionCall{Name: p.Name, Arguments: p.Args},
+			}
+			t, ok := tool.Find(tools, p.Name)
+			var r tool.InvokeResult
+			switch {
+			case !ok:
+				r = tool.InvokeResult{ToolName: p.Name, Status: tool.StatusError,
+					Content: fmt.Sprintf("未知工具：%s", p.Name)}
+			case a.invoker == nil:
+				r = tool.InvokeResult{ToolName: p.Name, Status: tool.StatusError,
+					Content: "工具执行器未配置，无法执行工具"}
+			default:
+				r = a.invoker.Invoke(ctx, t, call, in.Env)
+				toolCalls++
+			}
+			state := &agent.ToolState{
+				ID:         p.ID,
+				Name:       p.Name,
+				Args:       agent.TruncateText(p.Args, maxToolArgBytes),
+				Result:     agent.TruncateText(r.Content, 8*1024),
+				Status:     r.Status,
+				Risk:       r.Risk,
+				DurationMS: r.LatencyMS,
+			}
+			if err := emit(agent.Event{Type: agent.EventToolResult, Tool: state}); err != nil {
+				return res, err
+			}
+			res.Steps = append(res.Steps, agent.Step{
+				Type:       "tool",
+				ID:         state.ID,
+				Name:       state.Name,
+				Args:       state.Args,
+				Result:     state.Result,
+				Status:     state.Status,
+				Risk:       state.Risk,
+				DurationMS: state.DurationMS,
+			})
+			messages = append(messages, llm.Message{
+				Role:       llm.RoleTool,
+				ToolCallID: p.ID,
+				Content:    agent.TruncateText(r.Content, resultBudget(tools, p.Name)),
+			})
+		}
+		// 补齐后这一轮才算真正完成
+		checkpoint(roundStart-1, nil)
 	}
 
 	for round := roundStart; round < maxRounds; round++ {
@@ -258,6 +317,18 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			ToolCalls: out.ToolCalls,
 		})
 
+		// 「已经决定要调这些」先落一次：中断落在这批中途时，恢复器才知道要补哪几个。
+		// 这一条不做的话，快照停在上一轮结束，模型会重新规划、把副作用再做一遍。
+		unfinished := make([]agent.PendingCall, len(out.ToolCalls))
+		for i, call := range out.ToolCalls {
+			unfinished[i] = agent.PendingCall{
+				ID:   call.ID,
+				Name: call.Function.Name,
+				Args: call.Function.Arguments,
+			}
+		}
+		checkpoint(round, unfinished)
+
 		for _, call := range out.ToolCalls {
 			state := &agent.ToolState{
 				ID:     call.ID,
@@ -333,19 +404,8 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			if err := emit(agent.Event{Type: agent.EventToolResult, Tool: state}); err != nil {
 				return res, err
 			}
-			// 策略判定需要审批时额外推一条审批请求（§5.7.5），前端据此挂起并提示
-			if state.Status == tool.StatusApproval {
-				res.NeedApproval = true
-				if err := emit(agent.Event{Type: agent.EventApprovalReq, Approval: &agent.ApprovalState{
-					ID:       agent.ApprovalID(call.ID),
-					CallID:   call.ID,
-					Tool:     state.Name,
-					Reason:   r.Content,
-					TimeoutS: agent.ApprovalTimeoutS,
-				}}); err != nil {
-					return res, err
-				}
-			}
+			// 审批事件由 Invoker 在调用中途经 Approver 推（含命令原文与动作类别），
+			// 这里不再重复推送：命中审批时 Invoker 会先阻塞，拿到决策后才产出这条结果。
 
 			res.Steps = append(res.Steps, agent.Step{
 				Type:       "tool",
@@ -364,6 +424,10 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Content:    agent.TruncateText(r.Content, resultBudget(tools, call.Function.Name)),
 			})
 			lastToolMsg = len(messages) - 1
+
+			// 每拿到一条回执就前进一步：中断时已经做完的调用不必重来
+			unfinished = dropPending(unfinished, call.ID)
+			checkpoint(round, unfinished)
 			records = append(records, callRecord{
 				Name:   call.Function.Name,
 				Args:   call.Function.Arguments,
@@ -376,12 +440,22 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		if hint := guard.afterRound(records); hint != "" && lastToolMsg >= 0 {
 			messages[lastToolMsg].Content = hint + "\n\n" + messages[lastToolMsg].Content
 		}
-		checkpoint(round)
+		checkpoint(round, nil)
 	}
 
 	// 轮次用尽：不再静默返回半截内容，而是逼一次结论
 	return a.finish(ctx, &res, messages, emit, "budget",
 		fmt.Sprintf("已用完 %d 轮工具调用", maxRounds), true)
+}
+
+// dropPending 把一条已经拿到回执的调用从待办里移掉。
+func dropPending(list []agent.PendingCall, id string) []agent.PendingCall {
+	for i, p := range list {
+		if p.ID == id {
+			return append(list[:i], list[i+1:]...)
+		}
+	}
+	return list
 }
 
 // finish 在预算用尽或判定停滞时再做一次「不带工具」的调用，逼模型给出结论。

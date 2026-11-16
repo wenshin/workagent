@@ -91,11 +91,33 @@ type Env struct {
 	// Tasks 是任务派发能力（session 包实现），为 nil 时 task_* 工具不可用。
 	// 派发要代建会话、校验空间成员，这些都不该由工具直接碰存储，所以走接口注入。
 	Tasks TaskDispatcher
+
+	// Approvals 是审批通道（session 包实现）：只有命中审批动作时才会被用到，
+	// 为 nil 时按「拒绝」处理——宁可挡住，也不要在没有出口的情况下静默执行。
+	Approvals Approver
+
+	// Replay 是续跑时的结果缓存：key 是 ArgsHash，值是被中断那一轮已经产生的回执。
+	//
+	// 命中就直接回放，不再执行——副作用不能重来。为空表示这是全新的一轮，
+	// 或者上一轮没有值得回放的结果。
+	Replay map[string]InvokeResult
 }
 
 // TaskDispatchInput 是一次派发的入参。
+//
+// 按「需求背景 / 已做的事 / 待确认清单 / 确认后用途」分段，而不是让模型把一切塞进
+// 一段 brief：子会话的开场要拟人、要能一眼看出在问什么，流水账做不到这一点。
 type TaskDispatchInput struct {
 	Title string `json:"title"`
+	// Background 是需求背景：为什么要这份东西、口径与范围是什么。
+	Background string `json:"background"`
+	// Done 是已经做到哪一步，可以贴代码或初步结论。
+	Done string `json:"done"`
+	// Checks 是需要对方逐条确认的点。
+	Checks []string `json:"checks"`
+	// After 是确认之后打算怎么用；空表示把结论带回发起方会话。
+	After string `json:"after"`
+	// Brief 是补充说明，保留给没有分段的旧调用。
 	Brief string `json:"brief"`
 	// Assignee 可以是用户 id、工号或姓名；解析规则由实现决定。
 	Assignee string `json:"assignee"`
@@ -136,14 +158,19 @@ type Tool struct {
 	Parameters  json.RawMessage
 	Risk        int
 	// SideEffects 声明影响范围：read-only（默认）/ write-workspace（仅当前空间工作区）。
-	// 策略层据此区分「空间内写」与「外部写」，后者必须绑定 + 审批。
+	// 策略层据此区分「空间内写」与「外部写」。
 	SideEffects string
-	Runtime     string // builtin | mcp
+	Runtime     string // builtin | mcp | plugin
 	ServerID    string
 	ServerName  string
 
-	HasBinding  bool
-	Constraints policy.Constraints
+	// NetworkWrite 表示这个工具会以非 GET/HEAD 的动词出网（插件清单声明）。
+	// 这类调用默认要人工确认：远端可能已经接收并落地了改动。
+	NetworkWrite bool
+	// ShellApproval 是「命中就需要确认」的命令名单，只对 shell 类工具有意义。
+	// 为空表示不是 shell 工具；内置 shell_exec 用 DefaultApprovalCommands。
+	ShellApproval []string
+
 	// MaxResultBytes 是回填给模型的单次结果上限（默认 4KB）。
 	// 读类工具（file_read / plugin_read）可申请更高额度，避免长文档被无谓截断。
 	MaxResultBytes int
@@ -228,8 +255,17 @@ func NewRegistry(st store.Store, mcp MCPProvider, log *slog.Logger) *Registry {
 // query 为用户本轮输入，仅在工具数量超过上限时用于相关性裁剪。
 func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, error) {
 	tools := builtinTools()
-	if off := r.disabledBuiltinTools(ctx); len(off) > 0 {
+	off, shellCmds, hasShellCfg := r.builtinPolicy(ctx)
+	if len(off) > 0 {
 		tools = withoutTools(tools, off)
+	}
+	if hasShellCfg {
+		// 安装级配置覆盖默认名单；空切片表示「一条都不确认」。
+		for i := range tools {
+			if tools[i].Name == "shell_exec" {
+				tools[i].ShellApproval = shellCmds
+			}
+		}
 	}
 	if r.mcp != nil {
 		remote, err := r.mcp.Tools(ctx)
@@ -267,12 +303,6 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 	// 内置优先（先出现），插件与 MCP 重名时让路并留日志。
 	tools = dedupeByName(tools, r.log)
 
-	bindings, err := r.store.ListToolBindings(ctx, env.SpaceID, env.UserID)
-	if err != nil {
-		return nil, err
-	}
-	applyBindings(tools, bindings)
-
 	if len(tools) > r.limits.MaxTools {
 		tools = selectRelevant(tools, query, r.limits.TopK)
 	}
@@ -287,22 +317,59 @@ const RuntimeBuiltin = "builtin"
 // slug 由 plugin.builtinToolSlug 生成、这里反解，两边必须一致。
 const builtinToolSlugPrefix = "tool_"
 
-// disabledBuiltinTools 返回「被系统管理员停用」的内置工具名。
+// builtinPolicy 返回内置件的三项全局策略：停用名单、shell 审批命令、是否显式配置过。
 //
 // 内置工具的执行体是 Go 代码（见 builtin.go），安装记录只是元数据：不查这一下，
-// 系统空间里那个停用开关就只是标签，模型照样能调。停用只能在系统空间做，
-// 所以只看那一份全局安装；读取失败按「没停用」处理，不能让开关把对话打挂。
-func (r *Registry) disabledBuiltinTools(ctx context.Context) map[string]bool {
+// 系统空间里那个停用开关与命令名单就只是标签，模型照样按默认值跑。停用与命令名单
+// 只能在系统空间做，所以只看那一份全局安装；读取失败按「按默认值」处理，
+// 不能让配置问题把对话打挂。
+func (r *Registry) builtinPolicy(ctx context.Context) (map[string]bool, []string, bool) {
 	sys, err := r.store.GetSpaceByType(ctx, systemSpaceType)
 	if err != nil || sys.ID == "" {
-		return nil
+		return nil, nil, false
 	}
 	installs, err := r.store.ListPluginInstalls(ctx, sys.ID)
 	if err != nil {
 		r.log.Warn("读取内置件启停状态失败", "err", err)
-		return nil
+		return nil, nil, false
 	}
-	return disabledToolNames(installs)
+	off := disabledToolNames(installs)
+	for _, in := range installs {
+		if strings.TrimPrefix(in.Slug, builtinToolSlugPrefix) != "shell_exec" {
+			continue
+		}
+		var cfg map[string]string
+		if len(in.Config) == 0 || json.Unmarshal(in.Config, &cfg) != nil {
+			continue
+		}
+		raw, ok := cfg["approval_commands"]
+		if !ok {
+			continue
+		}
+		return off, splitCommands(raw), true
+	}
+	return off, nil, false
+}
+
+// splitCommands 按逗号、中文逗号、空白切分命令名单。
+func splitCommands(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case ',', '，', '\n', '\r', '\t', ' ':
+			return true
+		}
+		return false
+	})
+	seen := map[string]bool{}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
 }
 
 // disabledToolNames 把系统空间的安装记录换算成「被停用的内置工具名」。
@@ -330,40 +397,6 @@ func withoutTools(tools []Tool, off map[string]bool) []Tool {
 		out = append(out, t)
 	}
 	return out
-}
-
-// applyBindings 把管理员的 tool_binding 贴到工具上。
-//
-// 内置工具视为已绑定：tool_binding 的语义是「授权这个工具访问哪段数据」
-// （数据库、MCP、自定义工具），而内置工具由平台发版、代码受控，也没有
-// 按空间逐个配置的入口。按 L2 要求绑定等于把能力整体关掉——plugin_try
-// 就因此被判成「需要管理员绑定」而拒绝。L3 仍要 allow_write、L4 仍要审批，
-// 这里只放开「有没有绑定」这一项，不扩大写权限。
-func applyBindings(tools []Tool, bindings []store.ToolBinding) {
-	byName := make(map[string]store.ToolBinding, len(bindings))
-	for _, b := range bindings {
-		byName[strings.ToLower(b.ToolName)] = b
-	}
-
-	for i := range tools {
-		key := strings.ToLower(tools[i].Name)
-		if b, ok := byName[key]; ok {
-			tools[i].HasBinding = true
-			tools[i].Constraints = policy.ParseConstraints(b.Constraints)
-			continue
-		}
-		// MCP 工具名带服务前缀，允许按「服务名/工具名」绑定
-		if tools[i].ServerName != "" {
-			if b, ok := byName[strings.ToLower(tools[i].ServerName+"/"+tools[i].Capability)]; ok {
-				tools[i].HasBinding = true
-				tools[i].Constraints = policy.ParseConstraints(b.Constraints)
-				continue
-			}
-		}
-		if tools[i].Runtime == RuntimeBuiltin {
-			tools[i].HasBinding = true
-		}
-	}
 }
 
 // Definitions 批量转换成模型工具定义。
@@ -418,7 +451,8 @@ func mcpTool(item MCPTool, provider MCPProvider) Tool {
 		Capability:  item.Name,
 		Description: fmt.Sprintf("[MCP:%s] %s", item.ServerName, item.Description),
 		Parameters:  schema,
-		// 远端工具默认按「只读有成本」处理，需显式绑定后才可用
+		// 远端工具按「只读有成本」处理：数据范围与鉴权在远端 server 上，
+		// 注册/安装这个动作本身就是授权，策略层不再逐次核对绑定。
 		Risk:       policy.RiskReadCost,
 		Runtime:    "mcp",
 		ServerID:   serverID,

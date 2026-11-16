@@ -42,61 +42,6 @@ on conflict (name) do update set
 	return err
 }
 
-// ListToolBindings 返回空间维度与用户维度的有效绑定。
-func (d *DB) ListToolBindings(ctx context.Context, spaceID, userID string) ([]store.ToolBinding, error) {
-	const q = `
-select b.id::text, t.name, t.runtime, coalesce(t.mcp_server_id::text, ''),
-       coalesce(b.space_id::text, ''), coalesce(b.user_id::text, ''),
-       coalesce(b.constraints, '{}'::jsonb), t.risk_level
-from tool_binding b
-join tool t on t.id = b.tool_id
-where b.status = 'active'
-  and (b.space_id is null or b.space_id = $1::uuid)
-  and (b.user_id is null or b.user_id = $2::uuid)
-order by t.name`
-
-	rows, err := d.pool.Query(ctx, q, spaceID, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]store.ToolBinding, 0, 8)
-	for rows.Next() {
-		var b store.ToolBinding
-		if err := rows.Scan(&b.ID, &b.ToolName, &b.Runtime, &b.MCPServerID,
-			&b.SpaceID, &b.UserID, &b.Constraints, &b.RiskLevel); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
-}
-
-// UpsertToolBinding 创建绑定；相同工具 + 空间 + 用户视为同一条。
-func (d *DB) UpsertToolBinding(ctx context.Context, b store.ToolBinding) (store.ToolBinding, error) {
-	const q = `
-insert into tool_binding (tool_id, space_id, user_id, constraints)
-select t.id, nullif($2, '')::uuid, nullif($3, '')::uuid, $4::jsonb
-from tool t
-where t.name = $1
-returning id::text, coalesce(space_id::text, ''), coalesce(user_id::text, ''), coalesce(constraints, '{}'::jsonb)`
-
-	constraints := b.Constraints
-	if len(constraints) == 0 {
-		constraints = []byte(`{}`)
-	}
-
-	var out store.ToolBinding
-	if err := d.pool.QueryRow(ctx, q, b.ToolName, b.SpaceID, b.UserID, constraints).Scan(
-		&out.ID, &out.SpaceID, &out.UserID, &out.Constraints,
-	); err != nil {
-		return store.ToolBinding{}, err
-	}
-	out.ToolName = b.ToolName
-	return out, nil
-}
-
 // ListMCPServers 返回全部注册的 MCP Server。
 func (d *DB) ListMCPServers(ctx context.Context) ([]store.MCPServer, error) {
 	const q = `
@@ -173,31 +118,49 @@ values (nullif($1, '')::uuid, $2, $3, $4, $5::jsonb, nullif($6, ''))`
 // RecordToolCall 记录一次工具调用。
 func (d *DB) RecordToolCall(ctx context.Context, r store.ToolCallRecord) error {
 	const q = `
-insert into tool_call (session_id, run_id, tool_name, args, status, latency_ms, risk_level)
-values (nullif($1, '')::uuid, nullif($2, '')::uuid, $3, $4::jsonb, $5, $6, $7)`
+insert into tool_call (session_id, run_id, tool_name, args, status, latency_ms, risk_level, result)
+values (nullif($1, '')::uuid, nullif($2, '')::uuid, $3, $4::jsonb, $5, $6, $7, nullif($8, ''))`
 
 	args := r.Args
 	if len(args) == 0 {
 		args = []byte(`{}`)
 	}
-	_, err := d.pool.Exec(ctx, q, r.SessionID, r.RunID, r.ToolName, args, r.Status, r.LatencyMS, r.RiskLevel)
+	_, err := d.pool.Exec(ctx, q, r.SessionID, r.RunID, r.ToolName, args, r.Status, r.LatencyMS, r.RiskLevel, r.Result)
 	return err
 }
 
-// DeletePluginToolRecords 卸载插件时清理它注册的能力、工具与绑定。
+// ListToolResults 返回一次执行里已经产生结果的工具调用。
+func (d *DB) ListToolResults(ctx context.Context, runID string) ([]store.ToolCallRecord, error) {
+	const q = `
+select coalesce(session_id::text, ''), coalesce(run_id::text, ''), tool_name, args, status, latency_ms, risk_level, result
+from tool_call
+where run_id = $1::uuid and result is not null
+order by created_at`
+
+	rows, err := d.pool.Query(ctx, q, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]store.ToolCallRecord, 0, 8)
+	for rows.Next() {
+		var r store.ToolCallRecord
+		if err := rows.Scan(&r.SessionID, &r.RunID, &r.ToolName, &r.Args,
+			&r.Status, &r.LatencyMS, &r.RiskLevel, &r.Result); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeletePluginToolRecords 卸载插件时清理它注册的能力与工具。
 //
 // 工具名约定：工具插件就是 slug，MCP 是 slug__<远端工具>，所以按前缀匹配。
 // audit_log / run_step 是历史，不在这里删。
 func (d *DB) DeletePluginToolRecords(ctx context.Context, slug string) error {
 	pattern := slug + `\_\_%`
-	const q = `
-with doomed as (
-    select id from tool where name = $1 or name like $2
-)
-delete from tool_binding where tool_id in (select id from doomed)`
-	if _, err := d.pool.Exec(ctx, q, slug, pattern); err != nil {
-		return err
-	}
 	if _, err := d.pool.Exec(ctx,
 		`delete from tool where name = $1 or name like $2`, slug, pattern); err != nil {
 		return err

@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -48,6 +49,9 @@ const (
 	// defaultIdleTimeout 与配置项 RUN_IDLE_TIMEOUT 的缺省值保持一致：
 	// 连续这么久没有任何事件才算卡住。
 	defaultIdleTimeout = 10 * time.Minute
+	// resumeTTL 是断点的保质期。超过这个时间的快照不再提供「继续」：
+	// 文件树、插件、同事的回复都变了，接上去等于让模型基于过期世界行动。
+	resumeTTL = 7 * 24 * time.Hour
 
 	// spaceFilesDir 与 space 包的文件根一致（spaces/{id}/files）；用字面量避免为一行常量牵出循环依赖
 	spaceFilesDir = "files"
@@ -144,7 +148,12 @@ type Service struct {
 	runs *liveRuns
 	// autoBudget 限制「回执触发的 run」的密度，避免十条回执催出十轮模型调用。
 	autoBudget *autoRunBudget
-	log        *slog.Logger
+	// approvals 是审批通道：命中出网写 / 高危命令时把执行体挂起，等前端点按钮。
+	approvals *approvalHub
+	// resuming 记录「正在自动续跑」的会话：批准一个已经没人等的待办时，
+	// 连点两次不该起两份执行。
+	resuming sync.Map
+	log      *slog.Logger
 }
 
 // NewService 构造会话服务；能力源（插件目录）由空间服务与插件层提供。
@@ -164,7 +173,7 @@ func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs st
 		store: st, spaces: spaces, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
 		runBudget: wallClock, idleTimeout: idleTimeout, runs: newLiveRuns(),
-		autoBudget: newAutoRunBudget(), log: log,
+		autoBudget: newAutoRunBudget(), approvals: newApprovalHub(st, log), log: log,
 	}
 }
 

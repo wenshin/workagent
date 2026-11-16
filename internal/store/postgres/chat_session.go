@@ -105,7 +105,7 @@ func collectSessions(rows pgx.Rows) ([]store.Session, error) {
 		var s store.Session
 		if err := rows.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
 			&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt,
-			&s.AgentID, &s.AgentVersion, &s.AgentPrompt); err != nil {
+			&s.AgentID, &s.AgentSpaceID, &s.AgentVersion, &s.AgentPrompt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

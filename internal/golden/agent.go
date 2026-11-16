@@ -271,8 +271,6 @@ func buildTools(specs []ToolSpec) []tool.Tool {
 			Description: "黄金用例工具桩：" + spec.Name,
 			Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":true}`),
 			Risk:        risk,
-			// 用例声明的工具由用例自己"绑定"，测的是循环而不是授权
-			HasBinding:  true,
 			SideEffects: policy.SideEffectsReadOnly,
 			Runtime:     tool.RuntimeBuiltin,
 			Invoke: func(context.Context, json.RawMessage, tool.Env) (string, error) {

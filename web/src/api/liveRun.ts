@@ -1,6 +1,6 @@
-import { cancelSessionRun, getActiveRun } from './client';
+import { cancelSessionRun, getActiveRun, listPendingApprovals } from './client';
 import { streamChat, streamResume, streamRun, type StreamHandlers } from './stream';
-import type { ActiveRunResponse, StreamItem } from './types';
+import type { ActiveRunResponse, PendingApproval, StreamItem } from './types';
 
 /**
  * 正在进行的一轮对话。
@@ -127,6 +127,7 @@ export interface LiveRunOptions {
 function buildHandlers(
   patch: (fn: (view: LiveRunView) => LiveRunView) => void,
   markWrote: () => void,
+  sessionId: string,
   onError?: (message: string) => void,
 ): StreamHandlers {
   return {
@@ -162,11 +163,55 @@ function buildHandlers(
       }
       patch((v) => ({
         ...v,
+        waitingApproval: false,
         items: v.items.map((item): StreamItem =>
           item.kind === 'tool' && item.tool.id === tool.id ? { kind: 'tool', tool } : item,
         ),
       }));
     },
+    // 命中审批规则：把请求挂到对应工具卡片上，用户点按钮后由 tool.result 更新结局。
+    // 卡片还没到（理论上不会，tool.call 先发）时补一条，避免审批提示丢失。
+    onApproval: (req) =>
+      patch((v) => {
+        const approval = {
+          id: req.approvalId,
+          sessionId,
+          kind: req.kind,
+          detail: req.detail,
+          reason: req.reason,
+          risk: req.risk,
+          timeoutS: req.timeoutS,
+        };
+        const idx = v.items.findIndex((item) => item.kind === 'tool' && item.tool.id === req.callId);
+        if (idx < 0) {
+          return {
+            ...v,
+            waitingApproval: true,
+            items: [
+              ...v.items,
+              {
+                kind: 'tool',
+                tool: {
+                  id: req.callId,
+                  name: req.tool,
+                  args: '',
+                  status: 'approval',
+                  approval,
+                },
+              },
+            ],
+          };
+        }
+        return {
+          ...v,
+          waitingApproval: true,
+          items: v.items.map((item, i): StreamItem =>
+            i === idx && item.kind === 'tool'
+              ? { kind: 'tool', tool: { ...item.tool, status: 'approval', approval } }
+              : item,
+          ),
+        };
+      }),
     onError,
   };
 }
@@ -230,6 +275,64 @@ async function resumeStream(
  * 换会话时不做中断：旧会话若还在跑就让它跑完并落库，回来仍能看到结果；
  * 只有用户在新会话里发消息时，才接管并停掉旧的那一轮。
  */
+/**
+ * 用服务端的待办记录校准审批卡片。
+ *
+ * 重放 run_step 只能说明「这条请求出现过」，无法说明它是否已经被人点掉。
+ * 刷新后若照单全收，用户会看到一个点不动的按钮；反过来，事件缓冲里没有的待办
+ * （例如刚换进程）也要能补上。所以以 approval 表为准做一次对齐。
+ */
+async function syncApprovals(
+  sessionId: string,
+  patch: (fn: (view: LiveRunView) => LiveRunView) => void,
+): Promise<void> {
+  let list: PendingApproval[];
+  try {
+    list = await listPendingApprovals(sessionId);
+  } catch {
+    return; // 补卡片是增强项，失败不该影响正文
+  }
+  const byCall = new Map(list.map((a) => [a.call_id, a]));
+  patch((v) => {
+    const seen = new Set<string>();
+    const items = v.items.map((item): StreamItem => {
+      if (item.kind !== 'tool' || item.tool.status !== 'approval') return item;
+      seen.add(item.tool.id);
+      const live = byCall.get(item.tool.id);
+      // 服务端已经没有这条待办：说明已处理或本轮收尾了，别继续显示按钮
+      if (!live) return { ...item, tool: { ...item.tool, status: 'running', approval: undefined } };
+      return { ...item, tool: { ...item.tool, approval: toApprovalInfo(live, sessionId) } };
+    });
+    // 事件重放里没有、但服务端仍在等的待办：补一张卡片
+    for (const a of list) {
+      if (seen.has(a.call_id)) continue;
+      items.push({
+        kind: 'tool',
+        tool: {
+          id: a.call_id,
+          name: a.tool,
+          args: '',
+          status: 'approval',
+          approval: toApprovalInfo(a, sessionId),
+        },
+      });
+    }
+    return { ...v, items, waitingApproval: list.length > 0 };
+  });
+}
+
+function toApprovalInfo(a: PendingApproval, sessionId: string) {
+  return {
+    id: a.approval_id,
+    sessionId,
+    kind: a.kind,
+    detail: a.detail,
+    reason: a.reason,
+    risk: a.risk,
+    timeoutS: a.timeout_s,
+  };
+}
+
 export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   // 同一会话重复触发（连点发送）：忽略，避免两路事件写进同一份视图
   if (current && current.sessionId === opts.sessionId) return Promise.resolve();
@@ -263,7 +366,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
     emit();
   };
 
-  const handlers = buildHandlers(patch, markWrote, opts.onError);
+  const handlers = buildHandlers(patch, markWrote, opts.sessionId, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
 
   return (async () => {
@@ -282,6 +385,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       if (!outcome.finished) {
         await resumeStream(opts.sessionId, ctrl, reset, handlers);
       }
+      await syncApprovals(opts.sessionId, patch);
     } catch (e) {
       // 用户主动停止不算错误
       aborted = e instanceof DOMException && e.name === 'AbortError';
@@ -359,13 +463,16 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
     emit();
   };
 
-  const handlers = buildHandlers(patch, markWrote, opts.onError);
+  const handlers = buildHandlers(patch, markWrote, opts.sessionId, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
 
   return (async () => {
     let aborted = false;
     try {
       const outcome = await streamRun(opts.runId, opts.afterOffset ?? 0, handlers, ctrl.signal);
+      // 重放只说明「请求发生过」；谁点过按钮要看服务端的记录，否则刷新后会把
+      // 已经处理掉的审批又显示成待办。
+      await syncApprovals(opts.sessionId, patch);
       if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers);
     } catch (e) {
       aborted = e instanceof DOMException && e.name === 'AbortError';

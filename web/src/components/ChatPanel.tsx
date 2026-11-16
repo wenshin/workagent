@@ -7,7 +7,7 @@ import {
   IconSend,
   IconTick,
 } from '@douyinfe/semi-icons';
-import { Button, Empty, Input, Popover, Spin, TextArea, Tooltip, Typography } from '@douyinfe/semi-ui';
+import { Button, Empty, Input, Popover, Spin, TextArea, Toast, Tooltip, Typography } from '@douyinfe/semi-ui';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type {
@@ -19,6 +19,7 @@ import type {
   StreamItem,
   ToolCallRecord,
 } from '../api/types';
+import { decideApproval } from '../api/client';
 import { useAgents } from '../api/hooks';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
@@ -36,6 +37,8 @@ const INPUT_MAX_HEIGHT = 200;
 export interface StreamView {
   /** 思考、正文与工具调用按到达顺序排列：渲染时照序输出，保持真实时间线 */
   items: StreamItem[];
+  /** 卡在等人确认：气泡不该继续显示「生成中」，那会让人以为模型还在想 */
+  waitingApproval?: boolean;
 }
 
 /**
@@ -283,23 +286,31 @@ function parseMCPAppRequest(tool: ToolCallRecord): MCPAppKeyData | null {
   return { app, hint, state: app ? 'checking' : 'needs_app', available: true, pending: true };
 }
 
-/** 需要用户动手的卡片（凭证、应用密钥）必须整块露出，不能折进工具组 */
+/** 需要用户动手的卡片（凭证、应用密钥、审批）必须整块露出，不能折进工具组 */
 function isStandaloneTool(tool: ToolCallRecord): boolean {
-  return parseSecretRequest(tool) !== null || parseMCPAppRequest(tool) !== null;
+  return (
+    parseSecretRequest(tool) !== null ||
+    parseMCPAppRequest(tool) !== null ||
+    tool.status === 'approval'
+  );
 }
 
 function ToolCard({
   tool,
   spaceId,
   onSend,
+  onResume,
   flat,
 }: {
   tool: ToolCallRecord;
   spaceId?: string;
   onSend?: (content: string) => void;
+  /** 审批提交后服务端说「这一轮已中断、正在续跑」时重新挂流 */
+  onResume?: () => void;
   /** flat：已在工具组的折叠区内，不要再套一层折叠 */
   flat?: boolean;
 }) {
+  const [busy, setBusy] = useState('');
   const secret = parseSecretRequest(tool);
   // 需要用户动手的卡片不能塞进折叠区：折叠起来等于没提示
   if (secret) {
@@ -309,9 +320,30 @@ function ToolCard({
   if (appKey) {
     return <MCPAppKeyCard data={appKey} spaceId={spaceId} onContinue={onSend} />;
   }
+
+  const approval = tool.status === 'approval' ? tool.approval : undefined;
+  const decide = async (decision: 'approve' | 'deny', scope: 'once' | 'turn') => {
+    if (!approval || busy) return;
+    const key = `${decision}:${scope}`;
+    setBusy(key);
+    try {
+      const out = await decideApproval(approval.sessionId, approval.id, decision, scope);
+      if (out.resumed) {
+        // 当时的执行体已经不在了：决策已落库，服务端正从断点接着跑
+        Toast.info('这一轮已中断，正在从断点继续');
+        onResume?.();
+      }
+    } catch (err) {
+      Toast.error(err instanceof Error ? err.message : '提交审批失败，请重试');
+    } finally {
+      setBusy('');
+    }
+  };
+
   const head = (
     <>
       <span className="msg-tool-name">{tool.name}</span>
+      {approval?.risk ? <span className={`msg-risk msg-risk-${approval.risk}`}>L{approval.risk}</span> : null}
       <span className="msg-tool-status">{statusLabel(tool.status)}</span>
       {tool.duration_ms !== undefined ? <span className="msg-tool-time">{tool.duration_ms}ms</span> : null}
     </>
@@ -328,18 +360,54 @@ function ToolCard({
       ) : null}
     </div>
   );
+  // 「本轮」只覆盖这一条消息触发的执行：run 结束后记忆清空，下一轮重新确认
+  const approvalBar = approval ? (
+    <div className="msg-approval">
+      <div className="msg-approval-head">{approval.reason || '该操作需要人工确认'}</div>
+      {approval.detail ? <pre className="msg-approval-detail">{approval.detail}</pre> : null}
+      <div className="msg-approval-actions">
+        <Button
+          size="small"
+          theme="solid"
+          type="primary"
+          loading={busy === 'approve:once'}
+          onClick={() => decide('approve', 'once')}
+        >
+          本次同意
+        </Button>
+        <Button size="small" type="primary" onClick={() => decide('approve', 'turn')}>
+          本轮都同意
+        </Button>
+        <Button size="small" type="danger" onClick={() => decide('deny', 'once')}>
+          本次拒绝
+        </Button>
+        <Button size="small" onClick={() => decide('deny', 'turn')}>
+          本轮都拒绝
+        </Button>
+      </div>
+      <div className="msg-approval-hint">
+        「本轮」只对这一次执行生效，下一轮需重新确认
+        {approval.timeoutS ? `；${Math.max(1, Math.round(approval.timeoutS / 60))} 分钟未处理自动拒绝` : ''}
+      </div>
+    </div>
+  ) : null;
 
   if (flat) {
     return (
       <div className={`msg-tool msg-tool-flat msg-tool-${tool.status}`}>
         <div className="msg-tool-head">{head}</div>
+        {approvalBar}
         {body}
       </div>
     );
   }
   return (
-    <details className={`msg-tool msg-tool-${tool.status}`} open={tool.status === 'running'}>
+    <details
+      className={`msg-tool msg-tool-${tool.status}`}
+      open={tool.status === 'running' || !!approval}
+    >
       <summary className="msg-tool-head">{head}</summary>
+      {approvalBar}
       {body}
     </details>
   );
@@ -356,10 +424,12 @@ function ToolGroup({
   tools,
   spaceId,
   onSend,
+  onResume,
 }: {
   tools: ToolCallRecord[];
   spaceId?: string;
   onSend?: (content: string) => void;
+  onResume?: () => void;
 }) {
   const running = tools.some((t) => t.status === 'running');
   const failed = tools.filter((t) => t.status === 'error' || t.status === 'denied').length;
@@ -374,7 +444,7 @@ function ToolGroup({
       </summary>
       <div className="msg-tools-body">
         {tools.map((tool) => (
-          <ToolCard key={tool.id} tool={tool} spaceId={spaceId} onSend={onSend} flat />
+          <ToolCard key={tool.id} tool={tool} spaceId={spaceId} onSend={onSend} onResume={onResume} flat />
         ))}
       </div>
     </details>
@@ -400,18 +470,32 @@ function ToolRun({
   tools,
   spaceId,
   onSend,
+  onResume,
 }: {
   tools: ToolCallRecord[];
   spaceId?: string;
   onSend?: (content: string) => void;
+  onResume?: () => void;
 }) {
   return (
     <>
       {groupTools(tools).map((group) =>
         group.length > 1 ? (
-          <ToolGroup key={`group-${group[0].id}`} tools={group} spaceId={spaceId} onSend={onSend} />
+          <ToolGroup
+            key={`group-${group[0].id}`}
+            tools={group}
+            spaceId={spaceId}
+            onSend={onSend}
+            onResume={onResume}
+          />
         ) : (
-          <ToolCard key={group[0].id} tool={group[0]} spaceId={spaceId} onSend={onSend} />
+          <ToolCard
+            key={group[0].id}
+            tool={group[0]}
+            spaceId={spaceId}
+            onSend={onSend}
+            onResume={onResume}
+          />
         ),
       )}
     </>
@@ -470,6 +554,7 @@ function AssistantBody({
   live,
   spaceId,
   onSend,
+  onResume,
 }: {
   content?: string;
   reasoning?: string;
@@ -479,6 +564,7 @@ function AssistantBody({
   live?: boolean;
   spaceId?: string;
   onSend?: (content: string) => void;
+  onResume?: () => void;
 }) {
   const blocks = items ? toBlocks(items) : null;
   const hasBody = blocks ? blocks.length > 0 : Boolean(content) || tools.length > 0;
@@ -512,13 +598,14 @@ function AssistantBody({
               tools={block.tools}
               spaceId={spaceId}
               onSend={onSend}
+              onResume={onResume}
             />
           );
         })
       ) : (
         <>
           {/* 历史消息没有时间位置，工具统一落在正文之前，连续调用同样折成一组 */}
-          <ToolRun tools={tools} spaceId={spaceId} onSend={onSend} />
+          <ToolRun tools={tools} spaceId={spaceId} onSend={onSend} onResume={onResume} />
           {content ? (
             <div className="chat-msg-content chat-msg-markdown">
               <MarkdownView content={content} spaceId={spaceId} />
@@ -914,12 +1001,17 @@ export default function ChatPanel({
           visibleMessages.map((m) => (
             <div key={m.id} className={`chat-msg chat-msg-${m.role}`}>
               <div className="chat-msg-meta">
-                <span>{m.role === 'user' ? '我' : m.role === 'assistant' ? 'Agent' : '系统'}</span>
+                <span>
+                  {m.source === 'task_brief'
+                    ? '任务委托'
+                    : m.role === 'user'
+                      ? '我'
+                      : m.role === 'assistant'
+                        ? 'Agent'
+                        : '系统'}
+                </span>
                 {m.source === 'task_result' ? (
                   <span className="chat-msg-time">任务回执</span>
-                ) : null}
-                {m.source === 'task_brief' ? (
-                  <span className="chat-msg-time">任务说明</span>
                 ) : null}
                 {m.source === 'task_remind' ? (
                   <span className="chat-msg-time">催办</span>
@@ -941,7 +1033,13 @@ export default function ChatPanel({
                   tools={toRecords(m.parts)}
                   spaceId={session.space_id}
                   onSend={continueRun}
+                  onResume={onResume}
                 />
+              ) : m.source === 'task_brief' ? (
+                // 任务委托里有代码与编号清单，按 Markdown 渲染；普通输入仍走纯文本，避免误把用户打的符号当语法
+                <div className="chat-msg-content">
+                  <MarkdownView content={m.content} spaceId={session.space_id} />
+                </div>
               ) : (
                 <UserBody content={m.content} />
               )}
@@ -965,7 +1063,11 @@ export default function ChatPanel({
               <span>Agent</span>
               {busy ? (
                 <span className="chat-msg-time">
-                  {elapsedMs >= 1000 ? `生成中 · ${formatDuration(elapsedMs)}` : '生成中…'}
+                  {liveView.waitingApproval
+                    ? '等待确认…'
+                    : elapsedMs >= 1000
+                      ? `生成中 · ${formatDuration(elapsedMs)}`
+                      : '生成中…'}
                 </span>
               ) : null}
             </div>
@@ -977,6 +1079,7 @@ export default function ChatPanel({
                 live={Boolean(stream)}
                 spaceId={session.space_id}
                 onSend={continueRun}
+                onResume={onResume}
               />
             )}
           </div>

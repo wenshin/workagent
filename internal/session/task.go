@@ -17,9 +17,8 @@ const (
 	// maxActiveTasks 是每会话同时未完成的异步任务上限。
 	// 同步任务不占这个额度——它们仍然串行执行（§15.12.1）。
 	maxActiveTasks = 50
-	// baseAgentID 是平台默认智能体：派发出去的会话用它，不继承发起方的智能体。
-	// B 要的是一个通用助理帮他把话说清楚，A 那个特定角色的行为设定对他没有意义；
-	// A 的上下文在回执回到父会话时自然恢复，两边各用各的。
+	// baseAgentID 是平台默认智能体：父会话没绑定时，派发出去的会话用它。
+	// 绑定了就继承「slug + 来源空间」，子会话能拿到同一套设定与 requires 里的能力。
 	baseAgentID = "base"
 	// autoRunPerMinute 限制「回执触发的 run」的密度：
 	// 十个回执同时到达时不该催出十轮模型调用，剩下的留在消息里等下一轮一起读。
@@ -118,22 +117,20 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 		return tool.TaskInfo{}, ErrTaskQuota
 	}
 
+	// 分段内容：任一段有值就能派发，全空说明模型什么也没交代，对方打开只会看到一句「找你确认」。
+	background := strings.TrimSpace(in.Background)
+	done := strings.TrimSpace(in.Done)
 	brief := strings.TrimSpace(in.Brief)
+	if background == "" && done == "" && len(normalizeChecks(in.Checks)) == 0 && brief == "" {
+		return tool.TaskInfo{}, errors.New("缺少任务说明：background / done / checks 至少写一项，对方看不到本空间文件")
+	}
 	// dir 传空：父会话的目录是相对父空间 files/ 的路径，跨到个人空间后没有意义。
 	// titleAuto=false：会话名就是任务内容，不能被对方回的第一句「好的」改掉。
 	//
 	// 智能体继承父会话的绑定：子会话里记下来源空间，运行时按「发起方空间 + slug」
 	// 解析；提示词与版本留空，让智能体更新后子任务也能跟上。发起方的智能体不可用
 	// （被停用/删掉）时回落到通用助理，不能因为一个可选绑定让派发失败。
-	agentID, agentSpaceID, agentName := baseAgentID, "", ""
-	if sess.AgentID != "" && sess.AgentID != baseAgentID && s.agentPlugins != nil {
-		if r, err := s.agentPlugins.ResolveAgentPlugin(ctx, sess.SpaceID, sess.AgentID); err == nil {
-			agentID, agentSpaceID, agentName = sess.AgentID, sess.SpaceID, r.Name
-		} else {
-			s.log.Warn("派发时智能体不可用，回落到通用助理",
-				"agent_id", sess.AgentID, "space_id", sess.SpaceID, "err", err)
-		}
-	}
+	agentID, agentSpaceID, agentName := s.sessionAgent(ctx, sess)
 	child, err := s.store.CreateSessionTitled(ctx, personalSpaceID, assignee.ID,
 		truncate(title, 60), "", agentSpaceID, agentID, "", "", false)
 	if err != nil {
@@ -141,25 +138,21 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 	}
 
 	// 子会话的第一条消息就是任务说明：被派发人打开就知道是谁派的、要做什么、回什么。
-	// 话术以智能体为主语（「我是 XX 智能体」），而不是平台旁白，便于对方理解这是谁在问。
-	if brief != "" {
-		from := userID
-		if u, err := s.store.GetUser(ctx, userID); err == nil {
-			from = u.Name
-		}
-		var intro string
-		if agentName != "" {
-			intro = fmt.Sprintf("你好，我是「%s」智能体，%s 的助理。\n他委托我找你确认一件事：%s",
-				agentName, from, title)
-		} else {
-			intro = fmt.Sprintf("你好，我是%s 的助理。\n他委托我找你确认一件事：%s", from, title)
-		}
-		body := intro + "\n\n" + brief + "\n\n你的回复会转达给他，确认后我把结论带回去。"
-		if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user", body, "task_brief"); err != nil {
-			s.log.Warn("写入任务说明失败", "task_session", child.ID, "err", err)
-		}
+	// 话术以智能体为主语、按「需求 / 已做 / 待确认 / 确认后」分段，而不是平台旁白加一段流水账。
+	from := userID
+	if u, err := s.store.GetUser(ctx, userID); err == nil {
+		from = u.Name
+	}
+	if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user",
+		composeTaskBrief(in, agentName, from), "task_brief"); err != nil {
+		s.log.Warn("写入任务说明失败", "task_session", child.ID, "err", err)
 	}
 
+	// 任务列表只展示一句摘要：brief 优先，没有就退到需求背景。
+	storedBrief := brief
+	if storedBrief == "" {
+		storedBrief = background
+	}
 	now := time.Now()
 	task, err := s.store.CreateTask(ctx, store.Task{
 		// space_id 记的是「任务从哪个空间派出」；子会话在别人的个人空间，
@@ -168,7 +161,7 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 		ParentSessionID: sessionID,
 		ChildSessionID:  child.ID,
 		Title:           title,
-		Brief:           brief,
+		Brief:           storedBrief,
 		Assignee:        assignee.ID,
 		Status:          store.TaskWaitingExternal,
 		WaitingSince:    &now,
@@ -227,6 +220,29 @@ func (s *Service) CancelTask(ctx context.Context, userID, taskID string) error {
 	return nil
 }
 
+// sessionAgent 解析会话绑定的智能体，返回 slug、来源空间与显示名。
+//
+// 子会话（agent_space_id 指向发起方空间）再往下派发时，来源空间要跟着传，否则按会话
+// 自己的空间解析必然找不到——链式派发的第三层最容易漏。智能体被停用/删除时回落 base：
+// 一个可选绑定不该让派发失败。
+func (s *Service) sessionAgent(ctx context.Context, sess store.Session) (id, spaceID, name string) {
+	id = baseAgentID
+	if sess.AgentID == "" || sess.AgentID == baseAgentID || s.agentPlugins == nil {
+		return id, "", ""
+	}
+	spaceID = sess.SpaceID
+	if sess.AgentSpaceID != "" {
+		spaceID = sess.AgentSpaceID
+	}
+	r, err := s.agentPlugins.ResolveAgentPlugin(ctx, spaceID, sess.AgentID)
+	if err != nil {
+		s.log.Warn("派发时智能体不可用，回落到通用助理",
+			"agent_id", sess.AgentID, "space_id", spaceID, "err", err)
+		return id, "", ""
+	}
+	return sess.AgentID, spaceID, r.Name
+}
+
 // RemindTask 是「再次咨询」：向同一子会话再催一次，不新建会话。
 func (s *Service) RemindTask(ctx context.Context, userID, taskID string) (tool.TaskInfo, error) {
 	task, err := s.store.GetTask(ctx, taskID)
@@ -251,11 +267,17 @@ func (s *Service) RemindTask(ctx context.Context, userID, taskID string) (tool.T
 			from = u.Name
 		}
 		// 这条消息由平台代发起人写入：正文里必须点名，否则 B 的助理会把它
-		// 当成 B 自己说的话，上下文就串了。
-		_, _ = s.store.CreateMessageFrom(ctx, task.ChildSessionID, "user",
-			fmt.Sprintf("【催办】%s 想确认上面这件事的进展（第 %d 次）。方便的话请尽快回复；"+
-				"如果已经不需要了，直接说一声即可。", from, task.DispatchCount),
-			"task_remind")
+		// 当成 B 自己说的话，上下文就串了。口吻与首条任务说明保持一致。
+		text := fmt.Sprintf("【催办】%s 想确认上面这件事的进展（第 %d 次）。方便的话请尽快回复；"+
+			"如果已经不需要了，直接说一声即可。", from, task.DispatchCount)
+		if parent, err := s.store.GetSession(ctx, task.ParentSessionID); err == nil {
+			if _, _, agentName := s.sessionAgent(ctx, parent); agentName != "" {
+				text = fmt.Sprintf("【催办】你好，我是「%s」智能体，再来问一下上面这件事的进展（第 %d 次）。"+
+					"方便的话请尽快回复；如果已经不需要了，直接说一声即可。",
+					agentName, task.DispatchCount)
+			}
+		}
+		_, _ = s.store.CreateMessageFrom(ctx, task.ChildSessionID, "user", text, "task_remind")
 	}
 	return toTaskInfo(task, ""), nil
 }
@@ -397,4 +419,81 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n])
+}
+
+const (
+	// 单段正文上限：跨空间看不到对方文件，内容只能靠正文，但一条消息不该无限长。
+	taskBriefPartLimit = 4000
+	// 待确认项太多，对方反而不知道先看哪个。
+	taskBriefCheckLimit = 8
+	taskBriefCheckRunes = 200
+)
+
+// composeTaskBrief 拼出子会话的第一条消息：以智能体为主语，按「需求 / 已做 / 待确认 / 确认后」分段。
+//
+// 这是被派发人打开会话看到的第一段话，它决定对方把这件事当「系统通知」还是「有人找我办事」。
+// 分段也让模型不必把所有内容挤进一段流水账：背景归背景，代码归代码，要确认的点单列。
+func composeTaskBrief(in tool.TaskDispatchInput, agentName, from string) string {
+	var b strings.Builder
+	// 名称本身就常以「智能体」结尾（「大数据分析智能体」），再补一个后缀会变成
+	// 「我是「大数据分析智能体」智能体」，反而像机器模板。
+	if agentName != "" {
+		b.WriteString("你好，我是「" + agentName + "」。")
+	} else {
+		b.WriteString("你好，我是" + from + " 的助理。")
+	}
+	if title := strings.TrimSpace(in.Title); title != "" {
+		if agentName != "" {
+			b.WriteString("\n我接到 " + from + " 的一个需求：" + title + "。")
+		} else {
+			b.WriteString("\n他委托我找你确认一件事：" + title + "。")
+		}
+	}
+	if v := clipTaskPart(in.Background, taskBriefPartLimit); v != "" {
+		b.WriteString("\n\n" + v)
+	}
+	if v := clipTaskPart(in.Done, taskBriefPartLimit); v != "" {
+		b.WriteString("\n\n我这边已经做到：\n" + v)
+	}
+	if checks := normalizeChecks(in.Checks); len(checks) > 0 {
+		b.WriteString("\n\n辛苦帮忙确认：")
+		for i, c := range checks {
+			fmt.Fprintf(&b, "\n%d. %s", i+1, c)
+		}
+	}
+	if v := clipTaskPart(in.Brief, taskBriefPartLimit); v != "" {
+		b.WriteString("\n\n" + v)
+	}
+	after := strings.TrimRight(strings.TrimSpace(in.After), "。.!！")
+	if after == "" {
+		after = "把结论带回发起方会话"
+	}
+	b.WriteString("\n\n确认后，我会" + after + "。")
+	return b.String()
+}
+
+// normalizeChecks 去掉空条目并限量。
+func normalizeChecks(items []string) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		out = append(out, clipTaskPart(item, taskBriefCheckRunes))
+		if len(out) >= taskBriefCheckLimit {
+			break
+		}
+	}
+	return out
+}
+
+// clipTaskPart 限长并明确告知已截断：悄悄截断会让对方以为原文就这么短。
+func clipTaskPart(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\n……（内容较长，已截断）"
 }

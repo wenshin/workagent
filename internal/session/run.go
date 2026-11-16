@@ -42,6 +42,13 @@ type runSeed struct {
 	ActiveSkill *agent.ActiveSkill
 	AgentPrompt string
 	Resume      *agent.ResumeState
+
+	// PrevRunID 是被这一轮接替的执行（续跑时非空）：审批结论、工具结果
+	// 都挂在旧 run 上，恢复要沿这条链去找。
+	PrevRunID string
+	// Replay 是旧 run 已经产生过的工具结果（key 为工具 + 参数指纹）。
+	// 命中就不执行，直接回放：副作用不能因为续跑再发生一次。
+	Replay map[string]tool.InvokeResult
 }
 
 // runWatchdog 是「这一轮卡住了」的唯一判据。
@@ -286,6 +293,8 @@ func (s *Service) execute(
 	// 整轮耗时：从进入实现到回答落库，含所有工具轮次与思考时间。
 	// 用应用侧时钟而不是 run.started_at，避免与应用、数据库的时钟差导致耗时失真。
 	startedAt := time.Now()
+	// 审批授权只在「这一轮」有效：run 结束时把待办置 expired，下一轮重新确认。
+	defer s.expireRunApprovals(run.ID)
 
 	res, runErr := s.agent.Run(runCtx, agent.RunInput{
 		Env: tool.Env{
@@ -319,6 +328,20 @@ func (s *Service) execute(
 			PluginTry: s.pluginTry,
 			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
 			Tasks: s,
+			// 审批：命中出网写 / 需确认命令时挂起，等前端按钮（本轮内有效）
+			Approvals: &runApprover{
+				hub:         s.approvals,
+				runID:       run.ID,
+				sessionID:   sessionID,
+				emit:        emitEvent,
+				parentRunID: seed.PrevRunID,
+				beat: func() {
+					watch.touch()
+					beat()
+				},
+			},
+			// 续跑时把上一轮已经做完的结果带上：工具执行前先查它
+			Replay: seed.Replay,
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
 			Secrets:         s.secrets,
 			CanWriteSecrets: s.canWriteSecrets(user),
@@ -547,6 +570,9 @@ func (s *Service) Resumable(ctx context.Context, userID, sessionID string) (stor
 	if s.runs.get(run.ID) != nil {
 		return store.Run{}, false, nil
 	}
+	// 这一轮不在本进程：顺手把它的占位消息结算掉（心跳还新时 AbandonRun 自己会跳过）。
+	// 用户回到会话时看到的就是「问题 + 中断前的工具轨迹」，而不是只剩一条问题。
+	s.abandonRun(ctx, run)
 	return run, true, nil
 }
 
@@ -575,8 +601,11 @@ func (s *Service) Resume(
 	if !ok {
 		return out, ErrNoResume
 	}
-	// 同一轮不能跑两份：会写重复文件、发重复请求，还争同一条会话的上下文
-	if s.runs.get(prev.ID) != nil {
+	// 同一轮不能跑两份：会写重复文件、发重复请求，还争同一条会话的上下文。
+	//
+	// 判据是心跳，不只是本进程的登记表——多实例部署时，原先那个执行体
+	// 可能正在别的副本上跑（比如它只是连不上前端了）。
+	if s.runAlive(ctx, sessionID, prev.ID) {
 		return out, ErrResumeRunning
 	}
 	payload, found, err := s.store.GetRunResume(ctx, prev.ID)
@@ -594,16 +623,32 @@ func (s *Service) Resume(
 		s.log.Warn("清理旧断点失败", "run_id", prev.ID, "err", err)
 	}
 
-	// 上一轮如果还挂着 running（进程崩溃留下的），由这次续跑接替它收尾：
-	// 不置终态的话 active-run 会一直说「在跑」，前端永远等不到结果。
-	if s.runs.get(prev.ID) == nil {
-		if err := s.store.FinishRun(ctx, store.Run{
-			ID: prev.ID, Status: store.RunFailed,
-			Error: "执行已中断，由续跑接替",
-		}); err != nil {
-			s.log.Warn("收尾上一轮执行失败", "run_id", prev.ID, "err", err)
-		}
+	// 上一轮已经做完的工具结果：续跑时按「工具 + 参数」回放，副作用不重来。
+	// 读不到不算致命——最坏情况是多执行一次，比整轮跑不起来强。
+	replay, err := s.buildReplay(ctx, prev.ID)
+	if err != nil {
+		s.log.Warn("读取上一轮工具结果失败，续跑可能重复执行", "run_id", prev.ID, "err", err)
 	}
+	// 旧 run 的待办作废：这一轮遇到同样的动作会重新登记，
+	// 结论按参数从旧 run 复用，用户不会被问第二遍。
+	s.expireRunApprovals(prev.ID)
+
+	// 上一轮还挂着 running / waiting_approval（进程崩溃留下的），由这次续跑接替它收尾：
+	// 不置终态的话 active-run 会一直说「在跑」，前端永远等不到结果。
+	if err := s.store.FinishRun(ctx, store.Run{
+		ID: prev.ID, Status: store.RunFailed,
+		Error: "执行已中断，由续跑接替",
+	}); err != nil {
+		s.log.Warn("收尾上一轮执行失败", "run_id", prev.ID, "err", err)
+	}
+	// 占位消息也要一起结算：用 run_step 还原中断前的工具轨迹再标中断。
+	// 不结算的话它会永远挂在 streaming 上，用户点完「继续」也只看得到结论，
+	// 看不到中断前做过什么（历史记录从列表里消失的正是这一段）。
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	if err := s.store.InterruptStreamingMessage(settleCtx, prev.ID, sessionID); err != nil {
+		s.log.Warn("结算中断轮占位消息失败", "run_id", prev.ID, "err", err)
+	}
+	cancelSettle()
 
 	user, err := s.store.GetUser(ctx, userID)
 	if err != nil {
@@ -623,9 +668,33 @@ func (s *Service) Resume(
 		"round", state.Round, "tools", state.ToolCalls)
 
 	return s.execute(ctx, sess, sp, user, store.Message{}, run, runSeed{
-		Query:  state.Query,
-		Resume: &state,
+		Query:     state.Query,
+		Resume:    &state,
+		PrevRunID: prev.ID,
+		Replay:    replay,
 	}, out, emit)
+}
+
+// buildReplay 把上一轮已经产生结果的工具调用整理成回放表。
+//
+// key 是「工具 + 规范化参数」而不是 call_id：续跑时模型重新生成的调用 id 是新的，
+// 只有参数能证明「这就是刚才那一次」。
+func (s *Service) buildReplay(ctx context.Context, runID string) (map[string]tool.InvokeResult, error) {
+	records, err := s.store.ListToolResults(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]tool.InvokeResult, len(records))
+	for _, r := range records {
+		out[tool.ArgsHash(r.ToolName, r.Args)] = tool.InvokeResult{
+			ToolName: r.ToolName,
+			Status:   r.Status,
+			Content:  r.Result,
+			Risk:     r.RiskLevel,
+			Cached:   true,
+		}
+	}
+	return out, nil
 }
 
 // SweepStaleRuns 收尾上一个进程留下的执行。
@@ -643,6 +712,13 @@ func (s *Service) SweepStaleRuns(ctx context.Context) (int, error) {
 	}
 	if n > 0 {
 		s.log.Info("已收尾上次未完成的执行", "runs", n)
+	}
+	// 断点有保质期：一周前的快照接上去，模型看到的是一个早就变了的文件树，
+	// 「继续」只会得到一份基于过期世界的结论。
+	if purged, err := s.store.PurgeStaleResumes(ctx, resumeTTL); err != nil {
+		s.log.Warn("清理过期断点失败", "err", err)
+	} else if purged > 0 {
+		s.log.Info("已清理过期断点", "resumes", purged)
 	}
 	return n, nil
 }

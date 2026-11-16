@@ -374,10 +374,11 @@ curl -s -XPOST localhost:8322/auth/token -H 'Content-Type: application/json' \
 
 MCP 插件的风险等级由清单里的能力推导，不是固定值：
 
-- 只写 `transport` + `tools`（本 mock 的配置）→ L2「只读有成本」：安装时平台自动建绑定，装完直接可调，
-  **不需要**再找管理员绑定或审批
-- 清单里声明了写方法（POST / PUT / PATCH / DELETE 的 `capabilities`）→ 升到 L3，需要显式授权
+- 只写 `transport` + `tools`（本 mock 的配置）→ L2「只读有成本」：MCP 工具**安装即授权**，
+  装完直接可调，不需要再找管理员点一次授权
+- 清单里声明了写方法（POST / PUT / PATCH / DELETE 的 `capabilities`）→ 升到 L3，空间外写逐次审批
 - 写方法再叠加 `secret.use` 凭证 → L4，走管理员审批
 
-如果调用被拒并提示「需要管理员绑定」，说明插件没走安装流程（例如只把目录拷进 `plugins/` 没点安装），
-这与鉴权失败是两回事。
+数据范围与鉴权都在远端 server（本 mock 用 JWT/凭证自己判），平台侧没有能传给远端的约束，
+安装/启用这个动作本身就是空间管理员的授权。所以只把目录拷进 `plugins/` 而没有安装/启用时，
+插件不会进工具列表——这与鉴权失败是两回事。

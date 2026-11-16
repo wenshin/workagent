@@ -1008,7 +1008,62 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
 .msg-tool-time {
   margin-left: auto;
   font-size: 12px;
+}
+
+/* 审批卡片：必须整块露出，按钮不能被折叠 */
+.msg-approval {
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--semi-color-border);
+  background: var(--semi-color-warning-light-default, #fff8e6);
+}
+
+.msg-approval-head {
+  font-size: 13px;
+  color: var(--semi-color-text-0);
+  margin-bottom: 8px;
+}
+
+.msg-approval-detail {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--semi-color-fill-0);
+}
+
+.msg-approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.msg-approval-hint {
+  margin-top: 8px;
+  font-size: 12px;
   color: var(--semi-color-text-2);
+}
+
+.msg-risk {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  line-height: 18px;
+  background: var(--semi-color-fill-1);
+  color: var(--semi-color-text-1);
+}
+
+.msg-risk-3 {
+  background: var(--semi-color-warning-light-default, #fff8e6);
+  color: var(--semi-color-warning);
+}
+
+.msg-risk-4 {
+  background: var(--semi-color-danger-light-default, #fef1f1);
+  color: var(--semi-color-danger);
 }
 
 .msg-tool-body {
