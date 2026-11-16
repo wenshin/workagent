@@ -39,7 +39,10 @@ type Capabilities struct {
 	Reasoning bool `json:"reasoning"`
 	// Approval 是否会产生审批请求（approval.req）
 	Approval bool `json:"approval"`
-	// Resume 是否支持从 checkpoint 续跑（§5.7.5，尚未实现）
+	// Resume 是否支持从 checkpoint 续跑（§5.7.5）。
+	//
+	// 声明为 true 的实现必须：接受 RunInput.Resume 的完整消息序列、
+	// 每轮通过 RunInput.Checkpoint 交出快照，并且续跑时不重复执行已完成的工具。
 	Resume bool `json:"resume"`
 	// Dispatch 是否能派生子 Agent（agent_dispatch）
 	Dispatch bool `json:"dispatch"`

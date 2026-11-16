@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -57,12 +58,25 @@ type SecretItem struct {
 // 由调用方每次现算；传 nil 表示平台无法判断，此时不做使用中标记。
 type Usage func(ctx context.Context) map[string]bool
 
+// MCPApps 是「MCP 应用密钥」的管理员视图（plugin.Manager 实现）。
+//
+// 接口定义在这里、由装配层注入：admin 只负责鉴权与响应，密钥的生成、归属判定
+// 与审计仍留在插件层，避免同一件事出现两套规则。
+type MCPApps interface {
+	// ListMCPApps 列出全部应用、归属与密钥指纹，不含明文。
+	ListMCPApps(ctx context.Context) ([]plugin.MCPAppInfo, error)
+	// RevealMCPAppKey 取回明文并写审计；只读不建，缺密钥时返回
+	// plugin.ErrMCPAppKeyMissing。
+	RevealMCPAppKey(ctx context.Context, actor, app string) (plugin.MCPAppInfo, string, error)
+}
+
 // Handler 提供 /admin 下的接口。
 type Handler struct {
 	spaces  *space.Service
 	secrets secret.Store
 	refs    []SecretRef
 	usage   Usage
+	mcpApps MCPApps
 	resolve func(*http.Request) (store.User, error)
 	log     *slog.Logger
 }
@@ -74,11 +88,17 @@ func NewHandler(spaces *space.Service, secrets secret.Store, refs []SecretRef, u
 	return &Handler{spaces: spaces, secrets: secrets, refs: refs, usage: usage, resolve: resolve, log: log}
 }
 
+// SetMCPApps 注入 MCP 应用密钥视图；不注入时相关接口返回 503。
+func (h *Handler) SetMCPApps(view MCPApps) { h.mcpApps = view }
+
 // Register 注册路由。全部要求系统管理员（按工号白名单）。
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/settings", h.settings)
 	mux.HandleFunc("PUT /admin/secrets/{scope}/{name}", h.putSecret)
 	mux.HandleFunc("DELETE /admin/secrets/{scope}/{name}", h.deleteSecret)
+	// 应用密钥：列表只给指纹，明文按应用单独取，避免一次响应带走全部密钥。
+	mux.HandleFunc("GET /admin/mcp-apps", h.listMCPApps)
+	mux.HandleFunc("GET /admin/mcp-apps/{app}/key", h.revealMCPAppKey)
 }
 
 // settings 返回「平台引用了哪些凭证」以及每条凭证的指纹。
@@ -239,6 +259,69 @@ func (h *Handler) deleteSecret(w http.ResponseWriter, r *http.Request) {
 	h.log.Info("凭证已删除", "scope", scope, "name", name, "operator", user.ID)
 	// 前端统一按 JSON 解析响应，不返回 204，避免调用方拿到空 body
 	platform.WriteJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// listMCPApps 列出全部 MCP 应用及其密钥指纹。
+//
+// 系统空间页的「MCP 应用」入口用它：应用名是全局的（不随空间复制），所以这条
+// 只能是平台级接口，不能挂在某个空间下面。
+func (h *Handler) listMCPApps(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireAdmin(w, r); !ok {
+		return
+	}
+	if h.mcpApps == nil {
+		platform.WriteError(w, r, http.StatusServiceUnavailable, "not_ready", "MCP 应用视图未接入")
+		return
+	}
+	items, err := h.mcpApps.ListMCPApps(r.Context())
+	if err != nil {
+		h.log.Error("列举 MCP 应用失败", "err", err)
+		platform.WriteError(w, r, http.StatusInternalServerError, "internal", "读取 MCP 应用失败")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		// 凭证存储没启用时列表只有归属、没有密钥，界面按它给出提示
+		"secrets_enabled": h.secrets != nil && h.secrets.Enabled(),
+		"items":           items,
+	})
+}
+
+// revealMCPAppKey 取回某个应用的签名密钥明文。
+//
+// 明文只回这一次响应，不写日志、不进审计（审计只记动作与对象）。
+func (h *Handler) revealMCPAppKey(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if h.mcpApps == nil {
+		platform.WriteError(w, r, http.StatusServiceUnavailable, "not_ready", "MCP 应用视图未接入")
+		return
+	}
+	info, key, err := h.mcpApps.RevealMCPAppKey(r.Context(), user.ID, r.PathValue("app"))
+	switch {
+	case errors.Is(err, plugin.ErrMCPAppName):
+		platform.WriteError(w, r, http.StatusBadRequest, "bad_name", plugin.ErrMCPAppName.Error())
+		return
+	case errors.Is(err, plugin.ErrMCPAppKeyMissing):
+		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
+		return
+	case errors.Is(err, secret.ErrDisabled):
+		platform.WriteError(w, r, http.StatusServiceUnavailable, "secrets_disabled", err.Error())
+		return
+	case err != nil:
+		h.log.Error("读取 MCP 应用密钥失败", "app", r.PathValue("app"), "err", err)
+		platform.WriteError(w, r, http.StatusInternalServerError, "internal", "读取密钥失败")
+		return
+	}
+
+	h.log.Info("管理员查看 MCP 应用密钥", "app", info.App, "operator", user.ID)
+	w.Header().Set("Cache-Control", "no-store")
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"app": info.App,
+		"key": key,
+	})
 }
 
 // requireAdmin 统一鉴权：未登录 401，非管理员 403。

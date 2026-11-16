@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/workagent/auto-agent/internal/admin"
+	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/store"
@@ -127,5 +128,109 @@ func TestSettingsListsStoredSecretsWithoutRefs(t *testing.T) {
 	}
 	if _, ok := inUse["plugin/erp_token"]; !ok {
 		t.Error("plugin scope 的凭证也要列出来")
+	}
+}
+
+// fakeMCPApps 是应用密钥视图的桩：admin 只做鉴权与响应，取数在插件层，
+// 所以这里验证的是「谁能看、响应长什么样」，不是密钥逻辑本身。
+type fakeMCPApps struct {
+	items []plugin.MCPAppInfo
+	key   string
+}
+
+func (f *fakeMCPApps) ListMCPApps(context.Context) ([]plugin.MCPAppInfo, error) {
+	return f.items, nil
+}
+
+func (f *fakeMCPApps) RevealMCPAppKey(_ context.Context, _, app string) (plugin.MCPAppInfo, string, error) {
+	for _, it := range f.items {
+		if it.App == app && it.HasKey {
+			return it, f.key, nil
+		}
+	}
+	return plugin.MCPAppInfo{}, "", plugin.ErrMCPAppKeyMissing
+}
+
+func TestMCPAppsRequireAdminAndRevealOnDemand(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fs, err := secret.NewFileStore(filepath.Join(t.TempDir(), "secrets"), "0123456789abcdef")
+	if err != nil {
+		t.Fatalf("构造凭证存储失败: %v", err)
+	}
+	// 密钥本身存在凭证存储里；列表接口不该把它带出来
+	if err := fs.Put(context.Background(), "mcp_jwt", "crm_mcp", "k1"); err != nil {
+		t.Fatalf("写入凭证失败: %v", err)
+	}
+
+	spaces := space.NewService(nil, nil, log, []string{"E001"})
+	view := &fakeMCPApps{
+		items: []plugin.MCPAppInfo{{App: "crm_mcp", OwnerName: "张三", HasKey: true, Fingerprint: "aaaa1111"}},
+		key:   "k1",
+	}
+
+	newHandler := func(user store.User) *http.ServeMux {
+		h := admin.NewHandler(spaces, fs, nil, nil, func(*http.Request) (store.User, error) {
+			return user, nil
+		}, log)
+		h.SetMCPApps(view)
+		mux := http.NewServeMux()
+		h.Register(mux)
+		return mux
+	}
+
+	adminMux := newHandler(store.User{ID: "u1", JobNumber: "E001"})
+	rec := httptest.NewRecorder()
+	adminMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/mcp-apps", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /admin/mcp-apps 返回 %d: %s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		SecretsEnabled bool                `json:"secrets_enabled"`
+		Items          []plugin.MCPAppInfo `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !list.SecretsEnabled || len(list.Items) != 1 || list.Items[0].App != "crm_mcp" {
+		t.Fatalf("列表响应不对: %+v", list)
+	}
+	// 列表只给指纹：明文出现一次就会进浏览器缓存与 HAR
+	if strings.Contains(rec.Body.String(), "k1") {
+		t.Fatalf("列表响应不应包含明文密钥: %s", rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	adminMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/mcp-apps/crm_mcp/key", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("查看密钥返回 %d: %s", rec.Code, rec.Body.String())
+	}
+	var reveal struct {
+		App string `json:"app"`
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &reveal); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if reveal.Key != "k1" || reveal.App != "crm_mcp" {
+		t.Fatalf("查看密钥响应不对: %+v", reveal)
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("密钥响应必须 no-store")
+	}
+
+	rec = httptest.NewRecorder()
+	adminMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/mcp-apps/ghost/key", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("缺密钥应当 404，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 非系统管理员（= 非系统空间成员）一律 403
+	otherMux := newHandler(store.User{ID: "u2", JobNumber: "E999"})
+	for _, path := range []string{"/admin/mcp-apps", "/admin/mcp-apps/crm_mcp/key"} {
+		rec = httptest.NewRecorder()
+		otherMux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s 非管理员应当 403，实际 %d", path, rec.Code)
+		}
 	}
 }

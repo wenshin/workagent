@@ -75,7 +75,10 @@ type Manager struct {
 	mu    sync.RWMutex
 	inst  map[string]map[string]*instance // spaceID → slug → 已启用实例
 	mcpCs map[string]*mcpRuntime
-	boot  map[string]bool
+	// borrow 缓存跨空间借用的实例：key = 会话空间 | 来源引用集合。
+	// 与 inst 分开存：借用只加载指定插件，不能污染来源空间的完整快照。
+	borrow map[string][]*instance
+	boot   map[string]bool
 }
 
 type instance struct {
@@ -172,6 +175,7 @@ func New(o Options) (*Manager, error) {
 		invoker: o.Invoker,
 		inst:    map[string]map[string]*instance{},
 		mcpCs:   map[string]*mcpRuntime{},
+		borrow:  map[string][]*instance{},
 		boot:    map[string]bool{},
 	}
 	m.rt = &toolRuntime{
@@ -891,6 +895,8 @@ func (m *Manager) Uninstall(ctx context.Context, userID, spaceID, slug string) e
 	m.mu.Lock()
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)
+	// 借用池可能持有这个插件的工具，状态一变就整体丢弃。
+	m.borrow = map[string][]*instance{}
 	m.mu.Unlock()
 	// 系统空间的那份是全局源；普通空间卸载同名私有源时不能连带删掉全局
 	global := false
@@ -943,6 +949,8 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 	m.mu.Lock()
 	delete(m.inst[spaceID], slug)
 	delete(m.mcpCs, spaceID+"/"+slug)
+	// 借用池可能持有这个插件的工具，状态一变就整体丢弃。
+	m.borrow = map[string][]*instance{}
 	m.mu.Unlock()
 	// 系统空间的开关是全局开关：内置件只有一份安装，停用/启用对每个空间都成立。
 	global := false
@@ -1019,6 +1027,9 @@ func (m *Manager) evictSpaces(keep string) {
 			}
 		}
 	}
+	// 借用池按「会话空间 + 来源引用」缓存，来源空间或插件状态一变就可能过期，
+	// 直接整体丢弃比逐个判断前缀安全。
+	m.borrow = map[string][]*instance{}
 	m.mu.Unlock()
 	for _, id := range others {
 		m.closeSpaceProcs(id)
@@ -1192,19 +1203,132 @@ func (m *Manager) Tools(ctx context.Context, spaceID string) ([]tool.Tool, error
 	return out, nil
 }
 
+// ToolsFor 加载「借用插件」的工具：子会话继承发起方空间的智能体时使用。
+//
+// refs 里的插件按来源空间读文件与安装配置，实例归属 spaceID，所以执行期的文件
+// 沙箱与策略仍按当前会话空间。某个依赖坏掉只跳过它，不让整个会话没有工具。
+func (m *Manager) ToolsFor(ctx context.Context, spaceID string, refs []tool.PluginRef) ([]tool.Tool, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	key := borrowKey(spaceID, refs)
+	m.mu.RLock()
+	cached, ok := m.borrow[key]
+	m.mu.RUnlock()
+	if ok {
+		return flattenTools(cached), nil
+	}
+
+	insts := make([]*instance, 0, len(refs))
+	for _, ref := range refs {
+		if strings.TrimSpace(ref.SpaceID) == "" || strings.TrimSpace(ref.Slug) == "" {
+			continue
+		}
+		inst, err := m.buildBorrowed(ctx, spaceID, ref.SpaceID, ref.Slug)
+		if err != nil {
+			m.o.Logger.Warn("借用插件失败",
+				"space", spaceID, "source", ref.SpaceID, "slug", ref.Slug, "err", err)
+			continue
+		}
+		insts = append(insts, inst)
+	}
+
+	m.mu.Lock()
+	if m.borrow == nil {
+		m.borrow = map[string][]*instance{}
+	}
+	m.borrow[key] = insts
+	m.mu.Unlock()
+	return flattenTools(insts), nil
+}
+
+// borrowKey 对引用集合排序，调用方传参顺序不影响缓存命中。
+func borrowKey(spaceID string, refs []tool.PluginRef) string {
+	parts := make([]string, 0, len(refs))
+	for _, r := range refs {
+		parts = append(parts, r.SpaceID+"/"+r.Slug)
+	}
+	sort.Strings(parts)
+	return spaceID + "|" + strings.Join(parts, ",")
+}
+
+func flattenTools(insts []*instance) []tool.Tool {
+	var out []tool.Tool
+	for _, inst := range insts {
+		out = append(out, inst.Tools...)
+	}
+	// 借用的工具按「已绑定」处理：来源空间的安装 + 启用就是授权，当前空间没有
+	// tool_binding 记录（也不该为一次派发写一条），否则 MCP 这类 L2 工具会被策略拦下。
+	for i := range out {
+		out[i].HasBinding = true
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// buildBorrowed 优先用发布件（安装记录），其次用来源空间已启用的本地草稿。
+// 来源插件的「启用」以它自己空间的记录为准，不看借用方空间有没有装过。
+func (m *Manager) buildBorrowed(ctx context.Context, runSpaceID, sourceSpaceID, slug string) (*instance, error) {
+	in, err := m.installOf(ctx, sourceSpaceID, slug)
+	switch {
+	case err == nil:
+		if in.Status != store.PluginInstallEnabled {
+			return nil, fmt.Errorf("插件未启用")
+		}
+		p, err := m.o.Store.GetPluginBySlug(ctx, slug)
+		if err != nil {
+			return nil, err
+		}
+		v, err := m.o.Store.GetPluginVersion(ctx, p.ID, in.Version)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := Parse(v.Manifest, true)
+		if err != nil {
+			return nil, err
+		}
+		return m.buildInstanceAt(ctx, runSpaceID, sourceSpaceID, p.ID, slug, in.Version, meta, v.ArtifactPath)
+	case !errors.Is(err, store.ErrNotFound):
+		return nil, err
+	}
+
+	enabled, err := m.LocalEnabledMap(ctx, sourceSpaceID)
+	if err != nil {
+		return nil, err
+	}
+	if !enabled[slug] {
+		return nil, fmt.Errorf("插件未启用")
+	}
+	meta, err := m.readDraft(ctx, sourceSpaceID, slug)
+	if err != nil {
+		return nil, err
+	}
+	return m.buildInstanceAt(ctx, runSpaceID, sourceSpaceID, "",
+		slug, "", meta, DraftKey(m.o.Storage, sourceSpaceID, slug))
+}
+
 func (m *Manager) buildInstance(ctx context.Context, spaceID, pluginID, slug, version string, meta Manifest, dir string) (*instance, error) {
+	return m.buildInstanceAt(ctx, spaceID, spaceID, pluginID, slug, version, meta, dir)
+}
+
+// buildInstanceAt 用 sourceSpaceID 读插件文件与安装配置，实例归属 runSpaceID。
+//
+// 跨空间借用（子会话继承发起方空间的智能体）走这条路径：插件内容、MCP 地址与
+// 空间级配置都来自 A，但 inst.SpaceID 是 B，于是工具执行时的文件沙箱、凭证作用域
+// 与策略判定仍落在当前会话空间，不会把 B 的文件读写带进 A。
+func (m *Manager) buildInstanceAt(ctx context.Context, runSpaceID, sourceSpaceID, pluginID, slug, version string, meta Manifest, dir string) (*instance, error) {
 	// 运行以空间副本为准：用户改完文件即生效，不用等发布；
 	// 副本不存在（例如已被清理）才回落到发布件，保证已安装插件仍然可用。
-	if draft := DraftKey(m.o.Storage, spaceID, slug); draft != "" {
+	if draft := DraftKey(m.o.Storage, sourceSpaceID, slug); draft != "" {
 		if _, err := m.o.Storage.Stat(ctx, path.Join(draft, ManifestFile)); err == nil {
 			dir = draft
 		}
 	}
-	// 安装级配置在这里合并：MCP 的服务地址/凭证按空间覆盖，发布快照不动。
-	meta = m.applyInstallConfig(ctx, spaceID, slug, meta)
+	// 安装级配置在这里合并：MCP 的服务地址/凭证按来源空间覆盖，发布快照不动。
+	meta = m.applyInstallConfig(ctx, sourceSpaceID, slug, meta)
 	risk, effects := Derive(meta)
 	inst := &instance{
-		SpaceID: spaceID, PluginID: pluginID, Slug: slug, Version: version,
+		SpaceID: runSpaceID, PluginID: pluginID, Slug: slug, Version: version,
 		Manifest: meta, Dir: dir, Risk: risk, SideEffects: effects,
 	}
 	switch meta.Kind {
@@ -1226,9 +1350,9 @@ func (m *Manager) buildInstance(ctx context.Context, spaceID, pluginID, slug, ve
 	case KindSource:
 		// 源的构造失败不应该让整个空间加载失败：其余插件与内置能力照常可用，
 		// 这个源在 web_search 里表现为「没有可用源」或缺失，日志里有原因。
-		src, err := m.buildSource(ctx, spaceID, slug, dir, meta)
+		src, err := m.buildSource(ctx, sourceSpaceID, slug, dir, meta)
 		if err != nil {
-			m.o.Logger.Warn("搜索源初始化失败", "slug", slug, "space", spaceID, "err", err)
+			m.o.Logger.Warn("搜索源初始化失败", "slug", slug, "space", sourceSpaceID, "err", err)
 			break
 		}
 		inst.Source = src

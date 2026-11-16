@@ -1,10 +1,10 @@
 import { IconAlertCircle, IconExit, IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
-import { api, getActiveRun } from '../api/client';
+import { api, getActiveRun, getResumable } from '../api/client';
 import {
   invalidateAfterWrite,
   queryKeys,
@@ -27,6 +27,7 @@ import {
   getLiveRun,
   isLiveRunning,
   isStopping,
+  resumeLiveRun,
   startLiveRun,
   stopLiveRun,
   subscribeLiveRun,
@@ -34,6 +35,7 @@ import {
 import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
+import MCPAppsDialog from '../components/MCPAppsDialog';
 import PluginCatalogPanel, { PLUGIN_CATEGORY_LABEL } from '../components/PluginCatalogPanel';
 import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
@@ -65,6 +67,7 @@ export default function WorkspacePage() {
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);
   const [platformOpen, setPlatformOpen] = useState(false);
+  const [mcpAppsOpen, setMcpAppsOpen] = useState(false);
 
   const queryClient = useQueryClient();
   // 流式状态放在模块级单例里：路由切换时本组件会被卸载，
@@ -206,6 +209,7 @@ export default function WorkspacePage() {
       onSettled: (info) => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+        void queryClient.invalidateQueries({ queryKey: ['resumable', sessionId] });
         if (info.wroteFiles) invalidateAfterWrite(queryClient);
       },
     });
@@ -213,6 +217,34 @@ export default function WorkspacePage() {
 
   // 带上会话 id：服务端按会话定位这一轮，前端不必等 run.started 拿到 run_id
   const stopGenerating = () => stopLiveRun(selectedSession?.id);
+
+  // 断点续跑入口：只在没有轮次在跑时才探测，一轮结束后重新问一次
+  // （断点可能刚被这一轮覆盖或被用户停掉清掉，缓存留着就是错的）
+  const resumeKey = ['resumable', selectedSession?.id ?? ''] as const;
+  const { data: resumeInfo } = useQuery({
+    queryKey: resumeKey,
+    queryFn: () => getResumable(selectedSession!.id),
+    enabled: Boolean(selectedSession) && !stream,
+    staleTime: 0,
+    retry: false,
+  });
+
+  const resume = async () => {
+    if (!selectedSession) return;
+    const sessionId = selectedSession.id;
+    if (isLiveRunning(sessionId)) throw new Error('这轮回答还在生成，请先停止或等它结束');
+    if (isLiveRunning()) Toast.info('已停止另一个会话的生成');
+    await resumeLiveRun({
+      sessionId,
+      onError: (message) => Toast.error(message),
+      onSettled: (info) => {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+        void queryClient.invalidateQueries({ queryKey: ['resumable', sessionId] });
+        if (info.wroteFiles) invalidateAfterWrite(queryClient);
+      },
+    });
+  };
 
   // 刷新/切页回来：先问服务端「这个会话还有没有在跑」，有就接着往下看。
   // run 已经和请求解耦（§15.12.1），所以断开只是解绑流，内容仍在内存缓冲里。
@@ -465,6 +497,8 @@ export default function WorkspacePage() {
             }
               onSend={send}
               onStop={stopGenerating}
+              resumable={Boolean(resumeInfo?.resumable) && !stream}
+              onResume={() => void resume()}
             />
           </div>
         ) : (
@@ -475,6 +509,7 @@ export default function WorkspacePage() {
             onOpenSession={openSession}
             onAddSession={(agentId?: string) => selectedSpace && void addSession(selectedSpace.id, undefined, agentId)}
             onOpenPlatform={() => setPlatformOpen(true)}
+            onOpenMCPApps={() => setMcpAppsOpen(true)}
           />
         )}
       </Layout.Content>
@@ -485,6 +520,7 @@ export default function WorkspacePage() {
         onOpenSession={openSession}
       />
       <SecretSettingsDialog visible={platformOpen} onClose={() => setPlatformOpen(false)} />
+      <MCPAppsDialog visible={mcpAppsOpen} onClose={() => setMcpAppsOpen(false)} />
 
       <Modal
         title="删除会话"

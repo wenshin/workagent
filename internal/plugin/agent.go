@@ -45,6 +45,47 @@ func (m *Manager) ListAgentPlugins(ctx context.Context, spaceID string) ([]agent
 	return out, nil
 }
 
+// AgentDependencies 返回智能体自身 + agent.requires 的递归闭包（只含 slug，来源空间已知）。
+//
+// 子会话跨空间继承智能体时，只把这几个插件借过来，不把发起方空间的整份目录摊给
+// 被派发人：requires 之外的文件、技能、MCP 都不该出现在子会话里。
+func (m *Manager) AgentDependencies(ctx context.Context, spaceID, rawSlug string) ([]string, error) {
+	slug := strings.TrimSpace(rawSlug)
+	if slug == "" {
+		return nil, store.ErrNotFound
+	}
+	if err := m.ensureLoaded(ctx, spaceID); err != nil {
+		return nil, err
+	}
+	snap := m.snapshot(spaceID)
+
+	var out []string
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(cur string) {
+		if cur == "" || seen[cur] {
+			return
+		}
+		inst, ok := snap[cur]
+		if !ok {
+			return
+		}
+		seen[cur] = true
+		out = append(out, cur)
+		if inst.Manifest.Agent == nil {
+			return
+		}
+		for _, dep := range inst.Manifest.Agent.Requires {
+			walk(dep)
+		}
+	}
+	walk(slug)
+	if len(out) == 0 {
+		return nil, store.ErrNotFound
+	}
+	return out, nil
+}
+
 // ResolveAgentPlugin 把智能体插件的父链拼成一段追加提示词。
 //
 // 顺序是「祖先在前、自己在后」：父智能体定风格，子智能体补细节。

@@ -42,11 +42,12 @@ const (
 	// 首条消息自动生成的标题长度（超出部分省略）
 	autoTitleRunes = 20
 
-	// defaultRunBudget 与配置项 LLM_MAX_WALL_CLOCK 的缺省值保持一致
-	defaultRunBudget = 10 * time.Minute
-	// runBudgetBackstopMargin 是 ctx 兜底比实现内部预算多留的余量：
-	// 让实现先按自己的预算收尾，ctx 只兜住不自己计时的实现（如直答 direct）
-	runBudgetBackstopMargin = 30 * time.Second
+	// defaultRunBudget 与配置项 LLM_MAX_WALL_CLOCK 的缺省值保持一致。
+	// 它是「总上限」，只防「确实在动但永远跑不完」，不是长任务的成败判据。
+	defaultRunBudget = 2 * time.Hour
+	// defaultIdleTimeout 与配置项 RUN_IDLE_TIMEOUT 的缺省值保持一致：
+	// 连续这么久没有任何事件才算卡住。
+	defaultIdleTimeout = 10 * time.Minute
 
 	// spaceFilesDir 与 space 包的文件根一致（spaces/{id}/files）；用字面量避免为一行常量牵出循环依赖
 	spaceFilesDir = "files"
@@ -66,8 +67,11 @@ const (
 	ReasonClientDisconnected = "client_disconnected"
 	// ReasonUserCancelled 用户显式取消（POST /runs/{id}/cancel）或关掉任务
 	ReasonUserCancelled = "user_cancelled"
-	// ReasonWallClockExceeded 本服务的墙钟上限到点，连接仍可用，会补发 run.finished
+	// ReasonWallClockExceeded 总时长上限到点（最后一道保险），连接仍可用，会补发 run.finished
 	ReasonWallClockExceeded = "wall_clock_exceeded"
+	// ReasonIdleTimeout 连续一段时间没有任何事件：模型流卡死、工具挂住或进程半死。
+	// 这才是「卡住」的判据——跑得久不算问题，没有进展才算。
+	ReasonIdleTimeout = "idle_timeout"
 	// ReasonBudgetExceeded 实现自己的预算（墙钟 / 工具次数 / 轮次）用尽
 	ReasonBudgetExceeded = "budget_exceeded"
 	// ReasonStalled 循环守卫判定「再做也不会产生新进展」而提前收尾。
@@ -75,13 +79,34 @@ const (
 	ReasonStalled = "stalled"
 )
 
-// RunBudgetExceededMessage 是墙钟上限到点时的用户可见文案。
-const RunBudgetExceededMessage = "本次回答已达时长上限，已保留已生成的内容"
+// RunBudgetExceededMessage 是总时长上限到点时的用户可见文案。
+const RunBudgetExceededMessage = "本次回答已达总时长上限，已保留已生成的内容"
+
+// RunIdleTimeoutMessage 是长时间没有进展时的用户可见文案。
+//
+// 与「时长上限」分开说：前者是这一轮真的卡住了，后者是跑得太久，
+// 混成一句会让用户以为「是不是我任务太大」，而实际原因完全不同。
+const RunIdleTimeoutMessage = "本轮长时间没有进展，已保留已生成的内容，可以继续"
+
+// RunAbandonedMessage 是「库里还挂着 running、进程里已经没有执行体」时的收尾文案。
+//
+// 这条 run 不会再有事件，也不会有谁来写终态：进程被 kill、崩溃重启都会留下它。
+// 措辞不提「继续」——断点不保证存在（中途未保存断点的那一轮就点不了继续）。
+const RunAbandonedMessage = "这一轮执行已中断（服务端已不再持有它），已保留已生成的内容"
 
 // cancelDetail 生成 run.error：预算是实现给出的具体说明（如「超过时间预算（10m0s）」），其余用原因常量。
 func cancelDetail(reason string, runErr error) string {
 	if reason == "" {
 		return ""
+	}
+	// 落库的是给人看的原因：事后翻 run.error 时「idle_timeout」不如一句话直白
+	switch reason {
+	case ReasonIdleTimeout:
+		return RunIdleTimeoutMessage
+	case ReasonWallClockExceeded:
+		return RunBudgetExceededMessage
+	case ReasonUserCancelled:
+		return "已按用户请求停止"
 	}
 	if errors.Is(runErr, agent.ErrBudgetExceeded) || errors.Is(runErr, agent.ErrStalled) {
 		return runErr.Error()
@@ -96,8 +121,12 @@ type Service struct {
 	agent   agent.Agent
 	storage storage.Storage
 	memory  *ctxmgr.Manager
-	// runBudget 是单次回答的墙钟上限（ctx 兜底），由 LLM_MAX_WALL_CLOCK 加余量得到
+	// runBudget 是一轮回答的总时长上限（最后由 ctx 兜底），由 LLM_MAX_WALL_CLOCK 得到；
+	// 0 表示不限——它只防「确实在动但永远跑不完」，不当长任务的成败判据。
 	runBudget time.Duration
+	// idleTimeout 是连续多久没有任何事件就判定卡住（RUN_IDLE_TIMEOUT）。
+	// 长任务可以跑很久，但不能「没有动静地」跑很久，这才是要掐的情况。
+	idleTimeout time.Duration
 	// agentPlugins 是智能体来源（kind=agent 插件），为空时不注入追加提示词
 	agentPlugins AgentPluginSource
 	// search 是搜索 provider 注册表，为 nil 时 web_search 返回「能力未配置」
@@ -118,16 +147,23 @@ type Service struct {
 	log        *slog.Logger
 }
 
-// NewService 构造会话服务；能力源（插件目录）由空间服务与插件层提供，
-// wallClock 是单次回答的墙钟预算（LLM_MAX_WALL_CLOCK）。
-func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock time.Duration, log *slog.Logger) *Service {
-	if wallClock <= 0 {
-		wallClock = defaultRunBudget
+// NewService 构造会话服务；能力源（插件目录）由空间服务与插件层提供。
+//
+// wallClock 是一轮回答的总时长上限（LLM_MAX_WALL_CLOCK，<=0 表示不限），
+// idleTimeout 是「多久没有事件算卡住」（RUN_IDLE_TIMEOUT）。两者管的是不同的事：
+// 前者防无限跑，后者才防真卡死。
+func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock, idleTimeout time.Duration, log *slog.Logger) *Service {
+	if idleTimeout <= 0 {
+		idleTimeout = defaultIdleTimeout
+	}
+	// 总时长不允许比 idle 还短：那不是「上限」，是把正常的长回答一起砍掉
+	if wallClock > 0 && wallClock < idleTimeout {
+		wallClock = idleTimeout
 	}
 	return &Service{
 		store: st, spaces: spaces, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
-		runBudget: wallClock + runBudgetBackstopMargin, runs: newLiveRuns(),
+		runBudget: wallClock, idleTimeout: idleTimeout, runs: newLiveRuns(),
 		autoBudget: newAutoRunBudget(), log: log,
 	}
 }
@@ -139,6 +175,8 @@ func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs st
 type AgentPluginSource interface {
 	ListAgentPlugins(ctx context.Context, spaceID string) ([]agentspec.Summary, error)
 	ResolveAgentPlugin(ctx context.Context, spaceID, slug string) (agentspec.Resolved, error)
+	// AgentDependencies 返回智能体及其 requires 闭包，用于跨空间借用时只加载它自己声明的能力。
+	AgentDependencies(ctx context.Context, spaceID, slug string) ([]string, error)
 }
 
 // SetAgentPlugins 注入插件化智能体来源；不注入时行为与旧版完全一致。
@@ -648,316 +686,18 @@ func (s *Service) chat(
 		return out, err
 	}
 
-	// 一次 run 为根，预算与步骤都落库，进程重启后可据此恢复（§5.7.5）
-	budgetMap := s.agent.Budget()
-	if budgetMap == nil {
-		budgetMap = map[string]any{}
-	}
-	// 记录实际生效的实现，便于按实现定位问题（AGENT_IMPL 可切换）
-	budgetMap["impl"] = s.agent.Name()
-	budget, marshalErr := json.Marshal(budgetMap)
-	if marshalErr != nil {
-		budget = []byte(`{}`)
-	}
-	run, err := s.store.CreateRun(ctx, store.Run{SessionID: sessionID, Budget: budget})
+	// 一次 run 为根：预算、步骤与断点都落库，进程重启后能看出走到哪、能接着走（§5.7.5）
+	run, err := s.createRun(ctx, sessionID)
 	if err != nil {
 		return out, err
 	}
 	out.RunID = run.ID
 
-	// checkpoint 与事件推送共用一条链路，保证「推给前端的」与「落库的」一致
-	seq := 0
-	appendStep := func(typ string, payload any) {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return
-		}
-		seq++
-		stepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		_, err = s.store.AppendRunStep(stepCtx, store.RunStep{
-			RunID: run.ID, Seq: seq, Type: typ, Payload: data,
-		})
-		cancel()
-		if err != nil {
-			s.log.Warn("写入 run checkpoint 失败", "run_id", run.ID, "seq", seq, "err", err)
-		}
-	}
-
-	// runCtx 剥离了请求的取消信号：客户端刷新、切页、断网都只解绑流，
-	// 任务照旧跑完（§15.12.1）。只有显式取消或墙钟能停它。
-	//
-	// 前置准备（读历史、落用户消息、建 run）仍然跟着请求走——客户端已经
-	// 断开时没必要再为一个没人收的结果起任务，那才是真的浪费。
-	runCtx, cancelRun := context.WithTimeout(context.WithoutCancel(ctx), s.runBudget)
-	defer cancelRun()
-	live := s.runs.add(run.ID, userID, cancelRun)
-	defer func() {
-		live.finish()
-		s.runs.remove(run.ID, live)
-	}()
-
-	// 事件先落内存缓冲再推客户端：客户端断了写入会失败，但缓冲还在，
-	// 重连后按 offset 补齐（§15.12.2）。因此这里的错误一律吞掉——
-	// 让「写不出去」去中断 Agent，正是刷新丢任务的老问题。
-	// 首个正文增量到达时占位一条 streaming 消息：刷新后列表能看出「这一轮真的在跑」，
-	// 而不是空白。正文仍然在结束时一次性覆盖，不逐 token 写库（§15.12.2）。
-	var placeholderID string
-	ensurePlaceholder := func() {
-		if placeholderID != "" {
-			return
-		}
-		placeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		m, err := s.store.CreateStreamingMessage(placeCtx, sessionID)
-		cancel()
-		if err != nil {
-			s.log.Warn("占位消息写入失败", "session_id", sessionID, "err", err)
-			return
-		}
-		placeholderID = m.ID
-	}
-
-	emitEvent := func(ev agent.Event) error {
-		switch ev.Type {
-		case agent.EventToolCall, agent.EventToolResult:
-			appendStep(ev.Type, ev.Tool.Payload())
-		case agent.EventApprovalReq:
-			appendStep(ev.Type, ev.Approval)
-		case agent.EventMessageDelta:
-			// 思考不占位：只有真的开始写正文了，才值得在列表里留一条记录
-			if !ev.Reasoning {
-				ensurePlaceholder()
-			}
-		}
-		offset := live.broadcast(ev)
-		if emit != nil {
-			_ = emit(ev, offset)
-		}
-		return nil
-	}
-
-	// run.started 由会话层补发：此时 run 已落库，前端可以据此做断线重连与取消
-	emitEvent(agent.Event{Type: agent.EventRunStarted, RunID: run.ID})
-
-	// 技能：不再常驻索引，只有会话绑定的技能正文直接注入
-	var activeSkill *agent.ActiveSkill
-	if sess.SkillPath != "" {
-		skill, err := s.loadSkill(ctx, sess.SpaceID, sess.SkillPath)
-		if err != nil {
-			s.log.Warn("技能正文加载失败", "session_id", sessionID, "path", sess.SkillPath, "err", err)
-		} else {
-			activeSkill = skill
-		}
-	}
-
-	// 智能体：优先用建会话时固化的提示词，管理员事后改智能体不影响已开会话。
-	// 老会话（智能体还写在 agents/ 的年代）没有快照，这里按当前插件补一次。
-	agentPrompt := sess.AgentPrompt
-	if agentPrompt == "" && sess.AgentID != "" && s.agentPlugins != nil {
-		if r, err := s.agentPlugins.ResolveAgentPlugin(ctx, sess.SpaceID, sess.AgentID); err == nil {
-			agentPrompt = r.Prompt
-		} else {
-			s.log.Warn("智能体设定加载失败", "session_id", sessionID, "agent_id", sess.AgentID, "err", err)
-		}
-	}
-
-	// 整轮墙钟：从进入实现到回答落库，含所有工具轮次与思考时间。
-	// 用应用侧时钟而不是 run.started_at，避免与应用、数据库的时钟差导致耗时失真。
-	startedAt := time.Now()
-
-	res, runErr := s.agent.Run(runCtx, agent.RunInput{
-		Env: tool.Env{
-			UserID:    userID,
-			SpaceID:   sess.SpaceID,
-			SessionID: sessionID,
-			RunID:     run.ID,
-			SpacePerm: sp.Perm,
-			// 企业 wiki 的宿主：固定系统空间，与当前会话所在空间无关。
-			// 未初始化时为空，wiki 工具会报「不可用」而不是写进当前空间。
-			WikiSpaceID: s.wikiSpaceID(ctx),
-			Store:       s.store,
-			Storage:     s.storage,
-			Log:         s.log,
-			// 插件目录：当前空间 + 系统空间 + 已安装插件（未安装的发布件按需检索，不做同名覆盖）。
-			// published/... 路径也由空间服务转给插件层解析。
-			Plugins: pluginLoader{
-				spaces:  s.spaces,
-				spaceID: sess.SpaceID,
-			},
-			// 搜索：provider 与密钥都在装配层，工具只拿到注册表
-			Search: s.search,
-			// 命令执行：沙箱后端在装配层选定（bwrap / sandbox-exec / local），
-			// 工具只拿到 Runner，无法自行降级到无隔离执行。
-			Shell: s.shell,
-			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
-			PluginTry: s.pluginTry,
-			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
-			Tasks: s,
-			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
-			Secrets:         s.secrets,
-			CanWriteSecrets: s.canWriteSecrets(user),
-		},
-		History: contextMessages,
-		Query:   text,
-		// 顶层会话允许派生子 Agent；子 Agent 的深度与预算由实现自己管
-		AllowDispatch: true,
-		ActiveSkill:   activeSkill,
-		Dir:           sess.Dir,
-		DirPlugin:     s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
-		AgentPrompt:   agentPrompt,
-		// 平台事实进系统提示词，不做成工具：租户、IM 这类信息必须恒真
-		Platform: s.platformFacts(user, sp),
-	}, emitEvent)
-
-	// 落库不跟着请求走：run 已经跑完，客户端在不在都要把结果写进去
-	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancelSave()
-
-	// 中断原因：只有「用户显式取消」与「本服务的墙钟到点」两种。
-	// 少了这一步，被掐断的 run 会被记成 succeeded，事后完全看不出是截断的。
-	reason := live.cancelledReason()
-	switch {
-	case reason != "":
-		// 已经在 live 上记过，不再覆盖
-	case errors.Is(runErr, agent.ErrStalled):
-		// 循环守卫判定停滞：已经强制收尾并给出结论，重试同样不会更好
-		reason = ReasonStalled
-	case errors.Is(runErr, agent.ErrBudgetExceeded):
-		// 实现自己声明的预算用尽（builtin 的墙钟与工具次数上限）
-		reason = ReasonBudgetExceeded
-	case runCtx.Err() != nil:
-		reason = ReasonWallClockExceeded
-	}
-
-	status := store.RunSucceeded
-	switch {
-	case reason != "":
-		status = store.RunCancelled
-	case runErr != nil:
-		status = store.RunFailed
-	}
-	if reason != "" {
-		s.log.Warn("对话被中断",
-			"session_id", sessionID, "run_id", run.ID, "reason", reason,
-			"chars", utf8.RuneCountInString(res.Content), "tools", len(res.Steps))
-	}
-	out.Reason = reason
-
-	finish := func(errMsg string) {
-		usage, err := json.Marshal(map[string]int{
-			"in":  res.Usage.InputTokens,
-			"out": res.Usage.OutputTokens,
-		})
-		if err != nil {
-			usage = []byte(`{}`)
-		}
-		if err := s.store.FinishRun(saveCtx, store.Run{
-			ID: run.ID, Status: status, Usage: usage,
-			Provider: res.Provider, Model: res.Model, Error: errMsg,
-		}); err != nil {
-			s.log.Warn("更新 run 状态失败", "run_id", run.ID, "err", err)
-		}
-	}
-
-	if res.Content == "" && len(res.Steps) == 0 {
-		// 没有内容可存：取消不改判为失败，原因如实写进 run.error
-		if reason == "" {
-			status = store.RunFailed
-		}
-		// 状态要跟着带出去：思考阶段就被叫停时这里是唯一出口，不写的话 handler 会按
-		// 「失败」广播 run.finished（reason 为空），前端弹一个本不该有的错误
-		out.Status = status
-		err := runErr
-		if err == nil {
-			err = errors.New("模型没有返回内容，请重试")
-		}
-		if reason != "" {
-			finish(cancelDetail(reason, runErr))
-		} else {
-			finish(err.Error())
-		}
-		return out, err
-	}
-
-	// res.Steps 为空时 json.Marshal 会给出 null，而 parts 的契约是数组，这里显式落 []
-	parts := []byte("[]")
-	if len(res.Steps) > 0 {
-		data, marshalErr := json.Marshal(res.Steps)
-		if marshalErr != nil {
-			s.log.Warn("序列化执行轨迹失败", "session_id", sessionID, "err", marshalErr)
-		} else {
-			parts = data
-		}
-	}
-
-	// 这一轮的用量与耗时随消息落库：前端刷新后仍能看到 token 与总耗时
-	stats := store.MessageStats{
-		InTokens:   res.Usage.InputTokens,
-		OutTokens:  res.Usage.OutputTokens,
-		DurationMS: int(time.Since(startedAt).Milliseconds()),
-	}
-	var msg store.Message
-	if placeholderID != "" {
-		// 占位消息已经存在：整段覆盖，并把 streaming 置回 false
-		msg, err = s.store.FinishMessage(saveCtx, placeholderID,
-			res.Content, res.Reasoning, parts, stats, reason != "")
-	} else {
-		msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts, stats)
-	}
-	if err != nil {
-		status = store.RunFailed
-		finish(err.Error())
-		return out, err
-	}
-	appendStep("message", map[string]any{
-		"message_id":      msg.ID,
-		"chars":           utf8.RuneCountInString(res.Content),
-		"reasoning_chars": utf8.RuneCountInString(res.Reasoning),
-		"tools":           len(res.Steps),
-		"need_approval":   res.NeedApproval,
-		// 循环是怎么收尾的：done / budget / stalled。
-		// 与 reason 分开记——「答案被逼出来但可用」和「运行被打断」是两件事。
-		"stop_reason": res.StopReason,
-	})
-	// cancelled 也写原因，便于事后区分「用户停止」与「服务端到点」
-	finish(cancelDetail(reason, runErr))
-
-	if err := s.store.TouchSession(saveCtx, sessionID); err != nil {
-		s.log.Warn("更新会话活跃时间失败", "session_id", sessionID, "err", err)
-	}
-
-	sess.LastMessageAt = &msg.CreatedAt
-	if latest, err := s.store.GetSession(saveCtx, sessionID); err == nil {
-		sess = latest
-	}
-
-	// 向量索引异步执行，失败不影响本次对话
-	if s.memory.EmbeddingEnabled() {
-		go func() {
-			indexCtx, indexCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer indexCancel()
-			batch := []store.Message{msg}
-			if userMsg.ID != "" {
-				batch = append([]store.Message{userMsg}, msg)
-			}
-			if err := s.memory.Index(indexCtx, sessionID, batch); err != nil {
-				s.log.Warn("写入消息向量失败", "session_id", sessionID, "err", err)
-			}
-		}()
-	}
-
-	// 这个会话如果是一个派发任务的子会话，把结果回填给父会话（§15.12.4）
-	s.completeParentTask(saveCtx, sessionID, res.Content)
-
-	s.log.Info("对话完成",
-		"session_id", sessionID, "space_id", sess.SpaceID, "by", userID, "run_id", run.ID,
-		"status", status, "provider", res.Provider, "model", res.Model,
-		"chars", utf8.RuneCountInString(res.Content), "tools", len(res.Steps))
-
-	out.Message = msg
-	out.Session = sess
-	out.Usage = res.Usage
-	out.Status = status
-	return out, runErr
+	return s.execute(ctx, sess, sp, user, userMsg, run, runSeed{
+		History:     contextMessages,
+		Query:       text,
+		AgentPrompt: sess.AgentPrompt,
+	}, out, emit)
 }
 
 // RunState 返回一次执行的状态。刷新页面后前端靠它判断「还在不在跑」，
@@ -967,11 +707,45 @@ func (s *Service) RunState(ctx context.Context, userID, runID string) (store.Run
 }
 
 // ActiveRun 返回会话当前活跃的 run：刷新后的第一件事就是问它。
+//
+// 判活要过两道：库里的记录（心跳新鲜）与本进程的执行体。只看库会答错——进程被杀、
+// 崩溃重启之后，那条 run 可能还挂着 running 且心跳在窗口内（迁移给历史行补默认心跳
+// 就会造出这种假活），前端据此每次刷新都挂一条不会再来的流：先显示「思考中」，
+// 收到 detached 收尾再消失。所以这里查不到执行体就当场收尾，再回答「没在跑」。
 func (s *Service) ActiveRun(ctx context.Context, userID, sessionID string) (store.Run, bool, error) {
 	if _, _, err := s.load(ctx, userID, sessionID); err != nil {
 		return store.Run{}, false, err
 	}
-	return s.store.GetActiveRun(ctx, sessionID)
+	// 心跳停了的 run 不算「在跑」：它属于上一个进程，回答「在跑」会让前端
+	// 一直等一条不会再来的流，用户连「继续」都不会看到
+	run, found, err := s.store.GetActiveRun(ctx, sessionID, s.idleTimeout)
+	if err != nil || !found {
+		return run, found, err
+	}
+	if s.runs.get(run.ID) != nil {
+		return run, true, nil
+	}
+	s.abandonRun(ctx, run)
+	return store.Run{}, false, nil
+}
+
+// abandonRun 把「没人跑」的 run 落成终态，并结算它留下的流式占位消息。
+//
+// 这是自愈动作，不能因为它失败就让 active-run 变成 500：写库抖动时记日志走人，
+// 前端答案照旧是「没在跑」——挂不上流反正也拿不到内容。
+func (s *Service) abandonRun(ctx context.Context, run store.Run) {
+	// 请求可能已经被掐断（刷新、关页面），收尾必须落库，所以脱掉取消信号
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	// 心跳还在跳就不收：本进程拿不到流，不代表执行在别处没活。留两道心跳的余量，
+	// 假活（进程已死）半分钟内会被真正收掉，界面当次就已经答「没在跑」了。
+	grace := 2 * heartbeatInterval
+	if err := s.store.AbandonRun(ctx, run.ID, run.SessionID, RunAbandonedMessage, grace); err != nil {
+		s.log.Warn("收尾无人执行的 run 失败", "run_id", run.ID, "session_id", run.SessionID, "err", err)
+		return
+	}
+	s.log.Info("收尾无人执行的 run",
+		"run_id", run.ID, "session_id", run.SessionID, "started_at", run.StartedAt)
 }
 
 // CancelRun 是唯一能停掉一轮执行的入口。

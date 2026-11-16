@@ -85,8 +85,11 @@ type Session struct {
 	TitleAuto bool // true 表示标题可被首条消息改写
 	// SkillPath 是会话绑定的技能（相对空间 files/ 的 SKILL.md 路径），空表示未绑定
 	SkillPath string
-	// AgentID 是会话绑定的智能体（agents/ 目录下的 id），空表示未绑定
+	// AgentID 是会话绑定的智能体（插件 slug），空表示未绑定
 	AgentID string
+	// AgentSpaceID 是智能体所属空间；空表示与会话同空间。
+	// 派发出来的子会话会指向发起方空间，按 slug 解析时不能只看会话自己的空间。
+	AgentSpaceID string
 	// AgentVersion 是创建时绑定的版本，用于发现配置漂移
 	AgentVersion string
 	// AgentPrompt 是创建时固化的追加提示词，管理员事后改配置不影响已开会话
@@ -312,11 +315,12 @@ type Store interface {
 	DeleteSpaceTree(ctx context.Context, id string) ([]Space, error)
 
 	// CreateSession 创建会话；agent 参数是创建时固化的智能体绑定（id / 版本 / 追加提示词）。
-	// 标题按「自动」处理：用户发第一条消息时会被改写。
+	// 标题按「自动」处理：用户发第一条消息时会被改写。智能体默认属于本空间。
 	CreateSession(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string) (Session, error)
 	// CreateSessionTitled 创建会话并指定标题是否自动改写。
 	// 派发出来的任务会话传 false：标题是任务内容，不能被对方的第一句「好的」覆盖。
-	CreateSessionTitled(ctx context.Context, spaceID, userID, title, dir, agentID, agentVersion, agentPrompt string, titleAuto bool) (Session, error)
+	// agentSpaceID 为空表示智能体与会话同空间；派发时传发起方空间。
+	CreateSessionTitled(ctx context.Context, spaceID, userID, title, dir, agentSpaceID, agentID, agentVersion, agentPrompt string, titleAuto bool) (Session, error)
 	ListSessions(ctx context.Context, spaceID string) ([]Session, error)
 	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
 	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
@@ -334,7 +338,8 @@ type Store interface {
 	// UpdateSessionSkill 绑定/清除会话技能（相对空间 files/ 的 SKILL.md 路径，空串清除）。
 	UpdateSessionSkill(ctx context.Context, id, path string) error
 	// UpdateSessionAgent 重新绑定会话的智能体，按当前配置重新固化提示词。
-	UpdateSessionAgent(ctx context.Context, id, agentID, agentVersion, agentPrompt string) error
+	// agentSpaceID 为空表示智能体与会话同空间。
+	UpdateSessionAgent(ctx context.Context, id, agentSpaceID, agentID, agentVersion, agentPrompt string) error
 
 	CreateMessage(ctx context.Context, sessionID, role, content string) (Message, error)
 	// CreateMessageFrom 写入一条带来源的消息（task_result / external 需要区分渲染与提示词包装）。
@@ -376,9 +381,39 @@ type Store interface {
 	// GetRun 读一次执行的状态：前端刷新后据此判断「还在不在跑」。
 	GetRun(ctx context.Context, id string) (Run, error)
 	// GetActiveRun 返回会话当前活跃的 run（running / waiting_approval），没有则 ok=false。
-	GetActiveRun(ctx context.Context, sessionID string) (Run, bool, error)
+	//
+	// staleAfter > 0 时顺带按心跳判活：心跳停了超过这个时长的 run 不再算「在跑」，
+	// 否则进程崩溃后前端会一直以为任务还在，点停止也没有任何人来收尾。
+	GetActiveRun(ctx context.Context, sessionID string, staleAfter time.Duration) (Run, bool, error)
 	// ListRunSteps 按 seq 返回一次执行的全部 checkpoint，供恢复时重放。
 	ListRunSteps(ctx context.Context, runID string) ([]RunStep, error)
+
+	// TouchRun 刷新一次执行的心跳：跑它的进程还活着。
+	//
+	// 这是「在跑」的唯一凭据。用应用侧刷新而不是 started_at，是因为长任务本身就该跑很久，
+	// 只有「心跳停了」才说明执行没了。
+	TouchRun(ctx context.Context, runID string) error
+	// SaveRunResume 覆盖一次执行的断点快照（每轮一次，只有最新值有意义）。
+	SaveRunResume(ctx context.Context, runID string, payload []byte) error
+	// GetRunResume 取一次执行的断点快照；没有则 ok=false。
+	GetRunResume(ctx context.Context, runID string) ([]byte, bool, error)
+	// DeleteRunResume 丢弃断点：用户主动停止的那一轮不该再被「继续」。
+	DeleteRunResume(ctx context.Context, runID string) error
+	// ResumableRun 返回会话里最近一次留着断点的 run；没有则 ok=false。
+	ResumableRun(ctx context.Context, sessionID string) (Run, bool, error)
+	// SweepStaleRuns 把心跳停了却还挂着 running 的执行置为 failed，返回收尾条数。
+	//
+	// 顺带把它们的流式占位消息标成中断——否则刷新后会一直显示「生成中」，
+	// 而那条消息永远不会有人来写完。
+	SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string) (int, error)
+	// AbandonRun 收尾一条「没人跑」的执行：置为 failed 并结算它的流式占位消息。
+	//
+	// 与 SweepStaleRuns 的区别只在触发时机与判据：清扫靠心跳超时批量做，
+	// 这条给 active-run 用——库里还挂着 running、进程内却没有执行体时当场收尾，
+	// 不必等 idle 超时（进程被 kill、迁移给历史行补默认心跳都会造出这种假活）。
+	// staleAfter > 0 时按心跳再挡一道：心跳还在跳说明执行在别处活着，本进程无权替它收尾。
+	// 断点（run_resume）不动：用户仍可以在会话里点「继续」。
+	AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration) error
 
 	// ---- 任务派发（§15.12.4）----
 	CreateTask(ctx context.Context, t Task) (Task, error)
@@ -430,6 +465,9 @@ type Store interface {
 	// ClaimMCPApp 幂等抢占应用名：created=true 表示这次抢到的，
 	// false 表示别人已经占着（返回已有归属，调用方据此提示找创建人）。
 	ClaimMCPApp(ctx context.Context, app, userID, spaceID string) (MCPApp, bool, error)
+	// ListMCPApps 返回全部归属记录，按应用名排序。
+	// 只给管理员的应用密钥页用：它回答「谁创建的」，密钥本身在凭证存储里。
+	ListMCPApps(ctx context.Context) ([]MCPApp, error)
 	// ---- 插件候选：空间本地插件「已启用、未发布」的市场元数据 ----
 	UpsertPluginCandidate(ctx context.Context, c PluginCandidate) (PluginCandidate, error)
 	GetPluginCandidate(ctx context.Context, spaceID, slug string) (PluginCandidate, error)

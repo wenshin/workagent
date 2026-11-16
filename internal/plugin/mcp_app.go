@@ -5,9 +5,12 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/mcp"
+	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/store"
 )
 
@@ -190,4 +193,125 @@ func (m *Manager) userDisplayName(ctx context.Context, userID string) string {
 		return ""
 	}
 	return strings.TrimSpace(u.Name)
+}
+
+// ErrMCPAppKeyMissing 应用名有归属记录，但凭证存储里没有对应密钥。
+// 与「应用名不存在」区分开：管理员点开列表不该顺手生成一把新密钥。
+var ErrMCPAppKeyMissing = errors.New("该应用还没有签名密钥")
+
+// ErrMCPAppName 应用名不合规（它会直接作为凭证存储里的键）。
+var ErrMCPAppName = errors.New("应用名只能包含字母、数字、下划线与短横线，且不超过 64 个字符")
+
+// MCPAppInfo 是管理员视角的一条应用密钥，默认不含明文。
+//
+// 列表页一次拉全部应用：把密钥一起下发等于把生产密钥写进浏览器缓存、代理日志
+// 与 HAR 文件里。明文只在用户点「查看」时单独取一次（RevealMCPAppKey）。
+type MCPAppInfo struct {
+	App        string    `json:"app"`
+	OwnerID    string    `json:"owner_id,omitempty"`
+	OwnerName  string    `json:"owner_name,omitempty"`
+	OwnerSpace string    `json:"owner_space_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	// Fingerprint 与 UpdatedAt 来自凭证存储；HasKey=false 时为空。
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	HasKey      bool      `json:"has_key"`
+	// Legacy 表示有密钥但没有归属记录（早于 mcp_app 流程生成的），
+	// 只能由系统管理员兜底，界面上要标出来。
+	Legacy bool `json:"legacy"`
+}
+
+// secretStatusLister 是凭证存储的「列指纹」侧能力（secret.FileStore 实现）。
+// 只需要元信息，不解密：列表刷新不该把全部密钥解一遍。
+type secretStatusLister interface {
+	Status(ctx context.Context, scope string) ([]secret.Item, error)
+}
+
+// ListMCPApps 列出全部 MCP 应用及其密钥指纹（管理员入口，不含明文）。
+//
+// 数据必须合并两处：归属表 mcp_app 回答「谁创建的」，凭证存储 mcp_jwt 回答
+// 「有没有密钥、指纹是什么」。只看其中一处都会漏——历史密钥没有归属记录，
+// 归属记录也可能因为生成失败而没有密钥。
+func (m *Manager) ListMCPApps(ctx context.Context) ([]MCPAppInfo, error) {
+	recs, err := m.o.Store.ListMCPApps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byApp := make(map[string]MCPAppInfo, len(recs))
+	for _, rec := range recs {
+		byApp[rec.App] = MCPAppInfo{
+			App:        rec.App,
+			OwnerID:    rec.OwnerUserID,
+			OwnerName:  m.userDisplayName(ctx, rec.OwnerUserID),
+			OwnerSpace: rec.OwnerSpaceID,
+			CreatedAt:  rec.CreatedAt,
+		}
+	}
+
+	// 指纹与更新时间以凭证存储为准；存储没启用时列表只剩归属信息。
+	if m.o.Secrets != nil && !m.secretsUnavailable() {
+		if lister, ok := m.o.Secrets.(secretStatusLister); ok {
+			items, serr := lister.Status(ctx, mcp.MCPJWTScope)
+			if serr != nil {
+				if m.o.Logger != nil {
+					m.o.Logger.Warn("列举 MCP 应用密钥失败", "err", serr)
+				}
+			} else {
+				for _, it := range items {
+					info, seen := byApp[it.Name]
+					if !seen {
+						info = MCPAppInfo{App: it.Name, Legacy: true}
+					}
+					info.HasKey = true
+					info.Fingerprint = it.Fingerprint
+					info.UpdatedAt = it.UpdatedAt
+					byApp[it.Name] = info
+				}
+			}
+		}
+	}
+
+	out := make([]MCPAppInfo, 0, len(byApp))
+	for _, info := range byApp {
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].App < out[j].App })
+	return out, nil
+}
+
+// RevealMCPAppKey 取回任意应用的签名密钥明文（仅系统管理员入口）。
+//
+// 与 MCPAppKeyFor 的差别只在「谁能看」：那边按创建者收口，这条是平台兜底通道
+// （创建人离职、老数据没有归属时只能靠它）。所以这里**只读不建**：缺密钥就报错，
+// 管理员点开列表不该改变任何应用的密钥，更不该把「看过」变成「换过」。
+func (m *Manager) RevealMCPAppKey(ctx context.Context, actor, app string) (MCPAppInfo, string, error) {
+	app = strings.TrimSpace(app)
+	if !appNameRe.MatchString(app) {
+		return MCPAppInfo{}, "", fmt.Errorf("%w：%q", ErrMCPAppName, app)
+	}
+	if m.secretsUnavailable() {
+		return MCPAppInfo{}, "", errSecretsDisabled
+	}
+
+	key, err := m.o.Secrets.Get(ctx, mcp.MCPJWTScope, app)
+	if errors.Is(err, secret.ErrNotFound) || (err == nil && key == "") {
+		return MCPAppInfo{}, "", ErrMCPAppKeyMissing
+	}
+	if err != nil {
+		return MCPAppInfo{}, "", err
+	}
+
+	info := MCPAppInfo{App: app, HasKey: true, Fingerprint: secret.Fingerprint(key)}
+	if rec, rerr := m.o.Store.GetMCPApp(ctx, app); rerr == nil {
+		info.OwnerID = rec.OwnerUserID
+		info.OwnerName = m.userDisplayName(ctx, rec.OwnerUserID)
+		info.OwnerSpace = rec.OwnerSpaceID
+		info.CreatedAt = rec.CreatedAt
+	} else {
+		info.Legacy = true
+	}
+
+	// 审计只记「谁在什么时候看了哪个应用的密钥」，值不落审计。
+	m.recordAudit(ctx, actor, "mcp_app.key.admin_view", app, "ok", nil)
+	return info, key, nil
 }

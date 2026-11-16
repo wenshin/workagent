@@ -96,10 +96,28 @@ type Config struct {
 	// 预算控制（§5.7.2 关键约束）
 	LLMMaxToolCalls int
 	LLMMaxParallel  int
+	// LLMMaxWallClock 是一轮回答的总时长上限（<=0 表示不限）。
+	//
+	// 它只是最后一道保险，防「确实在动但永远跑不完」；判定「卡住」的是 RunIdleTimeout，
+	// 判定「该收了」的是进度守卫与 token 预算。长任务不该因为这个值被砍。
 	LLMMaxWallClock time.Duration
+	// RunIdleTimeout 是连续多久没有任何事件（模型增量、工具返回）就判定卡住。
+	// 跑得久不是问题，没有动静地跑很久才是。
+	RunIdleTimeout time.Duration
 	// LLMMaxTotalTokens 是一次 run 的累计 token 上限（所有轮次相加），
 	// 与 LLMMaxTokens（单次响应）不是一回事：后者限一次输出，前者限累计成本。
 	LLMMaxTotalTokens int
+	// LLMContextTokens 是模型上下文窗口（token）：输入超过它的 60% 就折叠较早的
+	// 工具往返（见 builtin/compact.go）。0 表示不做轮内压缩。
+	LLMContextTokens int
+
+	// 跨轮上下文预算（§5.7.2 三段式）：
+	// CtxWindow 是保留原文的最近消息条数，CtxMaxRunes 是总字数上限，
+	// CtxSummaryRunes 是摘要目标长度，CtxTopK 是向量检索补充的片段数。
+	CtxWindow       int
+	CtxMaxRunes     int
+	CtxSummaryRunes int
+	CtxTopK         int
 
 	// 凭证加密（§5.5.2 的 MVP 形态）：KEK 只从环境变量读，不进仓库。
 	// 为空时凭证存储不可用，搜索等需要密钥的能力自动降级为「未配置」。
@@ -130,16 +148,17 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("LLM_TIMEOUT 不是合法的时长: %w", err)
 	}
 
-	// 轮次是「一次模型调用」：检索 → 读正文 → 写文件这类多步任务在 5 轮内经常差一步，
-	// 因此默认给到 8；真正的上限由墙钟、工具次数与累计 token 三道预算共同兜住。
-	maxRounds := 8
+	// 轮次是「一次模型调用」。它只是防死循环的最后一道，不是长任务的判据：
+	// 真正决定收尾的是进度守卫（连续无新信息）、工具次数与累计 token。
+	// 长任务常常要几十轮，按 8 轮砍会把「正在推进」的任务判死。
+	maxRounds := 40
 	if v := getenv("LLM_MAX_ROUNDS", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxRounds); err != nil || maxRounds <= 0 {
 			return nil, fmt.Errorf("LLM_MAX_ROUNDS 必须是正整数")
 		}
 	}
 
-	maxToolCalls := 20
+	maxToolCalls := 150
 	if v := getenv("LLM_MAX_TOOL_CALLS", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxToolCalls); err != nil || maxToolCalls <= 0 {
 			return nil, fmt.Errorf("LLM_MAX_TOOL_CALLS 必须是正整数")
@@ -153,12 +172,50 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// 累计 token 预算：0 表示不限（只靠墙钟与工具次数兜底），
-	// 默认 80000 大致对应「十来轮中等工具调用」，超过它继续跑基本是在绕圈。
-	maxTotalTokens := 80000
+	// 累计 token 预算：0 表示不限（只靠总时长与工具次数兜底）。
+	// 这是唯一跟成本直接挂钩的预算，长任务按它收口；每轮都会重发完整上下文，
+	// 所以它在轮次上的消耗速度比看起来快。
+	maxTotalTokens := 400000
 	if v := getenv("LLM_MAX_TOTAL_TOKENS", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxTotalTokens); err != nil || maxTotalTokens < 0 {
 			return nil, fmt.Errorf("LLM_MAX_TOTAL_TOKENS 必须是非负整数（0 表示不限）")
+		}
+	}
+
+	// 上下文窗口：轮内压缩的判据。一轮长任务里工具回执线性增长，
+	// 输入超过窗口 60% 就把较早的往返折成进展记录（不调模型、零成本）。
+	// 0 表示不做轮内压缩，只靠跨轮的 ctxmgr。
+	//
+	// 默认按 deepseek-chat 的 128k 给；换成窗口更小的模型要跟着改，
+	// 否则会先撞上模型的 context-length 错误（那时折到只剩一轮再重试，能兜住但体验差）。
+	contextTokens := 128000
+	if v := getenv("LLM_CONTEXT_TOKENS", ""); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &contextTokens); err != nil || contextTokens < 0 {
+			return nil, fmt.Errorf("LLM_CONTEXT_TOKENS 必须是非负整数（0 表示不做轮内压缩）")
+		}
+	}
+
+	// 跨轮上下文预算（§5.7.2 三段式：摘要 + 检索 + 滑动窗口）
+	ctxWindow := 16
+	ctxMaxRunes := 24000
+	ctxSummaryRunes := 600
+	ctxTopK := 4
+	for _, item := range []struct {
+		name string
+		dst  *int
+		def  int
+	}{
+		{"CTX_WINDOW", &ctxWindow, 16},
+		{"CTX_MAX_RUNES", &ctxMaxRunes, 24000},
+		{"CTX_SUMMARY_RUNES", &ctxSummaryRunes, 600},
+		{"CTX_TOP_K", &ctxTopK, 4},
+	} {
+		v := getenv(item.name, "")
+		if v == "" {
+			continue
+		}
+		if _, err := fmt.Sscanf(v, "%d", item.dst); err != nil || *item.dst <= 0 {
+			return nil, fmt.Errorf("%s 必须是正整数", item.name)
 		}
 	}
 
@@ -186,9 +243,22 @@ func Load() (*Config, error) {
 		}
 	}
 
-	wallClock, err := time.ParseDuration(getenv("LLM_MAX_WALL_CLOCK", "10m"))
+	// 总时长上限：长任务默认给 2 小时，0 = 不限。真正的收尾靠进度守卫与 token 预算，
+	// 它只在「一直在动但跑不完」时兜底。
+	wallClock, err := time.ParseDuration(getenv("LLM_MAX_WALL_CLOCK", "2h"))
 	if err != nil {
 		return nil, fmt.Errorf("LLM_MAX_WALL_CLOCK 不是合法的时长: %w", err)
+	}
+	// 无进展判定：长任务可以跑很久，但不能静默地跑很久
+	idleTimeout, err := time.ParseDuration(getenv("RUN_IDLE_TIMEOUT", "10m"))
+	if err != nil {
+		return nil, fmt.Errorf("RUN_IDLE_TIMEOUT 不是合法的时长: %w", err)
+	}
+	if idleTimeout <= 0 {
+		idleTimeout = 10 * time.Minute
+	}
+	if wallClock > 0 && wallClock < idleTimeout {
+		return nil, fmt.Errorf("LLM_MAX_WALL_CLOCK 不能小于 RUN_IDLE_TIMEOUT（%s < %s）：总上限比无进展阈值还短会误杀正常的长回答", wallClock, idleTimeout)
 	}
 
 	// 上传单文件上限：按 MB 配，乘 2^20 落到字节；0 表示用 space 包的默认值（4MB）。
@@ -251,7 +321,13 @@ func Load() (*Config, error) {
 		LLMMaxToolCalls:   maxToolCalls,
 		LLMMaxParallel:    maxParallel,
 		LLMMaxWallClock:   wallClock,
+		RunIdleTimeout:    idleTimeout,
 		LLMMaxTotalTokens: maxTotalTokens,
+		LLMContextTokens:  contextTokens,
+		CtxWindow:         ctxWindow,
+		CtxMaxRunes:       ctxMaxRunes,
+		CtxSummaryRunes:   ctxSummaryRunes,
+		CtxTopK:           ctxTopK,
 
 		SecretKEK: getenv("SECRET_KEK", ""),
 

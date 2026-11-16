@@ -8,7 +8,8 @@
 // 平台侧能力不在这里实现（§5.7.7 能力边界）：
 //   - 审批判定在 tool.Invoker 的策略链里，本实现只把结果翻译成 approval.req 事件；
 //   - checkpoint 由会话层按事件落 run_step；
-//   - 上下文压缩由 ctxmgr 在调用前完成。
+//   - 跨轮的上下文压缩由 ctxmgr 在调用前完成；轮内的工具往返折叠在这里（compact.go），
+//     因为只有本实现知道「哪几轮是一个完整的工具往返」。
 package builtin
 
 import (
@@ -17,7 +18,6 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/config"
@@ -36,9 +36,12 @@ const (
 	// maxToolFeedBytes 是工具结果回填给模型的默认上限；
 	// 读类工具通过 Tool.MaxResultBytes 申请更高额度（见 file_read / plugin_read）。
 	maxToolFeedBytes = 4 * 1024
-	// defaultRounds 是配置缺失时的轮次兜底：一轮 = 一次模型调用，
-	// 典型任务（检索 → 读正文 → 写文件）在 8 轮内可以做完。
-	defaultRounds = 8
+	// defaultRounds 是配置缺失时的轮次兜底：一轮 = 一次模型调用。
+	//
+	// 它只是「防死循环」的最后一道，不是长任务的判据：真正决定收尾的是
+	// 进度守卫（连续无新信息）与 token 预算。按 10 轮给，长任务跑不满 10 轮就被砍
+	// 才是不该发生的事。
+	defaultRounds = 40
 )
 
 // Agent 是内置 ReAct 实现，满足 agent.Agent。
@@ -75,6 +78,7 @@ func (a *Agent) Capabilities() agent.Capabilities {
 		Streaming:     true,
 		Reasoning:     true,
 		Approval:      true,
+		Resume:        true,
 		Dispatch:      true,
 		Guard:         true,
 	}
@@ -94,6 +98,7 @@ func (a *Agent) Budget() map[string]any {
 		"max_wall_clock_s": int(a.cfg.LLMMaxWallClock.Seconds()),
 		"max_tokens":       a.cfg.LLMMaxTokens,
 		"max_total_tokens": a.cfg.LLMMaxTotalTokens,
+		"context_tokens":   a.cfg.LLMContextTokens,
 		"stall_rounds":     a.cfg.AgentStallRounds,
 		"max_depth":        a.maxDepth(),
 	}
@@ -123,24 +128,58 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	}
 	defs := tool.Definitions(tools)
 
-	messages := make([]llm.Message, 0, len(in.History)+2)
-	messages = append(messages, agent.BuildSystemMessage(in))
-	messages = append(messages, in.History...)
-
-	var reasoning strings.Builder
-	deadline := a.deadline(in)
-	maxRounds := a.roundLimit(in)
-	guard := newProgressGuard(a.cfg.AgentStallRounds)
+	// 续跑：直接沿用断点里的消息序列与预算计数。
+	//
+	// 系统提示词、历史、每一轮的工具回执都在里面，所以「接着走」不是重新规划——
+	// 已经执行过的工具不会因为续跑再执行一遍（副作用类工具尤其重要）。
+	var messages []llm.Message
+	roundStart := 0
 	toolCalls := 0
 	totalTokens := 0
+	if in.Resume != nil && len(in.Resume.Messages) > 0 {
+		messages = append(messages, in.Resume.Messages...)
+		roundStart = in.Resume.Round
+		toolCalls = in.Resume.ToolCalls
+		totalTokens = in.Resume.TotalTokens
+	} else {
+		messages = make([]llm.Message, 0, len(in.History)+2)
+		messages = append(messages, agent.BuildSystemMessage(in))
+		messages = append(messages, in.History...)
+	}
 
-	for round := 0; round < maxRounds; round++ {
+	var reasoning strings.Builder
+	maxRounds := a.roundLimit(in)
+	guard := newProgressGuard(a.cfg.AgentStallRounds)
+	// lastInputTokens 是上一轮模型回报的输入规模：它比字数估算准，
+	// 也是「这一轮上下文有多长」的唯一真实观测值
+	lastInputTokens := 0
+
+	// 续跑也可能把轮次用光：这时不必再问模型，直接按预算用尽收尾，
+	// 否则会走到「没有返回内容」那条更含糊的错误路径。
+	if roundStart >= maxRounds {
+		res.StopReason = "budget"
+		return res, fmt.Errorf("%w：续跑时轮次预算已用尽（%d 轮）", agent.ErrBudgetExceeded, maxRounds)
+	}
+
+	// checkpoint 只记「已经完成的轮次」：一轮里的模型增量没有重放价值，
+	// 工具回执才是真的进展，也是重入时必须原样带回模型的东西。
+	checkpoint := func(round int) {
+		if in.Checkpoint == nil {
+			return
+		}
+		state := agent.ResumeState{
+			Messages:    messages,
+			Round:       round + 1,
+			ToolCalls:   toolCalls,
+			TotalTokens: totalTokens,
+			Query:       in.Query,
+		}
+		_ = in.Checkpoint(state)
+	}
+
+	for round := roundStart; round < maxRounds; round++ {
 		if err := ctx.Err(); err != nil {
 			return res, err
-		}
-		if time.Now().After(deadline) {
-			res.StopReason = "budget"
-			return res, fmt.Errorf("%w：本轮对话超过时间预算（%s）", agent.ErrBudgetExceeded, a.cfg.LLMMaxWallClock)
 		}
 
 		// 每一轮先问「下一步还有没有价值」，再决定给不给工具
@@ -151,8 +190,17 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			messages = append(messages, finalInstruction(decision.Detail))
 		}
 
+		// 上下文管理：超预算就折叠较早的工具往返，别等模型报错。
+		// 判据用上一轮真实的 input_tokens，没有就按字数估。
+		messages = a.fitContext(messages, lastInputTokens)
+
 		var roundText strings.Builder
-		out, provider, chatErr := a.llm.Chat(ctx, llm.RouteChat, llm.ChatRequest{Messages: messages, Tools: roundDefs}, func(d llm.Delta) error {
+		// 注意用 = 而不是 :=：:= 会在循环里新建一个 messages，
+		// 外层那份就再也不长了（上下文每轮都被重置成系统提示词）
+		var out llm.Result
+		var provider string
+		var chatErr error
+		out, provider, messages, chatErr = a.chatRound(ctx, messages, roundDefs, func(d llm.Delta) error {
 			if d.Reasoning != "" {
 				reasoning.WriteString(d.Reasoning)
 				return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Reasoning, Reasoning: true})
@@ -165,6 +213,10 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		})
 		if chatErr != nil {
 			return res, chatErr
+		}
+		// 这一轮模型看到的输入规模，就是下一轮压缩的判据
+		if out.Usage.InputTokens > 0 {
+			lastInputTokens = out.Usage.InputTokens
 		}
 		appendRoundContent(&res, roundText.String())
 		res.Provider = provider
@@ -324,6 +376,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		if hint := guard.afterRound(records); hint != "" && lastToolMsg >= 0 {
 			messages[lastToolMsg].Content = hint + "\n\n" + messages[lastToolMsg].Content
 		}
+		checkpoint(round)
 	}
 
 	// 轮次用尽：不再静默返回半截内容，而是逼一次结论
@@ -352,9 +405,11 @@ func (a *Agent) finish(
 	msgs := make([]llm.Message, 0, len(messages)+1)
 	msgs = append(msgs, messages...)
 	msgs = append(msgs, finalInstruction(detail))
+	// 收尾调用最容易撞窗口：它要把整段历史再发一次，而这时上下文通常已经最长
+	msgs = a.fitContext(msgs, 0)
 
 	var text strings.Builder
-	out, provider, err := a.llm.Chat(ctx, llm.RouteChat, llm.ChatRequest{Messages: msgs}, func(d llm.Delta) error {
+	out, provider, _, err := a.chatRound(ctx, msgs, nil, func(d llm.Delta) error {
 		if d.Reasoning != "" {
 			return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Reasoning, Reasoning: true})
 		}
@@ -427,15 +482,6 @@ func (a *Agent) roundLimit(in agent.RunInput) int {
 		limit = 1
 	}
 	return limit
-}
-
-// deadline 取「自身墙钟预算」与「父任务截止时间」中更早的一个。
-func (a *Agent) deadline(in agent.RunInput) time.Time {
-	d := time.Now().Add(a.cfg.LLMMaxWallClock)
-	if !in.Deadline.IsZero() && in.Deadline.Before(d) {
-		return in.Deadline
-	}
-	return d
 }
 
 // riskOf 返回工具的风险等级（未知工具为 0）。

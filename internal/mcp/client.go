@@ -26,10 +26,10 @@ type Client struct {
 	authHeader string
 	secret     string
 	// secretFn 优先于 secret：每次请求现取，用于服务令牌的按需重签
-	secretFn func() string
-	http       *http.Client
-	sessionID  string
-	nextID     atomic.Int64
+	secretFn  func() string
+	http      *http.Client
+	sessionID string
+	nextID    atomic.Int64
 }
 
 // NewClient 构造客户端；secret 为空表示不需要鉴权。

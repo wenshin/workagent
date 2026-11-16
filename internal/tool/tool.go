@@ -31,6 +31,19 @@ type PluginTry interface {
 	DryRunJSON(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (string, error)
 }
 
+// PluginRef 指向另一个空间里的一个插件，用于「子会话借用发起方空间的智能体」。
+// SpaceID 是插件来源空间，Slug 是插件 slug；同名 slug 在多个空间可以并存，所以空间不能省。
+type PluginRef struct {
+	SpaceID string
+	Slug    string
+}
+
+// PluginBorrower 是可选的跨空间借用能力，由插件管理器实现。
+// 借用出来的工具执行时仍落在当前会话空间（文件读写不改空间），只有插件内容与配置来自来源空间。
+type PluginBorrower interface {
+	ToolsFor(ctx context.Context, spaceID string, refs []PluginRef) ([]Tool, error)
+}
+
 // Env 是工具执行时的上下文，决定能看到哪些数据。
 type Env struct {
 	UserID    string
@@ -51,6 +64,10 @@ type Env struct {
 
 	// Plugins 是「当前空间 + 系统空间」合并后的插件目录，为 nil 时 plugin_search / plugin_read 不可用。
 	Plugins PluginLoader
+
+	// ExtraPluginRefs 是跨空间借用的插件（子会话继承发起方空间的智能体及其依赖）。
+	// 只影响工具与技能的可视范围，不改文件读写空间：文件工具始终用 SpaceID。
+	ExtraPluginRefs []PluginRef
 
 	// Search 是搜索 provider 注册表（internal/search），为 nil 时 web_search 不可用。
 	// 密钥与出网策略都在实现内部，不经由工具参数传递。
@@ -104,6 +121,9 @@ type TaskDispatcher interface {
 	// RemindTask 催办已有任务：只往原会话补一条提醒，不新建会话、不改被派发人。
 	// 模型必须先 task_list 拿到 task_id，否则会退化成「再派发一次」。
 	RemindTask(ctx context.Context, userID, taskID string) (TaskInfo, error)
+	// ReplyTask 是子会话侧的正式回执：由被派发人确认结论后触发。
+	// 平台不再在每轮结束时自动回填，否则「我先确认一下」也会被当成结果。
+	ReplyTask(ctx context.Context, userID, sessionID, summary string) (TaskInfo, error)
 }
 
 // Tool 是一个可被模型调用的工具。
@@ -228,6 +248,18 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 			r.log.Warn("加载插件工具失败", "space", env.SpaceID, "err", err)
 		} else {
 			tools = append(tools, extra...)
+		}
+		// 跨空间借用：子会话继承发起方空间的智能体，工具来自来源空间、执行落在本会话空间。
+		// 借用失败同样只降级，不影响会话本身还能聊。
+		if len(env.ExtraPluginRefs) > 0 {
+			if b, ok := r.plugins.(PluginBorrower); ok {
+				borrowed, err := b.ToolsFor(ctx, env.SpaceID, env.ExtraPluginRefs)
+				if err != nil {
+					r.log.Warn("加载借用插件工具失败", "space", env.SpaceID, "err", err)
+				} else {
+					tools = append(tools, borrowed...)
+				}
+			}
 		}
 	}
 

@@ -60,8 +60,23 @@ func New(st store.Store, router *llm.Router, log *slog.Logger, budget Budget) *M
 	if log == nil {
 		log = slog.Default()
 	}
+	// 逐项补默认值，不整份替换：调用方只想改窗口条数时，
+	// 不该把字数上限与摘要长度一起清成 0
+	def := DefaultBudget()
 	if budget.Window <= 0 {
-		budget = DefaultBudget()
+		budget.Window = def.Window
+	}
+	if budget.MaxRunes <= 0 {
+		budget.MaxRunes = def.MaxRunes
+	}
+	if budget.TopK <= 0 {
+		budget.TopK = def.TopK
+	}
+	if budget.SummaryRunes <= 0 {
+		budget.SummaryRunes = def.SummaryRunes
+	}
+	if budget.MinScore <= 0 {
+		budget.MinScore = def.MinScore
 	}
 	return &Manager{store: st, router: router, budget: budget, log: log}
 }
@@ -104,14 +119,22 @@ func (m *Manager) Build(ctx context.Context, in Input) ([]llm.Message, error) {
 
 	// 最近消息按预算倒推，宁少勿超
 	recentMsgs := make([]llm.Message, 0, len(recent))
-	total := 0
-	for i := len(recent) - 1; i >= 0; i-- {
-		size := utf8.RuneCountInString(recent[i].Content)
-		if total+size > m.budget.MaxRunes {
+	remaining := m.budget.MaxRunes
+	for i := len(recent) - 1; i >= 0 && remaining > 0; i-- {
+		content := recent[i].Content
+		size := utf8.RuneCountInString(content)
+		if size > remaining {
+			// 最新一条自己就超预算（多半是用户粘了一整份日志）：截断保留头部，
+			// 而不是整条丢掉。丢掉等于「用户说的话模型一个字都没听到」，
+			// 而且不会报错，是最难排查的一类故障。
+			if len(recentMsgs) == 0 {
+				content = truncateRunes(content, remaining)
+				recentMsgs = append(recentMsgs, llm.Message{Role: recent[i].Role, Content: content})
+			}
 			break
 		}
-		total += size
-		recentMsgs = append(recentMsgs, llm.Message{Role: recent[i].Role, Content: recent[i].Content})
+		remaining -= size
+		recentMsgs = append(recentMsgs, llm.Message{Role: recent[i].Role, Content: content})
 	}
 	for i, j := 0, len(recentMsgs)-1; i < j; i, j = i+1, j-1 {
 		recentMsgs[i], recentMsgs[j] = recentMsgs[j], recentMsgs[i]

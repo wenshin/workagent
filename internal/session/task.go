@@ -120,22 +120,42 @@ func (s *Service) Dispatch(ctx context.Context, userID, sessionID string, in too
 
 	brief := strings.TrimSpace(in.Brief)
 	// dir 传空：父会话的目录是相对父空间 files/ 的路径，跨到个人空间后没有意义。
-	// 智能体不继承：用平台默认的通用助理，提示词与版本都留空，由运行时按 B 的空间解析。
 	// titleAuto=false：会话名就是任务内容，不能被对方回的第一句「好的」改掉。
+	//
+	// 智能体继承父会话的绑定：子会话里记下来源空间，运行时按「发起方空间 + slug」
+	// 解析；提示词与版本留空，让智能体更新后子任务也能跟上。发起方的智能体不可用
+	// （被停用/删掉）时回落到通用助理，不能因为一个可选绑定让派发失败。
+	agentID, agentSpaceID, agentName := baseAgentID, "", ""
+	if sess.AgentID != "" && sess.AgentID != baseAgentID && s.agentPlugins != nil {
+		if r, err := s.agentPlugins.ResolveAgentPlugin(ctx, sess.SpaceID, sess.AgentID); err == nil {
+			agentID, agentSpaceID, agentName = sess.AgentID, sess.SpaceID, r.Name
+		} else {
+			s.log.Warn("派发时智能体不可用，回落到通用助理",
+				"agent_id", sess.AgentID, "space_id", sess.SpaceID, "err", err)
+		}
+	}
 	child, err := s.store.CreateSessionTitled(ctx, personalSpaceID, assignee.ID,
-		truncate(title, 60), "", baseAgentID, "", "", false)
+		truncate(title, 60), "", agentSpaceID, agentID, "", "", false)
 	if err != nil {
 		return tool.TaskInfo{}, err
 	}
 
 	// 子会话的第一条消息就是任务说明：被派发人打开就知道是谁派的、要做什么、回什么。
+	// 话术以智能体为主语（「我是 XX 智能体」），而不是平台旁白，便于对方理解这是谁在问。
 	if brief != "" {
 		from := userID
 		if u, err := s.store.GetUser(ctx, userID); err == nil {
 			from = u.Name
 		}
-		intro := fmt.Sprintf("%s 通过智能体派了个任务给你，直接在本会话回复即可，结果会自动回传给他。", from)
-		if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user", intro+"\n\n"+brief, "task_brief"); err != nil {
+		var intro string
+		if agentName != "" {
+			intro = fmt.Sprintf("你好，我是「%s」智能体，%s 的助理。\n他委托我找你确认一件事：%s",
+				agentName, from, title)
+		} else {
+			intro = fmt.Sprintf("你好，我是%s 的助理。\n他委托我找你确认一件事：%s", from, title)
+		}
+		body := intro + "\n\n" + brief + "\n\n你的回复会转达给他，确认后我把结论带回去。"
+		if _, err := s.store.CreateMessageFrom(ctx, child.ID, "user", body, "task_brief"); err != nil {
 			s.log.Warn("写入任务说明失败", "task_session", child.ID, "err", err)
 		}
 	}
@@ -240,31 +260,51 @@ func (s *Service) RemindTask(ctx context.Context, userID, taskID string) (tool.T
 	return toTaskInfo(task, ""), nil
 }
 
-// completeParentTask 在子会话跑完一轮后把结果回填父会话。
+// ReplyTask 是子会话对被派发任务的正式回执：被派发人确认结论后由 Agent 调用。
 //
-// 回填后自动起一轮 run，否则派发方不再说话就永远不知道结果；
-// 但密度受限：一分钟内最多触发 3 次，其余的回执留在消息里等下一轮一起读。
-func (s *Service) completeParentTask(ctx context.Context, childSessionID, content string) {
-	if s.store == nil || strings.TrimSpace(content) == "" {
-		return
+// 平台不再在每轮 run 结束时自动回填：那样「我先确认一下」「能再说说是哪个表吗」
+// 这一轮也会被当成结果，发起方看到的状态永远是「已完成」，而实际对方只是在反问。
+// 现在的口径是「用户确认结论 → 调一次 task_reply → 任务才成功」。
+func (s *Service) ReplyTask(ctx context.Context, userID, sessionID, summary string) (tool.TaskInfo, error) {
+	if _, _, err := s.load(ctx, userID, sessionID); err != nil {
+		return tool.TaskInfo{}, err
 	}
-	task, err := s.store.GetTaskByChild(ctx, childSessionID)
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return tool.TaskInfo{}, errors.New("回执内容不能为空：请先总结结论")
+	}
+
+	task, err := s.store.GetTaskByChild(ctx, sessionID)
 	if err != nil {
-		if !errors.Is(err, store.ErrNotFound) {
-			s.log.Warn("反查派发任务失败", "session_id", childSessionID, "err", err)
+		if errors.Is(err, store.ErrNotFound) {
+			return tool.TaskInfo{}, errors.New("当前会话不是派发出来的任务会话，不需要回执")
 		}
-		return
+		return tool.TaskInfo{}, err
 	}
-	if task.Status == store.TaskSucceeded || task.Status == store.TaskCancelled {
-		return
+	if task.Assignee != userID {
+		return tool.TaskInfo{}, ErrForbidden
+	}
+	switch task.Status {
+	case store.TaskSucceeded:
+		return tool.TaskInfo{}, errors.New("这个任务已经回执过，不要重复提交")
+	case store.TaskCancelled, store.TaskFailed:
+		return tool.TaskInfo{}, errors.New("任务已结束，不能再回执")
 	}
 
 	task.Status = store.TaskSucceeded
-	task.Result = content
+	task.Result = summary
 	if err := s.store.UpdateTask(ctx, task); err != nil {
-		s.log.Warn("更新任务状态失败", "task_id", task.ID, "err", err)
+		return tool.TaskInfo{}, err
 	}
+	s.notifyParent(ctx, task, summary)
+	return toTaskInfo(task, ""), nil
+}
 
+// notifyParent 把回执写回父会话，并按配额自动续一轮。
+//
+// 回填后自动起一轮 run，否则派发方不再说话就永远不知道结果；
+// 但密度受限：一分钟内最多触发 3 次，其余的回执留在消息里等下一轮一起读。
+func (s *Service) notifyParent(ctx context.Context, task store.Task, content string) {
 	notice := fmt.Sprintf("【任务回执】%s\n\n%s", task.Title, content)
 	// 先落消息：即使这一轮 run 因为配额没起，用户刷新也能看到回执
 	if _, err := s.store.CreateMessageFrom(ctx, task.ParentSessionID, "user", notice, "task_result"); err != nil {
@@ -273,7 +313,7 @@ func (s *Service) completeParentTask(ctx context.Context, childSessionID, conten
 	}
 
 	// 父会话已经有 run 在跑：只排队，不打断（同会话串行）
-	if _, active, err := s.store.GetActiveRun(ctx, task.ParentSessionID); err == nil && active {
+	if _, active, err := s.store.GetActiveRun(ctx, task.ParentSessionID, s.idleTimeout); err == nil && active {
 		return
 	}
 	if !s.autoBudget.allow(task.ParentSessionID, time.Now()) {

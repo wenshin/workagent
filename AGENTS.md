@@ -168,6 +168,7 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - 凭证：`{STORAGE_ROOT}/secrets/{scope}.json`，KEK（`SECRET_KEK`）包裹每条凭证独立的 DEK，AES-256-GCM 信封加密；对外只暴露 8 位指纹。密钥只由平台内部取用，错误信息会精确抹除密钥原文。
 - **密钥不进空间文件树**：系统空间对管理员是可下载的文件，明文密钥进树就等于进备份、发布快照和任何有 read 权限的会话。更新走管理员接口：`GET /admin/settings`（指纹）、`PUT|DELETE /admin/secrets/{scope}/{name}`（只写不读，响应只含指纹），仅系统管理员可调用。插件清单里存的只是凭证名，不是密钥。
 - 界面入口是系统空间页的「**密钥配置**」：可录入**名称 + 密钥值**，列表展示 scope、指纹与更新时间。`refs` 传空——搜索凭证的引用关系由 `kind=source` 插件清单声明，属于运行期状态（随安装/卸载变化），启动时无法静态列出。因此列表口径是「**凭证存储里实际存在的 scope**」（`secret.FileStore.Scopes()`），不是 refs；「使用中」也是每次现算（搜索源看 `search.Registry`，插件声明看已启用安装件的清单，`admin.Usage`），不缓存静态表，否则界面上的密钥会「消失」或长期标错。
+- 系统空间页还有一个「**MCP 应用**」入口（`GET /admin/mcp-apps` / `GET /admin/mcp-apps/{app}/key`）：应用名是全局的（不随空间复制），所以走平台级 `/admin`；列表只回约定归属与密钥指纹，明文按应用单独取一次（`Cache-Control: no-store`），**只读不建**（缺密钥时报 `ErrMCPAppKeyMissing`，不顺手生成），审计记 `mcp_app.key.admin_view`。只有系统管理员（= 系统空间成员）能调，非管理员 403。
 - **会话内录入**（`secret_request`，能力 `system.secret.request`，L1）：模型只提供 `scope` / `name` / `label` / `hint`，前端在消息里渲染录入卡片（`SecretRequestCard`，不折叠），明文由浏览器直接 `PUT /admin/secrets/{scope}/{name}`，**不进工具参数、不进模型上下文、不进 `run_step` 审计**；模型回读到的只有「是否已配置 + 指纹」，`can_write` 由 `space.IsAdmin` 判定，非管理员只拿到「转给管理员」的指引。密钥存储没启用（无 `SECRET_KEK`）时工具直接说明，不引导填写，避免变相索要明文。平台基础规则与 `builtin_plugin_dev`（总纲 + `references/source.md` + `references/mcp.md`）都写明：需要凭证时用它，禁止向用户索要明文。
 - 搜索密钥改完**立即生效**（每次调用都从凭证存储取）。插件安装/启用即注册进 `search.Registry`，停用/卸载立即移除，不需要重启。
 - 新增搜索源：写一个 `kind=source` 插件（`plugin.json` 的 `source.endpoint` / `scope` / `priority` / `secret` + `search.json` 或 `main.ts`），发布、安装。**没有「改 Go 代码注册 provider」这条路了**，`internal/search` 不再持有任何厂商实现。
@@ -223,13 +224,17 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 | `LLM_BASE_URL` | 端点（不含 `/chat/completions`） | `https://api.deepseek.com/v1` |
 | `LLM_API_KEY` | 密钥；本地 Ollama / vLLM 可留空 | `sk-xxx` |
 | `LLM_MODEL` | 模型名 | `deepseek-chat` |
-| `LLM_TIMEOUT` | 单次模型调用超时（整请求，含流式读取），**必须 ≥ `LLM_MAX_WALL_CLOCK`** | `10m` |
+| `LLM_TIMEOUT` | 单次模型调用超时（整请求，含流式读取）。防「某一次调用挂死」，与一轮能跑多久无关 | `10m` |
 | `LLM_MAX_TOKENS` | 单次响应 token 上限，0 表示不传 | `4096` |
-| `LLM_MAX_ROUNDS` | 单轮对话内工具调用轮次上限（一轮 = 一次模型调用） | `8` |
-| `LLM_MAX_TOOL_CALLS` | 一次 run 内工具调用总次数上限 | `20` |
+| `LLM_MAX_ROUNDS` | 一次 run 的轮次硬上限（一轮 = 一次模型调用）。只是防死循环的最后一道 | `40` |
+| `LLM_MAX_TOOL_CALLS` | 一次 run 内工具调用总次数上限 | `150` |
 | `LLM_MAX_PARALLEL` | 同一轮内并行执行的工具数 | `4` |
-| `LLM_MAX_WALL_CLOCK` | 一次 run 的墙钟预算 | `10m` |
-| `LLM_MAX_TOTAL_TOKENS` | 一次 run 的累计 token 上限（与单次响应的 `LLM_MAX_TOKENS` 不是一回事），0 表示不限 | `80000` |
+| `LLM_MAX_WALL_CLOCK` | 一次 run 的**总时长上限**（最后一道保险，0 表示不限） | `2h` |
+| `RUN_IDLE_TIMEOUT` | 无进展判定：连续多久没有任何事件（模型增量 / 工具返回）就判卡住 | `10m` |
+| `LLM_MAX_TOTAL_TOKENS` | 一次 run 的累计 token 上限（与单次响应的 `LLM_MAX_TOKENS` 不是一回事），0 表示不限 | `400000` |
+| `LLM_CONTEXT_TOKENS` | 模型上下文窗口（token）。轮内输入超过它的 60% 就折叠较早的工具往返，0 = 不做轮内压缩 | `128000` |
+| `CTX_WINDOW` / `CTX_MAX_RUNES` | 跨轮滑动窗口：保留原文的最近消息条数 / 总字数上限 | `16` / `24000` |
+| `CTX_SUMMARY_RUNES` / `CTX_TOP_K` | 历史摘要目标字数 / 向量检索补充的历史片段条数 | `600` / `4` |
 | `AGENT_DISPATCH` | 是否把 `agent_dispatch`（派生子 Agent）暴露给模型 | `true` |
 | `AGENT_MAX_DEPTH` | 派发深度上限，1 = 只能主 → 子 | `2` |
 | `AGENT_STALL_ROUNDS` | 连续多少轮没有任何新信息就收回工具、强制收尾 | `2` |
@@ -251,13 +256,17 @@ Agent 的「编排与循环」是唯一可替换的一层，按技术方案 §5.
 - 契约 `internal/agent`：`Agent` 接口（`Name` / `Capabilities` / `Ready` / `Model` / `Budget` / `Run`）、§7.3 事件协议、`RunInput` / `Result`、系统提示词组装 `BuildSystemMessage`。**不出现任何框架类型**。
 - 实现：`internal/agent/builtin`（内置 ReAct，默认）、`internal/agent/direct`（无工具单轮直答）。实现包在 `init()` 里 `agent.Register(Name, New)`；接入 Eino 时新增 `internal/agent/eino`，**只有实现子包可以 import 框架**。
 - 切换：`AGENT_IMPL`（`builtin` / `direct`），装配在 `internal/app/app.go`；未注册的名字启动告警并回退 `builtin`。当前实现与能力见 `GET /agent/info`，每次运行写入 `run.budget.impl`。
-- 平台侧不因实现而变，实现里不要重做：审批判定与挂起（`internal/tool/invoker` + `internal/policy`）、checkpoint（`run` / `run_step`，会话层按事件落库）、上下文压缩（`internal/ctxmgr`）、预算上限（实现用 `Budget()` 声明，循环外层兜底）、SSE 事件契约。
+- 平台侧不因实现而变，实现里不要重做：审批判定与挂起（`internal/tool/invoker` + `internal/policy`）、checkpoint（`run` / `run_step`，会话层按事件落库）、**跨轮**上下文压缩（`internal/ctxmgr`）、预算上限（实现用 `Budget()` 声明，循环外层兜底）、SSE 事件契约。
 - 实现只负责：每轮上下文如何拼（可复用 `BuildSystemMessage`）、循环与轮次控制、工具选择与并行调度、把工具执行结果翻译成 §7.3 事件。
 - **循环守卫（`builtin/guard.go`）**：每轮结束后判断「下一步还有没有价值」——同一工具 + 相同参数（参数按 JSON 规范化后取指纹）第 3 次起拦截、不执行；连续 `AGENT_STALL_ROUNDS` 轮没有任何新信息（空结果 / 报错 / 与之前完全相同）就**收回工具**，逼一次不带工具的结论，而不是继续烧预算。轮次用尽同样走这条收尾路径，因此不会再出现「轮次耗尽 → 空回答」。
 - **收尾语义**：拿到结论 → `run` 成功，`stop_reason` 记 `budget` / `stalled` 供归因；拿不到结论 → 返回 `ErrBudgetExceeded` / `ErrStalled`，会话层标 `cancelled` 并保留已生成内容。
+- **时间不再判死**：实现内部不再按墙钟中断（`deadline` 已删），时机交给会话层——`RUN_IDLE_TIMEOUT` 内没有任何事件才算卡住，`LLM_MAX_WALL_CLOCK` 只是总时长上限。长任务只要在推进就一直跑，轮次/工具次数/token 才是它的实际边界。
+- **轮内上下文压缩（`builtin/compact.go`）**：跨轮压缩在 `ctxmgr`（用户两次发言之间），轮内的工具往返折叠放在实现里——只有实现知道「哪几轮是一个完整的 `assistant(tool_calls)` + 回执」。判据用上一轮真实的 `input_tokens`（拿不到时按 `llm.EstimateTokens` 估），超过 `LLM_CONTEXT_TOKENS` 的 60% 就把较早的往返折成一条 system 进展记录，保留最近 3 轮原始回执与每轮的 assistant 正文。**折叠只丢过程、不丢结论，且不调模型**：压缩必须确定性、零失败，否则它自己就成了新的故障点。撞上模型的 context-length 错误时再折到只留 1 轮重试一次（只在「一个增量都没吐」时重试，吐过字重放会让用户看到重复的答案）。
 - **派发（`builtin/dispatch.go`）**：`agent_dispatch` 暴露为一个普通工具，子 Agent 跑同一套 `Invoker`（PDP / 审批 / 审计不变），上下文与轮次预算隔离，结论按 4KB 回填。规则：子 Agent 只能拿到父 Agent 已有的工具；深度受 `AGENT_MAX_DEPTH` 约束；**子 Agent 看不到父会话历史**，任务描述必须自包含。派发本身是 L2、无副作用，真正的权限判定发生在子 Agent 的每次工具调用上。
 - **黄金用例（`internal/golden`）**：harness 行为用脚本化模型跑成数据（`evals.json`），断言停止原因、工具序列、轮次与拦截次数；`internal/golden/testdata/harness.json` 是平台回归闸门。插件目录里的 `evals.json` 在**发布时**执行（`kind=tool` 走 `DryRun` 的确定性断言，`kind=agent` 用同一套脚本化执行），失败即 `409` 拒绝发布，审计记 `plugin.publish.eval_failed`。
-- 已知差距：`Capabilities.Resume` 只声明未实现（§5.7.5 断点续跑未落地）；审批目前只推 `approval.req`，没有审批记录与恢复入口；长任务仍受「run 绑定请求」限制，跨 run 的任务队列未落地。
+- **断点续跑（§5.7.5，已落地）**：`builtin` 每轮工具执行完通过 `RunInput.Checkpoint` 把完整消息序列（含 `tool_calls` 与回执）与已消耗预算写入 `run_resume`（每轮覆盖一次）；中断时**系统侧原因**（卡死、总时长到点、非预算类失败）保留断点，用户主动停止与预算/停滞则当场删除。`GET /sessions/{id}/resume` 探测、`POST /sessions/{id}/resume` 接着跑（SSE 与 chat 同形），已经执行过的工具不会重跑。`Capabilities.Resume` 由实现声明，`direct` 不支持。
+- **判活与清扫**：`run.heartbeat_at` 每 15s 随事件刷新，`active-run` 只认心跳新鲜的 run，并且**还要查一次进程内执行表**——查不到就答「没在跑」，心跳停超过 30s 的当场置 `failed` 并结算占位消息（`AbandonRun`）。只看库会假活：进程被 kill 后那行还挂着 `running`，前端每次刷新都会挂一条不会再来的流（先「思考中」再消失）。启动时 `SweepStaleRuns` 仍按心跳批量清扫。心跳停了才算死，跑得久不算。
+- 已知差距：审批目前只推 `approval.req`，没有审批记录与恢复入口；跨 run 的任务队列未落地。
 
 # 运行流与 checkpoint
 

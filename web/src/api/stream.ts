@@ -205,6 +205,30 @@ export async function streamChat(
 }
 
 /**
+ * 从断点继续上一次被中断的执行。
+ *
+ * 与 streamChat 的响应形状完全一致（服务端共用同一套收尾），所以渲染逻辑不用分支；
+ * 区别只在语义：不是「重新问一遍」，服务端会带着已有的工具回执接着走，
+ * 已经执行过的工具不会再跑一遍。
+ */
+export async function streamResume(
+  sessionId: string,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<StreamOutcome> {
+  let res: Response;
+  try {
+    res = await fetch(`/sessions/${sessionId}/resume`, { method: 'POST', signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
+    throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
+  }
+
+  await ensureOK(res);
+  return readSSE(res, handlers);
+}
+
+/**
  * 续上一次仍在执行的 run：刷新页面后从这里接着往下看。
  *
  * afterOffset 传客户端已渲染到的累计字符数，服务端只补发之后的增量；

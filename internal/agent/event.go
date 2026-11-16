@@ -129,13 +129,35 @@ type RunInput struct {
 	Depth int
 	// RoundLimit 非零时覆盖实现自身的轮次上限，用于把父任务的剩余预算传给子 Agent。
 	RoundLimit int
-	// Deadline 非零时作为本次运行的截止时间（父任务预算继承）；
-	// 实现取它与自身墙钟预算中更早的一个。
+	// Deadline 非零时作为本次运行的截止时间（父任务预算继承）。
 	Deadline time.Time
 	// AllowDispatch 表示本轮允许把 agent_dispatch 暴露给模型。
 	AllowDispatch bool
 	// SubAgentPrompt 是子 Agent 专属的追加提示词（由派发方给出，同样只能追加）。
 	SubAgentPrompt string
+
+	// Resume 非空表示从断点继续：直接用快照里的消息序列，不再重建系统提示词与历史。
+	Resume *ResumeState
+	// Checkpoint 在每轮工具执行完成后被调用，用于把「走到哪了」落库。
+	//
+	// 只在轮次边界写：一轮里的模型增量没有可重放的价值，工具回执才是真的进展。
+	// 实现可以忽略调用错误——写不进去不该打断任务本身。
+	Checkpoint func(ResumeState) error
+}
+
+// ResumeState 是一次执行的断点快照，足够让实现「接着走」而不是重新规划。
+//
+// 里面是完整消息序列（含 assistant 的 tool_calls 与 tool 回执），所以续跑时
+// 已经执行过的工具不会再跑一遍；计数器一起带着走，避免「续跑」等于把预算重新充满。
+type ResumeState struct {
+	Messages []llm.Message `json:"messages"`
+	// Round 是已经完成的轮数（一次模型调用算一轮）
+	Round int `json:"round"`
+	// ToolCalls / TotalTokens 是已经消耗掉的预算
+	ToolCalls   int `json:"tool_calls"`
+	TotalTokens int `json:"total_tokens"`
+	// Query 是本次执行的用户输入：续跑时工具裁剪与系统提示词仍要按它来
+	Query string `json:"query"`
 }
 
 // ActiveSkill 是会话选中的技能。

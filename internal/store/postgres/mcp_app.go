@@ -24,6 +24,30 @@ from mcp_app where app = $1`
 	return out, err
 }
 
+// ListMCPApps 返回全部应用名归属，按应用名排序（管理员应用密钥页用）。
+func (d *DB) ListMCPApps(ctx context.Context) ([]store.MCPApp, error) {
+	const q = `
+select app, owner_user_id::text, coalesce(owner_space_id::text, ''), created_at
+from mcp_app
+order by app`
+
+	rows, err := d.pool.Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]store.MCPApp, 0, 16)
+	for rows.Next() {
+		var rec store.MCPApp
+		if err := rows.Scan(&rec.App, &rec.OwnerUserID, &rec.OwnerSpaceID, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // ClaimMCPApp 幂等抢占应用名：靠主键冲突决出唯一创建者，不覆盖已有归属。
 //
 // 这里必须用「插入成功即我建的」而不是「先查再写」：两个人同时生成同名应用时，

@@ -1,5 +1,5 @@
 import { cancelSessionRun, getActiveRun } from './client';
-import { streamChat, streamRun, type StreamHandlers } from './stream';
+import { streamChat, streamResume, streamRun, type StreamHandlers } from './stream';
 import type { ActiveRunResponse, StreamItem } from './types';
 
 /**
@@ -112,6 +112,13 @@ export interface LiveRunOptions {
   content: string;
   /** 引用的空间文件路径；服务端负责校验并拼进用户消息 */
   references?: string[];
+  /**
+   * 从断点继续上一次被中断的执行。
+   *
+   * 与普通发送的区别只在请求端点与「没有新的用户消息」：服务端带着已有的工具回执
+   * 接着走，已经执行过的工具不会再跑一遍。
+   */
+  resume?: boolean;
   onError?: (message: string) => void;
   onSettled?: (info: { sessionId: string; wroteFiles: boolean; aborted: boolean }) => void;
 }
@@ -262,13 +269,15 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   return (async () => {
     let aborted = false;
     try {
-      const outcome = await streamChat(
-        opts.sessionId,
-        opts.content,
-        opts.references ?? [],
-        handlers,
-        ctrl.signal,
-      );
+      const outcome = opts.resume
+        ? await streamResume(opts.sessionId, handlers, ctrl.signal)
+        : await streamChat(
+            opts.sessionId,
+            opts.content,
+            opts.references ?? [],
+            handlers,
+            ctrl.signal,
+          );
       // 没有终态事件就是断了（切页、代理掐连接、热更新……）：run 还在服务端跑，续上
       if (!outcome.finished) {
         await resumeStream(opts.sessionId, ctrl, reset, handlers);
@@ -292,6 +301,18 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       opts.onSettled?.({ sessionId: opts.sessionId, wroteFiles: wrote, aborted });
     }
   })();
+}
+
+/**
+ * 从断点继续上一次被中断的执行。
+ *
+ * 与 startLiveRun 共用一套视图与收尾：不发新的用户消息，服务端带着已有的工具回执
+ * 接着走，所以已经执行过的工具不会再执行一遍。
+ */
+export function resumeLiveRun(
+  opts: Omit<LiveRunOptions, 'content' | 'references' | 'resume'>,
+): Promise<void> {
+  return startLiveRun({ ...opts, content: '', resume: true });
 }
 
 export interface AttachRunOptions {

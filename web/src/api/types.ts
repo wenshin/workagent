@@ -83,6 +83,10 @@ export interface ChatSession {
   title_auto: boolean;
   /** 会话绑定的技能（SKILL.md 路径），空表示未绑定 */
   skill_path?: string;
+  /** 会话绑定的智能体插件 slug，空表示未绑定 */
+  agent_id?: string;
+  /** 智能体所属空间；子任务会话指向发起方空间，空表示与会话同空间 */
+  agent_space_id?: string;
   status: string;
   last_message_at?: string | null;
   created_at: string;
@@ -529,4 +533,36 @@ export interface MCPAppKeyResponse {
   header?: string;
   ttl_seconds?: number;
   claims?: string[];
+}
+
+/**
+ * 管理员视角的一条 MCP 应用密钥（系统空间页入口）。
+ *
+ * 列表只给指纹：一次拉全部应用，明文一起下发就等于把生产密钥写进浏览器缓存、
+ * 代理日志与 HAR。明文要点「查看密钥」单独取（MCPAppKeyAdminResponse）。
+ */
+export interface MCPAppItem {
+  app: string;
+  owner_id?: string;
+  owner_name?: string;
+  owner_space_id?: string;
+  created_at: string;
+  fingerprint?: string;
+  updated_at?: string;
+  /** 凭证存储里有没有这把密钥：没有就只能看归属，取不到明文 */
+  has_key: boolean;
+  /** 早于归属流程生成的历史密钥：没有创建人记录，只能管理员兜底 */
+  legacy: boolean;
+}
+
+export interface MCPAppsResponse {
+  /** 凭证存储没启用时列表只有归属、没有密钥 */
+  secrets_enabled: boolean;
+  items: MCPAppItem[];
+}
+
+/** 按应用取回明文：一次性响应，不进列表、不落缓存 */
+export interface MCPAppKeyAdminResponse {
+  app: string;
+  key: string;
 }

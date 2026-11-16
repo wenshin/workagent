@@ -61,6 +61,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// 停止按会话发起：前端不必先拿到 run_id，返回即代表这一轮已置终态
 	mux.HandleFunc("POST /sessions/{id}/cancel", h.cancelSessionRun)
 
+	// 断点续跑：GET 探测「有没有可以接着走的执行」，POST 接着跑（同样是 SSE）
+	mux.HandleFunc("GET /sessions/{id}/resume", h.resumeInfo)
+	mux.HandleFunc("POST /sessions/{id}/resume", h.resume)
+
 	// 任务派发：列表、取消、催办（§15.12.4）
 	mux.HandleFunc("GET /sessions/{id}/tasks", h.listTasks)
 	mux.HandleFunc("POST /tasks/{id}/cancel", h.cancelTask)
@@ -84,6 +88,8 @@ type sessionDTO struct {
 	SkillPath string `json:"skill_path,omitempty"`
 	// AgentID 是会话绑定的智能体，空表示未绑定
 	AgentID string `json:"agent_id,omitempty"`
+	// AgentSpaceID 是智能体所属空间，空表示与会话同空间；子任务会话指向发起方空间
+	AgentSpaceID string `json:"agent_space_id,omitempty"`
 	// AgentVersion 是创建时绑定的版本
 	AgentVersion  string  `json:"agent_version,omitempty"`
 	Status        string  `json:"status"`
@@ -100,12 +106,12 @@ type messageDTO struct {
 	Reasoning string          `json:"reasoning,omitempty"`
 	Parts     json.RawMessage `json:"parts"`
 	// 产生这条助手消息的那一轮的 token 消耗与总耗时；用户消息为 0
-	InTokens   int    `json:"in_tokens"`
-	OutTokens  int    `json:"out_tokens"`
-	DurationMS int    `json:"duration_ms"`
+	InTokens   int `json:"in_tokens"`
+	OutTokens  int `json:"out_tokens"`
+	DurationMS int `json:"duration_ms"`
 	// Streaming 表示还在生成中：刷新后据此渲染「生成中」骨架而不是空消息
-	Streaming   bool   `json:"streaming,omitempty"`
-	Interrupted bool   `json:"interrupted,omitempty"`
+	Streaming   bool `json:"streaming,omitempty"`
+	Interrupted bool `json:"interrupted,omitempty"`
 	// Source 区分用户输入、任务回执与外部回信，前端据此换一种样式
 	Source    string `json:"source,omitempty"`
 	CreatedAt string `json:"created_at"`
@@ -122,6 +128,7 @@ func toDTO(s store.Session) sessionDTO {
 		TitleAuto:    s.TitleAuto,
 		SkillPath:    s.SkillPath,
 		AgentID:      s.AgentID,
+		AgentSpaceID: s.AgentSpaceID,
 		AgentVersion: s.AgentVersion,
 		Status:       s.Status,
 		CreatedAt:    s.CreatedAt.Format(timeLayout),
@@ -140,12 +147,12 @@ func toMessageDTO(m store.Message) messageDTO {
 		parts = json.RawMessage("[]")
 	}
 	return messageDTO{
-		ID:         m.ID,
-		SessionID:  m.SessionID,
-		Role:       m.Role,
-		Content:    m.Content,
-		Reasoning:  m.Reasoning,
-		Parts:      parts,
+		ID:          m.ID,
+		SessionID:   m.SessionID,
+		Role:        m.Role,
+		Content:     m.Content,
+		Reasoning:   m.Reasoning,
+		Parts:       parts,
 		InTokens:    m.Stats.InTokens,
 		OutTokens:   m.Stats.OutTokens,
 		DurationMS:  m.Stats.DurationMS,
@@ -380,6 +387,72 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, content, emit)
+	h.streamOutcome(r, stream, sessionID, out, err)
+}
+
+// resumeInfo 报告这个会话有没有可以接着走的执行。
+//
+// 判据是「有没有断点」而不是「上一轮是不是失败」：进程崩溃时连失败都没写下来，
+// 而那正是最需要继续的时候。
+func (h *Handler) resumeInfo(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	run, resumable, err := h.svc.Resumable(r.Context(), user.ID, r.PathValue("id"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	body := map[string]any{"resumable": resumable}
+	if resumable {
+		body["run_id"] = run.ID
+		body["started_at"] = run.StartedAt
+	}
+	platform.WriteJSON(w, http.StatusOK, body)
+}
+
+// resume 从断点接着跑：响应形状与 chat 完全一致（SSE），前端复用同一套渲染。
+func (h *Handler) resume(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	sessionID := r.PathValue("id")
+	if _, ok := w.(http.Flusher); !ok {
+		platform.WriteError(w, r, http.StatusInternalServerError, "stream_unsupported", "当前服务不支持流式响应")
+		return
+	}
+	// 先探测再开流：没有断点时用普通 JSON 报错，前端不必解析一个空的 SSE
+	if _, resumable, err := h.svc.Resumable(r.Context(), user.ID, sessionID); err != nil {
+		h.writeErr(w, r, err)
+		return
+	} else if !resumable {
+		platform.WriteError(w, r, http.StatusConflict, "no_resume", ErrNoResume.Error())
+		return
+	}
+
+	stream := platform.NewStream(w)
+	if err := stream.Start(); err != nil {
+		h.log.Warn("SSE 初始化失败",
+			"session_id", sessionID, "request_id", platform.RequestIDFrom(r.Context()), "err", err)
+		return
+	}
+	defer stream.Close()
+
+	emit := func(ev agent.Event, offset int) error {
+		return sendRunEvent(stream, ev, offset)
+	}
+	out, err := h.svc.Resume(r.Context(), user.ID, sessionID, emit)
+	h.streamOutcome(r, stream, sessionID, out, err)
+}
+
+// streamOutcome 把一次执行的终局写成 SSE：成功发 message.done + run.finished，
+// 中断发带原因的 run.finished，失败发 failed。
+//
+// chat 与 resume 共用：两者只有「拿到哪些消息」不同，收尾必须一致，
+// 否则续跑结束时前端拿到的字段会和新对话不同。
+func (h *Handler) streamOutcome(r *http.Request, stream *platform.Stream, sessionID string, out ChatOutcome, err error) {
 	if err != nil {
 		switch {
 		case r.Context().Err() != nil:
@@ -390,7 +463,7 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 			// 连接仍然可用（到点或预算用尽，而不是用户断开）：补一个可解释的收尾
 			_ = stream.Send(agent.EventRunFinished, map[string]any{
 				"run_id": out.RunID, "status": out.Status, "reason": out.Reason,
-				"error": userFacingCancelError(err),
+				"error": userFacingCancelError(out.Reason, err),
 			})
 			return
 		}
@@ -792,8 +865,17 @@ func clientIP(r *http.Request) string {
 }
 
 // userFacingCancelError 说明一次中断的原因，避免前端把它当成「失败，请重试」。
-// 预算用尽由实现给出具体说明（如「本轮对话超过时间预算（10m0s）」），其余给通用文案。
-func userFacingCancelError(err error) string {
+//
+// 三种中断的含义完全不同，文案必须分开：卡住（idle）说明这一轮没有再推进，
+// 到点（总上限）说明任务太大，预算用尽说明实现给出的额度不够——混成一句
+// 「已达时长上限」，用户会以为是同一件事。
+func userFacingCancelError(reason string, err error) string {
+	switch reason {
+	case ReasonIdleTimeout:
+		return RunIdleTimeoutMessage
+	case ReasonWallClockExceeded:
+		return RunBudgetExceededMessage
+	}
 	// 预算与停滞都由实现给出了具体原因（「已用完 8 轮工具调用」「连续 2 轮没有新信息」），
 	// 直接透传比换成一句通用文案更有用：用户据此决定是改问法还是换个做法。
 	if errors.Is(err, agent.ErrBudgetExceeded) || errors.Is(err, agent.ErrStalled) {

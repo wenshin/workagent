@@ -37,6 +37,11 @@
   --wa-duration-fast: 120ms;
   --wa-duration-base: 180ms;
   --wa-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* 主色文字：--semi-color-primary 身兼「实心填充」与「文字/图标」两职，
+     暗色下这两个角色对亮度的要求相反（填充要深才压得住白字，文字要浅才看得清），
+     所以文字单独一个 token，暗色在 body[theme-mode='dark'] 里覆盖。 */
+  --wa-color-primary-text: #6c5ce7;
 }
 
 * {
@@ -58,9 +63,40 @@ body {
 
 /* 品牌主色，覆盖 Semi 默认蓝 */
 body[theme-mode='dark'] {
+  /* 实心填充（主色按钮底、进度条）：白字在其上 4.9:1，不要再调浅 */
   --semi-color-primary: #6c5ce7;
   --semi-color-primary-hover: #7d6ff0;
   --semi-color-primary-active: #5b4bd6;
+  /* 主色浅底：Semi 默认是蓝，跟品牌紫不同源，这里统一成紫 */
+  --semi-color-primary-light-default: rgba(108, 92, 231, 0.22);
+  --semi-color-primary-light-hover: rgba(108, 92, 231, 0.3);
+  --semi-color-primary-light-active: rgba(108, 92, 231, 0.38);
+  /* 主色文字：浅紫，在 bg-1/bg-2 与主色浅底上 ≥ 5:1 */
+  --wa-color-primary-text: #b3a4ff;
+  /* 主色浅底按钮（Semi theme=light）的底色：比浅底深、比实心浅 */
+  --wa-color-primary-soft: #352c66;
+  --wa-color-primary-soft-hover: #413782;
+  --wa-color-primary-soft-active: #2b2456;
+}
+
+/* Semi 的 light 主题按钮是「中性灰底 + 主色文字」，暗色下这对组合只有 1.7:1。
+   这里换回「主色深底 + 主色浅字」，并把 hover/active 一并覆盖（选择器比 Semi 更具体）。 */
+body[theme-mode='dark'] .semi-button-primary.semi-button-light:not(.semi-button-disabled) {
+  color: var(--wa-color-primary-text);
+  background-color: var(--wa-color-primary-soft);
+}
+
+body[theme-mode='dark'] .semi-button-primary.semi-button-light:not(.semi-button-disabled):hover {
+  background-color: var(--wa-color-primary-soft-hover);
+}
+
+body[theme-mode='dark'] .semi-button-primary.semi-button-light:not(.semi-button-disabled):active {
+  background-color: var(--wa-color-primary-soft-active);
+}
+
+body[theme-mode='dark'] .semi-button-primary.semi-button-outline,
+body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
+  color: var(--wa-color-primary-text);
 }
 
 .boot-screen {
@@ -546,7 +582,7 @@ body[theme-mode='dark'] {
 }
 
 .chat-skill-btn.is-active.semi-button {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   border-color: var(--semi-color-primary-light-active);
   background: var(--semi-color-primary-light-default);
 }
@@ -706,7 +742,7 @@ body[theme-mode='dark'] {
 }
 
 .file-picker-item.is-active .file-picker-icon {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 .file-picker-body {
@@ -734,7 +770,7 @@ body[theme-mode='dark'] {
 }
 
 .file-picker-check {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   flex: none;
 }
 
@@ -848,7 +884,7 @@ body[theme-mode='dark'] {
 
 .msg-reasoning-live {
   font-size: 11px;
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 /* 折叠状态下用字数当线索：不用点开也能判断这段想了多少 */
@@ -1020,7 +1056,7 @@ body[theme-mode='dark'] {
 
 .msg-tools-live {
   font-size: 11px;
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 .msg-tools-fail {
@@ -1061,6 +1097,20 @@ body[theme-mode='dark'] {
   gap: 6px;
   padding: 12px 16px;
   border-top: 1px solid var(--semi-color-border);
+}
+
+/* 断点续跑提示条：只在上一轮被系统侧中断时出现，点「继续」接着走 */
+.chat-resume-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--semi-color-warning-light-default);
+  border-radius: 8px;
+  background: var(--semi-color-warning-light-default);
+  color: var(--semi-color-text-1);
+  font-size: 12px;
 }
 
 /* 输入框与发送按钮同一行：边框画在外层，按钮嵌在右侧内部。
@@ -1152,7 +1202,7 @@ body[theme-mode='dark'] {
 }
 
 .chat-tool-btn.is-active.semi-button {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   background: var(--semi-color-primary-light-default);
 }
 
@@ -1369,7 +1419,7 @@ body[theme-mode='dark'] {
   top: var(--wa-space-8);
   right: var(--wa-space-8);
   font-size: var(--wa-text-sm);
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 .dialog-error {
@@ -1499,7 +1549,7 @@ body[theme-mode='dark'] {
 }
 
 .md-body a {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 .md-body code {
@@ -1600,7 +1650,7 @@ body[theme-mode='dark'] {
 
 .sider-nav-item.active {
   background: var(--semi-color-primary-light-default);
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   font-weight: 600;
 }
 
@@ -1638,7 +1688,7 @@ body[theme-mode='dark'] {
 
 .sider-sub-item.active {
   background: var(--semi-color-primary-light-default);
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   font-weight: 600;
 }
 
@@ -1669,7 +1719,7 @@ body[theme-mode='dark'] {
 
 .sider-space-item.active {
   background: var(--semi-color-primary-light-default);
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
 }
 
 .sider-space-name {
@@ -1927,7 +1977,7 @@ body[theme-mode='dark'] {
 }
 
 .plugin-tab.active {
-  color: var(--semi-color-primary);
+  color: var(--wa-color-primary-text);
   border-bottom-color: var(--semi-color-primary);
   font-weight: 600;
 }
@@ -2152,7 +2202,7 @@ body[theme-mode='dark'] {
 .ui-tone-success { color: var(--semi-color-success); }
 .ui-tone-warning { color: var(--semi-color-warning); }
 .ui-tone-danger { color: var(--semi-color-danger); }
-.ui-tone-info { color: var(--semi-color-primary); }
+.ui-tone-info { color: var(--wa-color-primary-text); }
 
 .ui-badge {
   display: inline-flex;
@@ -2257,7 +2307,7 @@ body[theme-mode='dark'] {
 }
 .ui-button:hover:not(:disabled) { background: var(--semi-color-fill-0); }
 .ui-button:disabled { opacity: 0.5; cursor: not-allowed; }
-.ui-button.ui-tone-info { border-color: var(--semi-color-primary); color: var(--semi-color-primary); }
+.ui-button.ui-tone-info { border-color: var(--semi-color-primary); color: var(--wa-color-primary-text); }
 
 .ui-field { display: flex; flex-direction: column; gap: 4px; }
 .ui-field-label { font-size: 12px; color: var(--semi-color-text-3); }
@@ -2280,4 +2330,4 @@ body[theme-mode='dark'] {
   cursor: pointer;
   border-bottom: 2px solid transparent;
 }
-.ui-tab.is-active { color: var(--semi-color-primary); border-bottom-color: var(--semi-color-primary); }
+.ui-tab.is-active { color: var(--wa-color-primary-text); border-bottom-color: var(--semi-color-primary); }

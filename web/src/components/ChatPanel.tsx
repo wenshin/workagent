@@ -19,6 +19,7 @@ import type {
   StreamItem,
   ToolCallRecord,
 } from '../api/types';
+import { useAgents } from '../api/hooks';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
 import { PluginIcon } from './PluginVisual';
@@ -112,6 +113,10 @@ interface Props {
   onStop: () => void;
   /** 本轮占位气泡里已引用的文件（流式过程中还没落库） */
   pendingRefs?: string[];
+  /** 服务端留了这一轮的断点：可以从断点继续，而不是重新问一遍 */
+  resumable?: boolean;
+  /** 从断点继续（调用方负责先确认没有正在跑的轮次） */
+  onResume?: () => void;
 }
 
 /** 用户消息：正文 + 引用文件标签 */
@@ -544,7 +549,21 @@ export default function ChatPanel({
   onSend,
   onStop,
   pendingRefs,
+  resumable,
+  onResume,
 }: Props) {
+  // 智能体清单只在同空间时查：子任务会话的 agent 来自发起方空间，被派发人无权读那份目录，
+  // 跨空间只显示「发起方智能体」，不去请求一个必然 403 的接口。
+  const agentSpaceId =
+    session.agent_space_id && session.agent_space_id !== session.space_id
+      ? undefined
+      : session.space_id;
+  const { data: agentList } = useAgents(agentSpaceId);
+  const agentLabel = session.agent_id
+    ? agentList?.agents.find((a) => a.id === session.agent_id)?.name ||
+      (agentSpaceId ? session.agent_id : '发起方智能体')
+    : '';
+
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
@@ -817,6 +836,8 @@ export default function ChatPanel({
           <h2 className="panel-title">{session.title}</h2>
           <Text type="tertiary" size="small">
             {spaceName ? `${spaceName} · ` : ''}
+            {/* 智能体是会话的行为设定：写明是谁在回答，切到别的会话时不至于混淆 */}
+            {agentLabel ? `智能体 ${agentLabel} · ` : ''}
             {/* 会话可以挂在某个目录下开：把现场写进标题区，和树里的位置对得上 */}
             {session.dir ? `目录 ${session.dir} · ` : ''}
             {agentReady ? `模型 ${model || '已就绪'}` : '模型未配置，无法对话'}
@@ -963,6 +984,16 @@ export default function ChatPanel({
       </div>
 
       <div className="chat-input">
+        {/* 断点续跑：上一轮被系统侧中断（卡死、服务重启、到点）时给出入口。
+            用户主动停止的不提供——那是明确的意思表示，不该再被「继续」拉回去。 */}
+        {resumable && !busy && onResume ? (
+          <div className="chat-resume-bar">
+            <span>上一轮执行被中断，可以从断点继续（已完成的工具不会重跑）</span>
+            <Button size="small" theme="borderless" onClick={onResume}>
+              继续
+            </Button>
+          </div>
+        ) : null}
         {/* 输入框与操作按钮同一行：按钮嵌在输入框内部右侧；引用标签单独占上方一行 */}
         <div className="chat-composer" ref={composerRef}>
           <div

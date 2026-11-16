@@ -106,7 +106,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 
 	// 上下文管理：摘要压缩 + 向量检索（§5.7.2 / §5.7.4）
-	memory := ctxmgr.New(st, router, log, ctxmgr.DefaultBudget())
+	memory := ctxmgr.New(st, router, log, ctxmgr.Budget{
+		Window:       cfg.CtxWindow,
+		MaxRunes:     cfg.CtxMaxRunes,
+		TopK:         cfg.CtxTopK,
+		SummaryRunes: cfg.CtxSummaryRunes,
+		MinScore:     0.35,
+	})
 
 	// 凭证存储（§5.5.2 的 MVP 形态）：信封加密落盘，明文只在用到的那一刻取出
 	secretStore, err := secret.NewFileStore(filepath.Join(cfg.StorageRoot, "secrets"), cfg.SecretKEK)
@@ -211,7 +217,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 
-	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, log)
+	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, cfg.RunIdleTimeout, log)
+
+	// 启动清扫：上一个进程留下的 running 不会再有人写终态，留着只会让前端
+	// 一直显示「生成中」。断点保留，用户打开会话就能点「继续」。
+	if _, err := sessionSvc.SweepStaleRuns(context.Background()); err != nil {
+		log.Warn("清扫上次未完成的执行失败", "err", err)
+	}
 	// 智能体也可以是插件（kind=agent）：系统空间安装的智能体对所有空间可选。
 	sessionSvc.SetAgentPlugins(pluginSvc)
 	// 插件试跑：会话里写完草稿直接验配置
@@ -226,7 +238,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		IMConfigured: idp.Ready(),
 	})
 
-	return &App{
+	app := &App{
 		cfg:        cfg,
 		log:        log,
 		store:      st,
@@ -243,7 +255,11 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		// 「使用中」标记因此也改成每次现算，而不是启动时定死。
 		adminH: admin.NewHandler(spaceSvc, secretStore, nil, secretUsage(searchReg, pluginSvc, log),
 			authHandler.CurrentUser, log),
-	}, nil
+	}
+	// 应用密钥页（系统空间入口）：归属与密钥都在插件层，这里只把视图接上，
+	// 鉴权仍由 admin 统一做（系统管理员 = 系统空间成员）。
+	app.adminH.SetMCPApps(pluginSvc)
+	return app, nil
 }
 
 // secretUsage 现算「哪些凭证正在被使用」：搜索源看注册表（装/停即变），

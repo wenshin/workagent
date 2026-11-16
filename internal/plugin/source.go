@@ -145,6 +145,8 @@ func (m *Manager) reloadSpace(ctx context.Context, spaceID string) error {
 			delete(m.mcpCs, key)
 		}
 	}
+	// 借用池可能引用这个空间的插件，内容一变就得整体重建。
+	m.borrow = map[string][]*instance{}
 	m.mu.Unlock()
 	return m.ensureLoaded(ctx, spaceID)
 }

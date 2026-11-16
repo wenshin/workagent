@@ -1,4 +1,4 @@
-import { IconKey, IconPlus } from '@douyinfe/semi-icons';
+import { IconApps, IconKey, IconPlus } from '@douyinfe/semi-icons';
 import { Button, Card, Empty, Select, Spin, Typography } from '@douyinfe/semi-ui';
 import { useState } from 'react';
 
@@ -17,6 +17,8 @@ interface Props {
   onAddSession: (agentId?: string) => void;
   /** 系统空间才有密钥配置入口（只影响平台能力，不涉及空间内容） */
   onOpenPlatform?: () => void;
+  /** 系统空间才有应用密钥入口：应用名是全局的，不随空间复制 */
+  onOpenMCPApps?: () => void;
 }
 
 function formatTime(iso: string) {
@@ -33,6 +35,7 @@ export default function SpacePanel({
   onOpenSession,
   onAddSession,
   onOpenPlatform,
+  onOpenMCPApps,
 }: Props) {
   // 智能体来自系统空间的全局安装 + 本空间安装，新建会话时选一次并固化在会话上
   const { data: agentResp } = useAgents(space?.id);
@@ -66,6 +69,11 @@ export default function SpacePanel({
           </Text>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          {space.type === 'system' && onOpenMCPApps ? (
+            <Button icon={<IconApps />} onClick={onOpenMCPApps}>
+              MCP 应用
+            </Button>
+          ) : null}
           {space.type === 'system' && onOpenPlatform ? (
             <Button icon={<IconKey />} onClick={onOpenPlatform}>
               密钥配置

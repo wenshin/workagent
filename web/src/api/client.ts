@@ -110,6 +110,18 @@ export function getActiveRun(sessionId: string): Promise<ActiveRunResponse> {
   return api<ActiveRunResponse>(`/sessions/${sessionId}/active-run`);
 }
 
+/**
+ * 这个会话有没有可以接着走的执行。
+ *
+ * 判据是服务端有没有断点，与「上一轮是不是失败」无关：进程崩溃时连失败都来不及写，
+ * 而那正是最需要「继续」的时候。
+ */
+export function getResumable(
+  sessionId: string,
+): Promise<{ resumable: boolean; run_id?: string; started_at?: string }> {
+  return api(`/sessions/${sessionId}/resume`);
+}
+
 /** 派发任务列表 */
 export function listTasks(sessionId: string): Promise<TasksResponse> {
   return api<TasksResponse>(`/sessions/${sessionId}/tasks`);

@@ -27,6 +27,7 @@ func builtinTools() []Tool {
 		taskList(),
 		taskRemind(),
 		taskCancel(),
+		taskReply(),
 		fileList(),
 		fileRead(),
 		fileWrite(),
@@ -519,7 +520,7 @@ func taskCreate() Tool {
 		Capability: "task.create",
 		Description: "把一件需要他人确认或处理的事派发出去（例如请数据负责人确认口径）。" +
 			"任务落在对方的个人空间里，他不需要是当前空间的成员，没用过平台的人也会被自动开通个人空间。" +
-			"派发后本轮会正常结束，用户仍可继续对话；对方回复后回执会自动回到本会话。" +
+			"派发后本轮会正常结束，用户仍可继续对话；对方确认结论后回执会自动回到本会话。" +
 			"注意：对方看不到本空间的文件，brief 必须自包含，需要引用的内容直接写进正文。" +
 			"assignee 传姓名、工号或用户 id，匹配到多人时工具会报错并要求用工号指定。",
 		Parameters: json.RawMessage(`{
@@ -551,7 +552,7 @@ func taskCreate() Tool {
 				"task_id": task.ID,
 				"title":   task.Title,
 				"status":  task.Status,
-				"note":    "任务已派发，请告知用户：对方回复后结果会自动回到本会话。",
+				"note":    "任务已派发，请告知用户：对方确认结论后结果会自动回到本会话。",
 			}, 4*1024), nil
 		},
 	}
@@ -623,7 +624,7 @@ func taskRemind() Tool {
 		Capability: "task.remind",
 		Description: "同一个任务需要再问一次时用这个，不要重新派发：向原任务会话追加一条提醒，" +
 			"不会新建会话、不改变被派发人。先用 task_list 找到那个任务的 id。" +
-			"如果对方已经回复，回执会自动回来，不需要催。",
+			"如果对方已经确认结论，回执会自动回来，不需要催。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {"task_id": {"type": "string", "description": "task_list 返回的任务 id"}},
@@ -651,7 +652,51 @@ func taskRemind() Tool {
 				"task_id":        task.ID,
 				"status":         task.Status,
 				"dispatch_count": task.DispatchCount,
-				"note":           "已催办，对方回复后结果会自动回到本会话。",
+				"note":           "已催办，对方确认结论后回执会回到本会话。",
+			}, 4*1024), nil
+		},
+	}
+}
+
+// taskReply 是子会话侧的正式回执：只有被派发人确认结论后才该调用。
+//
+// 平台不在每轮结束时自动回填，所以这是任务从 waiting_external 走到 succeeded 的
+// 唯一出口；不调它，发起方会一直看到「等待中」。
+func taskReply() Tool {
+	return Tool{
+		Name:       "task_reply",
+		Capability: "task.reply",
+		Description: "把确认过的结论回执给发起人，任务由此结束。" +
+			"只有本会话是别人派发来的任务时才有用；必须在用户明确确认结论之后调用，" +
+			"不要一有回答就调，也不要用它发送中间态的反问、草稿或未确认的内容。",
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "summary": {"type": "string", "description": "要回传的完整结论：结论、依据、还需要发起人确认什么，脱离上下文也能看懂"}
+  },
+  "required": ["summary"],
+  "additionalProperties": false
+}`),
+		Risk:        policy.RiskWrite,
+		SideEffects: policy.SideEffectsWorkspace,
+		Runtime:     "builtin",
+		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
+			if env.Tasks == nil {
+				return "", fmt.Errorf("任务派发不可用")
+			}
+			var in struct {
+				Summary string `json:"summary"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return "", fmt.Errorf("参数解析失败：%w", err)
+			}
+			task, err := env.Tasks.ReplyTask(ctx, env.UserID, env.SessionID, in.Summary)
+			if err != nil {
+				return "", err
+			}
+			return marshalLimited(map[string]any{
+				"status": task.Status,
+				"note":   "已回执给发起人，本会话可以继续聊别的事。",
 			}, 4*1024), nil
 		},
 	}

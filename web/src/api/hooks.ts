@@ -13,7 +13,9 @@ import type {
   FilesResponse,
   MeResponse,
   MessagesResponse,
+  MCPAppKeyAdminResponse,
   MCPAppKeyResponse,
+  MCPAppsResponse,
   PluginBaselineStatus,
   PluginCatalogResponse,
   PluginConfigView,
@@ -43,6 +45,7 @@ export const queryKeys = {
   messages: (sessionId: string) => ['messages', sessionId] as const,
   file: (spaceId: string, path: string) => ['file', spaceId, path] as const,
   adminSettings: ['admin', 'settings'] as const,
+  mcpApps: ['admin', 'mcp-apps'] as const,
   plugins: (spaceId: string) => ['plugins', spaceId] as const,
   pluginInstalled: (spaceId: string) => ['plugin', 'installed', spaceId] as const,
   pluginConfig: (spaceId: string, slug: string) => ['plugin', 'config', spaceId, slug] as const,
@@ -447,6 +450,34 @@ export function useMCPAppKey() {
         `/spaces/${input.spaceId}/mcp-apps/${encodeURIComponent(input.app)}/key`,
         { method: 'POST' },
       ),
+  });
+}
+
+/**
+ * 全部 MCP 应用与密钥指纹（系统空间页入口）。
+ *
+ * 只有系统管理员能拿到，非管理员 403，所以用 enabled 控制是否发起请求。
+ * 列表按需刷新即可：密钥只在「重新取回」时变，不需要轮询。
+ */
+export function useMCPApps(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.mcpApps,
+    queryFn: () => api<MCPAppsResponse>('/admin/mcp-apps'),
+    enabled,
+    staleTime: 15_000,
+  });
+}
+
+/**
+ * 按应用取回签名密钥明文。
+ *
+ * 与 useMCPAppKey 的区别只在「谁能看」：那边按创建者收口（POST，缺密钥会顺手
+ * 生成一把），这里只读不建——管理员点开列表不该改变任何应用的密钥。
+ */
+export function useRevealMCPAppKey() {
+  return useMutation({
+    mutationFn: (app: string) =>
+      api<MCPAppKeyAdminResponse>(`/admin/mcp-apps/${encodeURIComponent(app)}/key`),
   });
 }
 

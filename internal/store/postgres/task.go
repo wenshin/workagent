@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/workagent/auto-agent/internal/store"
@@ -184,17 +185,21 @@ func (d *DB) TouchShareView(ctx context.Context, id string) error {
 }
 
 // GetActiveRun 返回会话当前活跃的 run：刷新后前端据此决定要不要续流。
-func (d *DB) GetActiveRun(ctx context.Context, sessionID string) (store.Run, bool, error) {
+//
+// staleAfter > 0 时按心跳判活：心跳停了的 run 属于上一个进程，回答「没在跑」
+// 比回答「在跑」诚实——后者会让前端一直等一条不会再来的流。
+func (d *DB) GetActiveRun(ctx context.Context, sessionID string, staleAfter time.Duration) (store.Run, bool, error) {
 	const q = `
 select id::text, session_id::text, status, budget, usage, provider, model, error, started_at, ended_at
 from run
 where session_id = $1::uuid
   and status in ('running', 'waiting_approval')
+  and ($2 <= 0 or heartbeat_at > now() - ($2 * interval '1 second'))
 order by started_at desc
 limit 1`
 
 	var r store.Run
-	err := d.pool.QueryRow(ctx, q, sessionID).Scan(
+	err := d.pool.QueryRow(ctx, q, sessionID, staleAfter.Seconds()).Scan(
 		&r.ID, &r.SessionID, &r.Status, &r.Budget, &r.Usage,
 		&r.Provider, &r.Model, &r.Error, &r.StartedAt, &r.EndedAt,
 	)
