@@ -21,7 +21,7 @@
 
 | 位置 | 能做什么 |
 |---|---|
-| 当前空间 `files/` | `file_list` / `file_read` 读；`file_write` 写 md / json / txt / yaml / ts / js，单文件 ≤256KB |
+| 当前空间 `files/` | `file_list` / `file_read` 读；`file_write` 写 md / json / txt / yaml / ts / js，单文件 ≤256KB，**单次 content ≤12KB**（更大就分块 `append`） |
 | 沙箱命令 | `shell_exec` 跑 `sh -c`：只有空间目录可写、**默认无网络**、默认 15s（最长 25s）、输出上限 16KB |
 | 用户本地仓库 | 看不到、改不了：只给 diff / 补丁与操作步骤，并说明「需要你在本地应用」 |
 
@@ -47,6 +47,7 @@
 ## 坑
 
 - `file_write` 报「仅支持 md / json / txt / yaml / ts / js」：不是权限问题，是后缀限制，改走 `shell_exec`。
+- `file_write` 报「参数被截断」：内容超了模型单次输出上限，不是文件大小超限。把正文切成 ≤12KB 的块，第一块 `mode=overwrite`、其余 `append` 追加到同一路径。
 - 沙箱无网络：`npm install` / `pip install` / `git clone` 必然失败，别当成环境坏了反复排查。
 - `shell_exec` 单次 15s：全量测试、大范围 `find`、`sleep` 容易超时，用过滤条件或分批跑。
 - 输出超 16KB 会被截断：测试日志先 `| tail -n 40` 或 `| grep -E "FAIL|Error"` 再回填。

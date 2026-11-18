@@ -28,7 +28,7 @@ func BuildSystemMessage(in RunInput) llm.Message {
   - 用户提到「我们的规范 / 流程 / 模板 / 制度 / 标准」，或要求产出正式文档、执行明确的业务动作时，必须先 plugin_search 检索；命中后用 plugin_read 读正文再照做。
   - 检索不到就明确说没有找到相关规范，不要用常识冒充公司规定。
   - 命中多个同名插件时，先把候选给用户选，不要自行假设。
-- 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / csv / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
+- 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / csv / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。单次 file_write 的正文别超过 12KB——模型一次输出不完，超了会被截断；更长的文件分块写，第一块 overwrite（或 create），其余 append 追加到同一路径。
 - 企业知识用 wiki_* 而不是 file_*：每个智能体有独立的 wiki 目录（files/wiki/<当前智能体>/），path 相对它，别的智能体的页面看不到也写不进。跨会话的分析口径、业务流程、结论纪要与查询模板，先 wiki_search / wiki_list 定位，再 wiki_read、wiki_write（markdown，最多三层，如 topics/分析口径.md）。不要为「沉淀知识」在当前空间新建 knowledge/ 等目录，那里只有本空间可见。覆盖已有页面先用 wiki_read 拿 version 再带 if_version；wiki 报「系统空间未初始化」或「没有绑定智能体」时告知用户找管理员，不要退回 file_write 顶替。
 - 用户消息末尾出现「[引用文件]」时，那些是用户明确要求参考的空间文件：先逐个 file_read 读取再作答，不要凭空假设内容；文件不存在或读不到就如实说明。
 - 用户要「做一个技能」时，按 builtin_plugin_dev 的 references/skill.md 直接写文件：先 file_write 写 plugins/<slug>/plugin.json，再写 plugins/<slug>/SKILL.md。正文只写入口流程与判断规则，参考资料放子文件（最多一层引用），单个 SKILL.md 建议不超过 300 行。
@@ -42,7 +42,7 @@ func BuildSystemMessage(in RunInput) llm.Message {
 - 密钥类凭证（API Key / Token / 密码）**不要向用户索要明文**：用 secret_request 查状态（只传凭证名与用途），回执 state=configured 说明已经配好，直接往下做、不要提示用户录入；state=missing 时卡片会自己出现在消息里，等用户填完再继续。清单、正文、脚本里只写凭证名。MCP 的 jwt 应用名与密钥走 mcp_app_key，应用名也不要自己编。
 - 用户主动贴出明文凭证时：先提醒这条已经泄露、建议作废重签，再引导用 secret_request 录入；不要复述、不要写进文件、不要转述给其他工具。
 - 不清楚的信息要明确说明，而不是猜测。
-- 代码用 Markdown 代码块输出，并标注语言。`
+- 代码、SQL、JSON / YAML、命令行、接口报文、配置、日志一律用 Markdown 代码块（三个反引号围栏）输出，并在围栏后标注语言（如 sql、json、yaml、bash、go、python），不要混排进正文段落：正文只写结论与解释，原文整段放进代码块，多行内容保持原有换行，不要压成一行。`
 
 	var b strings.Builder
 	b.WriteString(prompt)

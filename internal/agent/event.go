@@ -90,6 +90,36 @@ func (t *ToolState) Payload() map[string]any {
 	return payload
 }
 
+// Segment 是消息时间线上的一段：思考、正文或一次工具调用。
+//
+// 落库时按顺序写进 message.parts，历史消息据此还原「先想一段 → 调工具 → 再说一句」
+// 的原始顺序。只靠 reasoning + parts（纯工具列表）两个字段拼不回时间位置，
+// 排障时看到的就是「思考一堆在顶、工具一堆在中、正文在底」。
+type Segment struct {
+	// Type 取 reasoning / text / tool
+	Type string
+	// Text 是 reasoning / text 段的正文
+	Text string
+	// ToolID 是 tool 段对应的调用 id，指向 Result.Steps 里的同 id 步骤
+	ToolID string
+}
+
+// AppendSegment 把一段思考 / 正文接到时间线末尾。
+//
+// 增量是一个 token 一个到达的：每次新开一段会让历史回放出现几十个折叠块，
+// 所以同类型连续到达时续写同一段；只有工具调用插进来才真正开始新的一段。
+func (r *Result) AppendSegment(typ, text string) {
+	if text == "" {
+		return
+	}
+	n := len(r.Timeline)
+	if n > 0 && r.Timeline[n-1].Type == typ {
+		r.Timeline[n-1].Text += text
+		return
+	}
+	r.Timeline = append(r.Timeline, Segment{Type: typ, Text: text})
+}
+
 // Step 是落库的一条执行轨迹，用于历史消息还原。
 type Step struct {
 	Type       string `json:"type"`
@@ -231,6 +261,12 @@ type Result struct {
 	Content   string
 	Reasoning string
 	Steps     []Step
+	// Timeline 是这一轮产出内容的原始顺序：思考段、正文段与工具段交错排列。
+	// Steps 只存工具步骤（带参数与回执），时间线里的工具段用 ToolID 指向它；
+	// 会话层落库时把两者合成 message.parts，历史回放才能按真实顺序渲染。
+	//
+	// 可以不填：没有工具调用时位置是固定的（思考在前、正文在后），会话层不会落它。
+	Timeline []Segment
 	// NeedApproval 表示本次执行中至少有一次工具调用被策略要求审批
 	NeedApproval bool
 	Provider     string

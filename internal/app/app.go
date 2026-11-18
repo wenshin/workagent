@@ -80,6 +80,9 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	registry := tool.NewRegistry(st, mcpManager, log)
 	invoker := tool.NewInvoker(policy.RBACEngine{}, st, log)
+	// 单次调用参数上限跟着单次输出预算走：调大 LLM_MAX_TOKENS 就能一次写更大的文件，
+	// 不用再改工具代码（见 tool.DefaultMaxArgBytes）。
+	invoker.SetMaxArgBytes(tool.DefaultMaxArgBytes(cfg.LLMMaxTokens))
 
 	// Agent 运行时（§5.7.7）：编排实现按 AGENT_IMPL 选择；框架依赖只允许出现在实现子包内，
 	// 本层只依赖 agent.Agent 契约。配置写错时回退内置实现，避免整个服务起不来。

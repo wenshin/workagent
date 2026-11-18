@@ -222,13 +222,15 @@ func fileWrite() Tool {
 		Capability: "fs.write",
 		Description: "写入当前空间内的文本文件（md / json / txt / csv / yaml / ts / js），path 相对空间文件根目录，" +
 			"父目录不存在时自动创建。mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
+			"单次 content 建议不超过 12KB：模型单次输出有上限，写更长的内容会被截断；" +
+			"更大的文件请分块写，第一块 mode=overwrite（或 create），其余用 mode=append 追加到同一路径，单文件上限 256KB。" +
 			"修改已有文件前建议先用 file_read 读取现有内容。" +
 			"团队知识（口径、流程、结论）请用 wiki_write 沉淀，本工具只写当前空间的工作文件。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "path": {"type": "string", "description": "相对空间文件根目录的路径，如 plugins/weekly_report/SKILL.md"},
-    "content": {"type": "string", "description": "要写入的完整文本内容"},
+    "content": {"type": "string", "description": "要写入的文本内容；超过约 12KB 请拆成多块用 mode=append 续写"},
     "mode": {"type": "string", "enum": ["overwrite", "append", "create"], "description": "写入方式，默认 overwrite"}
   },
   "required": ["path", "content"],

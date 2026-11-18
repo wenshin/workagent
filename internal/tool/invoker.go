@@ -52,6 +52,9 @@ type Invoker struct {
 	rec     Recorder
 	log     *slog.Logger
 	timeout time.Duration
+	// maxArgBytes 是单次调用参数上限，0 表示用 DefaultMaxArgBytes(0)。
+	// 由装配层按 LLM_MAX_TOKENS 设置，见 SetMaxArgBytes。
+	maxArgBytes int
 }
 
 // NewInvoker 构造执行器；engine 为空时使用默认 RBAC 策略，rec 为空时只告警不落库。
@@ -65,6 +68,10 @@ func NewInvoker(engine policy.Engine, rec Recorder, log *slog.Logger) *Invoker {
 	return &Invoker{engine: engine, rec: rec, log: log, timeout: 30 * time.Second}
 }
 
+// SetMaxArgBytes 设置单次调用参数上限（<=0 表示用 DefaultMaxArgBytes(0)）。
+// 装配层应传 DefaultMaxArgBytes(cfg.LLMMaxTokens)。
+func (i *Invoker) SetMaxArgBytes(n int) { i.maxArgBytes = n }
+
 // Invoke 执行一次工具调用。策略拒绝与需要审批不会中断对话，而是作为结果回喂模型。
 func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env) InvokeResult {
 	result := InvokeResult{ToolName: t.Name, Risk: t.Risk}
@@ -77,10 +84,13 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	if !json.Valid(args) {
 		return i.finish(ctx, env, result, start, StatusError, "工具参数不是合法 JSON")
 	}
-	if len(args) > 16*1024 {
-		return i.finish(ctx, env, result, start, StatusError, "工具参数过大（上限 16KB）")
+	if limit := i.argLimit(); len(args) > limit {
+		return i.finish(ctx, env, result, start, StatusError, argTooLarge(t.Name, len(args), limit))
 	}
 	result.Args = args
+	// 展示等级按这次实参细化（如 shell_exec 按命令判只读/写入）。
+	// 下面策略判定仍用声明的 t.Risk：「这条命令看起来只读」不能绕过空间写权限。
+	result.Risk = t.EffectiveRisk(args)
 
 	// 审批动作在这里算：只有它需要看实参（命令、出网方法），策略层只做成员校验。
 	action := ApprovalFor(t, args)
@@ -109,6 +119,10 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 			"tool", t.Name, "run_id", env.RunID, "status", cached.Status)
 		replayed := result
 		replayed.Cached = true
+		if cached.Risk > 0 {
+			// 徽标沿用当初记录的等级：历史回看与实际执行的展示一致
+			replayed.Risk = cached.Risk
+		}
 		return i.finish(ctx, env, replayed, start, cached.Status, cached.Content)
 	}
 
@@ -175,8 +189,9 @@ func (i *Invoker) askApproval(
 		ArgsHash:  ArgsHash(t.Name, json.RawMessage(call.Function.Arguments)),
 		Detail:    decision.Action.Detail,
 		Reason:    decision.Reason,
-		Risk:      t.Risk,
-		Timeout:   DefaultApprovalTimeout,
+		// 确认卡上的徽标与工具卡一致：同样按这次实参细化
+		Risk:    t.EffectiveRisk(json.RawMessage(call.Function.Arguments)),
+		Timeout: DefaultApprovalTimeout,
 	})
 	switch {
 	case err == nil:
@@ -261,6 +276,46 @@ func (i *Invoker) finish(
 	}
 
 	return result
+}
+
+// DefaultMaxArgBytes 返回单次调用参数的上限。
+//
+// 参数是模型在一次响应里生成的，所以它和 LLM_MAX_TOKENS 是同一个约束的两半：
+// 16KB ≈ 4096 output tokens（英文 4 字节/token，中文 0.6 token/字 ≈ 5 字节/字）。
+// 写死一个常数会跟模型配置脱节——运维把 LLM_MAX_TOKENS 调到 16384，工具却还卡在 16KB；
+// 反过来调低时又拦不住半截 JSON。所以这里按单次输出预算折算，上限跟着配置走。
+func DefaultMaxArgBytes(maxTokens int) int {
+	// 1 token ≈ 4 字节是保守值：中文按 UTF-8 三字节/字折算下来每 token 约 5 字节，
+	// 取小值只会让上限更紧一点，不会放过模型根本生成不出来的参数。
+	if b := maxTokens * 4; b > 16<<10 {
+		return b
+	}
+	return 16 << 10
+}
+
+// argLimit 返回本次调用的参数上限。
+func (i *Invoker) argLimit() int {
+	if i.maxArgBytes > 0 {
+		return i.maxArgBytes
+	}
+	return DefaultMaxArgBytes(0)
+}
+
+// argTooLarge 是参数超限时回给模型的说明。
+//
+// 只说「参数过大」的话，模型往往原地重发一遍同样的内容，再撞一次同一个上限——
+// 它不是不知道超了，是不知道该切成几块、切完之后用哪种 mode 续上。
+func argTooLarge(toolName string, got, limit int) string {
+	return fmt.Sprintf(
+		"工具参数过大（%s 单次上限 %s，本次 %s），这次调用没有执行。"+
+			"请缩小这一次的调用规模后重试：如果内容是文件正文，请拆成多块写入——"+
+			"第一块用 mode=overwrite（新文件用 create），其余各块用 mode=append 依次追加到同一路径；"+
+			"其它工具请减少条目、缩短文本或分批处理。",
+		toolName, kib(limit), kib(got))
+}
+
+func kib(n int) string {
+	return fmt.Sprintf("%.1fKB", float64(n)/1024)
 }
 
 // clampMaxBytes 是工具结果回填的硬上限，避免超长结果撑爆上下文。

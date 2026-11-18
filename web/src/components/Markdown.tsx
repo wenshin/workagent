@@ -1,11 +1,47 @@
-import { memo, type ReactNode } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import hljs from 'highlight.js/lib/core';
+import bash from 'highlight.js/lib/languages/bash';
+import css from 'highlight.js/lib/languages/css';
+import go from 'highlight.js/lib/languages/go';
+import ini from 'highlight.js/lib/languages/ini';
+import java from 'highlight.js/lib/languages/java';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import markdown from 'highlight.js/lib/languages/markdown';
+import python from 'highlight.js/lib/languages/python';
+import sql from 'highlight.js/lib/languages/sql';
+import typescript from 'highlight.js/lib/languages/typescript';
+import xml from 'highlight.js/lib/languages/xml';
+import yaml from 'highlight.js/lib/languages/yaml';
 
 import UiBlock, { parseUiBlock } from './UiBlock';
 
+// 只注册控制台里真正会出现的语言：核心包按需加载，不引全量 bundle
+for (const [name, lang] of Object.entries({
+  bash,
+  css,
+  go,
+  ini,
+  java,
+  javascript,
+  json,
+  markdown,
+  python,
+  sql,
+  typescript,
+  xml,
+  yaml,
+})) {
+  hljs.registerLanguage(name, lang);
+}
+
 /**
  * 轻量 Markdown 渲染：只覆盖文档类文件常用的语法（标题、列表、代码块、引用、表格、链接），
- * 不引入额外依赖，也不用 dangerouslySetInnerHTML，避免外部文件带 HTML 注入风险。
- * 需要完整 CommonMark 时再替换为 marked/markdown-it。
+ * 不引入完整 CommonMark 解析器。
+ *
+ * 代码块走 highlight.js 上色：它只输出 <span class="hljs-*"> 并把源码里的 < & 转义，
+ * 不会带出任意 HTML，所以这里是唯一允许用 dangerouslySetInnerHTML 的地方；
+ * 行内语法仍然走 renderInline，不碰 HTML。
  */
 interface Props {
   content: string;
@@ -47,6 +83,93 @@ function renderInline(text: string, prefix: string): ReactNode[] {
   if (last < text.length) nodes.push(text.slice(last));
   return nodes;
 }
+
+/**
+ * 流式输出时每来一个增量整篇 Markdown 都会重解析，已结束的代码块没必要重复高亮。
+ * 只做定长 FIFO：键里带语言，避免同一段源码在两种语言下互相命中。
+ */
+const HIGHLIGHT_CACHE_MAX = 80;
+const highlightCache = new Map<string, string>();
+
+/**
+ * 有围栏语言且该语言已注册才上色：没标语言或标了没注册的一律按纯文本渲染，
+ * 不用自动识别——猜错语言比不上色更糟（SQL 被当成纯文本只是无色，被当成别的语言会整段乱色）。
+ */
+function highlightCode(source: string, lang: string): string | null {
+  const name = lang.split(/\s+/)[0]?.toLowerCase() ?? '';
+  if (!name || !hljs.getLanguage(name)) return null;
+  const cacheKey = `${name}\u0000${source}`;
+  const cached = highlightCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  try {
+    const value = hljs.highlight(source, { language: name, ignoreIllegals: true }).value;
+    if (highlightCache.size >= HIGHLIGHT_CACHE_MAX) {
+      const oldest = highlightCache.keys().next().value;
+      if (oldest !== undefined) highlightCache.delete(oldest);
+    }
+    highlightCache.set(cacheKey, value);
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+/** 代码块：语言标签 + 高亮 + 复制。复制状态留在组件内，流式重渲染不会把「已复制」重置掉 */
+const CodeBlock = memo(function CodeBlock({ source, lang }: { source: string; lang: string }) {
+  const html = useMemo(() => highlightCode(source, lang), [source, lang]);
+  const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const timer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (timer.current !== null) window.clearTimeout(timer.current);
+    },
+    [],
+  );
+
+  const copy = () => {
+    const done = (next: 'copied' | 'failed') => {
+      setCopied(next);
+      if (timer.current !== null) window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setCopied('idle'), 1600);
+    };
+    // clipboard 只在安全上下文可用；不可用或权限被拒时在按钮上给一次反馈，不弹全局错误
+    const pending = navigator.clipboard?.writeText(source);
+    if (!pending) {
+      done('failed');
+      return;
+    }
+    void pending.then(
+      () => done('copied'),
+      () => done('failed'),
+    );
+  };
+
+  return (
+    <div className="md-code">
+      <div className="md-code-head">
+        {lang ? <span className="md-code-lang">{lang}</span> : null}
+        <button
+          type="button"
+          className="md-code-copy"
+          onClick={copy}
+          aria-label={copied === 'copied' ? '已复制' : copied === 'failed' ? '复制失败，可重试' : '复制代码'}
+          title="复制代码"
+        >
+          {copied === 'copied' ? '已复制' : copied === 'failed' ? '复制失败' : '复制'}
+        </button>
+      </div>
+      <pre>
+        {html ? (
+          // html 来自 highlight.js：源码已转义，只含 <span class="hljs-*">
+          <code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />
+        ) : (
+          <code>{source}</code>
+        )}
+      </pre>
+    </div>
+  );
+});
 
 function isTableDivider(line: string) {
   return /^\|?[\s:-]*-[\s|:-]*\|?$/.test(line.trim());
@@ -97,10 +220,7 @@ function MarkdownView({ content, spaceId }: Props) {
         continue;
       }
       blocks.push(
-        <pre key={key++} className="md-code">
-          {lang ? <span className="md-code-lang">{lang}</span> : null}
-          <code>{code.join('\n')}</code>
-        </pre>,
+        <CodeBlock key={key++} source={code.join('\n')} lang={lang.split(/\s+/)[0] ?? ''} />,
       );
       continue;
     }

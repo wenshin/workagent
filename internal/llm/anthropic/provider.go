@@ -248,8 +248,20 @@ func (p *Provider) handleEvent(
 		if payload.Usage != nil {
 			res.Usage.OutputTokens = payload.Usage.OutputTokens
 		}
+		if payload.Delta != nil && payload.Delta.StopReason != "" {
+			res.FinishReason = normalizeStopReason(payload.Delta.StopReason)
+		}
 	}
 	return nil
+}
+
+// normalizeStopReason 把 Anthropic 的停止原因对齐成 llm.Result.FinishReason 的取值：
+// 上限截断在这边叫 max_tokens，与 openai 的 length 是同一件事。
+func normalizeStopReason(s string) string {
+	if s == "max_tokens" {
+		return llm.FinishLength
+	}
+	return s
 }
 
 // Embed Anthropic 无 Embedding 接口，需单独配置向量 Provider。
@@ -298,6 +310,8 @@ type ssePayload struct {
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
 		PartialJSON string `json:"partial_json"`
+		// StopReason 在 message_delta 事件里给出：max_tokens 表示被上限截断
+		StopReason string `json:"stop_reason"`
 	} `json:"delta"`
 	Message *struct {
 		Model string `json:"model"`

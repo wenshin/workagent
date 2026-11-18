@@ -139,8 +139,8 @@ export interface ToolCallRecord {
   approval?: ApprovalInfo;
 }
 
-/** 消息里的结构化执行轨迹 */
-export interface MessagePart {
+/** 消息里的一次工具调用 */
+export interface MessageToolPart {
   type: 'tool';
   id: string;
   name: string;
@@ -152,13 +152,27 @@ export interface MessagePart {
   risk?: number;
 }
 
+/** 消息时间线上的思考 / 正文段：与工具段按发生顺序交错 */
+export interface MessageTextPart {
+  type: 'reasoning' | 'text';
+  text: string;
+}
+
+/**
+ * 消息里的结构化执行轨迹，按发生顺序排列。
+ *
+ * 新消息是完整时间线（思考 / 正文 / 工具交错），历史回放据此还原真实顺序；
+ * 老消息只有工具段（这次改动之前没有时间线），前端回落到分组渲染。
+ */
+export type MessagePart = MessageToolPart | MessageTextPart;
+
 /**
  * 流式过程中的一段内容：思考、正文片段或一次工具调用。
  *
  * 用有序数组而不是几个并列字段，是为了保住「先想一段、再说一句、调工具、再想一段」
  * 的真实时间线——分组渲染会把工具卡全堆到正文上面、把思考永远钉在最顶部，
  * 看起来像顺序错了，也看不出当前进展到哪一步。
- * 只用于流式过程；落库后的历史消息没有这些片段的时间位置，仍按分组渲染。
+ * 流式与落库后的历史消息用同一套形状（历史走 parts），渲染逻辑共用。
  */
 export type StreamItem =
   | { kind: 'reasoning'; text: string }

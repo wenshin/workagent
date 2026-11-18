@@ -1248,6 +1248,83 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   margin-top: var(--wa-space-6);
 }
 
+/* 本轮写入的文件：模型在正文里给的路径不可点，这份清单才是找到文件的入口 */
+.msg-files {
+  margin-top: var(--wa-space-8);
+  padding: var(--wa-space-8) var(--wa-space-12);
+  border: 1px solid var(--semi-color-border);
+  border-radius: var(--wa-radius-8);
+  background: var(--semi-color-fill-0);
+}
+
+.msg-files-head {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-4);
+  color: var(--semi-color-text-2);
+  font-size: var(--wa-text-xs);
+}
+
+.msg-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-2);
+  margin: var(--wa-space-6) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.msg-files-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wa-space-6);
+  width: 100%;
+  padding: var(--wa-space-4) var(--wa-space-6);
+  border: 0;
+  border-radius: var(--wa-radius-4);
+  background: transparent;
+  color: var(--semi-color-text-0);
+  font-family: inherit;
+  font-size: var(--wa-text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.msg-files-item:hover:not(:disabled) {
+  background: var(--semi-color-fill-1);
+  color: var(--wa-color-primary-text);
+}
+
+.msg-files-item:focus-visible {
+  outline: 2px solid var(--semi-color-primary);
+  outline-offset: 1px;
+}
+
+.msg-files-item:disabled {
+  cursor: default;
+}
+
+.msg-files-icon {
+  flex: none;
+  color: var(--semi-color-text-2);
+}
+
+.msg-files-name {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-files-dir {
+  overflow: hidden;
+  color: var(--semi-color-text-3);
+  font-size: var(--wa-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 输入框内的次要操作：上传、引用，与发送按钮同尺寸 */
 .chat-tool-btn.semi-button {
   width: 32px;
@@ -1620,28 +1697,142 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   font-size: 12.5px;
 }
 
-.md-body .md-code {
-  position: relative;
+/* 代码块：头部（语言 + 复制）走文档流，不做绝对定位——
+   长行横向滚动时按钮不会压在代码上，也不会跟着滚走 */
+.md-code {
   margin: 0 0 14px;
-  padding: 14px 16px;
-  overflow: auto;
-  border-radius: 8px;
+  border-radius: var(--wa-radius-8);
   background: var(--semi-color-fill-0);
+  overflow: hidden;
 }
 
-.md-body .md-code code {
-  padding: 0;
-  background: none;
-  font-size: 12.5px;
-  line-height: 1.7;
+.md-code-head {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-8);
+  padding: var(--wa-space-6) var(--wa-space-6) 0 var(--wa-space-12);
 }
 
 .md-code-lang {
-  position: absolute;
-  top: 6px;
-  right: 10px;
-  font-size: 11px;
+  margin-right: auto;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: var(--wa-text-xs);
+  line-height: var(--wa-leading-tight);
   color: var(--semi-color-text-3);
+}
+
+.md-code-copy {
+  margin-left: auto;
+  padding: 1px var(--wa-space-6);
+  border: 0;
+  border-radius: var(--wa-radius-4);
+  background: transparent;
+  font-family: inherit;
+  font-size: var(--wa-text-xs);
+  line-height: var(--wa-leading-tight);
+  color: var(--semi-color-text-3);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--wa-duration-fast) var(--wa-ease),
+    color var(--wa-duration-fast) var(--wa-ease);
+}
+
+.md-code:hover .md-code-copy,
+.md-code-copy:focus-visible {
+  opacity: 1;
+}
+
+.md-code-copy:hover {
+  color: var(--wa-color-primary-text);
+}
+
+.md-code-copy:focus-visible {
+  outline: 2px solid var(--semi-color-primary);
+  outline-offset: 1px;
+}
+
+/* 触屏没有 hover：复制按钮常驻，否则永远点不到 */
+@media (hover: none) {
+  .md-code-copy {
+    opacity: 1;
+  }
+}
+
+.md-code pre {
+  margin: 0;
+  padding: var(--wa-space-8) var(--wa-space-16) var(--wa-space-12);
+  overflow: auto;
+}
+
+.md-code code {
+  padding: 0;
+  background: none;
+  line-height: var(--wa-leading-relaxed);
+}
+
+/* 语法高亮：颜色全部取语义 token，不引 highlight.js 主题 CSS——
+   自带主题是一套独立配色，深色下与 Semi 的对比度口径对不上，也会绕过色值规范 */
+.md-code .hljs-comment,
+.md-code .hljs-quote {
+  color: var(--semi-color-text-3);
+  font-style: italic;
+}
+
+.md-code .hljs-keyword,
+.md-code .hljs-selector-tag,
+.md-code .hljs-meta,
+.md-code .hljs-doctag {
+  color: var(--wa-color-primary-text);
+}
+
+.md-code .hljs-string,
+.md-code .hljs-regexp,
+.md-code .hljs-attr,
+.md-code .hljs-attribute,
+.md-code .hljs-addition {
+  color: var(--semi-color-success);
+}
+
+.md-code .hljs-number,
+.md-code .hljs-literal,
+.md-code .hljs-symbol,
+.md-code .hljs-bullet {
+  color: var(--semi-color-warning);
+}
+
+.md-code .hljs-title,
+.md-code .hljs-section,
+.md-code .hljs-name,
+.md-code .hljs-selector-id,
+.md-code .hljs-selector-class {
+  color: var(--semi-color-info);
+  font-weight: 600;
+}
+
+.md-code .hljs-built_in,
+.md-code .hljs-type,
+.md-code .hljs-class .hljs-title {
+  color: var(--wa-color-primary-text);
+}
+
+.md-code .hljs-variable,
+.md-code .hljs-template-variable,
+.md-code .hljs-params,
+.md-code .hljs-subst {
+  color: var(--semi-color-text-1);
+}
+
+.md-code .hljs-deletion {
+  color: var(--semi-color-danger);
+}
+
+.md-code .hljs-emphasis {
+  font-style: italic;
+}
+
+.md-code .hljs-strong {
+  font-weight: 600;
 }
 
 .md-body blockquote {

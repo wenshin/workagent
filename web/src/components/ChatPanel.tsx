@@ -14,6 +14,7 @@ import type {
   ChatMessage,
   ChatSession,
   MessagePart,
+  MessageToolPart,
   SpaceFile,
   SpaceSkill,
   StreamItem,
@@ -121,6 +122,8 @@ interface Props {
   resumable?: boolean;
   /** 从断点继续（调用方负责先确认没有正在跑的轮次） */
   onResume?: () => void;
+  /** 打开本轮写入的空间文件：清单由工具回执推导，点击跳到右侧预览 */
+  onOpenFile?: (path: string) => void;
 }
 
 /** 用户消息：正文 + 引用文件标签 */
@@ -463,10 +466,21 @@ function ToolGroup({
 }) {
   const running = tools.some((t) => t.status === 'running');
   const failed = tools.filter((t) => t.status === 'error' || t.status === 'denied').length;
+  // 折起来之后单条卡上的风险等级就看不见了，组头只留最高的一档：
+  // 「这一组里最危险的是哪一步」才是要不要点开看的判断依据。
+  const risk = tools.reduce((max, t) => {
+    const level = (t.status === 'approval' ? t.approval?.risk : undefined) || t.risk || 0;
+    return Math.max(max, level);
+  }, 0);
   return (
     <details className="msg-tools">
       <summary className="msg-tools-head">
         <span>调用了 {tools.length} 个工具</span>
+        {risk > 0 ? (
+          <span className={`msg-risk msg-risk-${risk}`} title={`本组最高风险 · ${riskHint(risk)}`}>
+            {riskLabel(risk)}
+          </span>
+        ) : null}
         {running ? <span className="msg-tools-live">执行中…</span> : null}
         {failed > 0 ? <span className="msg-tools-fail">{failed} 个失败</span> : null}
         {/* 收起时靠名字一眼看出调过什么，不用点开 */}
@@ -565,8 +579,8 @@ function toBlocks(items: StreamItem[]): TurnBlock[] {
   return blocks;
 }
 
-function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
-  return (parts ?? []).map((p) => ({
+function toToolRecord(p: MessageToolPart): ToolCallRecord {
+  return {
     id: p.id,
     name: p.name,
     args: p.args,
@@ -574,34 +588,133 @@ function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
     status: p.status,
     duration_ms: p.duration_ms,
     risk: p.risk,
-  }));
+  };
+}
+
+function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
+  const out: ToolCallRecord[] = [];
+  for (const p of parts ?? []) {
+    if (p.type === 'tool') out.push(toToolRecord(p));
+  }
+  return out;
+}
+
+/**
+ * 把落库的 parts 还原成时间线。
+ *
+ * 新消息的 parts 里带思考段与正文段，顺序就是当时的真实顺序；老消息只有工具段，
+ * 返回 null，交给「思考置顶 + 工具分组 + 正文」那套分组渲染。
+ */
+function toItems(parts?: MessagePart[]): StreamItem[] | null {
+  if (!parts || !parts.some((p) => p.type !== 'tool')) return null;
+  return parts.map((p) =>
+    p.type === 'tool'
+      ? { kind: 'tool' as const, tool: toToolRecord(p) }
+      : { kind: p.type, text: p.text },
+  );
+}
+
+function parseToolArgs(args: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(args);
+    return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+  } catch {
+    // 流式中参数还没生成完：这一帧先跳过，下一次增量再算
+    return null;
+  }
+}
+
+/**
+ * 本轮写入的空间文件，按路径去重、保留首次出现的位置。
+ *
+ * 只认工具回执：`file_write` 成功才算写过——失败的那次（例如参数超限）不能出现在
+ * 「已写入」里；append 分段写同一路径按一次计。wiki_write 落在系统空间，
+ * 普通成员打不开，不放进这份可点击的清单。
+ */
+function writtenFiles(tools: ToolCallRecord[]): string[] {
+  const out: string[] = [];
+  for (const tool of tools) {
+    if (tool.name !== 'file_write' || tool.status !== 'ok') continue;
+    const args = parseToolArgs(tool.args);
+    const path = typeof args?.path === 'string' ? args.path.trim() : '';
+    if (path && !out.includes(path)) out.push(path);
+  }
+  return out;
+}
+
+/**
+ * 写入文件清单：模型给的结论里通常只有文件名，没法点，也不带目录。
+ * 这里直接由工具回执推导，结论后面固定给一块，点一下在右侧打开。
+ */
+function WrittenFiles({ paths, onOpen }: { paths: string[]; onOpen?: (path: string) => void }) {
+  if (paths.length === 0) return null;
+  return (
+    <div className="msg-files">
+      <div className="msg-files-head">
+        <IconFile size="small" className="msg-files-icon" />
+        本轮写入 {paths.length} 个文件
+      </div>
+      <ul className="msg-files-list">
+        {paths.map((path) => {
+          const name = path.split('/').pop() || path;
+          const dir = path.slice(0, path.length - name.length).replace(/\/+$/, '');
+          return (
+            <li key={path}>
+              <button
+                type="button"
+                className="msg-files-item"
+                title={onOpen ? `打开 ${path}` : path}
+                onClick={onOpen ? () => onOpen(path) : undefined}
+                disabled={!onOpen}
+              >
+                <IconFile size="small" className="msg-files-icon" />
+                <span className="msg-files-name">{name}</span>
+                {dir ? <span className="msg-files-dir">{dir}</span> : null}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
 function AssistantBody({
   content,
   reasoning,
-  tools = [],
+  parts,
   items,
   live,
   spaceId,
   onSend,
   onResume,
+  onOpenFile,
 }: {
   content?: string;
   reasoning?: string;
-  tools?: ToolCallRecord[];
+  /** 历史消息的执行轨迹：带思考 / 正文段时按它还原顺序 */
+  parts?: MessagePart[];
   /** 流式过程中的有序片段；有值时按它渲染（仅连续工具调用会被并组） */
   items?: StreamItem[];
   live?: boolean;
   spaceId?: string;
   onSend?: (content: string) => void;
   onResume?: () => void;
+  onOpenFile?: (path: string) => void;
 }) {
-  const blocks = items ? toBlocks(items) : null;
+  const tools = toRecords(parts);
+  // 流式与历史共用同一套渲染：历史消息里新消息带时间线，老消息只有工具段
+  const timeline = items ?? toItems(parts);
+  const blocks = timeline ? toBlocks(timeline) : null;
   const hasBody = blocks ? blocks.length > 0 : Boolean(content) || tools.length > 0;
+  // 写入清单在两种渲染路径下都从工具回执推导：老消息没有时间线时 tools 就是全量
+  const allTools = timeline
+    ? timeline.flatMap((item) => (item.kind === 'tool' ? [item.tool] : []))
+    : tools;
+  const writes = writtenFiles(allTools);
   return (
     <>
-      {reasoning ? <ReasoningBlock text={reasoning} live={live && !hasBody} /> : null}
+      {timeline ? null : reasoning ? <ReasoningBlock text={reasoning} live={live && !hasBody} /> : null}
       {blocks ? (
         // 流式：思考、正文与工具按实际到达顺序交错，
         // 而不是「思考钉在顶部、工具全在上、正文全在下」
@@ -635,7 +748,7 @@ function AssistantBody({
         })
       ) : (
         <>
-          {/* 历史消息没有时间位置，工具统一落在正文之前，连续调用同样折成一组 */}
+          {/* 老消息没有时间线（parts 里只有工具调用），工具统一落在正文之前，连续调用同样折成一组 */}
           <ToolRun tools={tools} spaceId={spaceId} onSend={onSend} onResume={onResume} />
           {content ? (
             <div className="chat-msg-content chat-msg-markdown">
@@ -644,6 +757,8 @@ function AssistantBody({
           ) : null}
         </>
       )}
+      {/* 写在结论后面：模型在正文里给的路径不可点，这块才是「去哪找文件」的确定答案 */}
+      <WrittenFiles paths={writes} onOpen={onOpenFile} />
     </>
   );
 }
@@ -669,6 +784,7 @@ export default function ChatPanel({
   pendingRefs,
   resumable,
   onResume,
+  onOpenFile,
 }: Props) {
   // 智能体清单只在同空间时查：子任务会话的 agent 来自发起方空间，被派发人无权读那份目录，
   // 跨空间只显示「发起方智能体」，不去请求一个必然 403 的接口。
@@ -1065,10 +1181,11 @@ export default function ChatPanel({
                 <AssistantBody
                   content={m.content}
                   reasoning={m.reasoning}
-                  tools={toRecords(m.parts)}
+                  parts={m.parts}
                   spaceId={session.space_id}
                   onSend={continueRun}
                   onResume={onResume}
+                  onOpenFile={onOpenFile}
                 />
               ) : m.source === 'task_brief' ? (
                 // 任务委托里有代码与编号清单，按 Markdown 渲染；普通输入仍走纯文本，避免误把用户打的符号当语法
@@ -1115,6 +1232,7 @@ export default function ChatPanel({
                 spaceId={session.space_id}
                 onSend={continueRun}
                 onResume={onResume}
+                onOpenFile={onOpenFile}
               />
             )}
           </div>
@@ -1162,14 +1280,15 @@ export default function ChatPanel({
                     setMention(null);
                     return;
                   }
-                  // 键盘优先选第一个候选：@ 列表打开时回车不该直接把半截文件名发出去
-                  if (e.key === 'Enter' && !e.shiftKey && fileOptions.length > 0) {
+                  // 键盘优先选第一个候选：@ 列表打开时 Tab 补全，回车仍然换行
+                  if (e.key === 'Tab' && fileOptions.length > 0) {
                     e.preventDefault();
                     selectFromMention(fileOptions[0].path);
                     return;
                   }
                 }
-                if (e.key === 'Enter' && !e.shiftKey) {
+                // Shift + Enter 发送，Enter 换行
+                if (e.key === 'Enter' && e.shiftKey) {
                   e.preventDefault();
                   void send();
                 }
@@ -1288,7 +1407,7 @@ export default function ChatPanel({
         <div className="chat-input-foot">
           <span className="chat-error">{error}</span>
           <span className="chat-input-hint">
-            {busy ? `已用时 ${formatDuration(elapsedMs) || '0.0s'}` : 'Enter 发送，Shift + Enter 换行'}
+            {busy ? `已用时 ${formatDuration(elapsedMs) || '0.0s'}` : 'Shift + Enter 发送，Enter 换行'}
           </span>
         </div>
       </div>

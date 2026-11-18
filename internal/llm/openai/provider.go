@@ -179,6 +179,9 @@ func (p *Provider) parseStream(ctx context.Context, body io.Reader, res *llm.Res
 					}
 				}
 				for _, choice := range chunk.Choices {
+					if choice.FinishReason != "" {
+						res.FinishReason = choice.FinishReason
+					}
 					reasoning := choice.Delta.ReasoningContent
 					if reasoning == "" {
 						reasoning = choice.Delta.Reasoning
@@ -236,6 +239,9 @@ func (p *Provider) parseWholeBody(body io.Reader, res *llm.Result, onDelta llm.D
 	}
 
 	for _, choice := range resp.Choices {
+		if choice.FinishReason != "" {
+			res.FinishReason = choice.FinishReason
+		}
 		content, reasoning := choice.Message.Content, choice.Message.ReasoningContent
 		if content == "" && reasoning == "" {
 			content, reasoning = choice.Delta.Content, choice.Delta.ReasoningContent
@@ -325,7 +331,9 @@ func (p *Provider) Embed(ctx context.Context, texts []string) ([][]float32, erro
 
 type streamChunk struct {
 	Choices []struct {
-		Delta struct {
+		// FinishReason 只出现在最后一个 chunk 里：length 表示被 max_tokens 截断
+		FinishReason string `json:"finish_reason"`
+		Delta        struct {
 			Content          string `json:"content"`
 			ReasoningContent string `json:"reasoning_content"`
 			Reasoning        string `json:"reasoning"`

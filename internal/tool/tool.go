@@ -161,6 +161,12 @@ type Tool struct {
 	Description string
 	Parameters  json.RawMessage
 	Risk        int
+	// RiskFor 可选：按实参细化「展示用」风险等级（1~4，返回 0 表示判不出来）。
+	//
+	// 单一工具覆盖多种动作时需要它——shell_exec 从 `ls` 到 `rm -rf` 走的是同一份
+	// 工具声明，只按声明展示就只能永远写「写入」。它只影响卡片徽标与历史回看，
+	// 不参与审批判定，也不改变空间写权限的判据（那里仍按声明的 Risk）。
+	RiskFor func(t Tool, args json.RawMessage) int
 	// SideEffects 声明影响范围：read-only（默认）/ write-workspace（仅当前空间工作区）。
 	// 策略层据此区分「空间内写」与「外部写」。
 	SideEffects string
@@ -202,6 +208,19 @@ func (t Tool) Definition() llm.Tool {
 			Parameters:  params,
 		},
 	}
+}
+
+// EffectiveRisk 返回这一次调用用于展示的风险等级。
+//
+// RiskFor 判得出来就用它，判不出来（返回 0 或越界）退回工具声明的 Risk：
+// 展示宁可报高——把写操作显示成只读，比把只读显示成写入糟糕得多。
+func (t Tool) EffectiveRisk(args json.RawMessage) int {
+	if t.RiskFor != nil {
+		if r := t.RiskFor(t, args); r >= policy.RiskReadOnly && r <= policy.RiskSensitive {
+			return r
+		}
+	}
+	return t.Risk
 }
 
 // MCPTool 是 MCP Server 暴露的工具（由 mcp.Manager 提供）。

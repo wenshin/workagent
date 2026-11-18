@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -469,16 +471,7 @@ func (s *Service) execute(
 		return out, err
 	}
 
-	// res.Steps 为空时 json.Marshal 会给出 null，而 parts 的契约是数组，这里显式落 []
-	parts := []byte("[]")
-	if len(res.Steps) > 0 {
-		data, marshalErr := json.Marshal(res.Steps)
-		if marshalErr != nil {
-			s.log.Warn("序列化执行轨迹失败", "session_id", sessionID, "err", marshalErr)
-		} else {
-			parts = data
-		}
-	}
+	parts := marshalParts(s.log, sessionID, res)
 
 	// 这一轮的用量与耗时随消息落库：前端刷新后仍能看到 token 与总耗时
 	stats := store.MessageStats{
@@ -550,6 +543,59 @@ func (s *Service) execute(
 	out.Usage = res.Usage
 	out.Status = status
 	return out, runErr
+}
+
+// timelinePart 是 message.parts 里思考 / 正文段的形状，与前端 MessagePart 对齐。
+type timelinePart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// marshalParts 把这一轮的时间线落成 message.parts。
+//
+// parts 是数组，按发生顺序排列：思考段与正文段带文本，工具段直接复用 Steps 的
+// JSON 形状（参数与回执不重复写）。历史消息据此还原「想一段 → 调工具 → 再说一句」
+// 的真实顺序，排障时才看得出结论是在哪一步之后得出的。
+//
+// 没有工具调用时正文位置是固定的（思考在前、正文在后），分组渲染已经够用，
+// 不再把整段正文复制一份进 parts。
+func marshalParts(log *slog.Logger, sessionID string, res agent.Result) []byte {
+	if len(res.Steps) == 0 {
+		return []byte("[]")
+	}
+	steps := make(map[string]agent.Step, len(res.Steps))
+	for _, st := range res.Steps {
+		steps[st.ID] = st
+	}
+	parts := make([]any, 0, len(res.Timeline)+len(res.Steps))
+	placed := make(map[string]bool, len(res.Steps))
+	for _, seg := range res.Timeline {
+		if seg.Type == "tool" {
+			st, ok := steps[seg.ToolID]
+			if !ok {
+				continue
+			}
+			placed[seg.ToolID] = true
+			parts = append(parts, st)
+			continue
+		}
+		if strings.TrimSpace(seg.Text) == "" {
+			continue
+		}
+		parts = append(parts, timelinePart{Type: seg.Type, Text: seg.Text})
+	}
+	// 时间线缺失或不完整（第三方实现、续跑补齐）时工具轨迹不能丢
+	for _, st := range res.Steps {
+		if !placed[st.ID] {
+			parts = append(parts, st)
+		}
+	}
+	data, err := json.Marshal(parts)
+	if err != nil {
+		log.Warn("序列化消息轨迹失败", "session_id", sessionID, "err", err)
+		return []byte("[]")
+	}
+	return data
 }
 
 // keepResume 判断这一轮的断点值不值得留。

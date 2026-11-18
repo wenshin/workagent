@@ -14,6 +14,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -226,6 +227,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Risk:       state.Risk,
 				DurationMS: state.DurationMS,
 			})
+			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				ToolCallID: p.ID,
@@ -262,10 +264,12 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		out, provider, messages, chatErr = a.chatRound(ctx, messages, roundDefs, func(d llm.Delta) error {
 			if d.Reasoning != "" {
 				reasoning.WriteString(d.Reasoning)
+				res.AppendSegment("reasoning", d.Reasoning)
 				return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Reasoning, Reasoning: true})
 			}
 			if d.Content != "" {
 				roundText.WriteString(d.Content)
+				res.AppendSegment("text", d.Content)
 				return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Content})
 			}
 			return nil
@@ -337,7 +341,8 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Status: "running",
 			}
 			if t, ok := tool.Find(tools, call.Function.Name); ok {
-				state.Risk = t.Risk
+				// running 态与最终回执用同一套计算，否则徽标会在中途跳变
+				state.Risk = t.EffectiveRisk(json.RawMessage(call.Function.Arguments))
 			}
 			if err := emit(agent.Event{Type: agent.EventToolCall, Tool: state}); err != nil {
 				return res, err
@@ -352,6 +357,18 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		}
 		rejected := guard.inspect(pending)
 
+		// 被单次输出上限截断的调用不能执行：参数只是半截 JSON，
+		// 拿去执行要么报「参数不是合法 JSON」，要么把半个文件写下去。
+		// 回填的说明必须写清「怎么切」，否则模型会原样重发一遍再撞同一个上限。
+		if out.FinishReason == llm.FinishLength {
+			for _, call := range out.ToolCalls {
+				if json.Valid([]byte(call.Function.Arguments)) {
+					continue
+				}
+				rejected[call.ID] = truncatedCallHint(a.cfg.LLMMaxTokens)
+			}
+		}
+
 		// 同一轮的多个调用并行执行，但事件与消息拼接保持确定顺序
 		results := make([]tool.InvokeResult, len(out.ToolCalls))
 		sem := make(chan struct{}, maxParallel(a.cfg.LLMMaxParallel))
@@ -362,7 +379,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 					ToolName: call.Function.Name,
 					Status:   tool.StatusError,
 					Content:  reason,
-					Risk:     riskOf(tools, call.Function.Name),
+					Risk:     riskOf(tools, call.Function.Name, json.RawMessage(call.Function.Arguments)),
 				}
 				continue
 			}
@@ -417,6 +434,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Risk:       state.Risk,
 				DurationMS: state.DurationMS,
 			})
+			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
 
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
@@ -485,10 +503,12 @@ func (a *Agent) finish(
 	var text strings.Builder
 	out, provider, _, err := a.chatRound(ctx, msgs, nil, func(d llm.Delta) error {
 		if d.Reasoning != "" {
+			res.AppendSegment("reasoning", d.Reasoning)
 			return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Reasoning, Reasoning: true})
 		}
 		if d.Content != "" {
 			text.WriteString(d.Content)
+			res.AppendSegment("text", d.Content)
 			return emit(agent.Event{Type: agent.EventMessageDelta, Role: llm.RoleAssistant, Delta: d.Content})
 		}
 		return nil
@@ -558,10 +578,10 @@ func (a *Agent) roundLimit(in agent.RunInput) int {
 	return limit
 }
 
-// riskOf 返回工具的风险等级（未知工具为 0）。
-func riskOf(tools []tool.Tool, name string) int {
+// riskOf 返回这一次调用的展示等级（未知工具为 0）。
+func riskOf(tools []tool.Tool, name string, args json.RawMessage) int {
 	if t, ok := tool.Find(tools, name); ok {
-		return t.Risk
+		return t.EffectiveRisk(args)
 	}
 	return 0
 }
@@ -572,6 +592,28 @@ func resultBudget(tools []tool.Tool, name string) int {
 		return t.MaxResultBytes
 	}
 	return maxToolFeedBytes
+}
+
+// truncatedCallHint 说明「这次调用为什么作废、下次怎么发」。
+//
+// 建议的单块大小按单次输出预算折算（留 25% 余量给路径、mode 与转义），
+// 与 Invoker 的参数上限同源：模型照着这个数切，就不会再撞同一个上限。
+func truncatedCallHint(maxTokens int) string {
+	chunk := 8 // 未知配置时按 8KB 给：默认 4096 输出预算下的保守值
+	if maxTokens > 0 {
+		if kb := maxTokens * 3 / 1024; kb > 0 {
+			chunk = kb
+		}
+	}
+	budget := "单次响应上限"
+	if maxTokens > 0 {
+		budget = fmt.Sprintf("单次响应上限 LLM_MAX_TOKENS=%d", maxTokens)
+	}
+	return fmt.Sprintf(
+		"本次调用的参数被%s截断（模型这次没说完），没有执行。"+
+			"请把内容拆小后重试：写文件时每块不超过 %dKB，第一块用 mode=overwrite（新文件用 create），"+
+			"其余各块用 mode=append 追加到同一路径；其它工具请缩窄参数范围（减少条目、缩短正文、分批处理）。",
+		budget, chunk)
 }
 
 func maxParallel(configured int) int {

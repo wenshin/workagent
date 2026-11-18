@@ -515,6 +515,10 @@ export default function WorkspacePage() {
               onStop={stopGenerating}
               resumable={Boolean(resumeInfo?.resumable) && !stream}
               onResume={() => void resume()}
+              // 写入文件清单里的条目：切到右侧文件预览，路径落在会话所属空间
+              onOpenFile={(path) =>
+                setSearchParams({ space: selectedSession.space_id, file: path })
+              }
             />
           </div>
         ) : (

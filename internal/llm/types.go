@@ -66,6 +66,12 @@ type ChatRequest struct {
 	MaxTokens int
 }
 
+// FinishLength 是「被单次响应上限截断」的停止原因。
+//
+// openai 兼容端点报 finish_reason=length，Anthropic 报 stop_reason=max_tokens，
+// 两边是同一件事，这里统一成一个值。它意味着模型这次没说完——工具参数可能只有半截 JSON。
+const FinishLength = "length"
+
 // Result 是一次完整模型调用的产出。
 type Result struct {
 	Content   string
@@ -75,6 +81,11 @@ type Result struct {
 	Model string
 	// Usage 记录 token 消耗（部分 Provider 不返回，为 0）
 	Usage Usage
+	// FinishReason 是归一化后的停止原因（见 FinishLength）。
+	//
+	// 只有被截断时需要上层特判：半截参数拿去执行，要么把副作用做一半，
+	// 要么报一句「参数不是合法 JSON」让模型原样重试、再撞同一个上限。
+	FinishReason string
 }
 
 // Usage 是一次调用的 token 计量。

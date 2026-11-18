@@ -361,7 +361,9 @@ func wikiWrite() Tool {
 			"不要在当前空间用 file_write 自建 knowledge/ 之类的知识目录。" +
 			"mode：create 仅新建 / overwrite 覆盖（默认）/ append 追加。" +
 			"覆盖已有页面时务必带上 wiki_read 返回的 if_version，被他人改过会报冲突；" +
-			"日志类内容用 append 追加到按日期命名的页面，天生不冲突。",
+			"日志类内容用 append 追加到按日期命名的页面，天生不冲突。" +
+			"单次 content 建议不超过 12KB：模型单次输出有上限，写更长的内容会被截断；" +
+			"更大的页面请分块写（首页 create，其余 append；单页上限 128KB）。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {

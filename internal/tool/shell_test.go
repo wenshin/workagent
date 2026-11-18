@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/storage/localfs"
@@ -96,5 +97,69 @@ func TestShellExecNeedsLocalStorage(t *testing.T) {
 	env := Env{SpaceID: "sp1", Storage: &nonLocalStorage{}, Shell: sandbox.NewLocal()}
 	if _, err := runShell(t, env, `{"command":"echo hi"}`); err == nil {
 		t.Fatal("存储不支持本地路径时应给出明确错误")
+	}
+}
+
+// 徽标按命令判：只读命令显示「只读」，写操作与判不准的显示「写入」。
+func TestShellRiskByCommand(t *testing.T) {
+	sh := shellExec()
+	cases := []struct {
+		command string
+		want    int
+	}{
+		// 只读：白名单命令、无重定向
+		{"ls -la", policy.RiskReadOnly},
+		{"cat data.csv | wc -l", policy.RiskReadOnly},
+		{"grep -rn foo . 2>/dev/null", policy.RiskReadOnly},
+		{"find . -name '*.md'", policy.RiskReadOnly},
+		{"sort a.txt", policy.RiskReadOnly},
+		{"git status", policy.RiskReadOnly},
+		{"git log --oneline -5", policy.RiskReadOnly},
+		{"git diff --stat", policy.RiskReadOnly},
+		{"echo hello", policy.RiskReadOnly},
+
+		// 写入：重定向 / 白名单外 / 解释器 / 把读变成写的参数
+		{"echo hello > a.txt", policy.RiskWrite},
+		{"echo hello >> a.txt", policy.RiskWrite},
+		{"rm -rf data", policy.RiskWrite},
+		{"mkdir -p out", policy.RiskWrite},
+		{"cp a.txt out/", policy.RiskWrite},
+		{"python3 analyze.py", policy.RiskWrite},
+		{"find . -name '*.tmp' -delete", policy.RiskWrite},
+		{"find . -exec grep -l foo {} +", policy.RiskWrite},
+		{"sort -o b.txt a.txt", policy.RiskWrite},
+		{"git commit -m 'x'", policy.RiskWrite},
+		{"git push origin main", policy.RiskWrite},
+		{"cat a.txt | tee out.txt", policy.RiskWrite},
+		{"echo $(date)", policy.RiskWrite},
+		{"ls | xargs rm", policy.RiskWrite},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			args, _ := json.Marshal(map[string]string{"command": tc.command})
+			if got := sh.EffectiveRisk(args); got != tc.want {
+				t.Fatalf("命令 %q 展示等级 %d，期望 %d", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+// 判不出来就退回声明等级，不猜「大概是只读」。
+func TestEffectiveRiskFallback(t *testing.T) {
+	sh := shellExec()
+	for _, args := range []string{`{}`, `{"command":""}`, `not-json`} {
+		if got := sh.EffectiveRisk(json.RawMessage(args)); got != policy.RiskWrite {
+			t.Fatalf("参数 %s 应退回声明的写入等级，实际 %d", args, got)
+		}
+	}
+	plain := Tool{Name: "file_read", Risk: policy.RiskReadOnly}
+	if got := plain.EffectiveRisk(json.RawMessage(`{"path":"a"}`)); got != policy.RiskReadOnly {
+		t.Fatalf("没有 RiskFor 的工具应直接用声明等级，实际 %d", got)
+	}
+	// RiskFor 返回越界值时同样退回声明，不把非法值传给前端
+	bad := Tool{Name: "x", Risk: policy.RiskWrite, RiskFor: func(Tool, json.RawMessage) int { return 9 }}
+	if got := bad.EffectiveRisk(nil); got != policy.RiskWrite {
+		t.Fatalf("非法细化值应退回声明等级，实际 %d", got)
 	}
 }
