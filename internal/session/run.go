@@ -269,6 +269,9 @@ func (s *Service) execute(
 	// 跨空间借用的插件引用：只借智能体自己声明的 requires，不摊来源空间的整份目录。
 	// 工具执行仍按 sess.SpaceID，文件读写不受影响。
 	var extraRefs []tool.PluginRef
+	// 智能体自带技能：只并进本会话的检索池与提示词，空间索引里没有它们。
+	var agentSkills []agent.SkillRef
+	var agentInternals []tool.PluginEntry
 	if sess.AgentID != "" && s.agentPlugins != nil {
 		if seed.Resume == nil && seed.AgentPrompt == "" {
 			if r, err := s.agentPlugins.ResolveAgentPlugin(ctx, agentSpaceID, sess.AgentID); err == nil {
@@ -276,6 +279,21 @@ func (s *Service) execute(
 			} else {
 				s.log.Warn("智能体设定加载失败",
 					"session_id", sessionID, "agent_id", sess.AgentID, "agent_space", agentSpaceID, "err", err)
+			}
+		}
+		// 续跑沿用快照里的系统提示词，不重新注入技能段落；但检索池要补上，
+		// 否则「重启后 plugin_search 找不到刚才那个技能」会显得很怪。
+		if list, err := s.agentPlugins.AgentInternals(ctx, agentSpaceID, sess.AgentID); err != nil {
+			s.log.Warn("智能体内置技能加载失败",
+				"session_id", sessionID, "agent_id", sess.AgentID, "agent_space", agentSpaceID, "err", err)
+		} else {
+			agentInternals = list
+			if seed.Resume == nil {
+				for _, e := range list {
+					agentSkills = append(agentSkills, agent.SkillRef{
+						Name: e.Name, Description: e.Description, Path: e.Path,
+					})
+				}
 			}
 		}
 		if agentSpaceID != sess.SpaceID {
@@ -306,16 +324,20 @@ func (s *Service) execute(
 			// 企业 wiki 的宿主：固定系统空间，与当前会话所在空间无关。
 			// 未初始化时为空，wiki 工具会报「不可用」而不是写进当前空间。
 			WikiSpaceID: s.wikiSpaceID(ctx),
-			Store:       s.store,
-			Storage:     s.storage,
-			Log:         s.log,
+			// wiki 再按智能体分区：每个智能体只读写自己的 files/wiki/<slug>/。
+			// 会话没固化智能体（历史数据）时落到 base，避免这些会话忽然没有知识目录。
+			AgentID: wikiAgentID(sess.AgentID),
+			Store:   s.store,
+			Storage: s.storage,
+			Log:     s.log,
 			// 插件目录：当前空间 + 系统空间 + 已安装插件（未安装的发布件按需检索，不做同名覆盖）。
 			// published/... 路径也由空间服务转给插件层解析。
 			// extraRefs 只补「发起方智能体及其 requires」，不含来源空间的其它插件。
 			Plugins: pluginLoader{
-				spaces:    s.spaces,
-				spaceID:   sess.SpaceID,
-				extraRefs: extraRefs,
+				spaces:         s.spaces,
+				spaceID:        sess.SpaceID,
+				extraRefs:      extraRefs,
+				agentInternals: agentInternals,
 			},
 			// 工具侧借用：插件内容来自发起方空间，执行仍落在本会话空间。
 			ExtraPluginRefs: extraRefs,
@@ -354,6 +376,7 @@ func (s *Service) execute(
 		Dir:           sess.Dir,
 		DirPlugin:     s.dirPluginContext(ctx, sess.SpaceID, sess.Dir),
 		AgentPrompt:   seed.AgentPrompt,
+		AgentSkills:   agentSkills,
 		// 平台事实进系统提示词，不做成工具：租户、IM 这类信息必须恒真
 		Platform: s.platformFacts(user, sp),
 		Resume:   seed.Resume,

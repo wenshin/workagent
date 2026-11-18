@@ -49,6 +49,8 @@ const pluginDevSkillDoc = `# 技能插件（kind=skill）
 
 ## 边界
 - 技能不能调用工具：要执行动作请配套 tool / mcp 插件，并在智能体的 requires 里引用。
+- 只想给某个智能体用，可以把它放进智能体插件的 agent.skills（见 references/agent.md），
+  那样不必单独发布，也不会出现在插件市场与空间插件面板。
 - 不要把密钥、内网地址写进正文：技能正文会进模型上下文与检索结果。`
 
 const pluginDevEvalsDoc = `# 发布前自测（evals.json）
@@ -155,6 +157,41 @@ const pluginDevToolDoc = `# 工具插件（kind=tool）
 - 这些选择会原样出现在「安装确认」里给用户看，写宽了会劝退安装方。
 - 示例里的 secret.use 不是可选项：脚本里调了 host.secret("erp_token")，清单就必须有对应的一条，
   否则运行时会被拒绝（不是返回空串）。
+
+## 安装方能改的配置（config 段）
+
+发布后代码不能改，但「连哪个环境、按什么策略跑」属于安装决定。清单里声明 config 段，
+安装页就自动出现表单，脚本里用 await wa.config() 取：
+
+~~~json
+"config": [
+  { "key": "region", "label": "服务区域", "type": "select", "default": "cn",
+    "options": [{ "value": "cn", "label": "中国大陆" }, { "value": "intl", "label": "国际" }],
+    "help": "决定请求打到哪个集群" },
+  { "key": "retry", "label": "重试次数", "type": "number", "default": "2", "min": "0", "max": "5" },
+  { "key": "tenant_header", "label": "租户 Header", "type": "text", "placeholder": "X-Tenant-Id" }
+]
+~~~
+
+- 类型只有 8 种：text / textarea / number / boolean / select / url / list / secret_ref。
+  select 必须给 options，number 可以用 min / max 限定整数范围，text / textarea 可用 max_length 限制长度。
+- default 是安装方没填时的生效值，也必须通过本字段的校验；required 与 default
+  不能同时写（有默认值就永远不为空，必填形同虚设）。
+- 键名只能是小写字母开头的 [a-z0-9_]，且不能用平台保留键（url / auth_name / secret /
+  approval_policy / approval_commands）——那几个由平台按能力生成，写进清单会解析失败。
+- 只有脚本工具（kind=tool 且非内置）能声明 config；技能、MCP、组件、智能体写了会解析失败。
+- **敏感信息不要用 text 存**：用 secret_ref 引用「密钥配置」里的名字，脚本再
+  host.secret("名字") 取明文，清单与安装配置里只留名字。
+
+运行时：
+
+~~~ts
+const cfg = await wa.config();       // 全量键值，没配过的用 default 补齐
+const region = cfg.region ?? "cn";   // 值一律是字符串，number 要自己转
+~~~
+
+配置保存后会重建运行时（常驻进程也会被杀掉），所以不会读到上一次安装的值。
+试运行（plugin_try / 试运行按钮）跑的是草稿、还没有安装记录，拿到的只有 default。
 
 ## 入口
 ~~~ts
@@ -377,8 +414,15 @@ plugins/sales_board/
 }
 ~~~
 - height：120-2000，组件最小高度。
-- state：初始状态，键必须是 a-z 开头的 [a-z0-9_]。
+- state：初始状态，键必须是 a-z 开头的 [a-z0-9_]；初值可以写 {{props.x}}（只能引用 props），
+  用来把模型推断出的条件预填进表单；不能引用 state 或 data。
 - data：键必须是 data_sources 里的只读数据源 id；auto: false 可关掉首屏取数；params 支持 {{state.x}}。
+  watch 声明「这些 state 变了就重取」，reset 声明「重取前清空哪些下游 state」：
+  ~~~json
+  "data": {"stores": {"params": {"city_code": "{{state.city_codes}}"},
+                      "watch": ["city_codes"], "reset": ["store_codes", "store_labels"]}}
+  ~~~
+  watch / reset 里的键必须已在 state 里声明，拼错直接发布失败（否则表现是「输入没反应」）。
 
 ## 可用节点
 | type | 必需字段 | 说明 |
@@ -397,12 +441,13 @@ plugins/sales_board/
 | Table | columns、source | columns: [{"key":"name","label":"客户","align":"left"}]；source 绑定对象数组 |
 | Progress | value | 进度条，max 默认 100，label 可选 |
 | Button | text、action | 触发动作 |
-| Input | name | 文本输入，写入 state.<name> |
-| Select | name、options | 下拉，options: [{"label":"本月","value":"month"}] |
+| Input | name | 输入框，input_type: text/number/date，required 可选，写入 state.<name> |
+| Select | name、options\|options_from | 下拉，见下方「动态选项」；multiple 多选、max 上限、label_name 同步存储展示名 |
 | Tabs | name、options | 页签，选中值写入 state.<name> |
 | Divider | — | 分割线 |
 
-所有节点可选 when：{"path":"state.period","op":"eq","value":"month"}，op ∈ eq/ne/gt/lt/in/exists/truthy。
+所有节点可选 when：{"path":"state.period","op":"eq","value":"month"}，
+op ∈ eq/ne/gt/lt/in/exists/truthy/empty（empty：null / "" / [] / {} 都算空，用于「还没选」时的提示）。
 字段写错会直接校验失败（不会静默忽略），节点最多 300 个、嵌套最多 8 层。
 
 ## 绑定
@@ -417,6 +462,57 @@ plugins/sales_board/
 | {"type":"reload","target":"orders","params":{…}} | 重新取只读数据 |
 | {"type":"invoke","source":"submit","params":{…},"confirm":"确认提交？"} | 调写数据源；必须用户点击，成功后自动刷新只读数据 |
 | {"type":"message","text":"帮我把 {{state.period}} 的销售明细导出"} | 把一句话填进输入框，由用户决定是否发送 |
+| {"type":"submit","payload":{…},"text":"已选：{{state.city_labels}}"} | 把选择整理成结构化参数填进输入框；omit_empty 去掉空值，confirm 可二次确认 |
+
+## 动态选项（options_from）
+
+下拉候选来自只读数据源，不写死在 options 里：
+
+~~~json
+"state": {"city_codes": [], "city_labels": []},
+"data": {"dim_city": {"params": {"dim": "city", "limit": 200}}},
+"view": {"type": "Select", "name": "city_codes", "label": "城市", "multiple": true,
+         "label_name": "city_labels", "placeholder": "搜索城市",
+         "options_from": {"source": "dim_city", "items": "items", "label": "city_name", "value": "city_code"}}
+~~~
+
+- options_from 与 options 二选一；source 必须**同时**出现在 ui.json 的 data 段，否则没人取数（发布时拒绝）。
+- items 是数组所在路径（默认 items，可写 rows / data.items）；label / value 是每项里的字段名，支持 a.b。
+- 候选 >200 条时把下拉自带的搜索框接出去：options_from.search 写 state 键，data 里 watch 同一个键，
+  用户输入就重取（发布时校验「search 必须在 watch 里」，避免出现输入没反应）。
+- 选项的 value 一律按字符串处理：编码类 id（行政区划码、门店编码）可能带前导零，转数字就查不到了。
+- multiple 时 state 初值必须是数组；max（1-50）限制可选数量；label_name 会把展示名同步到另一个 state 键，
+  提交时 id 给 SQL、名称给复述。
+- 候选会被 32KB / limit 截断：工具回 has_more 时要给 Alert 提示「继续输入关键字」，不要让用户以为只有这些。
+
+## 查询参数组件（筛选表单）
+
+数据分析类智能体最常缺的能力：用户只说了「查一下上个月的销售」，城市 / 门店 / 车系这些条件
+需要用户选，而 SQL 要的是 code。这类组件按下面四步生成，不要自由发挥：
+
+1. **先查维度**：plugin_read / 调维度工具（如 dim_list、dim_lookup）确认字段名与候选规模，
+   不要凭记忆写 value 字段；维度来源必须是当前空间已安装插件提供的工具。
+2. **定控件**：≤30 且稳定用字面量 options；30-200 用 options_from + 前端过滤；
+   >200 用 options_from + watch 远程搜索；时间区间用两个 Input(type=date)；自由文本用 Input。
+3. **定必填与默认值**：required 标出必填；默认值写 state 初值（可引用 {{props.x}}，由模型在渲染时预填）。
+4. **定提交**：submit 的 payload 键就是模型要用的参数名，id 与名称各一份，omit_empty 去掉未选的条件。
+
+~~~json
+{
+  "type": "Button", "text": "提交条件", "action": {
+    "type": "submit", "omit_empty": true,
+    "payload": {"city_codes": "{{state.city_codes}}", "city_names": "{{state.city_labels}}",
+                "start_date": "{{state.start_date}}", "end_date": "{{state.end_date}}"},
+    "text": "已选条件：城市 {{state.city_labels}}，日期 {{state.start_date}} ~ {{state.end_date}}。"
+  }
+}
+~~~
+
+提交后输入框里会出现摘要 + filter-params 围栏的 JSON（不自动发送，由用户确认）。
+智能体拿到后应**原样使用其中的 code**，不要改名、也不要再按名称查一次——这是整个链路最容易错的地方。
+
+条件是否随问题变化，用 when + props 控制显隐（每行 when: {"path":"props.show_city","op":"truthy"}），
+不要试图让 props 决定生成哪些控件：props 没有 schema 校验，等于绕过 DSL 白名单。
 
 ## 生成流程
 1. 先问清：展示什么、数据来自哪个**已安装**插件的哪个工具、有没有写操作。
@@ -433,8 +529,8 @@ plugins/sales_board/
 
 const pluginDevAgentDoc = `# 智能体插件（kind=agent）
 
-智能体是「行为设定」：提示词 + 父智能体 + 依赖插件。它不是权限，
-可见工具仍由空间安装与策略决定。
+智能体是「行为设定」：提示词 + 父智能体 + 依赖插件 + 自带的内置技能与工具。
+它不是权限，可见工具仍由空间安装与策略决定。
 
 ## 清单
 ~~~json
@@ -448,10 +544,14 @@ const pluginDevAgentDoc = `# 智能体插件（kind=agent）
   "agent": {
     "entry": "AGENT.md",
     "extends": "service_base",
-    "requires": ["builtin_plugin_dev", "crm_mcp"]
+    "requires": ["builtin_plugin_dev", "crm_mcp"],
+    "skills": ["skills"],
+    "tools": ["tools/crm_query"]
   }
 }
 ~~~
+- entry / extends / requires 都可以省略；skills 与 tools 见下面「内置技能与工具」，
+  真正需要自带执行逻辑时才写 tools。
 
 ## 提示词（AGENT.md）
 - 只写「这个人怎么工作」：目标、步骤、口径、禁止事项。
@@ -466,9 +566,53 @@ const pluginDevAgentDoc = `# 智能体插件（kind=agent）
 ## 依赖
 - requires 里的插件会在安装智能体时一并安装到同一空间；已全局可用的内置件自动跳过。
 - 依赖只接受已发布的 slug；依赖装不上时整个安装失败，不会留下半个智能体。
-- 智能体没有执行器，清单里不允许写 capabilities，也不允许写 endpoint、密钥、命令。
+- requires 是「借别人的插件」：它会出现在空间插件面板与插件市场。只想给这个智能体用，
+  用下面的内置技能与工具，不要为它单独发布插件。
+
+## 内置技能与工具
+- 清单里用**相对智能体插件目录**的路径声明，随智能体一起发布、安装，不单独发布也不用写进 requires：
+  - agent.skills：.md 文件，或目录（只取该目录下一层 .md）。首个 # 标题作名称，
+    其后第一行非空正文作描述。只对绑定了这个智能体的会话可见：会进该会话的 plugin_search
+    （source=agent）与系统提示词，正文用 plugin_read 读 plugins/<智能体>/...。
+  - agent.tools：工具插件目录（含 plugin.json 与入口脚本，kind 必须是 tool）。加载成
+    <智能体>__<工具> 的工具，模型在工具列表里直接看到；不进空间插件面板、不进 plugin_search、
+    不需要安装记录，停用/卸载智能体即失效。
+- 只看得到自己那份：extends 的父子智能体互不继承；要共享就写 requires 或复制一份。
+- 上限：skills 最多 12 条路径、单文件 64KB；tools 最多 8 个，每个仍受发布上限约束（200 文件 / 5MB）。
+- 内部工具的清单按草稿写法（不写 version），可以声明 capabilities / secret；凭证仍走平台
+  凭证存储，config 只取清单默认值（没有安装级配置入口，要改就改智能体版本）。风险和审批
+  按各自清单判定，发布时取最高风险写进版本记录。
+
+示例：
+
+~~~json
+{
+  "protocol": "wa-plugin/1",
+  "kind": "agent",
+  "slug": "sales_assistant",
+  "name": "销售助理",
+  "capability": "agent.use",
+  "agent": {
+    "entry": "AGENT.md",
+    "skills": ["skills", "skills/口径/大客户口径.md"],
+    "tools": ["tools/crm_query"]
+  }
+}
+~~~
+
+目录结构：
+
+~~~
+sales_assistant/
+  plugin.json
+  AGENT.md
+  skills/周报模板.md
+  tools/crm_query/plugin.json
+  tools/crm_query/index.ts
+~~~
 
 ## 使用
 - 安装到系统空间即为全局可用：所有空间的会话都能在新会话时选到它。
 - 安装到普通空间只在该空间可选。
-- 会话创建时把提示词快照固化在会话上，事后改智能体不影响已开会话。`
+- 会话创建时把提示词快照固化在会话上，事后改智能体不影响已开会话；内置件按会话的
+  agent_id 现算，所以停用智能体后新的调用会立刻拿不到内置工具。`

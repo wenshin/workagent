@@ -103,6 +103,11 @@ const (
 	MethodSecretGet = "secret.get"
 	// MethodLog 写一行宿主日志（插件进程的 stdout 有上限，长日志会被截）。
 	MethodLog = "log"
+	// MethodConfigGet 取安装方为这个插件填的配置（清单 config 段 + 默认值）。
+	//
+	// 它不需要在 capabilities 里声明：读的是「安装方给自己的插件填的值」，
+	// 不涉及跨主体授权，也不是一个能触碰外部系统的动作。凭证另有 secret.use。
+	MethodConfigGet = "config.get"
 	// MethodShell 对应命令执行：内置工具用它表达风险，脚本插件暂不开放。
 	MethodShell = "shell.exec"
 	// MethodSearch 对应联网检索：只计读成本，不允许写。
@@ -345,6 +350,12 @@ type Manifest struct {
 	DataSources  []DataSource    `json:"data_sources,omitempty"`
 	// FS 是文件访问范围（只能收紧平台默认边界）。
 	FS *FSSpec `json:"fs,omitempty"`
+	// Config 是「安装方可填」的配置项声明：发布方定义 schema，安装方在空间里填值，
+	// 平台负责渲染表单、校验与存储，运行时经 wa.config() 交给脚本。
+	//
+	// 它与 capabilities / limits 的区别：那两段约束的是「插件能做什么」，
+	// 发布后不可改；config 是「这东西装在哪、怎么连、按什么策略跑」，属于安装。
+	Config []ConfigItem `json:"config,omitempty"`
 	// Builtin 表示「平台已在 Go 侧实现」的工具：没有脚本运行时，
 	// 只借插件体系做全局安装与市场展示，执行仍走平台能力注册表。
 	Builtin bool `json:"builtin,omitempty"`
@@ -353,6 +364,52 @@ type Manifest struct {
 	// 内置工具没有 capabilities 可推导，风险直接来自 Go 侧的那份声明。
 	DeriveRisk    int    `json:"-"`
 	DeriveEffects string `json:"-"`
+}
+
+// 安装级配置项的类型集合。
+//
+// 刻意保持小：每一种类型都要有「前端怎么渲染 + 后端怎么校验 + 运行时怎么读」
+// 三处的确定语义，加一种就要把三处都补齐，而不是先塞进清单再让某处碰运气。
+const (
+	ConfigTypeText      = "text"       // 单行文本
+	ConfigTypeTextarea  = "textarea"   // 多行文本
+	ConfigTypeNumber    = "number"     // 十进制整数
+	ConfigTypeBoolean   = "boolean"    // true / false
+	ConfigTypeSelect    = "select"     // 枚举，值必须在 options 里
+	ConfigTypeURL       = "url"        // http(s) 地址
+	ConfigTypeList      = "list"       // 逗号/换行分隔的多值
+	ConfigTypeSecretRef = "secret_ref" // 凭证引用名（只存名字，密钥在凭证存储里）
+)
+
+// configTypes 是允许在清单里声明的类型。
+var configTypes = map[string]bool{
+	ConfigTypeText: true, ConfigTypeTextarea: true, ConfigTypeNumber: true,
+	ConfigTypeBoolean: true, ConfigTypeSelect: true, ConfigTypeURL: true,
+	ConfigTypeList: true, ConfigTypeSecretRef: true,
+}
+
+// ConfigItem 是清单里的一条安装级配置声明。
+//
+// 为什么放在清单而不是产物里：安装方要看到「这个插件有哪些可调项、各自什么含义」，
+// 而这些信息必须在发布时就是不可变的快照，不能由脚本在运行时临时改变表单。
+type ConfigItem struct {
+	// Key 是存储键，也是 wa.config() 里的字段名：发布后不可改（改了等于丢配置）。
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Type  string `json:"type"`
+	// Required 为 true 时安装方必须填非空值，保存时才校验（不能有默认值兜底）。
+	Required bool `json:"required,omitempty"`
+	// Default 是安装方没填过时的生效值，也必须通过本字段的类型校验。
+	Default     string         `json:"default,omitempty"`
+	Placeholder string         `json:"placeholder,omitempty"`
+	Help        string         `json:"help,omitempty"`
+	Options     []ConfigOption `json:"options,omitempty"`
+	// Min / Max 只对 number 生效，写法是十进制整数的字符串（清单里统一用字符串，
+	// 避免 JSON 数字在 float64 与 int 之间来回转）。
+	Min string `json:"min,omitempty"`
+	Max string `json:"max,omitempty"`
+	// MaxLength 只对 text / textarea 生效，0 表示用平台默认（256 / 4096）。
+	MaxLength int `json:"max_length,omitempty"`
 }
 
 // 搜索源的实现协议：声明式 JSON 与两段式脚本。
@@ -402,6 +459,11 @@ type SourceSpec struct {
 //
 // 智能体只描述行为：正文是提示词，执行能力来自 requires 引用的插件
 // （技能/工具/MCP）。它不携带 endpoint、密钥或命令。
+//
+// Skills / Tools 是「自带」的内容：都在智能体插件目录内，随智能体一起发布与
+// 安装，只对绑定了这个智能体的会话可见，不写 plugin_install，也不进插件市场。
+// 和 requires 的差别就在这里——requires 借的是空间里的公共插件，会出现在空间
+// 插件面板里；自带件属于智能体自己，别的智能体看不到。
 type AgentSpec struct {
 	// Entry 是提示词正文文件，默认 AGENT.md
 	Entry string `json:"entry,omitempty"`
@@ -409,14 +471,120 @@ type AgentSpec struct {
 	Extends string `json:"extends,omitempty"`
 	// Requires 是随智能体一并安装的插件 slug（技能/工具/MCP）
 	Requires []string `json:"requires,omitempty"`
+	// Skills 是自带技能页：相对插件目录的 .md 文件，或只取一层 *.md 的目录。
+	// 解析出的名称与路径会进该智能体会话的检索池与系统提示词，正文仍按需 plugin_read。
+	Skills []string `json:"skills,omitempty"`
+	// Tools 是自带工具插件目录：相对插件目录，每个目录必须有 plugin.json 且 kind=tool。
+	// 加载成 <智能体>__<工具>，只能在该智能体的会话里调用。
+	Tools []string `json:"tools,omitempty"`
+	// Icon 是头像文件（插件目录内的相对路径）。头像只用于列表与选择器展示，
+	// 不参与执行；空表示没设置，前端用智能体兜底样式与普通会话区分。
+	Icon string `json:"icon,omitempty"`
 }
+
+// 内置件的数量上限：清单直接进上下文，路径再多也只是噪音；体积上限沿用发布快照。
+const (
+	maxAgentSkills      = 12
+	maxAgentTools       = 8
+	maxAgentSkillFiles  = 50
+	maxAgentSkillBytes  = 64 << 10
+	maxAgentSkillDepth  = 3
+	maxAgentSkillDescrR = 120
+)
 
 var (
 	slugRe    = regexp.MustCompile(`^[a-z][a-z0-9_]{1,31}$`)
 	versionRe = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 	// secretNameRe 是凭证名：只允许名字，不允许把密钥本身写进清单。
 	secretNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$`)
+	// agentIconExts 是允许的头像格式：都是浏览器能直接显示的位图。
+	// 上传接口会统一转成 256×256 的 PNG，这里只是兜底——手写清单写错扩展名会静默 404。
+	agentIconExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".webp": true}
 )
+
+// validateAgentAssets 校验自带技能与工具的路径声明。
+//
+// 只看语法：文件在不在、工具清单合不合法由 validateAgentInternals 在发布与
+// plugin_try 时对整份快照校验——清单本身不许碰文件系统，否则草稿也没法校验。
+func validateAgentAssets(a *AgentSpec) error {
+	if a == nil {
+		return nil
+	}
+	if len(a.Skills) > maxAgentSkills {
+		return fmt.Errorf("agent.skills 最多 %d 条", maxAgentSkills)
+	}
+	seen := map[string]bool{}
+	for i, p := range a.Skills {
+		if err := validateAgentAssetPath(p); err != nil {
+			return fmt.Errorf("agent.skills[%d]: %w", i, err)
+		}
+		if seen[p] {
+			return fmt.Errorf("agent.skills 里的 %q 重复", p)
+		}
+		seen[p] = true
+	}
+	if len(a.Tools) > maxAgentTools {
+		return fmt.Errorf("agent.tools 最多 %d 个", maxAgentTools)
+	}
+	seen = map[string]bool{}
+	for i, p := range a.Tools {
+		if err := validateAgentAssetPath(p); err != nil {
+			return fmt.Errorf("agent.tools[%d]: %w", i, err)
+		}
+		if seen[p] {
+			return fmt.Errorf("agent.tools 里的 %q 重复", p)
+		}
+		seen[p] = true
+	}
+	return nil
+}
+
+// validateAgentAssetPath 校验内置件路径：必须是插件目录内的规整相对路径。
+//
+// 这些路径会被拼成存储 key，也会拼成 plugin_read 的路径，所以绝对路径、反斜杠、
+// 隐藏段、越界一律拒绝；层级压住是为了让「智能体的附带内容」保持可读。
+func validateAgentAssetPath(p string) error {
+	if strings.TrimSpace(p) == "" {
+		return fmt.Errorf("路径不能为空")
+	}
+	if strings.TrimSpace(p) != p {
+		return fmt.Errorf("路径首尾不能有空白（%q）", p)
+	}
+	if strings.HasPrefix(p, "/") || strings.Contains(p, "\\") {
+		return fmt.Errorf("必须是插件目录内的相对路径（%q）", p)
+	}
+	clean := path.Clean(p)
+	if clean != p || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("路径必须是规整的相对路径（%q）", p)
+	}
+	segs := strings.Split(clean, "/")
+	if len(segs) > maxAgentSkillDepth {
+		return fmt.Errorf("路径最多 %d 层（%q）", maxAgentSkillDepth, p)
+	}
+	for _, seg := range segs {
+		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("路径不允许隐藏段或空段（%q）", p)
+		}
+	}
+	if clean == ManifestFile {
+		return fmt.Errorf("%q 不能是清单本身", p)
+	}
+	return nil
+}
+
+// validateAgentIcon 校验头像路径：必须是插件目录内的图片文件，不能跳出目录、不能是清单本身。
+func validateAgentIcon(p string) error {
+	if strings.HasPrefix(p, "/") || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
+		return fmt.Errorf("agent.icon 必须是插件目录内的相对路径")
+	}
+	if p == ManifestFile {
+		return fmt.Errorf("agent.icon 不能是 %s", ManifestFile)
+	}
+	if !agentIconExts[strings.ToLower(path.Ext(p))] {
+		return fmt.Errorf("agent.icon 只支持 png / jpg / jpeg / webp，收到 %q", p)
+	}
+	return nil
+}
 
 // 上限：schema 直接进模型上下文，炸上下文比漏洞更快出事。
 const (
@@ -753,6 +921,14 @@ func (m Manifest) IsExtensible() bool {
 	return m.Extensible == nil || *m.Extensible
 }
 
+// HasAgentSkills 表示智能体声明了自带技能页。
+//
+// 技能页要按 plugins/<slug>/... 的路径被 plugin_read 读到，所以这类智能体
+// 即便不可扩展也要在空间里落一份副本。
+func (m Manifest) HasAgentSkills() bool {
+	return m.Kind == KindAgent && m.Agent != nil && len(m.Agent.Skills) > 0
+}
+
 // Validate 校验清单的硬约束。
 func (m *Manifest) Validate(publishing bool) error {
 	if m.Protocol != Protocol {
@@ -805,6 +981,9 @@ func (m *Manifest) Validate(publishing bool) error {
 		}
 	}
 	if err := validateFS(m.FS); err != nil {
+		return err
+	}
+	if err := validateConfigItems(*m); err != nil {
 		return err
 	}
 
@@ -864,6 +1043,11 @@ func (m *Manifest) Validate(publishing bool) error {
 		if m.Agent.Entry == ManifestFile {
 			return fmt.Errorf("agent.entry 不能是 %s：提示词与清单必须分开", ManifestFile)
 		}
+		if m.Agent.Icon != "" {
+			if err := validateAgentIcon(m.Agent.Icon); err != nil {
+				return err
+			}
+		}
 		if m.Agent.Extends != "" {
 			if !slugRe.MatchString(m.Agent.Extends) {
 				return fmt.Errorf("agent.extends 必须是父智能体的 slug，收到 %q", m.Agent.Extends)
@@ -887,6 +1071,9 @@ func (m *Manifest) Validate(publishing bool) error {
 		}
 		if len(m.Agent.Requires) > 16 {
 			return fmt.Errorf("agent.requires 最多 16 个")
+		}
+		if err := validateAgentAssets(m.Agent); err != nil {
+			return err
 		}
 		// 智能体没有执行器，声明能力只会误导权限判断
 		if len(m.Capabilities) > 0 {
@@ -1203,6 +1390,109 @@ func validateHost(raw string) error {
 	}
 	if !strings.Contains(h, ".") {
 		return fmt.Errorf("hosts 需要完整域名：%q", raw)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- 安装级配置
+
+const (
+	// maxConfigItems 限制表单规模：安装页是一屏能看完的东西，
+	// 超过 20 项更该考虑「这插件是不是该拆」。
+	maxConfigItems = 20
+	// maxConfigLabelRunes 是字段标题长度：标题是给人扫的，不是说明文档。
+	maxConfigLabelRunes = 40
+)
+
+// validateConfigItems 校验清单里的安装级配置声明。
+//
+// 这些问题必须在发布时暴露：config 段最终会直接变成安装页的表单，
+// 留到安装时才失败，安装方看到的只是一个「点了保存就报错」的对话框。
+func validateConfigItems(m Manifest) error {
+	if len(m.Config) == 0 {
+		return nil
+	}
+	// 只有脚本工具消费配置（wa.config()）。内置件的执行体在 Go 里，声明了没人读；
+	// 技能/组件/智能体没有执行器，同样没有消费点。
+	if m.Kind != KindTool || m.Builtin {
+		return fmt.Errorf("config 段只对脚本工具（kind=tool 且非内置）有效：%s 插件请把参数写进清单或正文", m.Kind)
+	}
+	if len(m.Config) > maxConfigItems {
+		return fmt.Errorf("config 最多声明 %d 项", maxConfigItems)
+	}
+	seen := map[string]bool{}
+	for i, item := range m.Config {
+		if !configKeyRe.MatchString(item.Key) {
+			return fmt.Errorf("config[%d].key 必须是 1-%d 位小写字母开头的 [a-z0-9_]：收到 %q", i, maxConfigKeyLen, item.Key)
+		}
+		if seen[item.Key] {
+			return fmt.Errorf("config[%d].key 重复：%q", i, item.Key)
+		}
+		seen[item.Key] = true
+		if reservedConfigKeys[item.Key] {
+			return fmt.Errorf("config[%d].key %q 是平台保留键：它对应执行器行为（地址/鉴权/审批），清单不能重复声明", i, item.Key)
+		}
+		if n := utf8.RuneCountInString(strings.TrimSpace(item.Label)); n == 0 || n > maxConfigLabelRunes {
+			return fmt.Errorf("config[%d].label 必填且不超过 %d 个字符", i, maxConfigLabelRunes)
+		}
+		if !configTypes[item.Type] {
+			return fmt.Errorf("config[%d].type 只支持 text / textarea / number / boolean / select / url / list / secret_ref，收到 %q", i, item.Type)
+		}
+		if err := validateConfigShape(item); err != nil {
+			return fmt.Errorf("config[%d]（%s）：%w", i, item.Key, err)
+		}
+		// required + default 是自相矛盾的组合：有默认值就永远不会为空，
+		// required 拦不住任何人，作者多半想的是「必填但给个建议值」。
+		if item.Required && item.Default != "" {
+			return fmt.Errorf("config[%d]（%s）同时声明了 required 与 default：有默认值就永远不会为空", i, item.Key)
+		}
+		if item.Default != "" {
+			if err := validateConfigValue(item, item.Default); err != nil {
+				return fmt.Errorf("config[%d]（%s）的 default 不合法：%w", i, item.Key, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateConfigShape 校验「字段形态」：哪些属性适用于哪些类型。
+//
+// 不适用的属性一律拒绝而不是忽略：清单里写了 max: 10 却没生效，
+// 作者会以为平台在按 10 校验，直到某天录进 999。
+func validateConfigShape(item ConfigItem) error {
+	switch item.Type {
+	case ConfigTypeSelect:
+		if len(item.Options) == 0 {
+			return fmt.Errorf("select 必须声明 options")
+		}
+		values := map[string]bool{}
+		for _, op := range item.Options {
+			v := strings.TrimSpace(op.Value)
+			if v == "" {
+				return fmt.Errorf("options 里有空 value")
+			}
+			if values[v] {
+				return fmt.Errorf("options 的 value 重复：%q", v)
+			}
+			values[v] = true
+			if strings.TrimSpace(op.Label) == "" {
+				return fmt.Errorf("options[%s] 缺少 label", v)
+			}
+		}
+	case ConfigTypeNumber:
+		if _, err := configRange(item); err != nil {
+			return err
+		}
+	default:
+		if len(item.Options) > 0 {
+			return fmt.Errorf("%s 类型不支持 options（只有 select 有）", item.Type)
+		}
+		if item.Min != "" || item.Max != "" {
+			return fmt.Errorf("%s 类型不支持 min/max（只有 number 有）", item.Type)
+		}
+	}
+	if item.MaxLength > 0 && item.Type != ConfigTypeText && item.Type != ConfigTypeTextarea {
+		return fmt.Errorf("max_length 只对 text / textarea 生效")
 	}
 	return nil
 }

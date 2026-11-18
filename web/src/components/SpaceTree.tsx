@@ -1,6 +1,5 @@
 import {
   IconBook,
-  IconComment,
   IconDelete,
   IconFile,
   IconFolder,
@@ -15,6 +14,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import type { ChatSession, Space, SpaceDir, SpaceFile } from '../api/types';
+import { SessionAgentIcon } from './AgentAvatar';
 import { PluginIcon } from './PluginVisual';
 
 export const SESSION_KEY_PREFIX = 'session:';
@@ -198,7 +198,9 @@ export default function SpaceTree({
           kind: 'session',
           refId: sess.id,
           isLeaf: true,
-          icon: <IconComment />,
+          // 绑定了非默认智能体的会话显示它的头像（没上传头像就是首字徽标），
+          // 普通会话保持评论图标：一眼能看出这条会话是谁在回答
+          icon: <SessionAgentIcon session={sess} />,
         };
         const dirNode = sess.dir ? dirNodes.get(dirKey(sess.space_id, sess.dir)) : undefined;
         (dirNode ?? nodes.get(sess.space_id))?.children?.push(node);

@@ -11,7 +11,7 @@ import (
 // 分工：
 //   - 文件：沙箱按 fs 段挂载，脚本直接用 Deno.readTextFile / writeTextFile；
 //   - 出网：脚本用 wa.fetch，走宿主给的 unix socket HTTP 代理（白名单在宿主侧判定）；
-//   - 宿主只剩两件事——日志，以及按名字下发凭证明文。
+//   - 宿主只剩三件事——写日志、按名字下发凭证明文、下发安装方填的配置。
 //
 // 凭证为什么走宿主下发而不是环境变量：环境变量对插件进程里的一切代码可见，
 // 包括它 import 进来的第三方依赖；走一次显式的 host.secret("名称") 调用，
@@ -76,9 +76,8 @@ const pump = (async () => {
 
 export const host = {
   /**
-   * 申请一次宿主能力。现在只剩两种：
-   *   - log：写一行日志；
-   *   - secret.get：按名字取凭证明文（名字必须在清单里声明过）。
+   * 申请一次宿主能力：log（写日志）、secret.get（按名字取凭证明文，
+   * 名字必须在清单里声明过）、config.get（取安装方填的配置，无需声明）。
    */
   call(method: string, args: any): Promise<any> {
     if (closed) return Promise.reject(new Error("插件会话已结束"));
@@ -101,6 +100,17 @@ export const host = {
   async secret(name: string): Promise<string> {
     const r = await host.call("secret.get", { name });
     return r && typeof r.value === "string" ? r.value : "";
+  },
+  /**
+   * 取安装方为这个插件填的配置：清单 config 段声明的键，已经用默认值补齐。
+   *
+   * 调一次就拿到全量键值，值一律是字符串——声明成 number 的字段拿到的也是
+   * "3"，要算数就自己转。清单里没声明的键不会出现（换配置项等于换清单版本）。
+   * 配置在保存后会重建运行时，所以不存在「读到上一次安装的值」。
+   */
+  async config(): Promise<Record<string, string>> {
+    const r = await host.call("config.get", {});
+    return r && typeof r.config === "object" && r.config ? r.config : {};
   },
 };
 

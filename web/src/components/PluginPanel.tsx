@@ -1,4 +1,4 @@
-import { IconKey, IconLock, IconRefresh, IconSetting } from '@douyinfe/semi-icons';
+import { IconImage, IconKey, IconLock, IconRefresh, IconSetting } from '@douyinfe/semi-icons';
 import {
   Button,
   Card,
@@ -10,9 +10,10 @@ import {
   Toast,
   Typography,
 } from '@douyinfe/semi-ui';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
 import {
+  useAgents,
   useDryRunPlugin,
   useInstallPlugin,
   usePlugins,
@@ -20,16 +21,66 @@ import {
   useUninstallPlugin,
 } from '../api/hooks';
 import type { PluginDryRunResult, PluginItem, Space } from '../api/types';
+import AgentAvatar from './AgentAvatar';
+import AgentAvatarDialog from './AgentAvatarDialog';
 import PluginConfigDialog from './PluginConfigDialog';
 import { KIND_LABEL, PluginIcon, type PluginKind } from './PluginVisual';
 import SecretSettingsDialog from './SecretSettingsDialog';
 
 const { Text } = Typography;
 
-const RISK_LABEL = ['', 'L1 免审', 'L2 只读', 'L3 写操作', 'L4 高敏'];
+/**
+ * 风险等级的中文名。
+ *
+ * 界面上不出现 L1~L4 编号：编号是内部口径，用户看到「L3」只会问「所以呢」。
+ * 标签只回答一件事——这个插件会做到哪一步。
+ */
+const RISK_LABEL = ['', '只读', '查询', '写入', '高危'];
 
 function riskLabel(risk: number) {
-  return RISK_LABEL[Math.min(Math.max(risk, 0), 4)] || `L${risk}`;
+  return RISK_LABEL[Math.min(Math.max(risk, 0), 4)] || '未评级';
+}
+
+/**
+ * 审批档位徽标：安装方要能一眼看到这个插件会不会拦自己。
+ *
+ * 有权限时徽标本身就是入口——「看到了想改」和「去别处找配置按钮」不该是两件事，
+ * 所以点它直接打开配置对话框（没有 onEdit 时只展示）。
+ */
+function ApprovalTag({
+  level,
+  onEdit,
+}: {
+  level?: PluginItem['approval_level'];
+  onEdit?: () => void;
+}) {
+  if (!level) {
+    // 技能 / 组件 / 智能体不进审批链路，没有档位可显示
+    return null;
+  }
+  const view = {
+    always: { color: 'amber' as const, text: '审批：每次确认', hint: '每次调用都先弹确认框' },
+    off: { color: 'red' as const, text: '审批：不确认', hint: '直接执行，不再弹确认框' },
+    declared: {
+      color: 'grey' as const,
+      text: '审批：按声明',
+      hint: '声明了改数据、或命令命中名单时才确认',
+    },
+  }[level];
+  if (!view) return null;
+  // Semi 的 Tag 不接 title，悬停说明放在外面一层 span 上
+  return (
+    <span title={onEdit ? `${view.hint}；点击修改审批级别` : view.hint}>
+      <Tag
+        size="small"
+        color={view.color}
+        onClick={onEdit}
+        className={onEdit ? 'plugin-tag-clickable' : undefined}
+      >
+        {view.text}
+      </Tag>
+    </span>
+  );
 }
 
 interface Props {
@@ -47,6 +98,12 @@ export default function PluginPanel({ space }: Props) {
   const { data, isLoading, refetch, isFetching } = usePlugins(space.id);
   const items = data?.items ?? [];
   const isAdmin = data?.is_admin ?? false;
+  // 智能体头像只在 kind=agent 的卡片上出现：从会话选择器的同一份清单取，避免第二个来源
+  const { data: agentResp } = useAgents(space.id);
+  const agentById = useMemo(
+    () => new Map((agentResp?.agents ?? []).map((a) => [a.id, a])),
+    [agentResp],
+  );
   const dryRun = useDryRunPlugin();
   const toggle = useTogglePlugin();
   const uninstall = useUninstallPlugin();
@@ -63,6 +120,8 @@ export default function PluginPanel({ space }: Props) {
   const [pendingUpgrade, setPendingUpgrade] = useState<PluginItem | null>(null);
   // 卡片上的「配置密钥」：带上缺的那条凭证，直接打开平台密钥配置弹窗
   const [secretPreset, setSecretPreset] = useState<{ scope: string; name: string } | null>(null);
+  // 智能体头像：只有本地草稿能改，安装副本是只读的发布快照
+  const [iconTarget, setIconTarget] = useState<PluginItem | null>(null);
 
   const writable = space.perm === 'write' || space.perm === 'manage';
   const canManage = space.perm === 'manage';
@@ -144,7 +203,15 @@ export default function PluginPanel({ space }: Props) {
             return (
               <Card key={item.slug} className="plugin-card" bodyStyle={{ padding: 16 }}>
                 <div className="plugin-card-head">
-                  <PluginIcon kind={item.kind as PluginKind} />
+                  {/* 智能体有头像就直接用头像：卡片和市场列表看到的是同一个视觉 */}
+                  {item.kind === 'agent' ? (
+                    <AgentAvatar
+                      agent={agentById.get(item.slug) ?? { id: item.slug, name: item.name }}
+                      size={28}
+                    />
+                  ) : (
+                    <PluginIcon kind={item.kind as PluginKind} />
+                  )}
                   <span className="plugin-card-name">{item.name || item.slug}</span>
                   <span className="plugin-kind-label">{KIND_LABEL[item.kind as PluginKind]}</span>
                   {local ? (
@@ -178,6 +245,14 @@ export default function PluginPanel({ space }: Props) {
                   <Tag size="small" color={item.risk >= 3 ? 'red' : item.risk >= 2 ? 'orange' : 'grey'}>
                     {riskLabel(item.risk)}
                   </Tag>
+                  <ApprovalTag
+                    level={item.approval_level}
+                    onEdit={
+                      !local && item.configurable && canManage
+                        ? () => setConfigTarget(item)
+                        : undefined
+                    }
+                  />
                   {local && item.published && item.update_available ? (
                     <Tag size="small" color="cyan">
                       有改动待发布
@@ -239,6 +314,18 @@ export default function PluginPanel({ space }: Props) {
                     </Button>
                   ) : null}
 
+                  {/* 头像只对智能体有意义；安装副本只读，入口只给草稿 */}
+                  {local && writable && item.kind === 'agent' ? (
+                    <Button
+                      size="small"
+                      theme="borderless"
+                      icon={<IconImage />}
+                      onClick={() => setIconTarget(item)}
+                    >
+                      头像
+                    </Button>
+                  ) : null}
+
                   {/* 停用只在空间插件页做：普通空间只能关自己的安装，系统空间是平台总开关。
                       内置件只有一份安装（系统空间），在这里停用/启用对所有空间立即生效。 */}
                   {canManage && (item.origin !== 'system' || isSystemSpace) ? (
@@ -271,7 +358,7 @@ export default function PluginPanel({ space }: Props) {
                     </Button>
                   ) : null}
 
-                  {!local && item.kind === 'mcp' ? (
+                  {!local && item.configurable ? (
                     <Button
                       size="small"
                       theme="borderless"
@@ -386,6 +473,15 @@ export default function PluginPanel({ space }: Props) {
         slug={configTarget?.slug}
         name={configTarget?.name}
         onClose={() => setConfigTarget(null)}
+      />
+
+      <AgentAvatarDialog
+        visible={Boolean(iconTarget)}
+        spaceId={space.id}
+        slug={iconTarget?.slug}
+        name={iconTarget?.name || iconTarget?.slug}
+        currentIcon={iconTarget ? agentById.get(iconTarget.slug)?.icon_url : undefined}
+        onClose={() => setIconTarget(null)}
       />
 
       {/* 复用平台密钥配置弹窗：凭证是平台级的，空间内只提供入口与预填 */}

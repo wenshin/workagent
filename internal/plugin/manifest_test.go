@@ -48,6 +48,26 @@ func TestPermissions(t *testing.T) {
 	}
 }
 
+// 自带件路径在清单层就要挡住越界写法：等到发布才发现，草稿已经被写成「看起来能跑」的样子。
+func TestAgentAssetsInManifest(t *testing.T) {
+	ok := agentManifest(`, "skills": ["skills", "skills/口径/大客户.md"], "tools": ["tools/crm_query"]`)
+	if _, err := Parse([]byte(ok), false); err != nil {
+		t.Fatalf("合法自带件声明应解析成功: %v", err)
+	}
+	for _, extra := range []string{
+		`, "skills": ["../x"]`,
+		`, "skills": ["/abs"]`,
+		`, "skills": [".hidden"]`,
+		`, "skills": ["a/b/c/d.md"]`,
+		`, "tools": ["a/../b"]`,
+		`, "skills": ["skills", "skills"]`,
+	} {
+		if _, err := Parse([]byte(agentManifest(extra)), false); err == nil {
+			t.Errorf("%s 应被拒绝", extra)
+		}
+	}
+}
+
 func TestParseRejectsUnknownFields(t *testing.T) {
 	_, err := Parse([]byte(toolManifest(`, "risk": 1`)), false)
 	if err == nil || !strings.Contains(err.Error(), "未知字段") {
@@ -482,5 +502,53 @@ func TestToolsSectionOnlyForMCP(t *testing.T) {
 	_, err := Parse([]byte(toolManifest(`, "tools": {"allow": ["*"], "writes": true}`)), false)
 	if err == nil || !strings.Contains(err.Error(), "只对 mcp") {
 		t.Fatalf("非 mcp 声明 tools 段应报错，实际: %v", err)
+	}
+}
+
+// 清单 config 段声明的是「安装方可填」的表单：错声明必须在发布时就拦住，
+// 否则安装方看到的是一个点了保存才报错的对话框。
+func TestParseConfigSection(t *testing.T) {
+	ok := toolManifest(`, "config": [
+	  {"key": "region", "label": "服务区域", "type": "select", "default": "cn",
+	   "options": [{"value": "cn", "label": "中国大陆"}, {"value": "intl", "label": "国际"}]},
+	  {"key": "retry", "label": "重试次数", "type": "number", "default": "2", "min": "0", "max": "5"},
+	  {"key": "extra_header", "label": "附加 Header", "type": "text", "placeholder": "X-Tenant"}
+	]`)
+	if _, err := Parse([]byte(ok), false); err != nil {
+		t.Fatalf("合法配置声明应通过：%v", err)
+	}
+
+	cases := []struct{ name, extra, want string }{
+		{"未知类型", `, "config": [{"key": "x", "label": "X", "type": "date"}]`, "只支持"},
+		{"保留键", `, "config": [{"key": "url", "label": "地址", "type": "text"}]`, "平台保留键"},
+		{"键名不合规", `, "config": [{"key": "Region", "label": "R", "type": "text"}]`, "config[0].key"},
+		{"重复键", `, "config": [{"key": "a", "label": "A", "type": "text"}, {"key": "a", "label": "B", "type": "text"}]`, "重复"},
+		{"select 缺选项", `, "config": [{"key": "a", "label": "A", "type": "select"}]`, "options"},
+		{"默认值不合法", `, "config": [{"key": "n", "label": "N", "type": "number", "default": "abc"}]`, "default 不合法"},
+		{"required 与 default 冲突", `, "config": [{"key": "a", "label": "A", "type": "text", "required": true, "default": "x"}]`, "required 与 default"},
+		{"min 写在非 number 上", `, "config": [{"key": "a", "label": "A", "type": "text", "min": "1"}]`, "min/max"},
+		{"选项写反范围", `, "config": [{"key": "n", "label": "N", "type": "number", "min": "9", "max": "1"}]`, "不能大于"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(toolManifest(tc.extra)), false)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("期望包含 %q 的错误，实际 %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// 只有脚本工具消费配置（wa.config()）：别的 kind 声明了没人读，必须直接拒绝。
+func TestParseConfigSectionRejectsOtherKinds(t *testing.T) {
+	skill := `{
+  "protocol": "wa-plugin/1", "kind": "skill", "slug": "crm_docs",
+  "name": "CRM 规范", "description": "客户资料的填写规范",
+  "skill": {"entry": "SKILL.md"},
+  "config": [{"key": "a", "label": "A", "type": "text"}]
+}`
+	_, err := Parse([]byte(skill), false)
+	if err == nil || !strings.Contains(err.Error(), "只对脚本工具") {
+		t.Fatalf("技能声明 config 必须被拒绝，实际 %v", err)
 	}
 }

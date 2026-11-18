@@ -33,6 +33,9 @@ type Summary struct {
 	Version     string `json:"version"`
 	Description string `json:"description"`
 	Extends     string `json:"extends,omitempty"`
+	// IconURL 是头像的访问地址；清单没声明头像或文件不存在时为空，
+	// 前端据此回落到「智能体首字徽标」而不是普通会话图标。
+	IconURL string `json:"icon_url,omitempty"`
 }
 
 // Resolved 是合并完成、可直接注入提示词的结果。

@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 
-import { api, uploadSpaceFiles } from './client';
+import { api, deleteAgentIcon, uploadAgentIcon, uploadSpaceFiles } from './client';
 import type {
   AdminSettings,
   AgentInfo,
@@ -327,6 +327,38 @@ export function useAgents(spaceId?: string) {
     queryKey: queryKeys.agents(spaceId ?? ''),
     enabled: Boolean(spaceId),
     queryFn: () => api<{ agents: AgentSummary[] }>(`/spaces/${spaceId}/agents`),
+  });
+}
+
+/**
+ * 改智能体头像。头像属于会话展示信息，改完要连会话列表一起作废：
+ * 树里的图标、选择器里的头像都从这两处来。
+ */
+export function useSetAgentIcon() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string; blob: Blob }) =>
+      uploadAgentIcon(input.spaceId, input.slug, input.blob),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['agents'] });
+      void qc.invalidateQueries({ queryKey: queryKeys.sessions });
+      void qc.invalidateQueries({ queryKey: ['plugins'] });
+      void qc.invalidateQueries({ queryKey: ['plugin'] });
+    },
+  });
+}
+
+export function useClearAgentIcon() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { spaceId: string; slug: string }) =>
+      deleteAgentIcon(input.spaceId, input.slug),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['agents'] });
+      void qc.invalidateQueries({ queryKey: queryKeys.sessions });
+      void qc.invalidateQueries({ queryKey: ['plugins'] });
+      void qc.invalidateQueries({ queryKey: ['plugin'] });
+    },
   });
 }
 

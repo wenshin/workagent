@@ -2371,6 +2371,7 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
 
 .ui-field { display: flex; flex-direction: column; gap: 4px; }
 .ui-field-label { font-size: 12px; color: var(--semi-color-text-3); }
+.ui-field-required { margin-left: 2px; color: var(--semi-color-danger); }
 .ui-input {
   padding: 5px 10px;
   border: 1px solid var(--semi-color-border);
@@ -2391,3 +2392,173 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   border-bottom: 2px solid transparent;
 }
 .ui-tab.is-active { color: var(--wa-color-primary-text); border-bottom-color: var(--semi-color-primary); }
+
+/* 可点的审批档位徽标：有管理权时点它直接打开配置（没权限时是纯展示） */
+.plugin-tag-clickable {
+  cursor: pointer;
+}
+
+.plugin-tag-clickable:hover {
+  opacity: 0.82;
+}
+
+/* ---- 智能体头像 ----
+   树里是 16px、卡片与标题是 20~28px，统一用圆角方块：圆形会和 Semi 的
+   Checkbox / Radio 混在一起，实心方块又会在 16px 上糊成一团。 */
+.agent-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border-radius: var(--wa-radius-6);
+  object-fit: cover;
+  overflow: hidden;
+  font-weight: 600;
+  line-height: 1;
+  user-select: none;
+}
+
+/* 首字徽标 = 浅底 + 深彩字，两个颜色都从身份色算。
+   固定暗色主题下，暗底（fill-1 / *-light-default）会和侧栏糊成一片，只有浅色
+   方块能一眼看出这里有个头像；品牌色原样当字色又只有 3:1 左右，读不清，
+   所以混黑压深。老浏览器忽略 color-mix 时退回灰底 + 品牌色字。 */
+.agent-avatar-fallback {
+  background: var(--semi-color-fill-1);
+  background: color-mix(in srgb, var(--agent-tint, var(--semi-color-primary)) 22%, var(--semi-color-white));
+  color: var(--agent-tint, var(--semi-color-primary));
+  color: color-mix(in srgb, var(--agent-tint, var(--semi-color-primary)) 50%, var(--semi-color-black));
+}
+
+/* 会话图标 = 智能体头像 + 右下角会话角标：头像回答「谁」，角标回答「这是会话」 */
+.session-agent-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  vertical-align: middle;
+}
+
+.session-agent-icon-badge {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  /* 底色与页面一致，让角标从头像角上「切」出来；深色主题跟着 token 一起变 */
+  background: var(--semi-color-bg-2);
+  /* 字形用 text-1：text-2 在这枚暗色小圆里太糊 */
+  color: var(--semi-color-text-1);
+}
+
+/* 字形只占角标 3/4：8px 的圆里塞进 8px 字形就会溢出色块边界看成一坨黑 */
+.session-agent-icon-badge .semi-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  /* 归零 font-size，让 svg 自带的 1em 尺寸失效，改由下面的百分比决定 */
+  font-size: 0;
+  line-height: 1;
+}
+
+.session-agent-icon-badge svg {
+  width: 75%;
+  height: 75%;
+  fill: currentColor;
+}
+
+/* 树节点里自绘图标要自己补右间距（Semi 只给内置 .semi-icon 加） */
+.space-tree .semi-tree-option-label .session-agent-icon {
+  margin-right: var(--wa-space-8);
+}
+
+/* 会话卡片与对话页标题：头像和标题同一行 */
+.session-card-head {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-8);
+  margin-bottom: var(--wa-space-6);
+}
+
+.session-card-head .session-card-title {
+  margin-bottom: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-heading-title {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-8);
+  min-width: 0;
+}
+
+/* ---- 头像裁剪弹窗 ---- */
+.agent-avatar-editor {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--wa-space-12);
+}
+
+.agent-avatar-stage {
+  width: 240px;
+  height: 240px;
+  border: 1px dashed var(--semi-color-border);
+  border-radius: var(--wa-radius-10);
+  background: var(--semi-color-fill-0);
+  overflow: hidden;
+}
+
+.agent-avatar-canvas {
+  display: block;
+  width: 240px;
+  height: 240px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.agent-avatar-canvas:active {
+  cursor: grabbing;
+}
+
+.agent-avatar-empty {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: transparent;
+  color: var(--wa-color-primary-text);
+  font-size: var(--wa-text-base);
+  cursor: pointer;
+}
+
+.agent-avatar-zoom {
+  display: flex;
+  align-items: center;
+  gap: var(--wa-space-12);
+  width: 240px;
+}
+
+.agent-avatar-zoom .semi-slider {
+  flex: 1;
+}
+
+.agent-avatar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--wa-space-8);
+  width: 100%;
+}
+
+.agent-avatar-actions-right {
+  display: flex;
+  gap: var(--wa-space-8);
+  margin-left: auto;
+}

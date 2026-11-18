@@ -145,6 +145,105 @@ func TestBuiltinSkillExampleValidates(t *testing.T) {
 	}
 }
 
+// 筛选条件组件的完整写法：动态下拉 + 多选 + 搜索 + 结构化提交。
+const filterFormDSL = `{
+  "dsl": "wa-ui/1",
+  "height": 420,
+  "state": {"city_codes": [], "city_labels": [], "city_q": "", "start_date": "", "end_date": ""},
+  "data": {"orders": {"params": {"keyword": "{{state.city_q}}"}, "watch": ["city_q"]}},
+  "view": {"type": "Stack", "gap": "md", "children": [
+    {"type": "Select", "name": "city_codes", "label": "城市", "multiple": true,
+     "label_name": "city_labels", "placeholder": "搜索城市", "max": 20,
+     "options_from": {"source": "orders", "items": "items", "label": "city_name",
+                      "value": "city_code", "search": "city_q"}},
+    {"type": "Input", "name": "start_date", "label": "开始日期", "input_type": "date", "required": true},
+    {"type": "Input", "name": "end_date", "label": "结束日期", "input_type": "date"},
+    {"type": "Text", "text": "请选择城市", "when": {"path": "state.city_codes", "op": "empty"}},
+    {"type": "Button", "text": "提交条件", "action": {
+      "type": "submit", "omit_empty": true,
+      "payload": {"city_codes": "{{state.city_codes}}", "city_names": "{{state.city_labels}}",
+                  "start_date": "{{state.start_date}}", "end_date": "{{state.end_date}}"},
+      "text": "已选城市：{{state.city_labels}}"}}
+  ]}
+}`
+
+func TestValidateDSLAcceptsFilterForm(t *testing.T) {
+	if _, err := ValidateDSL([]byte(filterFormDSL), testSources()); err != nil {
+		t.Fatalf("筛选组件应通过校验：%v", err)
+	}
+}
+
+func TestValidateDSLRejectsOptionsFromNotLoaded(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":""},"view":{"type":"Select","name":"a",
+	  "options_from":{"source":"orders","label":"x","value":"y"}}}`
+	_, err := ValidateDSL([]byte(raw), testSources())
+	if err == nil || !strings.Contains(err.Error(), "data 里声明") {
+		t.Fatalf("options_from 未在 data 段声明必须拒绝，收到 %v", err)
+	}
+}
+
+func TestValidateDSLRejectsBothOptionSources(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":""},"data":{"orders":{}},
+	  "view":{"type":"Select","name":"a","options":[{"label":"x","value":"x"}],
+	  "options_from":{"source":"orders","label":"x","value":"y"}}}`
+	if _, err := ValidateDSL([]byte(raw), testSources()); err == nil {
+		t.Fatal("options 与 options_from 同时出现必须拒绝")
+	}
+}
+
+func TestValidateDSLRejectsMultipleWithoutArrayState(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":""},"data":{"orders":{}},
+	  "view":{"type":"Select","name":"a","multiple":true,
+	  "options_from":{"source":"orders","label":"x","value":"y"}}}`
+	if _, err := ValidateDSL([]byte(raw), testSources()); err == nil {
+		t.Fatal("多选时 state 初值必须是数组")
+	}
+}
+
+func TestValidateDSLRejectsSearchNotWatched(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":[],"q":""},"data":{"orders":{}},
+	  "view":{"type":"Select","name":"a","multiple":true,
+	  "options_from":{"source":"orders","label":"x","value":"y","search":"q"}}}`
+	_, err := ValidateDSL([]byte(raw), testSources())
+	if err == nil || !strings.Contains(err.Error(), "watch") {
+		t.Fatalf("search 没被 watch 监听必须拒绝，收到 %v", err)
+	}
+}
+
+func TestValidateDSLRejectsUnknownWatchKey(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":""},"data":{"orders":{"watch":["nope"]}},
+	  "view":{"type":"Text","text":"x"}}`
+	if _, err := ValidateDSL([]byte(raw), testSources()); err == nil {
+		t.Fatal("watch 指向未声明的 state 键必须拒绝")
+	}
+}
+
+func TestValidateDSLStateInitialValueOnlyFromProps(t *testing.T) {
+	ok := `{"dsl":"wa-ui/1","state":{"a":"{{props.a}}"},"view":{"type":"Text","text":"x"}}`
+	if _, err := ValidateDSL([]byte(ok), testSources()); err != nil {
+		t.Fatalf("state 初值引用 props 应通过：%v", err)
+	}
+	bad := `{"dsl":"wa-ui/1","state":{"a":"{{data.orders.x}}"},"data":{"orders":{}},
+	  "view":{"type":"Text","text":"x"}}`
+	if _, err := ValidateDSL([]byte(bad), testSources()); err == nil {
+		t.Fatal("state 初值引用 data 必须拒绝")
+	}
+}
+
+func TestValidateDSLRejectsBadInputType(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","state":{"a":""},"view":{"type":"Input","name":"a","input_type":"password"}}`
+	if _, err := ValidateDSL([]byte(raw), testSources()); err == nil {
+		t.Fatal("非法 input_type 必须拒绝")
+	}
+}
+
+func TestValidateDSLRejectsSubmitWithoutPayload(t *testing.T) {
+	raw := `{"dsl":"wa-ui/1","view":{"type":"Button","text":"x","action":{"type":"submit","text":"hi"}}}`
+	if _, err := ValidateDSL([]byte(raw), testSources()); err == nil {
+		t.Fatal("submit 没有 payload 必须拒绝")
+	}
+}
+
 func TestComponentManifestUsesDSLFile(t *testing.T) {
 	m, err := Parse([]byte(`{
   "protocol": "wa-plugin/1",

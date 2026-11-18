@@ -189,6 +189,7 @@ func pluginSearch() Tool {
 		Description: "按关键词检索可用的插件：技能（skills）、工具（tools）、MCP 服务（mcps）与组件（components），返回最相关的若干条及读取路径。" +
 			"插件总量没有上限，不要试图列举全部；需要某类能力但不确定叫什么时，用用户原话里的关键词检索。" +
 			"不确定有什么可用能力时，可以省略 query 只给 kind，按名称列出该类插件再挑。" +
+			"结果里 source=agent 的是当前智能体自带的内置技能，别的智能体看不到。" +
 			"命中多个同名插件时先让用户选择，不要自行假设。",
 		Parameters: json.RawMessage(`{
   "type": "object",
@@ -464,7 +465,8 @@ func fileList() Tool {
 			if err != nil {
 				return "", err
 			}
-			// wiki 是系统空间里的共享区，file_* 只认当前空间，放行会让两处各长一份
+			// wiki 是系统空间里的知识页区（按智能体分区），file_* 只认当前空间，
+			// 放行会让两处各长一份
 			if isWikiPath(rel) {
 				return "", errWikiPath
 			}

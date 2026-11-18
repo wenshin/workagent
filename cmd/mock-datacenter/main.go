@@ -107,6 +107,8 @@ func main() {
 	mux.HandleFunc("POST /auth/token", srv.issueToken)
 	mux.Handle("GET /auth/me", srv.requireAuth(http.HandlerFunc(srv.me)))
 	mux.Handle("GET /api/v1/tables", srv.requireAuth(http.HandlerFunc(srv.searchTables)))
+	mux.Handle("GET /api/v1/dimensions", srv.requireAuth(http.HandlerFunc(srv.dimensionsHandler)))
+	mux.Handle("GET /api/v1/dimensions/{dim}", srv.requireAuth(http.HandlerFunc(srv.dimensionLookupHandler)))
 	mux.Handle("POST /api/v1/queries", srv.requireAuth(http.HandlerFunc(srv.submitQuery)))
 	mux.Handle("GET /api/v1/queries/{id}", srv.requireAuth(http.HandlerFunc(srv.getQuery)))
 	mux.Handle("GET /api/v1/queries/{id}/result", srv.requireAuth(http.HandlerFunc(srv.queryResult)))

@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	// pluginReadLimit 是 plugin_read 单次读取插件文件的上限，与工具侧 24KB 上限一致
-	pluginReadLimit = 24 << 10
+	// pluginReadLimit 是把插件文件读进内存的上限。工具侧单次回填仍限制在 24KB，
+	// 这里留出整份文件的空间：智能体内置技能单页上限 64KB，读不全就等于没有。
+	pluginReadLimit = 64 << 10
 	// maxSkillDocBytes 是读取技能正文的上限；真正的注入预算按 token 控制（见 agent.systemMessage），
 	// 这里只防止把超大文件整体读进内存
 	maxSkillDocBytes = 64 << 10
@@ -29,6 +30,9 @@ type pluginLoader struct {
 	// extraRefs 是跨空间借用的插件：子会话继承发起方空间的智能体及其 requires。
 	// 只扩大「检索与读取」的范围，不改写空间——写文件、建目录仍按 spaceID。
 	extraRefs []tool.PluginRef
+	// agentInternals 是当前会话智能体自带的技能页（agent.skills）。它们不在空间
+	// 索引里，只在这里并进检索池：换成另一个智能体开会话就自然看不到了。
+	agentInternals []tool.PluginEntry
 }
 
 func (l pluginLoader) Plugins(ctx context.Context) ([]tool.PluginEntry, error) {
@@ -63,6 +67,16 @@ func (l pluginLoader) Plugins(ctx context.Context) ([]tool.PluginEntry, error) {
 	// 借用只放行 requires 闭包里的插件目录，来源空间的其它内容不摊给被派发人。
 	for src, slugs := range l.extraBySpace() {
 		appendBundle(l.spaces.MergedSources(ctx, src), slugs)
+	}
+
+	// 智能体自带技能放在最后：同路径以空间/系统那份为准（理论上不会重名，
+	// 但智能体目录里的文件是用户可写的，别让一份草稿盖掉正式技能）。
+	for _, e := range l.agentInternals {
+		if seen[e.Path] {
+			continue
+		}
+		seen[e.Path] = true
+		out = append(out, e)
 	}
 
 	// 发布件不默认进检索池：只有安装到本空间的插件才可用。市场浏览走插件接口；

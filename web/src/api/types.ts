@@ -87,6 +87,10 @@ export interface ChatSession {
   agent_id?: string;
   /** 智能体所属空间；子任务会话指向发起方空间，空表示与会话同空间 */
   agent_space_id?: string;
+  /** 会话列表渲染用的智能体名称；无绑定时为空 */
+  agent_name?: string;
+  /** 智能体头像地址；没上传头像时为空，界面回落到智能体徽标 */
+  agent_icon_url?: string;
   status: string;
   last_message_at?: string | null;
   created_at: string;
@@ -379,6 +383,10 @@ export interface PluginItem {
   blocked?: boolean;
   /** 未启用原因（人类可读） */
   blocked_reason?: string;
+  /** 有安装级可配置项（审批级别、MCP 的地址与鉴权、shell 的审批命令名单）：有才显示「配置」 */
+  configurable?: boolean;
+  /** 当前生效的审批档位：declared 按声明 / always 每次确认 / off 不确认 */
+  approval_level?: 'declared' | 'always' | 'off';
 }
 
 /** 插件声明的一处凭证：scope/name 就是密钥配置里的地址 */
@@ -404,6 +412,8 @@ export interface AgentSummary {
   version: string;
   description: string;
   extends?: string;
+  /** 头像地址；没上传头像时为空，界面回落到「智能体首字徽标」 */
+  icon_url?: string;
 }
 
 /** 插件市场里的已发布插件（只读） */
@@ -439,10 +449,23 @@ export interface PluginCatalogResponse {
 export interface PluginConfigField {
   key: string;
   label: string;
-  type: 'text' | 'url' | 'list';
+  /** text / textarea / number / boolean / select / url / list / secret_ref */
+  type:
+    | 'text'
+    | 'textarea'
+    | 'number'
+    | 'boolean'
+    | 'url'
+    | 'list'
+    | 'select'
+    | 'secret_ref';
   required: boolean;
   placeholder?: string;
   help?: string;
+  /** select 型字段的选项；help 说明选它之后会发生什么 */
+  options?: Array<{ value: string; label: string; help?: string }>;
+  /** 安装方没填过时的生效值：留空就是它 */
+  default?: string;
 }
 
 export interface PluginConfigView {
@@ -450,6 +473,8 @@ export interface PluginConfigView {
   kind: PluginKind;
   fields: PluginConfigField[];
   values: Record<string, string>;
+  /** space=只影响当前空间；global=平台内置件，改一次全部空间生效 */
+  scope: 'space' | 'global';
 }
 
 /** plugin.json 的内容：元数据的唯一定义点 */
@@ -487,7 +512,10 @@ export type UiDSL = {
   dsl: 'wa-ui/1';
   height?: number;
   state?: Record<string, unknown>;
-  data?: Record<string, { params?: Record<string, unknown>; auto?: boolean }>;
+  data?: Record<
+    string,
+    { params?: Record<string, unknown>; auto?: boolean; watch?: string[]; reset?: string[] }
+  >;
   view: UiNode;
 };
 
@@ -500,14 +528,22 @@ export type UiNode = {
 
 export type UiCond = {
   path: string;
-  op: 'eq' | 'ne' | 'gt' | 'lt' | 'in' | 'exists' | 'truthy';
+  op: 'eq' | 'ne' | 'gt' | 'lt' | 'in' | 'exists' | 'truthy' | 'empty';
   value?: unknown;
 };
 
 export type UiAction =
   | { type: 'reload'; target: string; params?: Record<string, unknown> }
   | { type: 'invoke'; source: string; params?: Record<string, unknown>; confirm?: string }
-  | { type: 'message'; text: string };
+  | { type: 'message'; text: string }
+  /** 把表单选择整理成结构化参数填进输入框，由用户确认后发送（不发请求） */
+  | {
+      type: 'submit';
+      payload: Record<string, unknown>;
+      text?: string;
+      omit_empty?: boolean;
+      confirm?: string;
+    };
 
 export interface PluginComponentView {
   slug: string;

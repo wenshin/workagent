@@ -11,6 +11,7 @@ func wikiEnv(t *testing.T) Env {
 	t.Helper()
 	env := newTestEnv(t)
 	env.WikiSpaceID = "sys1"
+	env.AgentID = "reviewer"
 	return env
 }
 
@@ -40,6 +41,59 @@ func TestWikiUnavailableWithoutHost(t *testing.T) {
 	_, err := wikiRead().Invoke(context.Background(), json.RawMessage(`{"path":"a.md"}`), env)
 	if err == nil || !strings.Contains(err.Error(), "不可用") {
 		t.Fatalf("缺少宿主空间时应报不可用，实际: %v", err)
+	}
+}
+
+// 知识页按智能体分区：没有绑定智能体时不知道该读写哪一份，必须报错而不是落到公共目录。
+func TestWikiUnavailableWithoutAgent(t *testing.T) {
+	env := newTestEnv(t)
+	env.WikiSpaceID = "sys1" // 只缺 AgentID
+	_, err := wikiRead().Invoke(context.Background(), json.RawMessage(`{"path":"a.md"}`), env)
+	if err == nil || !strings.Contains(err.Error(), "没有绑定智能体") {
+		t.Fatalf("缺少智能体时应报不可用，实际: %v", err)
+	}
+}
+
+// 分区目录名会拼进存储 key：带分隔符或隐藏段的标识必须被挡住，否则能写到分区外面去。
+func TestWikiRejectsUnsafeAgentDir(t *testing.T) {
+	for _, id := range []string{"../x", "a/b", `a\b`, ".hidden", ".", ".."} {
+		env := wikiEnv(t)
+		env.AgentID = id
+		_, err := wikiList().Invoke(context.Background(), json.RawMessage(`{}`), env)
+		if err == nil || !strings.Contains(err.Error(), "不可用") {
+			t.Errorf("AgentID=%q 应被拒绝，实际: %v", id, err)
+		}
+	}
+}
+
+// 每个智能体只看得到自己目录：list / read / search / write 都不能跨分区。
+func TestWikiIsolatedPerAgent(t *testing.T) {
+	env := wikiEnv(t) // reviewer
+	callTool(t, wikiWrite(), env, `{"path":"topics/分析口径.md","content":"# 口径\nreviewer 专用"}`)
+
+	key := wikiKey(env, "reviewer", "topics/分析口径.md")
+	if !strings.Contains(key, "/files/wiki/reviewer/") {
+		t.Fatalf("页面应落在智能体分区下: %s", key)
+	}
+
+	other := env
+	other.AgentID = "writer"
+
+	if list := callTool(t, wikiList(), other, `{}`); strings.Contains(list, "分析口径") {
+		t.Fatalf("别的智能体不该看到 reviewer 的页面: %s", list)
+	}
+	if _, err := wikiRead().Invoke(context.Background(),
+		json.RawMessage(`{"path":"topics/分析口径.md"}`), other); err == nil {
+		t.Fatal("别的智能体不该读到 reviewer 的页面")
+	}
+	if hits := callTool(t, wikiSearch(), other, `{"query":"专用"}`); strings.Contains(hits, "reviewer 专用") {
+		t.Fatalf("搜索范围应限定在自己的分区: %s", hits)
+	}
+
+	// 同名路径各写各的：writer 覆盖不掉 reviewer 的内容
+	callTool(t, wikiWrite(), other, `{"path":"topics/分析口径.md","content":"# 口径\nwriter 专用"}`)
+	if read := callTool(t, wikiRead(), env, `{"path":"topics/分析口径.md"}`); !strings.Contains(read, "reviewer 专用") {
+		t.Fatalf("reviewer 的页面被别的智能体覆盖了: %s", read)
 	}
 }
 

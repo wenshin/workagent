@@ -38,6 +38,25 @@ func TestAgentPromptAppendedAfterBaseRules(t *testing.T) {
 	}
 }
 
+// 智能体自带技能只给索引（名称 + 路径 + 一句说明），正文按需 plugin_read；
+// 全量注入会把每一轮上下文都撑爆。
+func TestAgentSkillsIndexedNotInlined(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{AgentSkills: []SkillRef{{
+		Name:        "周报模板",
+		Description: "按客户维度汇总本周进展",
+		Path:        "plugins/sales_assistant/skills/周报模板.md",
+	}}})
+
+	for _, want := range []string{"本智能体内置技能", "周报模板", "按客户维度汇总本周进展", "plugins/sales_assistant/skills/周报模板.md"} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("缺少内置技能索引 %q", want)
+		}
+	}
+	if strings.Contains(BuildSystemMessage(RunInput{}).Content, "本智能体内置技能") {
+		t.Fatal("没有内置技能时不应出现这一段")
+	}
+}
+
 func TestAgentPromptBeforeActiveSkill(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{
 		AgentPrompt: "AGENT-EXTRA",
@@ -59,9 +78,10 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 		Doc:  doc,
 	}})
 
-	// 预算只约束技能正文本身；固定基础规则大约占 1000 tokens（含检索与编程任务判断规则），
-	// 因此这里给的是「正文预算 + 基础规则」的余量，微调措辞时不用同步调数字。
-	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1100 {
+	// 预算只约束技能正文本身；固定基础规则大约占 1100 tokens（含检索、知识库按
+	// 智能体分区与编程任务判断规则），因此这里给的是「正文预算 + 基础规则」的余量，
+	// 微调措辞时不用同步调数字。基础规则成规模增长时要重新审视预算分配。
+	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1250 {
 		t.Fatalf("技能正文超预算：%d tokens", got)
 	}
 	for _, want := range []string{"本轮选中的技能：长技能", "已截断", "plugin_read"} {

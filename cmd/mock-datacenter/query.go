@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +21,24 @@ const (
 const maxResultRows = 200
 
 var (
-	tableRefPattern = regexp.MustCompile(`(?i)\b(?:from|join)\s+([a-zA-Z0-9_."]+)`)
-	limitPattern    = regexp.MustCompile(`(?i)\blimit\s+(\d+)`)
-	writePattern    = regexp.MustCompile(`(?i)^\s*(insert|update|delete|drop|create|truncate|alter|merge)\b`)
+	writePattern = regexp.MustCompile(`(?i)^\s*(insert|update|delete|drop|create|truncate|alter|merge)\b`)
+	fromPattern  = regexp.MustCompile(`(?i)\bfrom\b`)
 )
+
+// findTable 按表名解析：支持 t / db.t，也接受反引号与大小写差异。
+func findTable(name string) *Table {
+	raw := strings.Trim(strings.TrimSpace(name), "`\"")
+	short := raw
+	if i := strings.LastIndex(raw, "."); i >= 0 {
+		short = raw[i+1:]
+	}
+	for _, t := range mockTables() {
+		if strings.EqualFold(t.Name, short) || strings.EqualFold(t.FullName, raw) {
+			return t
+		}
+	}
+	return nil
+}
 
 // Task 是一次 Spark SQL 提交。
 type Task struct {
@@ -103,7 +116,7 @@ func (s *taskStore) run(id string) {
 	}
 	time.Sleep(s.delay / 3)
 
-	cols, rows, execErr := executeMockSQL(s.sqlOf(id))
+	cols, rows, execErr := executeSQL(s.sqlOf(id))
 	s.patch(id, func(t *Task) {
 		t.FinishedAt = time.Now()
 		t.Progress = 100
@@ -167,73 +180,5 @@ func (s *taskStore) wait(ctx context.Context, id string, timeout time.Duration) 
 	}
 }
 
-// executeMockSQL 根据 SQL 里引用的表生成稳定的 mock 结果。
-//
-// 规则（覆盖智能体的正常与异常路径）：
-//   - 写操作直接失败，提示只读账号（真实数仓的分析账号也是这样）；
-//   - SQL 里出现 error / fail / boom 时失败，便于测试错误分支；
-//   - from 引用了不存在的表时失败，报 Table or view not found；
-//   - 其他情况按表列返回样例行，行数取 LIMIT，缺省 5 行。
-func executeMockSQL(sql string) ([]string, []map[string]any, error) {
-	trimmed := strings.TrimSpace(sql)
-	if trimmed == "" {
-		return nil, nil, fmt.Errorf("SQL 不能为空")
-	}
-	if writePattern.MatchString(trimmed) {
-		return nil, nil, fmt.Errorf("当前账号为只读账号，不允许执行 DDL/DML，请只提交 SELECT 查询")
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "fail") || strings.Contains(lower, "error") || strings.Contains(lower, "boom") {
-		return nil, nil, fmt.Errorf("执行失败：mock 服务命中故意失败的关键字（fail/error/boom）")
-	}
-
-	tableName := ""
-	for _, m := range tableRefPattern.FindAllStringSubmatch(trimmed, -1) {
-		if len(m) > 1 {
-			tableName = strings.Trim(m[1], `"`)
-			break
-		}
-	}
-
-	limit := 5
-	if m := limitPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > maxResultRows {
-		limit = maxResultRows
-	}
-
-	if tableName == "" {
-		// select 1 / select current_date 这类无源查询
-		return []string{"result"}, []map[string]any{{"result": 1}}, nil
-	}
-
-	table := findTable(tableName)
-	if table == nil {
-		return nil, nil, fmt.Errorf("Table or view not found: %s", tableName)
-	}
-
-	cols := make([]string, 0, len(table.Columns))
-	for _, c := range table.Columns {
-		cols = append(cols, c.Name)
-	}
-	if len(table.rows) == 0 {
-		return cols, nil, nil
-	}
-
-	// 样例行循环填充到目标行数。故意不改写任何字段值：
-	// 跨表关联（user_id / series_id）在 mock 里必须自洽，
-	// 否则智能体做 join 时会拿到对不上的数据。
-	rows := make([]map[string]any, 0, limit)
-	for i := 0; i < limit; i++ {
-		src := table.rows[i%len(table.rows)]
-		row := make(map[string]any, len(cols))
-		for k, v := range src {
-			row[k] = v
-		}
-		rows = append(rows, row)
-	}
-	return cols, rows, nil
-}
+// 单任务默认返回行数：不写 limit 时按这个值截断，避免一次拉回整个表。
+const defaultResultRows = 50

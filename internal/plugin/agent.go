@@ -38,10 +38,36 @@ func (m *Manager) ListAgentPlugins(ctx context.Context, spaceID string) ([]agent
 		}
 		if inst.Manifest.Agent != nil {
 			item.Extends = inst.Manifest.Agent.Extends
+			// 头像地址带文件修改时间：草稿改完立刻换地址，列表不必等版本号变
+			item.IconURL = m.agentIconURL(ctx, spaceID, inst.Slug, inst.Dir, inst.Manifest.Agent.Icon)
 		}
 		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// AgentDisplayNames 返回空间内所有智能体插件的展示名（含已停用与草稿）。
+//
+// 只用于「会话列表里这条会话是谁在答」：停用的智能体不能再新建会话，但历史会话
+// 还在，图标要显示名字而不是退化成英文 slug。**选择器的白名单仍是 ListAgentPlugins**
+// （只含已启用），两者不能混用，否则停用就只是标签。
+func (m *Manager) AgentDisplayNames(ctx context.Context, spaceID string) (map[string]string, error) {
+	items, err := m.List(ctx, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(items))
+	for _, it := range items {
+		if it.Kind != string(KindAgent) {
+			continue
+		}
+		name := it.Name
+		if name == "" {
+			name = it.Slug
+		}
+		out[it.Slug] = name
+	}
 	return out, nil
 }
 

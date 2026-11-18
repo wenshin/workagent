@@ -13,7 +13,8 @@ import { KIND_LABEL, PluginIcon, type PluginKind } from './PluginVisual';
 
 const { Text } = Typography;
 
-const RISK_LABEL = ['', 'L1 免审', 'L2 只读', 'L3 写操作', 'L4 高敏'];
+/** 风险等级的中文名：界面上不出现 L1~L4 编号，用户看不懂那是什么意思 */
+const RISK_LABEL = ['', '只读', '查询', '写入', '高危'];
 
 const KIND_FILTERS: Array<'all' | PluginKind> = ['all', 'skill', 'tool', 'mcp', 'component', 'agent', 'source'];
 
@@ -26,7 +27,7 @@ export const PLUGIN_CATEGORY_LABEL: Record<PluginCategory, string> = {
 };
 
 function riskLabel(risk: number) {
-  return RISK_LABEL[Math.min(Math.max(risk, 0), 4)] || `L${risk}`;
+  return RISK_LABEL[Math.min(Math.max(risk, 0), 4)] || '未评级';
 }
 
 function categoryOf(item: PluginCatalogItem): PluginCategory {

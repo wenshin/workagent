@@ -124,6 +124,10 @@ type RunInput struct {
 	DirPlugin *DirPlugin
 	// AgentPrompt 是会话绑定的智能体追加提示词，只能追加在平台基础规则之后
 	AgentPrompt string
+	// AgentSkills 是智能体自带的技能页（agent.skills）：名称 + 路径直接写进系统
+	// 提示词，正文仍按需 plugin_read。它为空的含义是「这个智能体没有内置技能」，
+	// 而不是「加载失败」——加载失败按没有处理，会话照常能聊。
+	AgentSkills []SkillRef
 	// Platform 是本轮已确认的平台部署事实（租户、IM、当前用户与空间），
 	// 直接注入系统提示词。做成工具的话模型会凭先验抢答「我们用钉钉吧」，
 	// 而这类事实必须恒真，不能放在概率路径上。
@@ -183,6 +187,17 @@ type ActiveSkill struct {
 	Name string
 	Path string
 	Doc  string
+}
+
+// SkillRef 是智能体自带技能页的索引项：只有名字、说明和读取路径。
+//
+// 不预读正文——内置技能是「可能用到」的内容，全部塞进提示词会把上下文吃光；
+// 这里给出路径，模型判断需要时再用 plugin_read 读全文。
+type SkillRef struct {
+	Name        string
+	Description string
+	// Path 相对空间 files/，可直接交给 plugin_read。
+	Path string
 }
 
 // PlatformFacts 是本轮已知的平台部署事实，只保留「回答用户问题需要」的字段。

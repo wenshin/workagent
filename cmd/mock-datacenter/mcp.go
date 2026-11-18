@@ -85,9 +85,32 @@ func (s *server) mcp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// mcpToolDefs 只暴露四个业务工具，与 REST 接口一一对应。
+// mcpToolDefs 暴露的业务工具，与 REST 接口一一对应。
 func mcpToolDefs() []map[string]any {
 	return []map[string]any{
+		{
+			"name":        "dim_list",
+			"description": "列出可用的维度（城市 / 门店 / 车系 / 渠道），返回取值字段、展示字段、是否有父维度以及候选基数。写筛选组件前先用它确认字段名，不要凭记忆猜。",
+			"inputSchema": rawSchema(`{
+				"type": "object",
+				"properties": {}
+			}`),
+		},
+		{
+			"name":        "dim_lookup",
+			"description": "查询维度的可选值，返回 [{value, label, extra}]。用于把用户说的名称换成 SQL 需要的 id：keyword 模糊搜索，parent 按父维度级联（门店按城市），values 按 id 批量反查名称。value 一律是字符串（行政区划码可能带前导零）。",
+			"inputSchema": rawSchema(`{
+				"type": "object",
+				"properties": {
+					"dim":     {"type": "string", "description": "维度标识：city / store / series / channel"},
+					"keyword": {"type": "string", "description": "名称关键字，例如 北京、比亚迪、旗舰"},
+					"parent":  {"type": "string", "description": "父维度取值，用于级联：查门店时传城市 code"},
+					"values":  {"type": "array", "items": {"type": "string"}, "description": "按 id 批量反查，返回这些 id 对应的名称"},
+					"limit":   {"type": "integer", "description": "返回条数，默认 20，最大 200"}
+				},
+				"required": ["dim"]
+			}`),
+		},
 		{
 			"name":        "search_tables",
 			"description": "按关键字搜索大数据表，返回表元信息（库名、表名、字段、分区、行数、更新时间）与该表负责人（姓名、工号、邮箱）。关键字可以命中表名、字段名、描述、标签或负责人。",
@@ -167,6 +190,22 @@ func (s *server) callTool(r *http.Request, name string, args json.RawMessage) (s
 	}
 
 	switch name {
+	case "dim_list":
+		return toText(dimensionList()), false
+
+	case "dim_lookup":
+		out, err := dimensionLookup(
+			argString(in, "dim"),
+			argString(in, "keyword"),
+			argString(in, "parent"),
+			argStringSlice(in, "values"),
+			argInt(in, "limit", 0),
+		)
+		if err != nil {
+			return err.Error(), true
+		}
+		return toText(out), false
+
 	case "search_tables":
 		keyword := argString(in, "keyword")
 		database := argString(in, "database")
@@ -369,6 +408,33 @@ func argString(m map[string]any, key string) string {
 		}
 	}
 	return ""
+}
+
+// argStringSlice 接受 JSON 数组，也接受逗号分隔的字符串（模型经常后一种写法）。
+func argStringSlice(m map[string]any, key string) []string {
+	v, ok := m[key]
+	if !ok {
+		return nil
+	}
+	switch x := v.(type) {
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	case string:
+		var out []string
+		for _, part := range strings.Split(x, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func argInt(m map[string]any, key string, fallback int) int {

@@ -60,3 +60,20 @@ func TestSecretGetMissingValue(t *testing.T) {
 		t.Fatal("不存在的凭证应该报错")
 	}
 }
+
+// 配置对脚本可见，且不需要在 capabilities 里声明：读的是安装方
+// 为这个插件自己填的值，不涉及跨主体授权。
+func TestHostCallConfigGet(t *testing.T) {
+	rt := secretTestRuntime()
+	in := invokeInput{Config: map[string]string{"region": "intl"}}
+
+	out, err := rt.hostCall(context.Background(), in, rpcFrame{Method: MethodConfigGet})
+	if err != nil {
+		t.Fatalf("取配置失败：%v", err)
+	}
+	got, _ := out.(map[string]any)
+	cfg, _ := got["config"].(map[string]string)
+	if cfg["region"] != "intl" {
+		t.Fatalf("配置没下发：%v", got)
+	}
+}

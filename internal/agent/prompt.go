@@ -29,7 +29,7 @@ func BuildSystemMessage(in RunInput) llm.Message {
   - 检索不到就明确说没有找到相关规范，不要用常识冒充公司规定。
   - 命中多个同名插件时，先把候选给用户选，不要自行假设。
 - 文件能力只作用于当前空间的文件根目录：file_list 列出目录与文件，file_read 读取正文，file_write 写入 md / json / txt / csv / yaml。修改已有文件前先用 file_read 读一遍，避免覆盖用户内容；不要尝试读写空间之外的路径。
-- 企业知识用 wiki_* 而不是 file_*：跨会话、跨空间共享的分析口径、业务流程、结论纪要与可复用查询模板，先 wiki_search / wiki_list 定位，再 wiki_read、wiki_write（markdown，最多三层，如 topics/分析口径.md）。不要为「沉淀知识」在当前空间新建 knowledge/、知识库/ 之类目录，那里只有本空间可见。覆盖已有页面先用 wiki_read 拿 version 再带 if_version；wiki 报「系统空间未初始化」时如实告知用户找管理员，不要退回 file_write 顶替。
+- 企业知识用 wiki_* 而不是 file_*：每个智能体有独立的 wiki 目录（files/wiki/<当前智能体>/），path 相对它，别的智能体的页面看不到也写不进。跨会话的分析口径、业务流程、结论纪要与查询模板，先 wiki_search / wiki_list 定位，再 wiki_read、wiki_write（markdown，最多三层，如 topics/分析口径.md）。不要为「沉淀知识」在当前空间新建 knowledge/ 等目录，那里只有本空间可见。覆盖已有页面先用 wiki_read 拿 version 再带 if_version；wiki 报「系统空间未初始化」或「没有绑定智能体」时告知用户找管理员，不要退回 file_write 顶替。
 - 用户消息末尾出现「[引用文件]」时，那些是用户明确要求参考的空间文件：先逐个 file_read 读取再作答，不要凭空假设内容；文件不存在或读不到就如实说明。
 - 用户要「做一个技能」时，按 builtin_plugin_dev 的 references/skill.md 直接写文件：先 file_write 写 plugins/<slug>/plugin.json，再写 plugins/<slug>/SKILL.md。正文只写入口流程与判断规则，参考资料放子文件（最多一层引用），单个 SKILL.md 建议不超过 300 行。
 - 用户要「做一个组件 / 看板 / 表单 / 界面块」时，先 plugin_search(kind=skills, query=组件) 找「前端组件」技能，按里面的 DSL 规则生成 plugins/<slug>/plugin.json 与 ui.json。组件是声明式 DSL，不是代码：不要生成 TSX/HTML/CSS，也不要让用户上传或引用外部组件。
@@ -88,6 +88,9 @@ func BuildSystemMessage(in RunInput) llm.Message {
 		b.WriteString(extra)
 	}
 
+	// 智能体自带技能：只给索引，正文按需读——全部塞进提示词会把上下文吃光
+	writeAgentSkills(&b, in.AgentSkills)
+
 	// 子 Agent 的追加约束：由派发方给出，同样只能追加在基础规则与智能体设定之后
 	if sub := strings.TrimSpace(in.SubAgentPrompt); sub != "" {
 		b.WriteString("\n\n## 子任务约束\n")
@@ -109,6 +112,48 @@ func BuildSystemMessage(in RunInput) llm.Message {
 	}
 
 	return llm.Message{Role: llm.RoleSystem, Content: b.String()}
+}
+
+// writeAgentSkills 把智能体自带的技能页写成索引。
+//
+// 只写名称与路径：内置技能是「可能用到」的内容，全部注入正文等于每轮都付全价；
+// 模型判断相关时自己用 plugin_read 读。上限 20 条，超出的省略——数量本身就说明
+// 这个智能体该做减法了。
+func writeAgentSkills(b *strings.Builder, skills []SkillRef) {
+	lines := make([]string, 0, len(skills))
+	for _, s := range skills {
+		name := strings.TrimSpace(s.Name)
+		ref := strings.TrimSpace(s.Path)
+		if name == "" || ref == "" {
+			continue
+		}
+		line := "- " + name + "：" + ref
+		if d := strings.TrimSpace(s.Description); d != "" && d != name {
+			line += "（" + clipPromptText(d, 120) + "）"
+		}
+		lines = append(lines, line)
+		if len(lines) >= 20 {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	b.WriteString("\n\n## 本智能体内置技能\n")
+	b.WriteString("这些技能随当前智能体一起安装，只对本次会话可见。需要细节时用 plugin_read 读对应路径；与当前任务无关就不要读。\n")
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+}
+
+// clipPromptText 按字符截断，避免把中文切成半个字。
+func clipPromptText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // writePlatformFacts 把平台部署事实写成一小段提示词。

@@ -2,12 +2,13 @@
 
 一个本地可跑的模拟数仓，用来联调「数据分析类智能体」。它提供两组等价的能力：
 
-- **MCP 工具**（推荐）：`search_tables` / `submit_query` / `get_query_status` / `get_query_result` / `download_query_result`
+- **MCP 工具**（推荐）：`dim_list` / `dim_lookup` / `search_tables` / `submit_query` / `get_query_status` / `get_query_result` / `download_query_result`
   —— 下面是远端工具名；经平台 MCP 插件安装后，模型实际拿到的是带插件前缀的名字，如 `mock_datacenter__submit_query`
-- **REST 接口**：`/api/v1/tables`、`/api/v1/queries...`，语义与工具一一对应
+- **REST 接口**：`/api/v1/dimensions`、`/api/v1/tables`、`/api/v1/queries...`，语义与工具一一对应
 
-> **给智能体**：数据是模拟的。SQL 只做「找表 → 拼样例结果」的处理，**不执行聚合、过滤与列裁剪**。
-> 结论要说明数据来自 mock，不要把样例行当成真实统计值。
+> **给智能体**：数据是造出来的（几百到几千行），但 **SQL 是真的执行**：`where` / `group by` /
+> `join` / 聚合 / 排序 / 分页都生效，`count(*)` 与元信息里的 `row_count` 一致。
+> 这样筛选条件是否生效是能被验证的；结论里仍要说明数据来自 mock，不要把行数当成生产规模。
 >
 > 面向智能体的纯净版说明（只有 MCP 接口与工具用法，不含平台接入内容）见 [AGENT.md](./AGENT.md)。
 
@@ -20,7 +21,7 @@
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `keyword` | string | 否 | 关键字；为空时列出全部表 |
-| `database` | string | 否 | 限定库名：`dw` / `dm` / `ods` |
+| `database` | string | 否 | 限定库名：`dw` / `dm` / `ods` / `dim` |
 | `page` | int | 否 | 页码，默认 1 |
 | `page_size` | int | 否 | 每页条数，默认 20，最大 100 |
 
@@ -64,6 +65,48 @@
 ```
 
 `items` 是完整元信息，字段较多。先看 `full_name` 和 `columns`，需要时再展开。
+
+### dim_list — 维度清单
+
+无参数。用来确认「筛选条件该取哪个字段」，避免模型凭记忆写字段名。
+
+```json
+{
+  "items": [
+    {
+      "dim": "city", "label": "城市", "table": "dim_city",
+      "value_field": "city_code", "label_field": "city_name",
+      "extra_fields": ["province", "region", "city_level"],
+      "cardinality": 309,
+      "note": "按城市名称或省份搜索；value 是行政区划码"
+    }
+  ],
+  "total": 4
+}
+```
+
+### dim_lookup — 名称 ↔ id
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `dim` | string | **是** | `city` / `store` / `series` / `channel` |
+| `keyword` | string | 否 | 名称关键字（`北京` / `比亚迪` / `旗舰`） |
+| `parent` | string | 否 | 级联过滤：查门店时传城市 code |
+| `values` | array | 否 | 按 id 批量反查名称 |
+| `limit` | int | 否 | 默认 20，最大 200 |
+
+```json
+{
+  "dim": "city",
+  "items": [{ "value": "110100", "label": "北京市", "extra": { "province": "北京市", "region": "华北" } }],
+  "total": 2,
+  "has_more": false,
+  "limit": 20
+}
+```
+
+`value` 一律是字符串（行政区划码可能带前导零）。这个形状就是筛选组件 `options_from` 要吃的：
+`{"source":"dim_city","items":"items","label":"city_name","value":"city_code"}` 对应的回执字段。
 
 ### submit_query — 提交 SQL
 
@@ -167,6 +210,8 @@
 ## 2. 典型流程
 
 ```
+dim_list()                                          # 0. 需要按城市/门店/车系筛选时先看字段
+dim_lookup(dim="city", keyword="北京")               #    名称 → id
 search_tables(keyword="销售")                       # 1. 找表，确认库表名与字段
 submit_query(sql="select ... limit 100", wait_seconds=20)   # 2. 提交并等到终态
    └─ 若 status 仍是 running：get_query_status(task_id, wait_seconds=20) 继续等
@@ -190,46 +235,53 @@ download_query_result(task_id, format="csv")        # 3b. 要文件时用这个
 
 ---
 
-## 3. 可用的表（共 6 张）
+## 3. 可用的表（共 9 张）
 
 | 全名 | 说明 | 分区 | 主要字段 |
 |---|---|---|---|
-| `dw.dw_order_detail` | 订单明细宽表，全渠道成交与退款订单 | `dt` | order_id, user_id, city, order_amount, order_status, channel, create_time |
-| `dw.dw_user_profile` | 用户画像宽表，基础属性与关注车型 | `dt` | user_id, gender, age, city, register_date, is_new_user, prefer_series |
-| `dm.dm_sales_daily` | 销售日报，按城市与日期汇总订单量、GMV、退款量 | `stat_date` | stat_date, city, order_cnt, gmv, avg_price, refund_cnt |
-| `dm.dm_vehicle_visit` | 车型访问指标，PV / UV / 留资转化 | `stat_date` | stat_date, series_id, series_name, pv, uv, clue_cnt |
-| `ods.ods_clue` | 线索流水，各渠道留资与跟进状态 | `dt` | clue_id, source, phone_masked, series_name, status, created_at |
-| `dw.dim_city` | 城市维表，省份与大区归属 | 无 | city_code, city_name, province, region |
+| `dim.dim_city` | 城市维表，309 个城市 | 无 | city_code, city_name, province, region, city_level |
+| `dim.dim_store` | 门店维表，900+ 家 | 无 | store_code, store_name, city_code, city_name, channel, open_date, status |
+| `dim.dim_series` | 车系维表，62 个车系 | 无 | series_id, series_name, brand, energy_type, price_band |
+| `dim.dim_channel` | 渠道维表 | 无 | channel_code, channel_name, channel_type |
+| `dw.dw_order_detail` | 订单明细宽表，全渠道成交与退款订单 | `dt` | order_id, user_id, city_code, city, store_code, series_id, series_name, order_amount, discount_amount, order_status, channel_code, channel, create_time, dt |
+| `dw.dw_user_profile` | 用户画像宽表，基础属性与偏好车系 | 无 | user_id, gender, age, city_code, city, register_date, is_new_user, prefer_series_id, prefer_series |
+| `dm.dm_sales_daily` | 销售日报，由订单明细按日期+城市派生 | `dt` | dt, city_code, city, order_cnt, gmv, avg_price, refund_cnt |
+| `dm.dm_vehicle_visit` | 车系流量日报（30 天 × 62 车系） | `dt` | dt, series_id, series_name, pv, uv, clue_cnt |
+| `ods.ods_clue` | 线索明细，各渠道留资与跟进状态 | 无 | clue_id, series_id, series_name, city_code, city, source, status, created_at |
 
 所有表负责人都是 **严小序（工号 99999，yanxiaoxu99999@autohome.com.cn）**，搜「严小序」或「99999」能列出全部表。
 
-跨表字段可以关联：`dw_order_detail.user_id` ↔ `dw_user_profile.user_id`，`dm_vehicle_visit.series_name` ↔ `ods_clue.series_name`，`city` / `city_name` 是同城异名。
+可关联字段：`dw_order_detail.city_code` ↔ `dim_city.city_code`、`dw_order_detail.store_code` ↔ `dim_store.store_code`、
+`dw_order_detail.series_id` ↔ `dim_series.series_id`、`dw_order_detail.user_id` ↔ `dw_user_profile.user_id`。
+
+`dm_sales_daily` 由订单派生，因此两边 GMV 能交叉验证（日报按城市+日期分组后各自 `round2`，允许分位误差）。
+元信息里的 `row_count` 就是真实行数，与 `count(*)` 一致。
 
 ---
 
-## 4. SQL 的真实行为（重要）
+## 4. SQL 的真实行为
 
-这个 mock **只解析 SQL 的一小部分**，写 SQL 时按下面的规则预期结果：
+内置一个迷你 SQL 执行器（`sql.go`），够跑通分析链路：
 
 | SQL 写法 | 实际行为 |
 |---|---|
-| `select a, b from t` | 返回 `t` 的**全部列**，`select` 列表被忽略 |
-| `where` / `group by` / `order by` / 聚合函数 | **不生效**，返回样例行 |
-| `limit N` | **生效**：返回 N 行（默认 5，上限 200） |
-| `from a join b` | 只看第一个 `from`/`join` 后的表，join 本身不执行 |
-| 表名带库名、双引号包裹 | 支持：`dw.dim_city`、`"dw.dim_city"`；**不要用反引号**，解析不到表名会退化成 `result=1` |
+| `select a, b` / `select *` | **按列表裁剪**；`*` 返回主表全部列 |
+| `where` + `and/or/not`、`= != <> > >= < <=` | **生效** |
+| `in (...)`、`between a and b`、`like '%x%'`、`is [not] null` | **生效** |
+| `group by` + `count/sum/avg/min/max`（可 `as` 别名） | **生效** |
+| `order by ... [asc\|desc]`、`limit n [offset m]` | **生效**；`limit` 缺省 50，上限 200 |
+| `[inner\|left] join 表 on a.x = b.y` | **生效**（单条件等值连接） |
+| `distinct` | 生效 |
+| 子查询 / 窗口函数 / `case when` / `having` | **不支持**，返回语法错误 |
+| 表名带库名、反引号、双引号 | 支持：`dw.dim_city`、`` `dw.dim_city` ``、`"dw.dim_city"` |
 | 没有 `from`（如 `select 1`） | 返回单列 `result`，值 `1` |
 | 以写操作关键字开头（insert/update/delete/drop/create/truncate/alter/merge） | 失败：`当前账号为只读账号，不允许执行 DDL/DML，请只提交 SELECT 查询` |
 | SQL 中出现 `fail` / `error` / `boom` | 故意失败（测试异常分支用） |
-| 表名不存在 | 失败：`Table or view not found: xxx` |
+| 表名 / 字段名不存在 | 失败：`Table or view not found: xxx` / `Unknown column 'xxx'` |
 
-行内容是指定表的样例行**循环填充**到 `limit` 行，所以：
-
-- 行数不等于真实数据量，**不要据此下「共 N 条记录」的结论**
-- 大 `limit` 会出现重复行，去重后行数更少是正常现象
-- 需要「真实感」时用 `limit 5`~`20`，别写 `limit 1000`（会被截到 200）
-
-**写 SQL 的建议**：仍然写标准 Spark SQL（`select ... from 库.表 where 分区条件 limit N`），这样换成真实数仓时不用重写；只是要清楚 mock 目前不校验语义。
+**写 SQL 的建议**：写标准 Spark SQL（`select ... from 库.表 where ... group by ... limit N`），
+换成真实数仓时不用重写。数据量小（几百到几千行），但语义是真的——所以可以拿它验证
+「筛选条件选完后 SQL 是否只查了该查的数据」这类闭环问题。
 
 ---
 
@@ -329,6 +381,7 @@ MOCK_DC_TLS_KEY=./127.0.0.1+localhost-key.pem make mock-dc
   "auth": { "in": "header", "name": "Authorization", "mode": "jwt", "app": "mock_dc" },
   "tools": {
     "allow": [
+      "dim_list", "dim_lookup",
       "search_tables", "submit_query", "get_query_status",
       "get_query_result", "download_query_result"
     ]

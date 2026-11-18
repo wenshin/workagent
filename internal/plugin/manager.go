@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"path"
@@ -93,11 +94,20 @@ type instance struct {
 	Risk        int
 	SideEffects string
 	Tools       []tool.Tool
-	MCP         *mcpRuntime
+	// Internals 是智能体自带的技能页（agent.skills），路径相对空间 files/，
+	// 如 plugins/<slug>/skills/周报.md。只注入绑定该智能体的会话，不进空间索引。
+	Internals []tool.PluginEntry
+	MCP       *mcpRuntime
 	// Source 是 kind=source 的搜索源执行体；其它类型为 nil。
 	Source *sourceRuntime
 	// Global 表示来自系统空间的「全局安装」，对本空间只读可用。
 	Global bool
+	// ApprovalLevel 是这个插件在当前空间的审批档位（declared / always / off），
+	// 由安装配置决定，构造工具时落到每个 tool.Tool 上。
+	ApprovalLevel string
+	// Config 是清单 config 段声明、安装方填好的生效值（默认值已补齐），
+	// 脚本通过 wa.config() 取。构造实例时算一次，进程重建时重新算。
+	Config map[string]string
 }
 
 // ManifestOptions 返回已安装清单（HTTP 层透出用）。
@@ -135,6 +145,15 @@ type Item struct {
 	Blocked bool `json:"blocked"`
 	// BlockedReason 是未启用原因（人类可读），空表示没有阻塞。
 	BlockedReason string `json:"blocked_reason,omitempty"`
+	// Configurable 表示这个插件在安装层有可配置项：审批级别、MCP 的服务地址与鉴权、
+	// shell 的「需确认命令」名单。
+	//
+	// 由清单算出来，而不是让前端按 kind 判断——前端写死「kind=mcp 才有配置」
+	// 的时候，后端给 shell 补的字段就没有入口，功能做了却没人能用。
+	Configurable bool `json:"configurable"`
+	// ApprovalLevel 是这个插件当前生效的审批档位（declared / always / off）：
+	// 卡片上要能一眼看到「这个插件会不会拦我」。
+	ApprovalLevel string `json:"approval_level,omitempty"`
 }
 
 // DryRunResult 是试运行的回执：给作者看「它到底干了什么」。
@@ -318,6 +337,13 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 			// 安装副本只读，不再有「本地改动/基线合并」的概念，只提示上游版本。
 			item.UpdateAvailable = p.LatestVersion != "" && p.LatestVersion != in.Version
 		}
+		// 审批档位：卡片上要让安装方一眼看到「这个插件会不会拦我」。
+		//
+		// 判定条件是「这份清单有没有档位字段」，与配置入口用的是同一个函数——
+		// 两边各写一次就会出现「看得到档位、找不到改的地方」的卡片。
+		if meta, ok := metas[in.Slug]; ok && hasApprovalField(meta) {
+			item.ApprovalLevel = ApprovalLevelOf(in.Config)
+		}
 	}
 
 	out := make([]Item, 0, len(items))
@@ -340,6 +366,8 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 		if !ok {
 			continue
 		}
+		// 有可配置项的插件，卡片上才有「配置」按钮
+		out[i].Configurable = len(configFields(meta)) > 0
 		states, missing := m.secretStates(ctx, meta, cache)
 		out[i].Secrets = states
 		if len(missing) == 0 {
@@ -463,6 +491,8 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 			FS: fs, SpaceRoot: spaceDir, NetHosts: b.Meta.NetHosts(),
 			WSHosts: b.Meta.WSNetHosts(), OneShot: true,
 			Allow: allow, Verbs: verbs, Secrets: secrets,
+			// 试运行跑的是草稿：还没安装，拿不到安装值，只能是清单默认值
+			Config: b.Meta.ConfigDefaults(),
 		}, input)
 		if err != nil {
 			return res, err
@@ -498,6 +528,25 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 		}
 		if b.Meta.Agent != nil && len(b.Meta.Agent.Requires) > 0 {
 			detail += fmt.Sprintf("；依赖 %d 个插件", len(b.Meta.Agent.Requires))
+		}
+		// 自带件在试运行时就校验：坏了要在「写草稿」这一步暴露，
+		// 而不是等发布完、装进空间、会话里调不到工具才发现。
+		internals, err := validateAgentInternals(b)
+		if err != nil {
+			return res, err
+		}
+		if len(internals) > 0 {
+			names := make([]string, 0, len(internals))
+			maxRisk := risk
+			for _, meta := range internals {
+				r, _ := Derive(meta)
+				if r > maxRisk {
+					maxRisk = r
+				}
+				names = append(names, fmt.Sprintf("%s(L%d)", meta.Slug, r))
+			}
+			res.Risk = maxRisk
+			detail += fmt.Sprintf("；内置工具 %d 个：%s", len(internals), strings.Join(names, ", "))
 		}
 		res.Detail = detail
 	case KindComponent:
@@ -614,6 +663,20 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 		}
 	}
 	risk, _ := Derive(b.Meta)
+	// 自带工具的风险要算进发布快照：市场与安装确认读的就是这一列，
+	// 不聚合的话「只读智能体」和「顺手会写远端的智能体」长得一模一样。
+	// 自带件本身不单独发布，所以它们的校验也只能在这里做一次。
+	if b.Meta.Kind == KindAgent {
+		internals, err := validateAgentInternals(b)
+		if err != nil {
+			return store.PluginVersion{}, fmt.Errorf("%w：%s", ErrConflict, err)
+		}
+		for _, meta := range internals {
+			if r, _ := Derive(meta); r > risk {
+				risk = r
+			}
+		}
+	}
 	if risk >= policy.RiskSensitive && !isAdmin {
 		return store.PluginVersion{}, fmt.Errorf("%w：该插件同时使用密钥与外部写，需要系统管理员审批", ErrForbidden)
 	}
@@ -834,7 +897,9 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 	// 避免每个空间都存一份不可改的内容、也避免用户以为改了会生效。
 	// 系统空间安装要落副本：`系统空间/plugins/<slug>/` 就是「全局安装目录」，
 	// 管理员在文件树里能直接看到全局装了哪些插件（内容仍只读）。
-	if meta.IsExtensible() || globalScope {
+	// 带内置技能的智能体必须落副本：技能页对外路径是 plugins/<slug>/...，
+	// 没有副本就读不到（内置工具本身能从发布件目录跑，但技能页不行）。
+	if meta.IsExtensible() || globalScope || meta.HasAgentSkills() {
 		if err := m.ensureCopy(ctx, in.SpaceID, p.ID, in.Slug, v.Version, v.ArtifactPath, meta); err != nil {
 			rollback()
 			return store.PluginInstall{}, err
@@ -1203,6 +1268,29 @@ func (m *Manager) Tools(ctx context.Context, spaceID string) ([]tool.Tool, error
 	return out, nil
 }
 
+// AgentInternals 返回智能体自带的技能页（agent.skills）。
+//
+// 会话层把它并进 plugin_search 的候选，并写进该会话的系统提示词；别的智能体
+// 不会拿到这一份，因为它们根本不会来问这个 slug。智能体不存在（被停用/卸载）
+// 或没有内置技能时返回空，不报错——技能缺失不该让会话起不来。
+func (m *Manager) AgentInternals(ctx context.Context, spaceID, slug string) ([]tool.PluginEntry, error) {
+	if strings.TrimSpace(spaceID) == "" || strings.TrimSpace(slug) == "" {
+		return nil, nil
+	}
+	if err := m.ensureLoaded(ctx, spaceID); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	inst := m.inst[spaceID][slug]
+	m.mu.RUnlock()
+	if inst == nil || inst.Manifest.Kind != KindAgent {
+		return nil, nil
+	}
+	out := make([]tool.PluginEntry, len(inst.Internals))
+	copy(out, inst.Internals)
+	return out, nil
+}
+
 // ToolsFor 加载「借用插件」的工具：子会话继承发起方空间的智能体时使用。
 //
 // refs 里的插件按来源空间读文件与安装配置，实例归属 spaceID，所以执行期的文件
@@ -1325,6 +1413,8 @@ func (m *Manager) buildInstanceAt(ctx context.Context, runSpaceID, sourceSpaceID
 	inst := &instance{
 		SpaceID: runSpaceID, PluginID: pluginID, Slug: slug, Version: version,
 		Manifest: meta, Dir: dir, Risk: risk, SideEffects: effects,
+		ApprovalLevel: m.approvalLevelOf(ctx, sourceSpaceID, slug),
+		Config:        m.effectiveConfig(ctx, sourceSpaceID, slug, meta),
 	}
 	switch meta.Kind {
 	case KindTool, KindMCP:
@@ -1351,6 +1441,171 @@ func (m *Manager) buildInstanceAt(ctx context.Context, runSpaceID, sourceSpaceID
 			break
 		}
 		inst.Source = src
+	case KindAgent:
+		// 自带件跟着智能体实例一起构造：没有单独安装记录，停用/卸载智能体即失效。
+		inst.Internals, inst.Tools = m.agentInternals(ctx, runSpaceID, sourceSpaceID, inst)
+	}
+	return inst, nil
+}
+
+// agentInternals 加载智能体自带的技能页与内部工具。
+//
+// 技能只产出检索条目（正文仍按需 plugin_read），工具则挂到 inst.Tools 上——它们
+// 不是独立插件，没有安装记录，靠 tool.Tool.Agent 在会话侧按 agent_id 过滤。
+// 单条坏掉只跳过并告警：一个内部工具写错不该让整个空间的智能体都加载失败，
+// 发布与 plugin_try 已经把「坏」挡在入口了。
+func (m *Manager) agentInternals(ctx context.Context, runSpaceID, sourceSpaceID string, agent *instance) ([]tool.PluginEntry, []tool.Tool) {
+	spec := agent.Manifest.Agent
+	if spec == nil || agent.Dir == "" {
+		return nil, nil
+	}
+
+	var skills []tool.PluginEntry
+	// 技能页对外路径固定是 plugins/<slug>/...，只有安装副本正好在那个位置才对得上；
+	// 回落到发布件目录时读不到这条路径，宁可不给也不给一个读不了的路径。
+	if want := path.Join(m.o.Storage.SpaceKey(sourceSpaceID), "files", DraftDir, agent.Slug); agent.Dir == want {
+		seen := map[string]bool{}
+		for _, rel := range spec.Skills {
+			for _, e := range m.loadAgentSkillPages(ctx, agent, rel) {
+				// 一条声明目录、一条声明目录里的文件是常见写法，别在提示词里列两遍。
+				if seen[e.Path] {
+					continue
+				}
+				seen[e.Path] = true
+				skills = append(skills, e)
+			}
+		}
+	} else if len(spec.Skills) > 0 {
+		m.o.Logger.Warn("智能体技能页没有安装副本，跳过内置技能",
+			"agent", agent.Slug, "dir", agent.Dir)
+	}
+
+	var tools []tool.Tool
+	for _, rel := range spec.Tools {
+		ti, err := m.buildAgentTool(ctx, runSpaceID, sourceSpaceID, agent, rel)
+		if err != nil {
+			m.o.Logger.Warn("智能体内置工具加载失败",
+				"agent", agent.Slug, "path", rel, "err", err)
+			continue
+		}
+		tools = append(tools, ti.Tools...)
+	}
+	return skills, tools
+}
+
+// loadAgentSkillPages 把一条 agent.skills 声明展开成检索条目。
+func (m *Manager) loadAgentSkillPages(ctx context.Context, agent *instance, rel string) []tool.PluginEntry {
+	var pages []string
+	if st, err := m.o.Storage.Stat(ctx, path.Join(agent.Dir, rel)); err == nil && st.IsDir {
+		entries, err := m.o.Storage.List(ctx, path.Join(agent.Dir, rel))
+		if err != nil {
+			m.o.Logger.Warn("读取智能体技能目录失败",
+				"agent", agent.Slug, "path", rel, "err", err)
+			return nil
+		}
+		for _, e := range entries {
+			if e.IsDir {
+				continue
+			}
+			name := path.Base(e.Key)
+			if strings.HasPrefix(name, ".") || !strings.HasSuffix(strings.ToLower(name), ".md") {
+				continue
+			}
+			pages = append(pages, path.Join(rel, name))
+		}
+		sort.Strings(pages)
+		if len(pages) > maxAgentSkillFiles {
+			pages = pages[:maxAgentSkillFiles]
+		}
+	} else if strings.HasSuffix(strings.ToLower(rel), ".md") {
+		pages = []string{rel}
+	}
+	if len(pages) == 0 {
+		return nil
+	}
+
+	out := make([]tool.PluginEntry, 0, len(pages))
+	for _, p := range pages {
+		body, err := readFileLimited(ctx, m.o.Storage, path.Join(agent.Dir, p), maxAgentSkillBytes)
+		if err != nil {
+			m.o.Logger.Warn("读取智能体技能页失败",
+				"agent", agent.Slug, "path", p, "err", err)
+			continue
+		}
+		name, desc := agentSkillMeta(p, string(body))
+		out = append(out, tool.PluginEntry{
+			Kind:        tool.KindSkills,
+			Name:        name,
+			Description: desc,
+			// 正文按安装副本读：plugin_read 的 plugins/ 回落对系统空间智能体也成立。
+			Path:   path.Join(DraftDir, agent.Slug, p),
+			Source: tool.SourceAgent,
+		})
+	}
+	return out
+}
+
+// readFileLimited 读一个小文件，超过上限直接报错而不是悄悄截断：
+// 技能页被截断后 plugin_read 读到的仍是全文，模型会以为看到的是完整内容。
+func readFileLimited(ctx context.Context, st storage.Storage, key string, limit int64) ([]byte, error) {
+	f, err := st.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	body, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("文件超过 %dKB", limit>>10)
+	}
+	return body, nil
+}
+
+// buildAgentTool 把 agent.tools 里的一个目录构造成内部工具实例。
+func (m *Manager) buildAgentTool(ctx context.Context, runSpaceID, sourceSpaceID string, agent *instance, rel string) (*instance, error) {
+	dir := path.Join(agent.Dir, rel)
+	raw, err := m.o.Storage.Get(ctx, path.Join(dir, ManifestFile))
+	if err != nil {
+		return nil, fmt.Errorf("缺少 %s：%w", ManifestFile, err)
+	}
+	body, err := io.ReadAll(io.LimitReader(raw, maxBundleBytes))
+	_ = raw.Close()
+	if err != nil {
+		return nil, err
+	}
+	meta, err := Parse(body, false)
+	if err != nil {
+		return nil, err
+	}
+	if meta.Kind != KindTool {
+		return nil, fmt.Errorf("必须是 tool 插件，收到 %s", meta.Kind)
+	}
+	if meta.Builtin {
+		return nil, fmt.Errorf("不能使用平台内置件")
+	}
+	// 与智能体同名的子工具拼出来会和智能体 slug 撞名，前缀一下保证工具名可读且唯一。
+	child := meta.Slug
+	if child == agent.Slug {
+		child = "tool_" + child
+	}
+	inst := &instance{
+		SpaceID:  runSpaceID,
+		PluginID: agent.PluginID,
+		Slug:     ToolName(agent.Slug, child),
+		Version:  agent.Version,
+		Manifest: meta,
+		Dir:      dir,
+		Global:   agent.Global,
+		// 内置工具没有安装记录，也就没有安装级配置与档位，取清单默认值。
+		ApprovalLevel: m.approvalLevelOf(ctx, sourceSpaceID, ToolName(agent.Slug, child)),
+		Config:        m.effectiveConfig(ctx, sourceSpaceID, ToolName(agent.Slug, child), meta),
+	}
+	inst.Risk, inst.SideEffects = Derive(meta)
+	inst.Tools = m.toolTools(inst)
+	for i := range inst.Tools {
+		inst.Tools[i].Agent = agent.Slug
 	}
 	return inst, nil
 }
@@ -1370,6 +1625,7 @@ func (m *Manager) toolTools(inst *instance) []tool.Tool {
 		SideEffects:    inst.SideEffects,
 		Runtime:        "plugin",
 		NetworkWrite:   meta.WritesRemote(),
+		ApprovalLevel:  inst.ApprovalLevel,
 		MaxResultBytes: meta.Limits.MaxResultBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
 			return m.invokeTool(ctx, inst, args, env)
@@ -1421,8 +1677,10 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 			SideEffects:  inst.SideEffects,
 			Runtime:      "plugin",
 			NetworkWrite: inst.Manifest.WritesRemote(),
-			ServerID:     inst.PluginID,
-			ServerName:   inst.Slug,
+			// 名单来自发布快照，档位来自安装配置：安装方能改的是后者。
+			ApprovalLevel: inst.ApprovalLevel,
+			ServerID:      inst.PluginID,
+			ServerName:    inst.Slug,
 			Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
 				return inst.MCP.call(ctx, remote, args, env)
 			},
@@ -1443,6 +1701,7 @@ func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawM
 		UserID: env.UserID, Slug: inst.Slug, FS: fs, SpaceRoot: spaceDir,
 		NetHosts: inst.Manifest.NetHosts(), WSHosts: inst.Manifest.WSNetHosts(),
 		Allow: allow, Verbs: verbs, Secrets: secrets,
+		Config: inst.Config,
 		// 默认一次性：跑完即退，不占常驻池。声明 runtime.resident 才复用进程。
 		OneShot: !inst.Manifest.Runtime.Resident,
 	}, args)
@@ -1458,6 +1717,12 @@ func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawM
 // （MCP 是已注册），安装动作本身就是授权。
 func (m *Manager) registerTools(ctx context.Context, inst *instance) error {
 	for _, t := range inst.Tools {
+		// 智能体自带工具没有安装记录，也不该进工具银行：它的可见性由
+		// tool.Tool.Agent + 会话的 agent_id 决定，写进库里就等于给了它一个
+		// 全空间可见的身份。
+		if t.Agent != "" {
+			continue
+		}
 		if err := m.o.Store.UpsertCapability(ctx, store.Capability{
 			Name: t.Name, Description: t.Description, InputSchema: t.Parameters,
 			RiskLevel: t.Risk, SideEffects: t.SideEffects,

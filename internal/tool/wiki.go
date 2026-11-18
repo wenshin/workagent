@@ -18,7 +18,13 @@ import (
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
-// 企业 wiki：跨空间共享的 markdown 知识区，固定落在系统空间的 files/wiki/ 下。
+// 企业 wiki：跨空间共享的 markdown 知识区，固定落在系统空间的 files/wiki/ 下，
+// 并在里面按智能体分区——每个智能体独占 files/wiki/<智能体 slug>/，工具参数里的
+// path 一律相对这个目录。
+//
+// 为什么按智能体分区：不同智能体的口径、模板、结论文档是各自的事，混在一个池子里
+// 会互相污染（同一个「分析口径」在两个智能体下可能完全不同）。分区的边界又与写者
+// 天然对齐：写的一方就是会话绑定的那个智能体，所以不需要再引入一套页级 ACL。
 //
 // 为什么不让它跟着空间走：知识一旦按空间分家，同一个企业会出现 N 份互不相通的口径，
 // 而这恰恰是 wiki 要解决的问题。所以宿主固定为系统空间，工具参数里没有 space 维度。
@@ -46,7 +52,7 @@ const (
 //
 // file_* 的根是当前空间，直接放行会让用户在各自空间里长出一份同名 wiki，
 // 与系统空间那份形成事实上的两个知识库，且两边都以为自己是权威。
-var errWikiPath = errors.New("wiki/ 是企业公共知识区，请改用 wiki_list / wiki_read / wiki_write / wiki_search")
+var errWikiPath = errors.New("wiki/ 是智能体的知识页区，请改用 wiki_list / wiki_read / wiki_write / wiki_search")
 
 func isWikiPath(rel string) bool {
 	return rel == wikiRoot || strings.HasPrefix(rel, wikiRoot+"/")
@@ -62,15 +68,33 @@ func lockWiki(key string) func() {
 	return mu.Unlock
 }
 
-// wikiReady 检查 wiki 宿主是否可用。缺失时明确报错而不是静默降级。
-func wikiReady(env Env) error {
+// wikiReady 检查 wiki 是否可用，并返回当前智能体的分区目录名。
+//
+// 缺宿主空间或缺智能体都明确报错而不是静默降级：前者说明平台还没初始化，
+// 后者说明这一轮不知道该读写哪一份知识，随便挑一个目录只会让口径串味。
+func wikiReady(env Env) (string, error) {
 	if env.Storage == nil {
-		return fmt.Errorf("文件存储不可用")
+		return "", fmt.Errorf("文件存储不可用")
 	}
 	if env.WikiSpaceID == "" {
-		return fmt.Errorf("企业 wiki 不可用：平台还没初始化系统空间（需要系统管理员登录一次）")
+		return "", fmt.Errorf("企业 wiki 不可用：平台还没初始化系统空间（需要系统管理员登录一次）")
 	}
-	return nil
+	return wikiAgentDir(env.AgentID)
+}
+
+// wikiAgentDir 校验并返回智能体分区目录名（就是智能体插件 slug）。
+//
+// 它会被拼进存储 key，所以按路径段校验：不允许空、不允许带分隔符、不允许隐藏段，
+// 否则一个手滑的 agent_id 就能把知识写到别的分区、甚至跳出 wiki/ 目录。
+func wikiAgentDir(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", fmt.Errorf("企业 wiki 不可用：当前会话没有绑定智能体")
+	}
+	if name == "." || name == ".." || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) {
+		return "", fmt.Errorf("企业 wiki 不可用：会话绑定的智能体标识非法（%q）", raw)
+	}
+	return name, nil
 }
 
 // wikiRel 校验 wiki 内的相对路径：复用工作区的越界与隐藏文件规则，再加深度与后缀。
@@ -101,8 +125,10 @@ func depthOfRel(rel string) int {
 	return strings.Count(rel, "/") + 1
 }
 
-func wikiKey(env Env, rel string) string {
-	return path.Join(env.Storage.SpaceKey(env.WikiSpaceID), workspaceFilesDir, wikiRoot, rel)
+// wikiKey 拼出存储 key：spaces/{系统空间}/files/wiki/{智能体}/{rel}。
+// agentDir 必须来自 wikiReady，不能直接取 env.AgentID（未经校验的标识会跳出分区）。
+func wikiKey(env Env, agentDir, rel string) string {
+	return path.Join(env.Storage.SpaceKey(env.WikiSpaceID), workspaceFilesDir, wikiRoot, agentDir, rel)
 }
 
 // contentVersion 是页面版本指纹：取内容 sha256 前 8 字节。
@@ -141,12 +167,12 @@ func readWikiFile(ctx context.Context, env Env, key string) (string, bool, error
 	return string(b), true, nil
 }
 
-// walkWiki 递归收集 markdown 页面，返回相对 wiki 根的路径。
-func walkWiki(ctx context.Context, env Env, dirRel string) ([]wikiEntry, error) {
+// walkWiki 递归收集某个智能体分区下的 markdown 页面，返回相对该分区的路径。
+func walkWiki(ctx context.Context, env Env, agentDir, dirRel string) ([]wikiEntry, error) {
 	out := make([]wikiEntry, 0, 16)
 	var walk func(rel string) error
 	walk = func(rel string) error {
-		entries, err := env.Storage.List(ctx, wikiKey(env, rel))
+		entries, err := env.Storage.List(ctx, wikiKey(env, agentDir, rel))
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil
@@ -192,7 +218,7 @@ func wikiList() Tool {
 	return Tool{
 		Name:       "wiki_list",
 		Capability: "wiki.list",
-		Description: "列出企业 wiki 里的页面（跨空间共享，宿主是系统空间）。" +
+		Description: "列出当前智能体知识目录（wiki/<智能体>/）里的页面，路径相对该目录；别的智能体的页面看不到。" +
 			"写之前先 list 一遍，避免给同一个主题新建重复页面。",
 		Parameters: json.RawMessage(`{
   "type": "object",
@@ -205,7 +231,8 @@ func wikiList() Tool {
 		SideEffects: policy.SideEffectsReadOnly,
 		Runtime:     "builtin",
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if err := wikiReady(env); err != nil {
+			agentDir, err := wikiReady(env)
+			if err != nil {
 				return "", err
 			}
 			var in struct {
@@ -221,12 +248,12 @@ func wikiList() Tool {
 				return "", err
 			}
 
-			pages, err := walkWiki(ctx, env, rel)
+			pages, err := walkWiki(ctx, env, agentDir, rel)
 			if err != nil {
 				return "", err
 			}
 			if len(pages) == 0 {
-				return "wiki 里还没有页面。", nil
+				return fmt.Sprintf("智能体 %s 的知识目录（wiki/%s/）里还没有页面。", agentDir, agentDir), nil
 			}
 
 			rows := make([]map[string]any, 0, len(pages))
@@ -246,12 +273,12 @@ func wikiRead() Tool {
 	return Tool{
 		Name:       "wiki_read",
 		Capability: "wiki.read",
-		Description: "读取企业 wiki 的单个页面，返回正文与 version。" +
+		Description: "读取当前智能体知识目录下的单个页面（path 相对 wiki/<智能体>/），返回正文与 version。" +
 			"overwrite 前必须先用本工具拿到 version，否则并发修改会被覆盖。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "相对 wiki 根的路径，如 topics/报销制度.md"},
+    "path": {"type": "string", "description": "相对当前智能体知识目录的路径，如 topics/报销制度.md"},
     "offset": {"type": "integer", "description": "起始字节偏移，默认 0；长页面分段读"},
     "limit": {"type": "integer", "description": "本次最多读取的字节数，默认 16384，最大 24576"}
   },
@@ -263,7 +290,8 @@ func wikiRead() Tool {
 		Runtime:        "builtin",
 		MaxResultBytes: maxReadBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if err := wikiReady(env); err != nil {
+			agentDir, err := wikiReady(env)
+			if err != nil {
 				return "", err
 			}
 			var in struct {
@@ -279,12 +307,12 @@ func wikiRead() Tool {
 				return "", err
 			}
 
-			body, exists, err := readWikiFile(ctx, env, wikiKey(env, rel))
+			body, exists, err := readWikiFile(ctx, env, wikiKey(env, agentDir, rel))
 			if err != nil {
 				return "", err
 			}
 			if !exists {
-				return "", fmt.Errorf("页面不存在：%s；可用 wiki_list 查看现有页面", rel)
+				return "", fmt.Errorf("页面不存在：wiki/%s/%s；可用 wiki_list 查看当前智能体有哪些页面", agentDir, rel)
 			}
 
 			version := contentVersion(body)
@@ -309,7 +337,8 @@ func wikiRead() Tool {
 			}
 
 			var b strings.Builder
-			fmt.Fprintf(&b, "path: %s\nversion: %s\nsize: %d bytes, %d lines\n", rel, version, len(body), strings.Count(body, "\n")+1)
+			fmt.Fprintf(&b, "path: %s\nagent: %s\nversion: %s\nsize: %d bytes, %d lines\n",
+				rel, agentDir, version, len(body), strings.Count(body, "\n")+1)
 			if offset > 0 || truncated {
 				fmt.Fprintf(&b, "range: %d-%d\n", offset, end)
 			}
@@ -327,7 +356,8 @@ func wikiWrite() Tool {
 	return Tool{
 		Name:       "wiki_write",
 		Capability: "wiki.write",
-		Description: "写入企业 wiki 页面（跨空间共享）。团队知识——分析口径、业务流程、结论纪要、可复用 SQL—— 用它沉淀，" +
+		Description: "写入当前智能体的知识页（跨空间共享、按智能体隔离：path 相对 wiki/<智能体>/，别的智能体的页面写不进去）。" +
+			"团队知识——分析口径、业务流程、结论纪要、可复用 SQL—— 用它沉淀，" +
 			"不要在当前空间用 file_write 自建 knowledge/ 之类的知识目录。" +
 			"mode：create 仅新建 / overwrite 覆盖（默认）/ append 追加。" +
 			"覆盖已有页面时务必带上 wiki_read 返回的 if_version，被他人改过会报冲突；" +
@@ -335,7 +365,7 @@ func wikiWrite() Tool {
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "path": {"type": "string", "description": "相对 wiki 根的路径，如 topics/报销制度.md"},
+    "path": {"type": "string", "description": "相对当前智能体知识目录的路径，如 topics/报销制度.md"},
     "content": {"type": "string", "description": "要写入的完整 markdown 内容"},
     "mode": {"type": "string", "enum": ["create", "overwrite", "append"], "description": "写入方式，默认 overwrite"},
     "if_version": {"type": "string", "description": "可选，覆盖前校验版本；不匹配则拒绝写入"}
@@ -348,7 +378,8 @@ func wikiWrite() Tool {
 		SideEffects: policy.SideEffectsShared,
 		Runtime:     "builtin",
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if err := wikiReady(env); err != nil {
+			agentDir, err := wikiReady(env)
+			if err != nil {
 				return "", err
 			}
 			var in struct {
@@ -365,7 +396,7 @@ func wikiWrite() Tool {
 				return "", err
 			}
 
-			key := wikiKey(env, rel)
+			key := wikiKey(env, agentDir, rel)
 			unlock := lockWiki(key)
 			defer unlock()
 
@@ -413,7 +444,8 @@ func wikiWrite() Tool {
 				return "", err
 			}
 
-			return fmt.Sprintf("已写入 wiki/%s（%d 字节，mode=%s，version=%s）", rel, len(body), mode, contentVersion(body)), nil
+			return fmt.Sprintf("已写入 wiki/%s/%s（%d 字节，mode=%s，version=%s）",
+				agentDir, rel, len(body), mode, contentVersion(body)), nil
 		},
 	}
 }
@@ -422,8 +454,8 @@ func wikiSearch() Tool {
 	return Tool{
 		Name:       "wiki_search",
 		Capability: "wiki.search",
-		Description: "在整站 wiki 里按关键词找页面和所在行，适合回答前定位「这件事记在哪个页面」。" +
-			"命中结果给出 path，再用 wiki_read 读全文。",
+		Description: "在当前智能体的知识目录里按关键词找页面和所在行，适合回答前定位「这件事记在哪个页面」。" +
+			"命中结果给出 path，再用 wiki_read 读全文；别的智能体的知识不在检索范围内。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -437,7 +469,8 @@ func wikiSearch() Tool {
 		SideEffects: policy.SideEffectsReadOnly,
 		Runtime:     "builtin",
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
-			if err := wikiReady(env); err != nil {
+			agentDir, err := wikiReady(env)
+			if err != nil {
 				return "", err
 			}
 			var in struct {
@@ -459,12 +492,12 @@ func wikiSearch() Tool {
 				limit = 20
 			}
 
-			pages, err := walkWiki(ctx, env, "")
+			pages, err := walkWiki(ctx, env, agentDir, "")
 			if err != nil {
 				return "", err
 			}
 			if len(pages) == 0 {
-				return "wiki 里还没有页面。", nil
+				return fmt.Sprintf("智能体 %s 的知识目录（wiki/%s/）里还没有页面。", agentDir, agentDir), nil
 			}
 
 			needle := strings.ToLower(query)
@@ -473,7 +506,7 @@ func wikiSearch() Tool {
 				if len(hits) >= limit {
 					break
 				}
-				body, exists, err := readWikiFile(ctx, env, wikiKey(env, page.Path))
+				body, exists, err := readWikiFile(ctx, env, wikiKey(env, agentDir, page.Path))
 				if err != nil || !exists {
 					continue
 				}
@@ -492,7 +525,7 @@ func wikiSearch() Tool {
 				}
 			}
 			if len(hits) == 0 {
-				return fmt.Sprintf("没有页面命中 %q；可用 wiki_list 浏览全部页面。", query), nil
+				return fmt.Sprintf("没有页面命中 %q；可用 wiki_list 浏览智能体 %s 的全部页面。", query, agentDir), nil
 			}
 			return marshalLimited(hits, 8*1024), nil
 		},

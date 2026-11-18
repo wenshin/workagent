@@ -136,7 +136,11 @@ type sessionDTO struct {
 	// AgentSpaceID 是智能体所属空间，空表示与会话同空间；子任务会话指向发起方空间
 	AgentSpaceID string `json:"agent_space_id,omitempty"`
 	// AgentVersion 是创建时绑定的版本
-	AgentVersion  string  `json:"agent_version,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+	// AgentName / AgentIconURL 是会话列表渲染用的智能体展示信息；
+	// 无绑定时为空，前端回落到普通会话图标。
+	AgentName     string  `json:"agent_name,omitempty"`
+	AgentIconURL  string  `json:"agent_icon_url,omitempty"`
 	Status        string  `json:"status"`
 	LastMessageAt *string `json:"last_message_at"`
 	CreatedAt     string  `json:"created_at"`
@@ -218,7 +222,7 @@ func (h *Handler) listBySpace(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"sessions": sessionDTOs(list)})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"sessions": h.sessionDTOs(r.Context(), list)})
 }
 
 func (h *Handler) listMine(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +235,7 @@ func (h *Handler) listMine(w http.ResponseWriter, r *http.Request) {
 		h.writeErr(w, r, err)
 		return
 	}
-	platform.WriteJSON(w, http.StatusOK, map[string]any{"sessions": sessionDTOs(list)})
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"sessions": h.sessionDTOs(r.Context(), list)})
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -947,10 +951,26 @@ func userFacingAgentError(err error) string {
 	}
 }
 
-func sessionDTOs(list []store.Session) []sessionDTO {
+// sessionDTOs 把会话转成 DTO，并补上智能体的名称与头像地址。
+//
+// 会话列表要按智能体渲染图标，而会话行里只固化了 slug：逐个会话去查插件快照
+// 代价太高，这里按「来源空间」去重后批量解析一次。
+func (h *Handler) sessionDTOs(ctx context.Context, list []store.Session) []sessionDTO {
+	badges := h.svc.AgentBadges(ctx, list)
 	out := make([]sessionDTO, 0, len(list))
 	for _, s := range list {
-		out = append(out, toDTO(s))
+		dto := toDTO(s)
+		if s.AgentID != "" {
+			spaceID := s.SpaceID
+			if s.AgentSpaceID != "" {
+				spaceID = s.AgentSpaceID
+			}
+			if b, ok := badges[spaceID+"\x00"+s.AgentID]; ok {
+				dto.AgentName = b.Name
+				dto.AgentIconURL = b.IconURL
+			}
+		}
+		out = append(out, dto)
 	}
 	return out
 }

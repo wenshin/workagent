@@ -2,8 +2,11 @@ package plugin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -61,6 +64,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/dismiss", h.dismissUpdate)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/data", h.data)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/ui", h.ui)
+	// 智能体头像：读走空间 read（会话列表要渲染），写走空间 write（只能改草稿）
+	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/icon", h.agentIcon)
+	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/icon", h.uploadAgentIcon)
+	mux.HandleFunc("DELETE /spaces/{id}/plugins/{slug}/icon", h.removeAgentIcon)
 	// 插件市场：全部已发布插件，只读。
 	mux.HandleFunc("GET /plugins", h.catalog)
 }
@@ -514,6 +521,73 @@ func (h *Handler) ui(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, view)
 }
 
+// agentIcon 返回智能体头像。
+//
+// 头像在会话列表里每个会话都要渲染，所以允许浏览器缓存；地址里的 v 是文件
+// 修改时间，换头像即换地址，不会出现「改完还是旧图」。
+func (h *Handler) agentIcon(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.guard(w, r, "read"); !ok {
+		return
+	}
+	data, contentType, err := h.mgr.AgentIcon(r.Context(), r.PathValue("id"), r.PathValue("slug"))
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	sum := sha256.Sum256(data)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=300, must-revalidate")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+// uploadAgentIcon 收头像原图：裁剪与压缩都在服务端再做一次，
+// 前端算错或直接打接口都不会把大图落进空间。
+func (h *Handler) uploadAgentIcon(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.guard(w, r, "write"); !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxAgentIconSourceBytes+(1<<20))
+	if err := r.ParseMultipartForm(maxAgentIconSourceBytes); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请以 multipart/form-data 上传，字段名 icon")
+		return
+	}
+	file, _, err := r.FormFile("icon")
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "missing_icon", "缺少图片字段 icon")
+		return
+	}
+	defer func() { _ = file.Close() }()
+
+	raw, err := io.ReadAll(io.LimitReader(file, maxAgentIconSourceBytes+1))
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	iconURL, err := h.mgr.SetAgentIcon(r.Context(), r.PathValue("id"), r.PathValue("slug"), raw)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{"icon_url": iconURL})
+}
+
+func (h *Handler) removeAgentIcon(w http.ResponseWriter, r *http.Request) {
+	if _, _, ok := h.guard(w, r, "write"); !ok {
+		return
+	}
+	if err := h.mgr.ClearAgentIcon(r.Context(), r.PathValue("id"), r.PathValue("slug")); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // guard 校验空间权限，返回用户与实际权限。
 func (h *Handler) guard(w http.ResponseWriter, r *http.Request, need string) (store.User, string, bool) {
 	user, err := h.resolve(r)
@@ -567,7 +641,7 @@ func isValidation(err error) bool {
 	for _, kw := range []string{
 		"清单", "slug", "必须", "不允许", "只能是", "超过", "schema",
 		"protocol", "kind", "capability", "hosts", "tools.allow", "transport", "未知配置项",
-		"缺少 plugin.json", "体积",
+		"缺少 plugin.json", "体积", "头像",
 	} {
 		if strings.Contains(msg, kw) {
 			return true

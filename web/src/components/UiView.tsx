@@ -1,3 +1,5 @@
+import { Select as SemiSelect } from '@douyinfe/semi-ui';
+import { useEffect } from 'react';
 import type { ReactNode } from 'react';
 
 import type { UiAction, UiCond, UiNode } from '../api/types';
@@ -96,6 +98,13 @@ export function checkWhen(cond: UiCond | undefined, ctx: UiBindings): boolean {
       return Number(actual) < Number(cond.value);
     case 'in':
       return Array.isArray(cond.value) && cond.value.some((v) => looseEqual(actual, v));
+    case 'empty':
+      return (
+        actual === undefined ||
+        actual === null ||
+        actual === '' ||
+        (Array.isArray(actual) && actual.length === 0)
+      );
     default:
       return true;
   }
@@ -240,11 +249,18 @@ function renderNode(node: UiNode, rt: UiRuntime): ReactNode {
     case 'Input': {
       const name = asText(node.name);
       const label = text(node, 'label', rt);
+      const kind = asText(node.input_type) || 'text';
       return (
         <label className="ui-field">
-          {label ? <span className="ui-field-label">{label}</span> : null}
+          {label ? (
+            <span className="ui-field-label">
+              {label}
+              {node.required === true ? <span className="ui-field-required">*</span> : null}
+            </span>
+          ) : null}
           <input
             className="ui-input"
+            type={kind === 'number' ? 'number' : kind === 'date' ? 'date' : 'text'}
             value={asText(rt.state[name])}
             placeholder={text(node, 'placeholder', rt)}
             onChange={(e) => rt.setState(name, e.target.value)}
@@ -252,30 +268,8 @@ function renderNode(node: UiNode, rt: UiRuntime): ReactNode {
         </label>
       );
     }
-    case 'Select': {
-      const name = asText(node.name);
-      const label = text(node, 'label', rt);
-      const options = Array.isArray(node.options) ? (node.options as Array<Record<string, unknown>>) : [];
-      return (
-        <label className="ui-field">
-          {label ? <span className="ui-field-label">{label}</span> : null}
-          <select
-            className="ui-input"
-            value={asText(rt.state[name])}
-            onChange={(e) => rt.setState(name, e.target.value)}
-          >
-            {options.map((opt, i) => {
-              const value = asText(opt.value);
-              return (
-                <option key={i} value={value}>
-                  {asText(opt.label) || value}
-                </option>
-              );
-            })}
-          </select>
-        </label>
-      );
-    }
+    case 'Select':
+      return <SelectNode node={node} rt={rt} />;
     case 'Tabs': {
       const name = asText(node.name);
       const active = asText(rt.state[name]);
@@ -333,6 +327,118 @@ function renderList(node: UiNode, rt: UiRuntime): ReactNode {
         );
       })}
     </ul>
+  );
+}
+
+interface UiOptionFrom {
+  source: string;
+  items?: string;
+  label: string;
+  value: string;
+  /** 下拉自带搜索框写入的 state 键，配合 data.watch 做远程搜索 */
+  search?: string;
+}
+
+interface UiOption {
+  label: string;
+  value: string;
+}
+
+/** 按 `a.b.c` 取值；数组下标写成数字段即可（rows.0.name）。 */
+function readField(record: unknown, path: string): unknown {
+  let cur = record;
+  for (const part of path.split('.')) {
+    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return cur;
+}
+
+function asList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => asText(v));
+  const single = asText(value);
+  return single ? [single] : [];
+}
+
+function literalOptions(node: UiNode): UiOption[] {
+  const raw = Array.isArray(node.options) ? (node.options as Array<Record<string, unknown>>) : [];
+  return raw.map((opt) => ({
+    label: asText(opt.label) || asText(opt.value),
+    value: asText(opt.value),
+  }));
+}
+
+/** 候选来自数据源：items 是数组所在路径，label / value 是每一项里的字段名。 */
+function dynamicOptions(rt: UiRuntime, from: UiOptionFrom): UiOption[] {
+  const payload = rt.data[from.source];
+  const container = from.items ? readField(payload, from.items) : Array.isArray(payload) ? payload : readField(payload, 'items');
+  if (!Array.isArray(container)) return [];
+  const out: UiOption[] = [];
+  for (const item of container) {
+    const value = asText(readField(item, from.value));
+    if (!value) continue;
+    out.push({ value, label: asText(readField(item, from.label)) || value });
+  }
+  return out;
+}
+
+/**
+ * Select 的候选有两种来源：字面量 options，或 data 里某个只读数据源的 items。
+ * 后者不自己发请求——取数只走 UiBlock 的 data 管线，这样刷新、错误、loading 只有一份。
+ */
+function SelectNode({ node, rt }: { node: UiNode; rt: UiRuntime }) {
+  const name = asText(node.name);
+  const label = text(node, 'label', rt);
+  const multiple = node.multiple === true;
+  const max = Number(node.max) || 0;
+  const from = node.options_from as UiOptionFrom | undefined;
+  const options = from ? dynamicOptions(rt, from) : literalOptions(node);
+  const current = multiple ? asList(rt.state[name]) : asText(rt.state[name]);
+  const labelName = asText(node.label_name);
+  const optionsKey = JSON.stringify(options);
+  const valueKey = JSON.stringify(current);
+
+  // label_name 存展示名：模型提交时要 id 拼 SQL、要名称复述，反查只在这里做一次。
+  useEffect(() => {
+    if (!labelName) return;
+    const picked = multiple ? (current as string[]) : current ? [current as string] : [];
+    const labels = picked.map((v) => options.find((o) => o.value === v)?.label ?? v);
+    const next = multiple ? labels : labels[0] ?? '';
+    if (JSON.stringify(next) !== JSON.stringify(rt.state[labelName])) rt.setState(labelName, next);
+  }, [labelName, multiple, optionsKey, valueKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <label className="ui-field">
+      {label ? (
+        <span className="ui-field-label">
+          {label}
+          {node.required === true ? <span className="ui-field-required">*</span> : null}
+        </span>
+      ) : null}
+      <SemiSelect
+        style={{ width: '100%' }}
+        value={multiple ? current : current || undefined}
+        optionList={options.map((o) => ({ label: o.label, value: o.value }))}
+        multiple={multiple}
+        filter
+        showClear
+        maxTagCount={6}
+        placeholder={text(node, 'placeholder', rt) || '请选择'}
+        emptyContent={<div className="ui-empty">{text(node, 'empty', rt) || '暂无可选项'}</div>}
+        onSearch={(keyword: string) => {
+          if (from?.search) rt.setState(from.search, keyword);
+        }}
+        onChange={(value: unknown) => {
+          if (multiple) {
+            let picked = Array.isArray(value) ? value.map((v) => asText(v)) : [];
+            if (max > 0 && picked.length > max) picked = picked.slice(0, max);
+            rt.setState(name, picked);
+            return;
+          }
+          rt.setState(name, asText(value));
+        }}
+      />
+    </label>
   );
 }
 

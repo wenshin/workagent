@@ -57,6 +57,10 @@ type Env struct {
 	// 为空表示平台还没初始化系统空间：此时 wiki 工具明确报不可用，不退回当前空间，
 	// 否则每个空间都会长出一份同名 wiki，知识反而分裂。
 	WikiSpaceID string
+	// AgentID 是当前会话绑定的智能体（插件 slug）。wiki 在宿主空间里再按它分区：
+	// 每个智能体独占 files/wiki/<AgentID>/，工具参数里的 path 一律相对该目录。
+	// 为空表示不知道写哪一份，wiki 工具明确报不可用，而不是落到某个公共目录。
+	AgentID string
 
 	Store   store.Store
 	Storage storage.Storage
@@ -170,10 +174,16 @@ type Tool struct {
 	// ShellApproval 是「命中就需要确认」的命令名单，只对 shell 类工具有意义。
 	// 为空表示不是 shell 工具；内置 shell_exec 用 DefaultApprovalCommands。
 	ShellApproval []string
+	// ApprovalLevel 是安装方给这个插件定的审批档位（declared / always / off）。
+	// 空值与非法值都按 declared 处理，见 NormalizeApprovalLevel。
+	ApprovalLevel string
 
 	// MaxResultBytes 是回填给模型的单次结果上限（默认 4KB）。
 	// 读类工具（file_read / plugin_read）可申请更高额度，避免长文档被无谓截断。
 	MaxResultBytes int
+	// Agent 是自带工具的归属智能体 slug（agent.tools 声明的那批）。空表示空间级
+	// 插件；非空时只有绑定了该智能体的会话才看得到——按 Env.AgentID 精确匹配过滤。
+	Agent string
 
 	Invoke func(ctx context.Context, args json.RawMessage, env Env) (string, error)
 }
@@ -255,16 +265,21 @@ func NewRegistry(st store.Store, mcp MCPProvider, log *slog.Logger) *Registry {
 // query 为用户本轮输入，仅在工具数量超过上限时用于相关性裁剪。
 func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, error) {
 	tools := builtinTools()
-	off, shellCmds, hasShellCfg := r.builtinPolicy(ctx)
-	if len(off) > 0 {
-		tools = withoutTools(tools, off)
+	pol := r.builtinPolicy(ctx)
+	if len(pol.disabled) > 0 {
+		tools = withoutTools(tools, pol.disabled)
 	}
-	if hasShellCfg {
-		// 安装级配置覆盖默认名单；空切片表示「一条都不确认」。
-		for i := range tools {
-			if tools[i].Name == "shell_exec" {
-				tools[i].ShellApproval = shellCmds
-			}
+	for i := range tools {
+		// 档位对每个内置工具都生效（没配过的保持默认档），名单只有 shell 有
+		if lv, ok := pol.levels[tools[i].Name]; ok {
+			tools[i].ApprovalLevel = lv
+		}
+		if tools[i].Name != "shell_exec" {
+			continue
+		}
+		if pol.hasShellCfg {
+			// 安装级配置覆盖默认名单；空切片表示「一条都不确认」。
+			tools[i].ShellApproval = pol.shellCmds
 		}
 	}
 	if r.mcp != nil {
@@ -299,6 +314,11 @@ func (r *Registry) Load(ctx context.Context, env Env, query string) ([]Tool, err
 		}
 	}
 
+	// 智能体自带工具（agent.tools）只给绑定它的会话：按 Env.AgentID 精确过滤，
+	// 而不是靠「装没装」判断——它们本来就没有安装记录。过滤放在去重之前，
+	// 免得一个用不上的同名工具把空间级的那个挡掉。
+	tools = withoutOtherAgents(tools, env.AgentID)
+
 	// 同名工具只能留一个：模型看到两个同名函数会随机选，且策略判定会串味。
 	// 内置优先（先出现），插件与 MCP 重名时让路并留日志。
 	tools = dedupeByName(tools, r.log)
@@ -317,38 +337,82 @@ const RuntimeBuiltin = "builtin"
 // slug 由 plugin.builtinToolSlug 生成、这里反解，两边必须一致。
 const builtinToolSlugPrefix = "tool_"
 
-// builtinPolicy 返回内置件的三项全局策略：停用名单、shell 审批命令、是否显式配置过。
+// builtinOverrides 是内置件的全局策略：停用名单 + 各工具的审批档位 + shell 的命令名单。
+type builtinOverrides struct {
+	disabled map[string]bool
+	// levels 是显式配置过的审批档位（工具名 → declared / always / off）。
+	// 没出现过的工具按默认档（declared）走，所以这里只收非空值。
+	levels map[string]string
+	// shellCmds 与 hasShellCfg 描述命令名单：没显式配过时沿用平台默认。
+	shellCmds   []string
+	hasShellCfg bool
+}
+
+// builtinPolicy 读取内置件的全局策略。
 //
 // 内置工具的执行体是 Go 代码（见 builtin.go），安装记录只是元数据：不查这一下，
-// 系统空间里那个停用开关与命令名单就只是标签，模型照样按默认值跑。停用与命令名单
-// 只能在系统空间做，所以只看那一份全局安装；读取失败按「按默认值」处理，
+// 系统空间里那个停用开关、审批档位与命令名单就只是标签，模型照样按默认值跑。
+// 这些只能在系统空间做，所以只看那一份全局安装；读取失败按「按默认值」处理，
 // 不能让配置问题把对话打挂。
-func (r *Registry) builtinPolicy(ctx context.Context) (map[string]bool, []string, bool) {
+func (r *Registry) builtinPolicy(ctx context.Context) builtinOverrides {
+	out := builtinOverrides{}
 	sys, err := r.store.GetSpaceByType(ctx, systemSpaceType)
 	if err != nil || sys.ID == "" {
-		return nil, nil, false
+		return out
 	}
 	installs, err := r.store.ListPluginInstalls(ctx, sys.ID)
 	if err != nil {
 		r.log.Warn("读取内置件启停状态失败", "err", err)
-		return nil, nil, false
+		return out
 	}
-	off := disabledToolNames(installs)
+	out.disabled = disabledToolNames(installs)
+	out.levels = approvalLevels(installs)
+	out.shellCmds, out.hasShellCfg = shellApprovalCommands(installs)
+	return out
+}
+
+// approvalLevels 从安装记录里摘出显式配置过的档位（工具名 → 档位）。
+//
+// 档位对每个内置工具都生效，不只是 shell：装了 wiki_write 想让它每次确认，
+// 或装了 file_write 觉得空间权限够了不想再弹，都走这一处。没配过的工具不出现
+// 在结果里，由调用方按默认档处理。
+func approvalLevels(installs []store.PluginInstall) map[string]string {
+	levels := map[string]string{}
 	for _, in := range installs {
-		if strings.TrimPrefix(in.Slug, builtinToolSlugPrefix) != "shell_exec" {
+		// 只有内置工具才有对应 slug（`tool_xxx`）；技能、智能体、源没有执行器
+		name := strings.TrimPrefix(in.Slug, builtinToolSlugPrefix)
+		if name == in.Slug {
 			continue
 		}
 		var cfg map[string]string
 		if len(in.Config) == 0 || json.Unmarshal(in.Config, &cfg) != nil {
 			continue
 		}
-		raw, ok := cfg["approval_commands"]
-		if !ok {
+		if raw := strings.TrimSpace(cfg[ApprovalPolicyKey]); raw != "" {
+			levels[name] = NormalizeApprovalLevel(raw)
+		}
+	}
+	return levels
+}
+
+// shellApprovalCommands 从安装记录里摘出 shell 的命令名单。
+//
+// 返回的 bool 表示「配过」：没配过时调用方沿用平台默认名单，配成空串才是
+// 「一条都不确认」——两者不能混为一谈。
+func shellApprovalCommands(installs []store.PluginInstall) ([]string, bool) {
+	for _, in := range installs {
+		if in.Slug != builtinToolSlugPrefix+"shell_exec" {
 			continue
 		}
-		return off, splitCommands(raw), true
+		var cfg map[string]string
+		if len(in.Config) == 0 || json.Unmarshal(in.Config, &cfg) != nil {
+			continue
+		}
+		if raw, ok := cfg["approval_commands"]; ok {
+			return splitCommands(raw), true
+		}
 	}
-	return off, nil, false
+	return nil, false
 }
 
 // splitCommands 按逗号、中文逗号、空白切分命令名单。
@@ -392,6 +456,32 @@ func withoutTools(tools []Tool, off map[string]bool) []Tool {
 	out := make([]Tool, 0, len(tools))
 	for _, t := range tools {
 		if off[t.Name] {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// withoutOtherAgents 摘掉别的智能体自带的工具。
+//
+// 自带工具没有安装记录，唯一能判断「该不该给它看」的依据就是会话固化的
+// agent_id；这里必须精确匹配，`extends` 的父子也不互相继承——否则一个智能体
+// 的能力会沿继承链悄悄扩散。
+func withoutOtherAgents(tools []Tool, agentID string) []Tool {
+	hasScoped := false
+	for _, t := range tools {
+		if t.Agent != "" {
+			hasScoped = true
+			break
+		}
+	}
+	if !hasScoped {
+		return tools
+	}
+	out := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if t.Agent != "" && t.Agent != agentID {
 			continue
 		}
 		out = append(out, t)

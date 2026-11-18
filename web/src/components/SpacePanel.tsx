@@ -4,6 +4,7 @@ import { useState } from 'react';
 
 import { useAgents } from '../api/hooks';
 import type { ChatSession, Space } from '../api/types';
+import { SessionAgentIcon } from './AgentAvatar';
 import PluginPanel from './PluginPanel';
 
 const { Text } = Typography;
@@ -114,7 +115,10 @@ export default function SpacePanel({
           {sessions.map((s) => (
             <div key={s.id} onClick={() => onOpenSession(s.id)}>
               <Card className="session-card" bodyStyle={{ padding: 16 }}>
-                <div className="session-card-title">{s.title}</div>
+                <div className="session-card-head">
+                  <SessionAgentIcon session={s} size={18} />
+                  <div className="session-card-title">{s.title}</div>
+                </div>
                 <div className="session-card-time">{formatTime(s.last_message_at ?? s.created_at)}</div>
               </Card>
             </div>

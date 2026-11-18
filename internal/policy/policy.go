@@ -34,12 +34,15 @@ const (
 	SideEffectsExternal = "write-external"
 )
 
-// 需要审批的动作类别。目前只有两类，都是「不可逆且平台无法替用户判断」的动作：
+// 需要审批的动作类别。都是「不可逆且平台无法替用户判断」的动作：
 const (
 	// ActionNetwork 出网且方法不是 GET/HEAD：外部系统可能已经收到这次改动。
 	ActionNetwork = "net.write"
 	// ActionShell 命中需审批命令名单的 shell 命令。
 	ActionShell = "shell"
+	// ActionPlugin 插件的审批级别被设成「每次调用都确认」：与调用内容无关，
+	// 是安装方对该插件的整体要求（审计里要能和前两类区分开）。
+	ActionPlugin = "plugin.approval"
 )
 
 // Action 是一次调用命中的审批动作，由 Invoker 按工具声明与实参算出。

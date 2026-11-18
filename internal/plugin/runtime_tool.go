@@ -80,6 +80,9 @@ type invokeInput struct {
 	Allow   map[string]bool
 	Verbs   map[string]bool
 	Secrets map[string]bool
+	// Config 是安装方为这个插件填的配置（清单 config 段，含默认值），
+	// 脚本用 wa.config() 一次取全量。
+	Config map[string]string
 }
 
 // residentKey 是常驻进程的复用键：目录变化就是另一份代码，不能复用。
@@ -368,6 +371,12 @@ func (r *toolRuntime) hostCall(ctx context.Context, in invokeInput, frame rpcFra
 	// 作者会以为「补进 capabilities 就能用」，而补进去是解析失败。
 	if hint, ok := removedMethods[frame.Method]; ok {
 		return nil, fmt.Errorf("%s 已从宿主 ABI 移除：%s", frame.Method, hint)
+	}
+
+	// config.get 不走 capabilities 校验：读的是安装方为这个插件填的配置，
+	// 本来就是给插件自己用的（与 secret.use 的跨主体授权不是一回事）。
+	if frame.Method == MethodConfigGet {
+		return map[string]any{"config": in.Config}, nil
 	}
 
 	// 未在 plugin.json 里声明的宿主能力直接拒绝：审批看到的是清单，

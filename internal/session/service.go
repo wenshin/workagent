@@ -183,9 +183,15 @@ func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs st
 // 不关心它来自发布件、空间安装还是系统空间的全局安装。
 type AgentPluginSource interface {
 	ListAgentPlugins(ctx context.Context, spaceID string) ([]agentspec.Summary, error)
+	// AgentDisplayNames 返回空间内**全部**智能体的展示名（含已停用与草稿）。
+	// 只用于会话列表渲染：停用的智能体不能新建会话，但历史会话还在。
+	AgentDisplayNames(ctx context.Context, spaceID string) (map[string]string, error)
 	ResolveAgentPlugin(ctx context.Context, spaceID, slug string) (agentspec.Resolved, error)
 	// AgentDependencies 返回智能体及其 requires 闭包，用于跨空间借用时只加载它自己声明的能力。
 	AgentDependencies(ctx context.Context, spaceID, slug string) ([]string, error)
+	// AgentInternals 返回智能体自带的技能页（agent.skills）。只在绑定它的会话里注入，
+	// 不进空间索引，所以别的智能体搜不到。
+	AgentInternals(ctx context.Context, spaceID, slug string) ([]tool.PluginEntry, error)
 }
 
 // SetAgentPlugins 注入插件化智能体来源；不注入时行为与旧版完全一致。
@@ -338,6 +344,63 @@ func (s *Service) Agents(ctx context.Context, userID, spaceID string) ([]agentsp
 	return plugins, nil
 }
 
+// AgentBadges 批量解析会话绑定的智能体，key 为「来源空间 + \x00 + slug」。
+//
+// 会话行里只固化了 slug；列表要显示名称与头像，就得回到插件快照去取。
+// 按空间去重后每个空间只查一次，避免 N 个会话查 N 次。
+func (s *Service) AgentBadges(ctx context.Context, list []store.Session) map[string]agentspec.Summary {
+	out := make(map[string]agentspec.Summary, len(list))
+	if s.agentPlugins == nil {
+		return out
+	}
+	wanted := map[string]map[string]bool{}
+	for _, sess := range list {
+		if sess.AgentID == "" {
+			continue
+		}
+		spaceID := sess.SpaceID
+		if sess.AgentSpaceID != "" {
+			spaceID = sess.AgentSpaceID
+		}
+		if wanted[spaceID] == nil {
+			wanted[spaceID] = map[string]bool{}
+		}
+		wanted[spaceID][sess.AgentID] = true
+	}
+	for spaceID, slugs := range wanted {
+		missing := make(map[string]bool, len(slugs))
+		for slug := range slugs {
+			missing[slug] = true
+		}
+		items, err := s.agentPlugins.ListAgentPlugins(ctx, spaceID)
+		if err != nil {
+			s.log.Warn("读取智能体插件失败", "space", spaceID, "err", err)
+		}
+		for _, item := range items {
+			if slugs[item.ID] {
+				out[spaceID+"\x00"+item.ID] = item
+				delete(missing, item.ID)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		// 快照只含「已启用」的插件，而插件列表里草稿与停用件都在。会话图标要
+		// 显示它的名字，否则会退化成英文 slug——同一张卡片中文、会话里英文。
+		names, nerr := s.agentPlugins.AgentDisplayNames(ctx, spaceID)
+		if nerr != nil {
+			s.log.Warn("读取智能体展示名失败", "space", spaceID, "err", nerr)
+			continue
+		}
+		for slug := range missing {
+			if name, ok := names[slug]; ok {
+				out[spaceID+"\x00"+slug] = agentspec.Summary{ID: slug, Name: name}
+			}
+		}
+	}
+	return out
+}
+
 // wikiSpaceID 返回企业 wiki 的宿主空间（系统空间）。
 //
 // 取不到就返回空串而不是报错：wiki 是增强能力，系统空间没建好时
@@ -351,6 +414,18 @@ func (s *Service) wikiSpaceID(ctx context.Context) string {
 		return ""
 	}
 	return id
+}
+
+// wikiAgentID 是 wiki 分区用的智能体标识。
+//
+// 知识页跟着智能体走，所以这条链路上「空」不能是一个合法值：老会话（本次改动前
+// 创建的、没有固化 agent_id 的）与 base 插件缺失时统一落到 base，保证同一个
+// 会话的知识目录在重启前后不会跳变。
+func wikiAgentID(raw string) string {
+	if id := strings.TrimSpace(raw); id != "" {
+		return id
+	}
+	return agentspec.BaseID
 }
 
 // canWriteSecrets 判断当前用户能否写平台凭证。

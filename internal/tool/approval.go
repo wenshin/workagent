@@ -42,6 +42,40 @@ func normalizeArgs(args json.RawMessage) string {
 // DefaultApprovalTimeout 是一次审批请求的等待上限；超时按拒绝处理。
 const DefaultApprovalTimeout = 5 * time.Minute
 
+// 插件的审批级别：安装方在插件卡片上定，作用范围是这个插件的全部工具调用。
+//
+// 默认档（declared）走「按声明判断」——脚本看出网 verbs、MCP 看 tools.writes、
+// shell 看命令名单。另两档是给安装方的两个方向：宁可多点几次，或这个插件已经
+// 被远端鉴权兜住了、不想每次打扰。判断口径本身不参与审批的设计没变：等级仍然
+// 只用于展示，档位是安装方的显式选择，不是拿风险等级反推出来的。
+const (
+	// ApprovalDeclared 按清单声明与命令名单判断（默认）。
+	ApprovalDeclared = "declared"
+	// ApprovalAlways 每次调用都确认。
+	ApprovalAlways = "always"
+	// ApprovalOff 不确认，直接执行。
+	ApprovalOff = "off"
+)
+
+// ApprovalPolicyKey 是安装配置里审批档位的键。
+//
+// 定义在 tool 而不是 plugin：内置工具的档位由这里的 builtinPolicy 读，plugin 侧
+// 只负责写配置。两边共用一个常量，避免键名漂移后「配了但读不到」。
+const ApprovalPolicyKey = "approval_policy"
+
+// NormalizeApprovalLevel 收敛档位取值：不认的值一律按默认档处理。
+//
+// 这样旧安装记录（没有这个键）与拼错的值都退化成「按声明判断」，不会因为一个
+// 字符串把某个插件的确认悄悄关掉。
+func NormalizeApprovalLevel(level string) string {
+	switch strings.TrimSpace(level) {
+	case ApprovalAlways, ApprovalOff:
+		return strings.TrimSpace(level)
+	default:
+		return ApprovalDeclared
+	}
+}
+
 // DefaultApprovalCommands 是 shell_exec 默认需要确认的命令。
 //
 // 名单刻意很短：沙箱已经把「跑出去」和「删系统盘」挡住（全盘只读、只有当前空间
@@ -122,6 +156,20 @@ type ApprovalDecision struct {
 //     没有动词可看，只能由作者显式声明；
 //   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）。
 func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
+	// 安装方的档位先于声明生效：always 与调用内容无关，off 直接放行。
+	switch NormalizeApprovalLevel(t.ApprovalLevel) {
+	case ApprovalAlways:
+		return &policy.Action{
+			Kind:   policy.ActionPlugin,
+			Detail: argSummary(args),
+			// Key 带上参数指纹：档位是「每次都问」，本轮记忆不能把它并成「同类动作只问一次」；
+			// 但参数完全一样的重复调用（模型重试）复用结论，不再多弹一次。
+			Key:    policy.ActionPlugin + ":" + t.Name + ":" + ArgsHash(t.Name, args),
+			Reason: "这个插件的审批级别是「每次调用都确认」",
+		}
+	case ApprovalOff:
+		return nil
+	}
 	if t.NetworkWrite {
 		// MCP 工具与脚本工具的出网方式不同，文案要说清「谁在改」：
 		// 脚本是插件自己发请求，MCP 是远端 Server 替它改，用户判断依据不一样。

@@ -227,3 +227,39 @@ export async function uploadSpaceFiles(
 
   return (data as UploadFilesResponse).files ?? [];
 }
+
+/**
+ * 上传智能体头像：multipart 字段名 icon。
+ * 前端已经裁成正方形，服务端还会再裁再压一次——直接打接口也不会把大图落进空间。
+ */
+export async function uploadAgentIcon(
+  spaceId: string,
+  slug: string,
+  blob: Blob,
+): Promise<{ icon_url?: string }> {
+  const form = new FormData();
+  form.append('icon', blob, 'icon.png');
+
+  let res: Response;
+  try {
+    res = await fetch(`/spaces/${spaceId}/plugins/${slug}/icon`, { method: 'POST', body: form });
+  } catch {
+    throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
+  }
+
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
+  }
+
+  const data: unknown = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = (data ?? {}) as ErrorBody;
+    throw new ApiError(err.message ?? `上传失败（${res.status}）`, res.status, err.code ?? 'unknown');
+  }
+  return data as { icon_url?: string };
+}
+
+export function deleteAgentIcon(spaceId: string, slug: string): Promise<null> {
+  return api<null>(`/spaces/${spaceId}/plugins/${slug}/icon`, { method: 'DELETE' });
+}

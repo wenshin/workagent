@@ -23,6 +23,7 @@ import { decideApproval } from '../api/client';
 import { useAgents } from '../api/hooks';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
+import { SessionAgentIcon } from './AgentAvatar';
 import { PluginIcon } from './PluginVisual';
 import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
 
@@ -200,6 +201,28 @@ function statusLabel(status: ToolCallRecord['status']) {
 }
 
 /**
+ * 风险等级的用户可读标签。
+ *
+ * 不用 L1~L4：等级编号是内部口径，用户看到「L3」只会问「所以呢」。标签只回答
+ * 一件事——这一步动了什么。等级与可读名的映射跟着 policy.Risk* 走，改那边
+ * 记得同步这里。
+ */
+function riskLabel(risk: number) {
+  if (risk >= 4) return '高危';
+  if (risk === 3) return '写入';
+  if (risk === 2) return '查询';
+  return '只读';
+}
+
+/** 徽标太短，悬停时把完整含义补上。 */
+function riskHint(risk: number) {
+  if (risk >= 4) return '高危：涉及凭证或向外部发送数据';
+  if (risk === 3) return '写入：会改动数据';
+  if (risk === 2) return '查询：只读，但会访问外部系统或消耗额度';
+  return '只读：不改变任何数据';
+}
+
+/**
  * 思考块：默认折叠。
  *
  * 一轮对话里思考可能出现多次（想一段 → 调工具 → 再想一段），每段独立成块，
@@ -340,13 +363,17 @@ function ToolCard({
     }
   };
 
-  // 风险等级常驻：不只出现在审批卡上。翻历史时「这一步是 L4 外发」比
+  // 风险等级常驻：不只出现在审批卡上。翻历史时「这一步是写入」比
   // 「成功」有用得多，而且不审批的调用（fs 写、只读查询）同样需要这个标注。
   const risk = approval?.risk || tool.risk || 0;
   const head = (
     <>
       <span className="msg-tool-name">{tool.name}</span>
-      {risk > 0 ? <span className={`msg-risk msg-risk-${risk}`}>L{risk}</span> : null}
+      {risk > 0 ? (
+        <span className={`msg-risk msg-risk-${risk}`} title={riskHint(risk)}>
+          {riskLabel(risk)}
+        </span>
+      ) : null}
       <span className="msg-tool-status">{statusLabel(tool.status)}</span>
       {tool.duration_ms !== undefined ? <span className="msg-tool-time">{tool.duration_ms}ms</span> : null}
     </>
@@ -651,7 +678,8 @@ export default function ChatPanel({
       : session.space_id;
   const { data: agentList } = useAgents(agentSpaceId);
   const agentLabel = session.agent_id
-    ? agentList?.agents.find((a) => a.id === session.agent_id)?.name ||
+    ? session.agent_name ||
+      agentList?.agents.find((a) => a.id === session.agent_id)?.name ||
       (agentSpaceId ? session.agent_id : '发起方智能体')
     : '';
 
@@ -924,7 +952,10 @@ export default function ChatPanel({
     <div className="chat-panel">
       <div className="chat-head">
         <div className="chat-heading">
-          <h2 className="panel-title">{session.title}</h2>
+          <div className="chat-heading-title">
+            <SessionAgentIcon session={session} size={18} />
+            <h2 className="panel-title">{session.title}</h2>
+          </div>
           <Text type="tertiary" size="small">
             {spaceName ? `${spaceName} · ` : ''}
             {/* 智能体是会话的行为设定：写明是谁在回答，切到别的会话时不至于混淆 */}
