@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -105,12 +106,9 @@ func (w *runWatchdog) trigger(reason string) {
 	if w == nil || !w.stopped.CompareAndSwap(false, true) {
 		return
 	}
-	if w.idleT != nil {
-		w.idleT.Stop()
-	}
-	if w.maxT != nil {
-		w.maxT.Stop()
-	}
+	// 这里不碰 idleT / maxT：AfterFunc 可能在字段赋值完成前就醒来（-race 会报
+	// 「构造中的计时器字段被并发读写」）。两个计时器的互斥由 stopped 的 CAS 保证，
+	// 关计时器统一在 stop() 里做。
 	w.fire(reason)
 }
 
@@ -172,7 +170,7 @@ func (s *Service) execute(
 	// 断开时没必要再为一个没人收的结果起任务，那才是真的浪费。
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
-	live := s.runs.add(run.ID, userID, cancelRun)
+	live := s.runs.add(run.ID, userID, cancelRun, s.stream, s.log)
 	defer func() {
 		live.finish()
 		s.runs.remove(run.ID, live)
@@ -190,16 +188,23 @@ func (s *Service) execute(
 	// 事件先落内存缓冲再推客户端：客户端断了写入会失败，但缓冲还在，
 	// 重连后按 offset 补齐（§15.12.2）。因此这里的错误一律吞掉——
 	// 让「写不出去」去中断 Agent，正是刷新丢任务的老问题。
-	// 首个正文增量到达时占位一条 streaming 消息：刷新后列表能看出「这一轮真的在跑」，
-	// 而不是空白。正文仍然在结束时一次性覆盖，不逐 token 写库（§15.12.2）。
-	var placeholderID string
+	// 首个正文增量（或首个工具调用）到达时占位一条 streaming 消息：刷新后列表能看出
+	// 「这一轮真的在跑」，而不是空白。正文与帧由 live 每 1s 推到 Redis（§15.12.2），
+	// 结束时才整段落库——中间不写 message 表，避免写放大。
+	var (
+		progressMu    sync.Mutex
+		placeholderID string
+	)
+
 	ensurePlaceholder := func() {
+		progressMu.Lock()
+		defer progressMu.Unlock()
 		if placeholderID != "" {
 			return
 		}
 		placeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		m, err := s.store.CreateStreamingMessage(placeCtx, sessionID)
-		cancel()
 		if err != nil {
 			s.log.Warn("占位消息写入失败", "session_id", sessionID, "err", err)
 			return
@@ -230,10 +235,18 @@ func (s *Service) execute(
 	emitEvent := func(ev agent.Event) error {
 		watch.touch()
 		beat()
+		// 先广播：正文/帧进内存缓冲，工具事件也进这一轮的帧序列
+		offset := live.broadcast(ev)
 		switch ev.Type {
 		case agent.EventToolCall, agent.EventToolResult:
+			// 工具调用也是「内容」：只有轨迹、没有正文的中断轮同样要能在列表里看到
+			ensurePlaceholder()
+			// 断点前强制推一次：工具可能跑几分钟，这段时间里切页要能看到已经说了什么
+			live.flush(true)
 			appendStep(ev.Type, ev.Tool.Payload())
 		case agent.EventApprovalReq:
+			// 等人可能等满审批时限：进等待前先把已产出的正文推到缓存
+			live.flush(true)
 			appendStep(ev.Type, ev.Approval)
 		case agent.EventMessageDelta:
 			// 思考不占位：只有真的开始写正文了，才值得在列表里留一条记录
@@ -241,7 +254,6 @@ func (s *Service) execute(
 				ensurePlaceholder()
 			}
 		}
-		offset := live.broadcast(ev)
 		if emit != nil {
 			_ = emit(ev, offset)
 		}
@@ -451,7 +463,18 @@ func (s *Service) execute(
 		s.settleResume(saveCtx, run.ID, status, reason)
 	}
 
-	if res.Content == "" && len(res.Steps) == 0 {
+	// 流式刷新点上的正文：被中断时 Result 里可能还没收尾，
+	// 用缓冲里累积的内容兜底，别把已经说出口的话抹掉。
+	streamedText, streamedReasoning := live.texts()
+	content, reasoning := res.Content, res.Reasoning
+	if content == "" {
+		content = streamedText
+	}
+	if reasoning == "" {
+		reasoning = streamedReasoning
+	}
+
+	if content == "" && len(res.Steps) == 0 {
 		// 没有内容可存：取消不改判为失败，原因如实写进 run.error
 		if reason == "" {
 			status = store.RunFailed
@@ -481,12 +504,15 @@ func (s *Service) execute(
 	}
 	var msg store.Message
 	var err error
-	if placeholderID != "" {
+	progressMu.Lock()
+	placeID := placeholderID
+	progressMu.Unlock()
+	if placeID != "" {
 		// 占位消息已经存在：整段覆盖，并把 streaming 置回 false
-		msg, err = s.store.FinishMessage(saveCtx, placeholderID,
-			res.Content, res.Reasoning, parts, stats, reason != "")
+		msg, err = s.store.FinishMessage(saveCtx, placeID,
+			content, reasoning, parts, stats, reason != "")
 	} else {
-		msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, res.Content, res.Reasoning, parts, stats)
+		msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, content, reasoning, parts, stats)
 	}
 	if err != nil {
 		status = store.RunFailed
@@ -495,8 +521,8 @@ func (s *Service) execute(
 	}
 	appendStep("message", map[string]any{
 		"message_id":      msg.ID,
-		"chars":           utf8.RuneCountInString(res.Content),
-		"reasoning_chars": utf8.RuneCountInString(res.Reasoning),
+		"chars":           utf8.RuneCountInString(content),
+		"reasoning_chars": utf8.RuneCountInString(reasoning),
 		"tools":           len(res.Steps),
 		"need_approval":   res.NeedApproval,
 		// 循环是怎么收尾的：done / budget / stalled。
@@ -714,7 +740,8 @@ func (s *Service) Resume(
 	// 不结算的话它会永远挂在 streaming 上，用户点完「继续」也只看得到结论，
 	// 看不到中断前做过什么（历史记录从列表里消失的正是这一段）。
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	if err := s.store.InterruptStreamingMessage(settleCtx, prev.ID, sessionID); err != nil {
+	// 上一轮的正文在缓存里（最多丢最后 1s），和工具轨迹一起写回同一条消息
+	if err := s.store.InterruptStreamingMessage(settleCtx, prev.ID, sessionID, s.recoverContent(prev.ID)); err != nil {
 		s.log.Warn("结算中断轮占位消息失败", "run_id", prev.ID, "err", err)
 	}
 	cancelSettle()
@@ -775,7 +802,9 @@ func (s *Service) SweepStaleRuns(ctx context.Context) (int, error) {
 	if threshold <= 0 {
 		threshold = defaultIdleTimeout
 	}
-	n, err := s.store.SweepStaleRuns(ctx, threshold, "服务已重启，这一轮执行被中断")
+	n, err := s.store.SweepStaleRuns(ctx, threshold, "服务已重启，这一轮执行被中断", func(runID, _ string) store.RunContent {
+		return s.recoverContent(runID)
+	})
 	if err != nil {
 		return 0, err
 	}

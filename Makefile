@@ -3,12 +3,13 @@ GO ?= go
 NPM ?= npm
 NPM_REGISTRY ?= https://registry.npmmirror.com
 
-.PHONY: help tidy pg-up pg-down run build web fmt vet test mock-dc
+.PHONY: help tidy pg-up redis-up pg-down run build web fmt vet test mock-dc
 
 help:
 	@echo "tidy      拉齐依赖并生成 go.sum（首次必须执行）"
 	@echo "pg-up     启动本地 PostgreSQL"
-	@echo "pg-down   停止本地 PostgreSQL"
+	@echo "redis-up  启动本地 Redis（登录态与会话流缓存）"
+	@echo "pg-down   停止本地 PostgreSQL 与 Redis"
 	@echo "run       本地启动 API（127.0.0.1:8321）"
 	@echo "web       构建前端到 web/dist（上传 CDN）"
 	@echo "build     编译 API 到 bin/server"
@@ -20,6 +21,9 @@ tidy:
 
 pg-up:
 	docker compose up -d postgres
+
+redis-up:
+	docker compose up -d redis
 
 pg-down:
 	docker compose down

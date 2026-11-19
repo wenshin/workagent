@@ -15,6 +15,7 @@ import (
 
 	"github.com/workagent/auto-agent/internal/agent"
 	"github.com/workagent/auto-agent/internal/agentspec"
+	"github.com/workagent/auto-agent/internal/cache"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/sandbox"
@@ -146,6 +147,9 @@ type Service struct {
 	// runs 是进程内正在执行的 run：既提供显式取消，也提供断流续传的缓冲。
 	// 它不持久化——run 的权威状态在库里，这里只是「还活着」的那一份视图。
 	runs *liveRuns
+	// stream 是会话流的缓存（Redis）：登录态之外的另一半职责。
+	// 为 nil 时退回纯内存（单实例、进程一死就丢正文）。
+	stream cache.Client
 	// autoBudget 限制「回执触发的 run」的密度，避免十条回执催出十轮模型调用。
 	autoBudget *autoRunBudget
 	// approvals 是审批通道：命中出网写 / 高危命令时把执行体挂起，等前端点按钮。
@@ -161,7 +165,7 @@ type Service struct {
 // wallClock 是一轮回答的总时长上限（LLM_MAX_WALL_CLOCK，<=0 表示不限），
 // idleTimeout 是「多久没有事件算卡住」（RUN_IDLE_TIMEOUT）。两者管的是不同的事：
 // 前者防无限跑，后者才防真卡死。
-func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, wallClock, idleTimeout time.Duration, log *slog.Logger) *Service {
+func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs storage.Storage, memory *ctxmgr.Manager, searcher *search.Registry, shell sandbox.Runner, stream cache.Client, wallClock, idleTimeout time.Duration, log *slog.Logger) *Service {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultIdleTimeout
 	}
@@ -173,6 +177,7 @@ func NewService(st store.Store, spaces *space.Service, agents agent.Agent, fs st
 		store: st, spaces: spaces, agent: agents, storage: fs,
 		memory: memory, search: searcher, shell: shell,
 		runBudget: wallClock, idleTimeout: idleTimeout, runs: newLiveRuns(),
+		stream:     stream,
 		autoBudget: newAutoRunBudget(), approvals: newApprovalHub(st, log), log: log,
 	}
 }
@@ -803,11 +808,30 @@ func (s *Service) ActiveRun(ctx context.Context, userID, sessionID string) (stor
 	// 心跳停了的 run 不算「在跑」：它属于上一个进程，回答「在跑」会让前端
 	// 一直等一条不会再来的流，用户连「继续」都不会看到
 	run, found, err := s.store.GetActiveRun(ctx, sessionID, s.idleTimeout)
-	if err != nil || !found {
-		return run, found, err
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if !found {
+		// 心跳过期不等于记录已终态：那条 run 还挂着 running / waiting_approval，
+		// 占位消息也还 streaming。不顺手收尾的话，用户回来看到的是永远的「生成中」，
+		// 正文与工具轨迹都不会被结算（staleAfter=0 表示不看心跳，只找非终态记录）。
+		if stale, ok, err := s.store.GetActiveRun(ctx, sessionID, 0); err == nil && ok {
+			s.abandonRun(ctx, stale)
+		}
+		return store.Run{}, false, nil
 	}
 	if s.runs.get(run.ID) != nil {
 		return run, true, nil
+	}
+	// 本进程没有执行体，但这一轮可能在别的副本上跑：缓存里的快照还标着未结束、
+	// 且刚更新过，就说明它活着。这里答「没在跑」的代价很大——前端连流都不会挂，
+	// 正在写的内容就永久看不到（多副本部署与本地同时起了两个进程时，表现就是
+	// 「切页回来会话没了」）。缓存里已经没有进展的才按无人执行收尾。
+	if s.stream != nil {
+		if st, ok, err := s.stream.LoadRun(ctx, run.ID); err == nil && ok && !st.Done &&
+			time.Since(st.UpdatedAt) < s.idleTimeout {
+			return run, true, nil
+		}
 	}
 	s.abandonRun(ctx, run)
 	return store.Run{}, false, nil
@@ -824,12 +848,40 @@ func (s *Service) abandonRun(ctx context.Context, run store.Run) {
 	// 心跳还在跳就不收：本进程拿不到流，不代表执行在别处没活。留两道心跳的余量，
 	// 假活（进程已死）半分钟内会被真正收掉，界面当次就已经答「没在跑」了。
 	grace := 2 * heartbeatInterval
-	if err := s.store.AbandonRun(ctx, run.ID, run.SessionID, RunAbandonedMessage, grace); err != nil {
+	recovered := s.recoverContent(run.ID)
+	if err := s.store.AbandonRun(ctx, run.ID, run.SessionID, RunAbandonedMessage, grace, recovered); err != nil {
 		s.log.Warn("收尾无人执行的 run 失败", "run_id", run.ID, "session_id", run.SessionID, "err", err)
 		return
 	}
+	// 落库成功才清缓存：失败时正文还要靠它，下一次清扫能再取一次
+	if err := s.stream.DropRun(ctx, run.ID); err != nil {
+		s.log.Warn("清理流缓存失败", "run_id", run.ID, "err", err)
+	}
 	s.log.Info("收尾无人执行的 run",
-		"run_id", run.ID, "session_id", run.SessionID, "started_at", run.StartedAt)
+		"run_id", run.ID, "session_id", run.SessionID, "started_at", run.StartedAt,
+		"recovered_chars", len(recovered.Content))
+}
+
+// recoverContent 从中断执行的缓存快照里取回正文。
+//
+// 取不到（没配缓存、TTL 已过、另一个实例还没写）就返回零值：
+// 收尾仍要做，只是那条消息只剩工具轨迹。
+func (s *Service) recoverContent(runID string) store.RunContent {
+	if s.stream == nil || runID == "" {
+		return store.RunContent{}
+	}
+	// 收尾路径的 ctx 可能已经被取消（用户关了页面），这里不跟着它一起死
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	st, ok, err := s.stream.LoadRun(ctx, runID)
+	if err != nil {
+		s.log.Warn("读取流缓存失败", "run_id", runID, "err", err)
+		return store.RunContent{}
+	}
+	if !ok {
+		return store.RunContent{}
+	}
+	return store.RunContent{Content: st.Content, Reasoning: st.Reasoning}
 }
 
 // CancelRun 是唯一能停掉一轮执行的入口。
@@ -888,14 +940,189 @@ func (s *Service) CancelSessionRun(ctx context.Context, userID, sessionID string
 // SubscribeRun 订阅一次执行的事件流，afterOffset 是客户端已收到的最大偏移。
 // Live 为 false 表示 run 已不在本进程，调用方应改走「拉 run_step + 最终消息」。
 func (s *Service) SubscribeRun(ctx context.Context, userID, runID string, afterOffset int) (*runFeed, error) {
-	if _, err := s.loadRun(ctx, userID, runID); err != nil {
+	run, err := s.loadRun(ctx, userID, runID)
+	if err != nil {
 		return nil, err
 	}
-	live := s.runs.get(runID)
-	if live == nil {
-		return &runFeed{Done: closedCh, Live: false}, nil
+	if live := s.runs.get(runID); live != nil {
+		return live.subscribe(afterOffset), nil
 	}
-	return live.subscribe(afterOffset), nil
+	// 本进程没有执行体：要么这一轮在别的副本上跑，要么进程刚重启。
+	// 缓存里还有帧就从缓存回放并继续跟随；实在没有才让调用方去库里取最终消息。
+	if s.stream != nil {
+		if feed := s.subscribeFromCache(ctx, run.ID, afterOffset); feed != nil {
+			return feed, nil
+		}
+	}
+	return &runFeed{Done: closedCh, Live: false}, nil
+}
+
+// cachePollInterval 是「跟随远端副本」的轮询间隔。
+//
+// 用轮询而不是 Redis 订阅：一份实现同时覆盖「回放」与「追新」，
+// 且断线重连不需要额外状态；500ms 对一个人看回答的体感足够。
+const cachePollInterval = 500 * time.Millisecond
+
+// subscribeFromCache 从缓存回放 afterOffset 之后的帧，并继续读后续增量。
+//
+// 返回 nil 表示缓存里没有这一轮（已结束 / TTL 到期 / 没配 Redis）。
+func (s *Service) subscribeFromCache(ctx context.Context, runID string, afterOffset int) *runFeed {
+	frames, err := s.stream.ReplayFrames(ctx, runID, afterOffset)
+	if err != nil {
+		return nil
+	}
+	backlog := decodeFrames(frames)
+	// 帧列表在缓存里按条数上限只保留最新的那批，一段很长的思考会产生上万帧，
+	// 开头就被裁掉了。客户端从 after_offset=0 重连时，「只看到后半段」甚至
+	// 「什么都没有」都是这个原因。正文与思考的完整文本其实还在快照里，
+	// 按 offset 切出缺口补在最前面即可。
+	if st, ok, err := s.stream.LoadRun(ctx, runID); err == nil && ok {
+		backlog = append(recoverPrefix(st, afterOffset, frameGap(backlog, st.Offset)), backlog...)
+	}
+	if len(backlog) == 0 {
+		return nil
+	}
+	last := afterOffset
+	for _, f := range backlog {
+		if f.Offset > last {
+			last = f.Offset
+		}
+	}
+
+	// 只在这里关闭 done：handler 收到它就会结束这次订阅
+	done := make(chan struct{})
+	framesCh := make(chan RunFrame, 64)
+	pollCtx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(cachePollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pollCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			more, err := s.stream.ReplayFrames(pollCtx, runID, last)
+			if err != nil {
+				// 缓存暂时读不到：这一轮可能还在跑，继续等而不是把流断掉
+				continue
+			}
+			for _, raw := range more {
+				if raw.Offset <= last {
+					continue
+				}
+				f, ok := decodeFrame(raw)
+				if !ok {
+					continue
+				}
+				last = f.Offset
+				select {
+				case framesCh <- f:
+				case <-pollCtx.Done():
+					return
+				}
+			}
+			// 生产者写完 done，或键已过期：交给调用方去库里拿最终消息
+			st, ok, err := s.stream.LoadRun(pollCtx, runID)
+			if err == nil && (!ok || st.Done) {
+				return
+			}
+		}
+	}()
+
+	return &runFeed{Backlog: backlog, Frames: framesCh, Done: done, Live: true, stop: cancel}
+}
+
+// frameGap 返回「第一批可用帧之前已经产出多少字符」。
+//
+// offset 是思考与正文的累计字符数，落在「这条事件处理完之后」，所以首帧的起点
+// 要减掉它自己的长度；非增量帧（工具、审批）不改变 offset，直接拿它当边界。
+// 没有帧时以快照的 offset 为界：整轮内容都靠快照补。
+func frameGap(backlog []RunFrame, snapshotOffset int) int {
+	if len(backlog) == 0 {
+		return snapshotOffset
+	}
+	first := backlog[0]
+	gap := first.Offset
+	if first.Event.Type != agent.EventMessageDelta {
+		return gap
+	}
+	if n := utf8.RuneCountInString(first.Event.Delta); first.Offset >= n {
+		gap = first.Offset - n
+	}
+	return gap
+}
+
+// recoverPrefix 用缓存快照补回 (after, gap) 这段缺口。
+//
+// 缺口只可能落在「思考或正文」里：offset 不累计工具事件，所以前 gap 个字符
+// 就是 reasoning 的前缀加上 content 的前缀。思考总在前、正文在后，切分位置
+// 因此是确定的，不需要额外的分段记录。
+//
+// 快照是秒级写入的，可能比帧旧：缺口上界取快照已有字符数，宁可少补，
+// 不要凭长度切出空的或越界的内容。
+func recoverPrefix(st cache.RunState, after, gap int) []RunFrame {
+	if gap <= after || gap <= 0 {
+		return nil
+	}
+	reasoning := []rune(st.Reasoning)
+	content := []rune(st.Content)
+	upto := gap
+	if total := len(reasoning) + len(content); upto > total {
+		upto = total
+	}
+	if upto <= after {
+		return nil
+	}
+	var out []RunFrame
+	if after < len(reasoning) {
+		end := upto
+		if end > len(reasoning) {
+			end = len(reasoning)
+		}
+		out = append(out, RunFrame{
+			Offset: end,
+			Event: agent.Event{
+				Type: agent.EventMessageDelta, Role: "assistant",
+				Delta: string(reasoning[after:end]), Reasoning: true,
+			},
+		})
+	}
+	if upto > len(reasoning) {
+		start := after - len(reasoning)
+		if start < 0 {
+			start = 0
+		}
+		out = append(out, RunFrame{
+			Offset: upto,
+			Event: agent.Event{
+				Type: agent.EventMessageDelta, Role: "assistant",
+				Delta: string(content[start : upto-len(reasoning)]),
+			},
+		})
+	}
+	return out
+}
+
+// decodeFrames 把缓存里的帧解成事件；坏帧直接跳过，不打断整条流。
+func decodeFrames(raw []cache.Frame) []RunFrame {
+	out := make([]RunFrame, 0, len(raw))
+	for _, f := range raw {
+		if frame, ok := decodeFrame(f); ok {
+			out = append(out, frame)
+		}
+	}
+	return out
+}
+
+func decodeFrame(raw cache.Frame) (RunFrame, bool) {
+	var ev agent.Event
+	if err := json.Unmarshal(raw.Payload, &ev); err != nil {
+		return RunFrame{}, false
+	}
+	return RunFrame{Offset: raw.Offset, Event: ev}, true
 }
 
 // loadRun 读 run 并校验归属：run 的可见性跟随会话，只对会话创建者开放。

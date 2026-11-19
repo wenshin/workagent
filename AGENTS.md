@@ -72,10 +72,13 @@
 
 ```bash
 make pg-up   # 起 Postgres（docker）
+make redis-up # 起 Redis（docker，登录态与会话流缓存）
 make run     # 后端 :8321，启动时自动执行迁移
 make web     # 前端 :5173
 make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务，联调数仓类智能体）
 ```
+
+登录态与会话流缓存在 Redis（`REDIS_URL`）：登录会话只存 Redis（`wa:sess:*`），run 的增量帧与正文快照每 1s 写 `wa:run:<id>:*`，结束时整段落库。未配置 `REDIS_URL` 时退回进程内存——单实例可用，重启即掉登录、丢当前轮正文。
 
 # 系统空间（system）
 

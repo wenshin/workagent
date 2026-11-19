@@ -18,6 +18,12 @@ type Config struct {
 
 	DatabaseURL string
 
+	// RedisURL 是登录态与会话流缓存的地址。留空时退回进程内存：
+	// 单实例能跑，但重启即掉登录、丢当前轮正文（§5.1.1、§15.12.2）。
+	RedisURL string
+	// RunStreamTTL 是单个 run 的流缓存保留时长（秒级检查点 + 事件流）。
+	RunStreamTTL time.Duration
+
 	// 身份接入（§5.1.1 IdentityProvider）：dingtalk | wecom | feishu
 	IdentityProvider string
 
@@ -139,6 +145,16 @@ func Load() (*Config, error) {
 	ttl, err := time.ParseDuration(getenv("SESSION_TTL", "168h"))
 	if err != nil {
 		return nil, fmt.Errorf("SESSION_TTL 不是合法的时长: %w", err)
+	}
+
+	// 流缓存的保留时长要覆盖「审批等人 + 用户离开再回来」：
+	// 设得太短，切页回来时 Redis 里已经没有这一轮，续流退化成什么都不显示。
+	runStreamTTL, err := time.ParseDuration(getenv("RUN_STREAM_TTL", "30m"))
+	if err != nil {
+		return nil, fmt.Errorf("RUN_STREAM_TTL 不是合法的时长: %w", err)
+	}
+	if runStreamTTL <= 0 {
+		return nil, fmt.Errorf("RUN_STREAM_TTL 必须大于 0")
 	}
 
 	// 流式对话是「一个请求一条长连接」：这个值是整请求超时，必须 ≥ LLM_MAX_WALL_CLOCK，
@@ -282,6 +298,8 @@ func Load() (*Config, error) {
 		DingTalkRedirectURI:  getenv("DINGTALK_REDIRECT_URI", "http://127.0.0.1:8321/auth/dingtalk/callback"),
 		SessionCookie:        getenv("SESSION_COOKIE", "aa_session"),
 		SessionTTL:           ttl,
+		RedisURL:             getenv("REDIS_URL", ""),
+		RunStreamTTL:         runStreamTTL,
 		CookieSecure:         getenv("COOKIE_SECURE", "false") == "true",
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
 		UploadMaxFileMB:      uploadMaxFileMB,

@@ -174,6 +174,7 @@ var builtinSkills = []BuiltinSkill{
 			"- 建技能 / 插件没有专用工具：按 `builtin_plugin_dev` 的 `references/skill.md` 用 `file_write` 写 `plugins/<slug>/plugin.json` 与 `SKILL.md`。",
 			"",
 			"## 回答要点",
+			"- 只在用户要文件时才写：问问题、要结论、要方案时直接写在回复里，不要顺手建 md 留档。",
 			"- 写入后告诉用户具体路径与字节数。",
 			"- 不要尝试访问空间之外的路径（`../`），会被直接拒绝。",
 		),

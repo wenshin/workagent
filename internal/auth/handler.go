@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/workagent/auto-agent/internal/cache"
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/platform"
 	"github.com/workagent/auto-agent/internal/store"
@@ -236,6 +237,11 @@ func (h *Handler) newCookie(value string, maxAge int) *http.Cookie {
 
 func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, cache.ErrUnavailable):
+		// 缓存挂了不等于没登录：返回 503，别把用户踢去登录页（那里同样进不去）
+		h.log.Error("登录缓存不可用", "err", err, "request_id", platform.RequestIDFrom(r.Context()))
+		platform.WriteError(w, r, http.StatusServiceUnavailable, "session_store_unavailable",
+			"登录服务暂不可用，请稍后重试")
 	case errors.Is(err, ErrNotImplemented):
 		_, display, _, _ := h.svc.ProviderInfo()
 		platform.WriteError(w, r, http.StatusNotImplemented, "not_implemented",

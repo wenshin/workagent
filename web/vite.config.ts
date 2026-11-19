@@ -32,6 +32,9 @@ export default defineConfig({
         '/auth',
         '/spaces',
         '/sessions',
+        // 续流入口：刷新/切页回来靠它接上正在跑的那一轮。漏掉就会落到 SPA 路由，
+        // 拿到 index.html —— 表现是「切页回来会话没了」，且不报任何错
+        '/runs',
         '/resources',
         '/admin',
         '/healthz',

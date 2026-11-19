@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/cache"
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/identity"
 	"github.com/workagent/auto-agent/internal/store"
@@ -46,7 +47,9 @@ type SystemSpaceEnsurer interface {
 
 // Service 负责登录编排：state 校验、换取 token、落库、建空间、发会话。
 type Service struct {
-	store    store.Store
+	store store.Store
+	// sessions 是登录态的唯一存放处：Postgres 只存用户资料，不存会话（§5.1.1）。
+	sessions cache.Client
 	provider identity.Provider
 	cfg      *config.Config
 	spaces   SystemSpaceEnsurer
@@ -55,9 +58,10 @@ type Service struct {
 }
 
 // NewService 构造登录服务。IdP 由调用方按配置注入，切换 IdP 不改这里。
-func NewService(st store.Store, cfg *config.Config, idp identity.Provider, spaces SystemSpaceEnsurer, log *slog.Logger) *Service {
+func NewService(st store.Store, cfg *config.Config, idp identity.Provider, spaces SystemSpaceEnsurer, sessions cache.Client, log *slog.Logger) *Service {
 	return &Service{
 		store:    st,
+		sessions: sessions,
 		provider: idp,
 		cfg:      cfg,
 		spaces:   spaces,
@@ -157,7 +161,7 @@ func (s *Service) CompleteLogin(ctx context.Context, code, state string) (*Resul
 		return nil, err
 	}
 	expiresAt := time.Now().Add(s.cfg.SessionTTL)
-	if err := s.store.CreateAuthSession(ctx, hashToken(token), user.ID, expiresAt); err != nil {
+	if err := s.sessions.SetSession(ctx, hashToken(token), user.ID, s.cfg.SessionTTL); err != nil {
 		return nil, fmt.Errorf("创建登录会话失败: %w", err)
 	}
 
@@ -171,16 +175,19 @@ func (s *Service) CompleteLogin(ctx context.Context, code, state string) (*Resul
 }
 
 // Authenticate 用 cookie 中的 token 还原用户。
+//
+// 会话只在 Redis 里：读不到就是没登录；读出错（Redis 挂了）原样往上抛，
+// handler 据此返回 503 而不是 401——否则一次抖动会把所有人踢到登录页。
 func (s *Service) Authenticate(ctx context.Context, token string) (store.User, error) {
 	if token == "" {
 		return store.User{}, ErrUnauthenticated
 	}
-	sess, err := s.store.GetAuthSession(ctx, hashToken(token))
+	sess, ok, err := s.sessions.GetSession(ctx, hashToken(token))
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return store.User{}, ErrUnauthenticated
-		}
 		return store.User{}, err
+	}
+	if !ok {
+		return store.User{}, ErrUnauthenticated
 	}
 	user, err := s.store.GetUser(ctx, sess.UserID)
 	if err != nil {
@@ -200,7 +207,15 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 	if token == "" {
 		return nil
 	}
-	return s.store.DeleteAuthSession(ctx, hashToken(token))
+	return s.sessions.DeleteSession(ctx, hashToken(token))
+}
+
+// KickUser 让某个账号的所有会话立即失效（禁用账号、强制下线）。
+//
+// 会话只在 Redis，没有「库里的会话行」需要同步；调用方在改完 app_user.status
+// 之后调一次即可，不需要等 TTL 自然过期。
+func (s *Service) KickUser(ctx context.Context, userID string) error {
+	return s.sessions.DeleteUserSessions(ctx, userID)
 }
 
 // Spaces 返回用户可见空间。

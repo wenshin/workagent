@@ -14,6 +14,14 @@ import type { ActiveRunResponse, PendingApproval, StreamItem } from './types';
  */
 export interface LiveRunView {
   sessionId: string;
+  /**
+   * 这一轮真正开始的时刻（epoch ms），用于「已用时」。
+   *
+   * 不能由视图自己记 `Date.now()`：切页回来时 React 会卸载再挂载组件，
+   * 本地计时会从 0 重数，用户看到的耗时比真实值少一大截。
+   * 所以续流时用服务端 run.started_at 校准，只有新发起的一轮才取本地时间。
+   */
+  startedAtMs: number;
   /** 本轮用户输入，用于在消息列表里先占位；续流时为空（用户消息已经落库） */
   pendingUser: string;
   /** 本轮引用的空间文件（相对 files/ 的路径），占位气泡里渲染成文件标签 */
@@ -217,6 +225,16 @@ function buildHandlers(
   };
 }
 
+/**
+ * 把后端 RFC3339 时间解析成 epoch ms。
+ *
+ * 解析不出来就退回当前时间：宁可少算，也不要显示一个 1970 年的耗时。
+ */
+function toEpochMs(iso?: string): number {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(t) ? t : Date.now();
+}
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const done = () => {
@@ -243,6 +261,7 @@ async function resumeStream(
   ctrl: AbortController,
   reset: () => void,
   handlers: StreamHandlers,
+  onActive?: (startedAt: number) => void,
 ): Promise<boolean> {
   for (const delayMs of RESUME_DELAYS_MS) {
     if (ctrl.signal.aborted) return false;
@@ -257,6 +276,8 @@ async function resumeStream(
     }
     if (!active.active || !active.run) return false;
 
+    // 重挂回来的可能是同一个 run：以服务端开始时间为准，耗时才不会从头数
+    onActive?.(toEpochMs(active.run.started_at));
     reset();
     try {
       const outcome = await streamRun(active.run.id, 0, handlers, ctrl.signal);
@@ -348,6 +369,8 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
   controller = ctrl;
   current = {
     sessionId: opts.sessionId,
+    // 新发起的一轮：本地时间就是起点（服务端 run.started_at 那一刻才有）
+    startedAtMs: Date.now(),
     pendingUser: opts.content,
     pendingRefs: opts.references ?? [],
     items: [],
@@ -370,6 +393,8 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
 
   const handlers = buildHandlers(patch, markWrote, opts.sessionId, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
+  // 断流自愈拿到的 run 与视图里的可能是同一个：用服务端开始时间校准「已用时」
+  const onActive = (startedAt: number) => patch((v) => ({ ...v, startedAtMs: startedAt }));
 
   return (async () => {
     let aborted = false;
@@ -385,7 +410,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
           );
       // 没有终态事件就是断了（切页、代理掐连接、热更新……）：run 还在服务端跑，续上
       if (!outcome.finished) {
-        await resumeStream(opts.sessionId, ctrl, reset, handlers);
+        await resumeStream(opts.sessionId, ctrl, reset, handlers, onActive);
       }
       await syncApprovals(opts.sessionId, patch);
     } catch (e) {
@@ -393,7 +418,7 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
       aborted = e instanceof DOMException && e.name === 'AbortError';
       if (!aborted) {
         // 连接中途被掐断也是「流断了」：先试着重挂，真的续不上再报错
-        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers);
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, onActive);
         if (!resumed) opts.onError?.(e instanceof Error ? e.message : '发送失败，请重试');
       }
     } finally {
@@ -424,6 +449,8 @@ export function resumeLiveRun(
 export interface AttachRunOptions {
   sessionId: string;
   runId: string;
+  /** 服务端记录的这一轮开始时间（RFC3339）：续流时用它校准「已用时」 */
+  startedAt?: string;
   /** 从第几个字符之后开始补：默认 0，表示这一轮的全部内容 */
   afterOffset?: number;
   onError?: (message: string) => void;
@@ -447,6 +474,8 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
   controller = ctrl;
   current = {
     sessionId: opts.sessionId,
+    // 切页/刷新回来：耗时按服务端这一轮的开始时间算，不从本次挂载重数
+    startedAtMs: toEpochMs(opts.startedAt),
     // 用户消息已经落库，不再补一个占位气泡
     pendingUser: '',
     pendingRefs: [],
@@ -467,6 +496,8 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
 
   const handlers = buildHandlers(patch, markWrote, opts.sessionId, opts.onError);
   const reset = () => patch((v) => ({ ...v, items: [] }));
+  // 重挂回来的可能是同一个 run：耗时跟着服务端的开始时间走
+  const onActive = (startedAt: number) => patch((v) => ({ ...v, startedAtMs: startedAt }));
 
   return (async () => {
     let aborted = false;
@@ -475,11 +506,11 @@ export function attachLiveRun(opts: AttachRunOptions): Promise<void> {
       // 重放只说明「请求发生过」；谁点过按钮要看服务端的记录，否则刷新后会把
       // 已经处理掉的审批又显示成待办。
       await syncApprovals(opts.sessionId, patch);
-      if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers);
+      if (!outcome.finished) await resumeStream(opts.sessionId, ctrl, reset, handlers, onActive);
     } catch (e) {
       aborted = e instanceof DOMException && e.name === 'AbortError';
       if (!aborted) {
-        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers);
+        const resumed = await resumeStream(opts.sessionId, ctrl, reset, handlers, onActive);
         if (!resumed) opts.onError?.(e instanceof Error ? e.message : '续接失败，请重试');
       }
     } finally {

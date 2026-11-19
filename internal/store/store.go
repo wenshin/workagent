@@ -243,6 +243,18 @@ type Run struct {
 	EndedAt   *time.Time
 }
 
+// RunContent 是中断收尾时从缓存取回的正文快照。
+//
+// 只在内存/Redis 里存在过的东西（正文与思考）靠它写回消息；
+// 工具轨迹仍从 run_step 还原，两者互补，谁也不替代谁。
+type RunContent struct {
+	Content   string
+	Reasoning string
+}
+
+// RunContentFunc 按 run 取回缓存里的正文；取不到返回零值（缓存过期、未配置缓存）。
+type RunContentFunc func(runID, sessionID string) RunContent
+
 // RunStep 是一条 checkpoint（§6 run_step / §5.7.5）。
 type RunStep struct {
 	ID        string
@@ -307,13 +319,6 @@ const (
 	ApprovalExpired = "expired"
 )
 
-// AuthSession 是登录会话（注意：与聊天会话 session 表不是一回事）。
-type AuthSession struct {
-	TokenHash string
-	UserID    string
-	ExpiresAt time.Time
-}
-
 // Store 是持久化接口，业务层只依赖它。
 type Store interface {
 	Ping(ctx context.Context) error
@@ -324,10 +329,6 @@ type Store interface {
 	SearchUsers(ctx context.Context, keyword string, limit int) ([]User, error)
 	// FindUserByJobNumber 按工号查用户，用于按配置识别系统管理员。
 	FindUserByJobNumber(ctx context.Context, jobNumber string) (User, error)
-
-	CreateAuthSession(ctx context.Context, tokenHash, userID string, expiresAt time.Time) error
-	GetAuthSession(ctx context.Context, tokenHash string) (AuthSession, error)
-	DeleteAuthSession(ctx context.Context, tokenHash string) error
 
 	// EnsurePersonalSpace 保证用户拥有个人空间（含一个「新会话」），返回可见空间及是否本次创建。
 	EnsurePersonalSpace(ctx context.Context, userID string) ([]Space, bool, error)
@@ -444,9 +445,11 @@ type Store interface {
 	ResumableRun(ctx context.Context, sessionID string) (Run, bool, error)
 	// SweepStaleRuns 把心跳停了却还挂着 running 的执行置为 failed，返回收尾条数。
 	//
+	// recover 按 run 取回缓存里的正文快照，由调用方注入（store 不依赖缓存实现）。
+	//
 	// 顺带结算它们的流式占位消息：run_step 里的工具轨迹还原进 parts 并标中断，
 	// 否则刷新后要么一直显示「生成中」，要么连中断前做过什么都看不到。
-	SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string) (int, error)
+	SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string, recover RunContentFunc) (int, error)
 	// AbandonRun 收尾一条「没人跑」的执行：置为 failed 并结算它的流式占位消息。
 	//
 	// 与 SweepStaleRuns 的区别只在触发时机与判据：清扫靠心跳超时批量做，
@@ -454,12 +457,15 @@ type Store interface {
 	// 不必等 idle 超时（进程被 kill、迁移给历史行补默认心跳都会造出这种假活）。
 	// staleAfter > 0 时按心跳再挡一道：心跳还在跳说明执行在别处活着，本进程无权替它收尾。
 	// 断点（run_resume）不动：用户仍可以在会话里点「继续」。
-	AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration) error
+	//
+	// recovered 是中断时从缓存取回的正文（可能为空）：写回同一条占位消息，
+	// 否则重启后只剩工具卡，「已经说出口的话」凭空消失。
+	AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration, recovered RunContent) error
 	// InterruptStreamingMessage 结算一条已被接替的执行留下的流式占位消息。
 	//
 	// 续跑接手一条中断的 run 时用它：那条 run 已经置了终态，不会再走 AbandonRun，
 	// 占位没人结算就会永远挂在「生成中」，而中断前的工具轨迹在界面上一条都看不到。
-	InterruptStreamingMessage(ctx context.Context, runID, sessionID string) error
+	InterruptStreamingMessage(ctx context.Context, runID, sessionID string, recovered RunContent) error
 
 	// ---- 人工确认（§5.2）----
 	// CreateApproval 登记一条待确认记录；同 id 已存在时不覆盖（重放幂等）。

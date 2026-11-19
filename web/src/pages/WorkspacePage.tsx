@@ -287,6 +287,8 @@ export default function WorkspacePage() {
         await attachLiveRun({
           sessionId: session.id,
           runId: res.run.id,
+          // 耗时以这一轮真正的开始时间为准：切页回来不重新数
+          startedAt: res.run.started_at,
           onError: (message) => Toast.error(message),
           // 续流同样要刷树：这一轮可能在页面刷新期间写过文件（本轮事件是从 offset 0 重放的）
           onSettled: (info) => {
@@ -295,6 +297,10 @@ export default function WorkspacePage() {
             if (info.wroteFiles) invalidateAfterWrite(queryClient);
           },
         });
+        // 挂流已经结束（这一轮收尾，或者缓存里没内容直接 detached）：放开登记，
+        // 下次切页/切回会话还能再试一次。不释放的话，一次没挂上的失败会在这份
+        // 组件实例里变成永久空白——后面每次进来都被这行挡住。
+        attachedRef.current.delete(session.id);
       } catch {
         // 拉不到当次状态就当没在跑：用户可以重新发一条
       }

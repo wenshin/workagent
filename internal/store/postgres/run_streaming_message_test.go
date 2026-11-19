@@ -104,7 +104,7 @@ func TestInterruptStreamingMessageKeepsToolTrace(t *testing.T) {
 	appendStep(t, db, runID, 2, "tool.result", stepPayload("c1", "wiki_search", `{"query":"GMV"}`, "命中已确认模型", "ok", 12))
 	appendStep(t, db, runID, 3, "tool.call", stepPayload("c2", "mcp_call", `{}`, "", "running", 0))
 
-	if err := db.InterruptStreamingMessage(ctx, runID, sessionID); err != nil {
+	if err := db.InterruptStreamingMessage(ctx, runID, sessionID, store.RunContent{}); err != nil {
 		t.Fatalf("结算占位失败: %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestInterruptStreamingMessageKeepsToolTrace(t *testing.T) {
 	}
 
 	// 重复结算幂等：已经不再是 streaming，不会再被改
-	if err := db.InterruptStreamingMessage(ctx, runID, sessionID); err != nil {
+	if err := db.InterruptStreamingMessage(ctx, runID, sessionID, store.RunContent{}); err != nil {
 		t.Fatalf("重复结算失败: %v", err)
 	}
 	again, err := db.ListMessages(ctx, sessionID)
@@ -143,6 +143,41 @@ func TestInterruptStreamingMessageKeepsToolTrace(t *testing.T) {
 	}
 	if len(again) != 1 || !again[0].Interrupted {
 		t.Fatalf("重复结算改动了已结算的消息: %+v", again)
+	}
+}
+
+// TestInterruptStreamingMessageWritesRecoveredContent 锁定「重启不丢正文」：
+// 正文只存在过缓存里，收尾时必须把它写回同一条占位消息，
+// 否则用户回来只剩一条问题（没有工具轨迹时连卡片都没有）。
+func TestInterruptStreamingMessageWritesRecoveredContent(t *testing.T) {
+	db, sessionID := newStreamingFixture(t, "recover")
+	ctx := context.Background()
+
+	var runID string
+	if err := db.pool.QueryRow(ctx,
+		`insert into run (session_id, status, started_at, heartbeat_at)
+		 values ($1::uuid, 'waiting_approval', now(), now())
+		 returning id::text`, sessionID).Scan(&runID); err != nil {
+		t.Fatalf("建 run 失败: %v", err)
+	}
+	if _, err := db.CreateStreamingMessage(ctx, sessionID); err != nil {
+		t.Fatalf("写占位失败: %v", err)
+	}
+
+	// 这一轮没有任何工具轨迹：只有缓存里的正文，结算必须保留消息并标中断
+	recovered := store.RunContent{Content: "已经写了一半的正文", Reasoning: "想过的理由"}
+	if err := db.InterruptStreamingMessage(ctx, runID, sessionID, recovered); err != nil {
+		t.Fatalf("结算占位失败: %v", err)
+	}
+	msgs, err := db.ListMessages(ctx, sessionID)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("读消息失败: %v 条数=%d", err, len(msgs))
+	}
+	if !msgs[0].Interrupted || msgs[0].Streaming {
+		t.Fatalf("应标成中断，实际 streaming=%v interrupted=%v", msgs[0].Streaming, msgs[0].Interrupted)
+	}
+	if msgs[0].Content != recovered.Content || msgs[0].Reasoning != recovered.Reasoning {
+		t.Fatalf("缓存里的正文没写回: %+v", msgs[0])
 	}
 }
 
@@ -188,7 +223,7 @@ func TestSweepStaleRunsHealsOrphanPlaceholder(t *testing.T) {
 	// staleAfter 取很长：这条用例只关心孤儿占位的自愈，不去收尾库里别的执行。
 	// 注意 SweepStaleRuns 是全局自愈，会顺手结算库里其它会话的孤儿占位（幂等，
 	// 只碰「没有任何活 run」的会话）；跑在开发库上等于把历史遗留的脏占位一起清了。
-	if _, err := db.SweepStaleRuns(ctx, 24*time.Hour, "测试清扫"); err != nil {
+	if _, err := db.SweepStaleRuns(ctx, 24*time.Hour, "测试清扫", nil); err != nil {
 		t.Fatalf("清扫失败: %v", err)
 	}
 

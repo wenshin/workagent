@@ -77,10 +77,10 @@ func TestAbandonRunSettlesStreamingMessages(t *testing.T) {
 	// 心跳还新鲜（另一个副本可能在跑它）：本进程无权替它收尾
 	alive := runID(store.RunRunning, "0 seconds")
 
-	if err := db.AbandonRun(ctx, ghost, sessionID, "测试收尾", 30*time.Second); err != nil {
+	if err := db.AbandonRun(ctx, ghost, sessionID, "测试收尾", 30*time.Second, store.RunContent{}); err != nil {
 		t.Fatalf("收尾失败: %v", err)
 	}
-	if err := db.AbandonRun(ctx, alive, sessionID, "测试收尾", 30*time.Second); err != nil {
+	if err := db.AbandonRun(ctx, alive, sessionID, "测试收尾", 30*time.Second, store.RunContent{}); err != nil {
 		t.Fatalf("收尾失败: %v", err)
 	}
 	stillAlive, err := db.GetRun(ctx, alive)
@@ -131,7 +131,7 @@ func TestAbandonRunSettlesStreamingMessages(t *testing.T) {
 		 returning id::text`, sessionID).Scan(&freshID); err != nil {
 		t.Fatalf("写新一轮占位失败: %v", err)
 	}
-	if err := db.AbandonRun(ctx, done, sessionID, "重复收尾", 30*time.Second); err != nil {
+	if err := db.AbandonRun(ctx, done, sessionID, "重复收尾", 30*time.Second, store.RunContent{}); err != nil {
 		t.Fatalf("收尾失败: %v", err)
 	}
 	after, err := db.ListMessages(ctx, sessionID)

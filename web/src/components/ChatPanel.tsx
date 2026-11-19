@@ -39,6 +39,13 @@ const INPUT_MAX_HEIGHT = 200;
 export interface StreamView {
   /** 思考、正文与工具调用按到达顺序排列：渲染时照序输出，保持真实时间线 */
   items: StreamItem[];
+  /**
+   * 这一轮真正开始的时刻（epoch ms）。
+   *
+   * 由 liveRun 维护：新发起取本地时间，切页/刷新续流时取服务端 run.started_at。
+   * 组件自己记时间会在重新挂载时归零，「已用时」就会从 0 重数。
+   */
+  startedAtMs?: number;
   /** 卡在等人确认：气泡不该继续显示「生成中」，那会让人以为模型还在想 */
   waitingApproval?: boolean;
 }
@@ -845,8 +852,12 @@ export default function ChatPanel({
     handoverRef.current = null;
   }
 
-  // 列表里可见的消息：流式的空占位（后端在首个正文增量时创建）由下面的实时气泡接管
-  const visibleMessages = messages.filter((m) => !(m.streaming && !m.content));
+  // 列表里可见的消息：流式的空占位（后端在首个正文增量时创建）由下面的实时气泡接管。
+  // 只有「真的什么都没有」才藏：思考或工具轨迹已经写回占位消息时藏掉，用户看到的就是
+  // 「切页回来这一轮凭空消失了」——有轨迹就该显示，那是这一轮存在过的证据。
+  const visibleMessages = messages.filter(
+    (m) => !m.streaming || Boolean(m.content || m.reasoning || m.parts?.length),
+  );
   const lastVisible = visibleMessages[visibleMessages.length - 1];
 
   // 流结束的瞬间 stream 变 null，而这一轮回复还没落库：此时若立刻卸载实时气泡，列表高度
@@ -998,12 +1009,15 @@ export default function ChatPanel({
       setElapsedMs(0);
       return;
     }
+    // 基准优先取视图里的真实开始时间：切页回来组件会重新挂载，本地 ref 是空的，
+    // 若在这里取 Date.now()，「已用时」就从切回来的那一刻重新数。
+    if (liveView?.startedAtMs) startedAtRef.current = liveView.startedAtMs;
     if (startedAtRef.current === null) startedAtRef.current = Date.now();
     const tick = () => setElapsedMs(Date.now() - (startedAtRef.current ?? Date.now()));
     tick();
     const timer = window.setInterval(tick, 200);
     return () => window.clearInterval(timer);
-  }, [busy]);
+  }, [busy, liveView?.startedAtMs]);
 
   const send = async () => {
     const text = value.trim();

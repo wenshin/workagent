@@ -78,10 +78,11 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 		Doc:  doc,
 	}})
 
-	// 预算只约束技能正文本身；固定基础规则大约占 1100 tokens（含检索、知识库按
-	// 智能体分区与编程任务判断规则），因此这里给的是「正文预算 + 基础规则」的余量，
-	// 微调措辞时不用同步调数字。基础规则成规模增长时要重新审视预算分配。
-	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1250 {
+	// 预算只约束技能正文本身；固定基础规则大约占 1350 tokens（含检索、知识库按
+	// 智能体分区、默认在对话里回答与编程任务判断规则），因此这里给的是「正文预算
+	// + 基础规则」的余量，微调措辞时不用同步调数字。基础规则成规模增长时要重新
+	// 审视预算分配，而不是继续抬这里。
+	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1400 {
 		t.Fatalf("技能正文超预算：%d tokens", got)
 	}
 	for _, want := range []string{"本轮选中的技能：长技能", "已截断", "plugin_read"} {
@@ -94,7 +95,7 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 func TestDirContextMentionsDirectory(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{Dir: "docs/合同"})
 
-	for _, want := range []string{"当前会话的目录", "docs/合同", "新建文件也放在这里"} {
+	for _, want := range []string{"当前会话的目录", "docs/合同", "真要产出文件时放到这个目录"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("普通目录上下文缺少 %q", want)
 		}
@@ -177,6 +178,23 @@ func TestBasePromptRoutesKnowledgeToWiki(t *testing.T) {
 	// 能力缺失（系统空间没初始化）时不能静默降级成写文件
 	if !strings.Contains(msg.Content, "系统空间未初始化") {
 		t.Fatal("基础规则缺少 wiki 不可用时的处理要求")
+	}
+}
+
+// 普通问答必须在对话里回答：模型手里有 file_write，提示词不说清就会把
+// 每个回答都落成 md 文件，用户在会话里只看到「已写入 xxx.md」。
+func TestBasePromptAnswersInChatByDefault(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{})
+
+	for _, want := range []string{"默认在对话里回答", "不要产出文件", "file_write", "wiki_write"} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("基础规则缺少默认在对话里回答的约束 %q", want)
+		}
+	}
+	// 目录上下文不能把「新建文件」写成默认动作
+	dirMsg := BuildSystemMessage(RunInput{Dir: "docs/合同"})
+	if !strings.Contains(dirMsg.Content, "不要为了用上这个目录而建文件") {
+		t.Fatalf("目录上下文缺少「不为了用上目录而建文件」的约束:\n%s", dirMsg.Content)
 	}
 }
 

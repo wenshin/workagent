@@ -14,6 +14,7 @@ import (
 	// 副作用导入：注册 AGENT_IMPL=direct 的直答实现（只有配置选中时才实例化）
 	_ "github.com/workagent/auto-agent/internal/agent/direct"
 	"github.com/workagent/auto-agent/internal/auth"
+	"github.com/workagent/auto-agent/internal/cache"
 	"github.com/workagent/auto-agent/internal/config"
 	"github.com/workagent/auto-agent/internal/ctxmgr"
 	"github.com/workagent/auto-agent/internal/golden"
@@ -35,9 +36,11 @@ import (
 
 // App 组装路由与服务。
 type App struct {
-	cfg        *config.Config
-	log        *slog.Logger
-	store      store.Store
+	cfg   *config.Config
+	log   *slog.Logger
+	store store.Store
+	// cache 是登录态与会话流的缓存连接，随 App 关闭一起释放
+	cache      cache.Client
 	auth       *auth.Handler
 	spaceSvc   *space.Service
 	spaceH     *space.Handler
@@ -64,7 +67,13 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 管理员可能尚未登录过：启动时按配置工号尽量把系统空间准备好
 	spaceSvc.BootstrapSystemSpace(context.Background())
 
-	authHandler := auth.NewHandler(auth.NewService(st, cfg, idp, spaceSvc, log), cfg, log)
+	// 登录态与会话流都放在缓存层：配了 REDIS_URL 走 Redis，留空退回进程内存。
+	cacheClient, err := cache.Open(cfg.RedisURL, cfg.RunStreamTTL)
+	if err != nil {
+		return nil, err
+	}
+
+	authHandler := auth.NewHandler(auth.NewService(st, cfg, idp, spaceSvc, cacheClient, log), cfg, log)
 
 	router := buildRouter(cfg, log)
 
@@ -220,7 +229,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 
 	// 智能体设定：从系统空间 agents/ 读取，只追加提示词，不影响权限
 
-	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, searchReg, shellRunner, cfg.LLMMaxWallClock, cfg.RunIdleTimeout, log)
+	sessionSvc := session.NewService(st, spaceSvc, agentSvc, fs, memory, searchReg, shellRunner, cacheClient, cfg.LLMMaxWallClock, cfg.RunIdleTimeout, log)
 
 	// 启动清扫：上一个进程留下的 running 不会再有人写终态，留着只会让前端
 	// 一直显示「生成中」。断点保留，用户打开会话就能点「继续」。
@@ -245,6 +254,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		cfg:        cfg,
 		log:        log,
 		store:      st,
+		cache:      cacheClient,
 		auth:       authHandler,
 		spaceSvc:   spaceSvc,
 		spaceH:     space.NewHandler(spaceSvc, authHandler.CurrentUser, log),
@@ -315,6 +325,9 @@ func allowRules(ids []string) map[string]bool {
 func (a *App) Close() {
 	if a.pluginSvc != nil {
 		a.pluginSvc.Close()
+	}
+	if a.cache != nil {
+		_ = a.cache.Close()
 	}
 }
 

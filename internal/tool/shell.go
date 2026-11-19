@@ -213,20 +213,40 @@ func shellWritesByRedirect(command string) bool {
 	return false
 }
 
-// shellSegments 按管道 / 顺序分隔符切段（与审批判定同一口径）。
+// shellSegments 按管道 / 顺序分隔符切段。
+//
+// 只认真正起分隔作用的符号：引号里的 `|`、转义的 `\|`（grep 的或模式）、
+// `&&` / `||` 的连写都不产生新段。按字节硬切会把 `grep "a\|b" f` 切成两段，
+// 后一段的首词是 `b"`，于是整条只读命令被误判成写入。
 func shellSegments(command string) []string {
-	fields := strings.FieldsFunc(command, func(r rune) bool {
-		switch r {
+	out := make([]string, 0, 4)
+	start := 0
+	var quote byte
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if quote != 0 {
+			switch {
+			case c == '\\' && quote == '"':
+				i++ // 双引号里的转义：下一个字符不参与判定
+			case c == quote:
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '\\':
+			i++ // 转义的分隔符不是分隔符（grep 的 \|）
 		case ';', '&', '|', '\n', '\r':
-			return true
+			if s := strings.TrimSpace(command[start:i]); s != "" {
+				out = append(out, s)
+			}
+			start = i + 1
 		}
-		return false
-	})
-	out := make([]string, 0, len(fields))
-	for _, seg := range fields {
-		if s := strings.TrimSpace(seg); s != "" {
-			out = append(out, s)
-		}
+	}
+	if s := strings.TrimSpace(command[start:]); s != "" {
+		out = append(out, s)
 	}
 	return out
 }

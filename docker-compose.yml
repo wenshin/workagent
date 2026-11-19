@@ -16,5 +16,22 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: autoagent-redis
+    # 登录态与会话流都在这里：AOF everysec 兜住进程级故障，
+    # noeviction 保证流缓存不会被 LRU 悄悄淘汰（淘汰 = 静默丢正文）。
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:
+  redisdata:

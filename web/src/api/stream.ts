@@ -138,6 +138,12 @@ async function readSSE(res: Response, handlers: StreamHandlers): Promise<StreamO
   if (!res.body) {
     throw new ApiError('当前浏览器不支持流式响应', 0, 'stream_unsupported');
   }
+  // 拿到 200 不等于拿到了流：反代漏配路由时这里会是一段 HTML（SPA 的 index）。
+  // 不校验就会把它当成「零帧的空流」静默收尾，变成「切页回来会话没了」且毫无线索。
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('text/event-stream')) {
+    throw new ApiError('流式接口未正确路由（返回的不是 SSE）', 0, 'bad_stream_route');
+  }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

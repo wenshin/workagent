@@ -118,7 +118,7 @@ limit 1`
 // 只动「心跳停了」的那批：长任务跑两小时也该有事件，没有事件说明进程已经不在了。
 // 这些 run 的断点保留着，用户刷新后可以在会话里点「继续」接着走；
 // 它们残留的流式占位消息要一起标成中断，否则会永远显示「生成中」。
-func (d *DB) SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string) (int, error) {
+func (d *DB) SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reason string, recover store.RunContentFunc) (int, error) {
 	if staleAfter <= 0 {
 		staleAfter = 10 * time.Minute
 	}
@@ -161,7 +161,7 @@ returning id::text, session_id::text`
 	// 这些会话里不会再有活的 run 了，占位消息的收尾交给这里。
 	// 按 run 逐条结算而不是只按会话：要拿 run_step 还原中断前的工具轨迹。
 	for _, r := range stale {
-		if err := settleRunStreamingMessage(ctx, tx, r.runID, r.sessionID); err != nil {
+		if err := settleRunStreamingMessage(ctx, tx, r.runID, r.sessionID, recoverContent(recover, r.runID, r.sessionID)); err != nil {
 			return 0, err
 		}
 	}
@@ -227,7 +227,8 @@ where m.streaming
 			continue
 		}
 		done[o.sessionID] = true
-		if err := settleRunStreamingMessage(ctx, tx, o.runID, o.sessionID); err != nil {
+		// 孤儿占位不取缓存：它对应的 run 已终态，正文在当初结算时就该写回去了
+		if err := settleRunStreamingMessage(ctx, tx, o.runID, o.sessionID, store.RunContent{}); err != nil {
 			return err
 		}
 	}
@@ -242,7 +243,7 @@ where m.streaming
 //
 // staleAfter > 0 时带一道心跳判据：心跳还在跳说明执行在别的副本上活着，
 // 本进程只是拿不到它的流，不能替它决定结局。
-func (d *DB) AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration) error {
+func (d *DB) AbandonRun(ctx context.Context, runID, sessionID, reason string, staleAfter time.Duration, recovered store.RunContent) error {
 	if runID == "" || sessionID == "" {
 		return nil
 	}
@@ -268,7 +269,7 @@ where id = $1::uuid and session_id = $2::uuid
 	if tag.RowsAffected() == 0 {
 		return tx.Commit(ctx)
 	}
-	if err := settleRunStreamingMessage(ctx, tx, runID, sessionID); err != nil {
+	if err := settleRunStreamingMessage(ctx, tx, runID, sessionID, recovered); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -279,7 +280,7 @@ where id = $1::uuid and session_id = $2::uuid
 // 续跑（用户点「继续」）接手一条中断的 run 时用它：那条 run 已经被置为终态，
 // 不会再走 AbandonRun，占位消息也就没人结算——它会永远挂在 streaming=true 上，
 // 而中断前调过的工具（run_step 里有记录）在界面上一条都看不到。
-func (d *DB) InterruptStreamingMessage(ctx context.Context, runID, sessionID string) error {
+func (d *DB) InterruptStreamingMessage(ctx context.Context, runID, sessionID string, recovered store.RunContent) error {
 	if sessionID == "" {
 		return nil
 	}
@@ -288,7 +289,7 @@ func (d *DB) InterruptStreamingMessage(ctx context.Context, runID, sessionID str
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := settleRunStreamingMessage(ctx, tx, runID, sessionID); err != nil {
+	if err := settleRunStreamingMessage(ctx, tx, runID, sessionID, recovered); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -313,7 +314,20 @@ type messagePart struct {
 // 看到答案、看不到中断前做过什么——这就是「历史记录没了」。所以先把已经发生的
 // 工具调用还原成 parts 写回去：有轨迹就留一条 interrupted 消息（正文可以为空，
 // 工具卡还在），连轨迹都没有的空占位才删掉，那种留在列表里只是一条空白回答。
-func settleRunStreamingMessage(ctx context.Context, tx pgx.Tx, runID, sessionID string) error {
+func settleRunStreamingMessage(ctx context.Context, tx pgx.Tx, runID, sessionID string, recovered store.RunContent) error {
+	// 先把缓存里取回的正文写回去：正文只存在过内存/Redis 里，run_step 里没有。
+	// 这一步在轨迹还原之前做，后面「有正文就保留」的判断才有依据。
+	if recovered.Content != "" || recovered.Reasoning != "" {
+		const qcontent = `
+update message
+set content = case when coalesce($2, '') <> '' then $2 else content end,
+    reasoning = case when coalesce($3, '') <> '' then $3 else coalesce(reasoning, '') end
+where session_id = $1::uuid and streaming`
+		if _, err := tx.Exec(ctx, qcontent, sessionID, recovered.Content, recovered.Reasoning); err != nil {
+			return err
+		}
+	}
+
 	parts, err := toolPartsFromSteps(ctx, tx, runID)
 	if err != nil {
 		return err
@@ -347,11 +361,21 @@ where session_id = $1::uuid and streaming`
 	return err
 }
 
+// recoverContent 调一下调用方注入的取正文函数，顺手挡掉 panic 与空值：
+// 清扫是启动路径，不能因为缓存实现有 bug 让整个服务起不来。
+func recoverContent(fn store.RunContentFunc, runID, sessionID string) store.RunContent {
+	if fn == nil {
+		return store.RunContent{}
+	}
+	return fn(runID, sessionID)
+}
+
 // toolPartsFromSteps 用 run_step 还原中断前的工具调用轨迹。
 //
-// 只取 tool.call / tool.result：正文与思考没有逐 token 落库（§15.12.2 明确不做），
-// 能还原的只有「调过哪些工具、拿到什么回执」。没有回执的调用标成失败并写明原因——
-// 停在「执行中」会让人以为这一轮还在跑，而这已经是终态了。
+// 只取 tool.call / tool.result：正文与思考不在 run_step 里（§15.12.2），
+// 能还原的只有「调过哪些工具、拿到什么回执」；正文由调用方从缓存取回后先写上。
+// 没有回执的调用标成失败并写明原因——停在「执行中」会让人以为这一轮还在跑，
+// 而这已经是终态了。
 func toolPartsFromSteps(ctx context.Context, tx pgx.Tx, runID string) ([]messagePart, error) {
 	if runID == "" {
 		return nil, nil

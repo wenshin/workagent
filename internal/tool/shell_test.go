@@ -117,6 +117,11 @@ func TestShellRiskByCommand(t *testing.T) {
 		{"git log --oneline -5", policy.RiskReadOnly},
 		{"git diff --stat", policy.RiskReadOnly},
 		{"echo hello", policy.RiskReadOnly},
+		// 线上真实出现过的形态（会话 d72ce277 的三条 grep）
+		{`grep -n "^### Q1[3-8]\|^## \|^### Q1[1-9]" 面试题.md`, policy.RiskReadOnly},
+		{`grep -n "Q1[3-9]\|Q2[0-9]" 面试题.md | grep -v "^.*### Q" ; echo "---目录检查---"; grep -n "目录\|题号" 面试题.md`, policy.RiskReadOnly},
+		{`grep -n "分布式事务\|2PC\|XA" 面试题.md | head -30`, policy.RiskReadOnly},
+		{`grep -n "Q19\|Q30" 面试题.md | grep -v "^[0-9]*:### Q"; echo "exit=$?"`, policy.RiskReadOnly},
 
 		// 写入：重定向 / 白名单外 / 解释器 / 把读变成写的参数
 		{"echo hello > a.txt", policy.RiskWrite},

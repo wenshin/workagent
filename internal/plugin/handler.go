@@ -94,7 +94,7 @@ func (h *Handler) detail(w http.ResponseWriter, r *http.Request) {
 	// 待发布候选的内容只有系统管理员能看；其他用户仍按空间 read 权限。
 	user, err := h.resolve(r)
 	if err != nil {
-		platform.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "未登录")
+		platform.WriteAuthError(w, r, err)
 		return
 	}
 	if !h.spaces.IsAdmin(user) {
@@ -134,7 +134,7 @@ func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {
 	// 发布权只在系统管理员；不要求是来源空间成员。
 	user, err := h.resolve(r)
 	if err != nil {
-		platform.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "未登录")
+		platform.WriteAuthError(w, r, err)
 		return
 	}
 	if !h.spaces.IsAdmin(user) {
@@ -422,7 +422,7 @@ func catalogCategory(origin string) string {
 func (h *Handler) catalog(w http.ResponseWriter, r *http.Request) {
 	user, err := h.resolve(r)
 	if err != nil {
-		platform.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "未登录")
+		platform.WriteAuthError(w, r, err)
 		return
 	}
 	isAdmin := h.spaces.IsAdmin(user)
@@ -592,7 +592,7 @@ func (h *Handler) removeAgentIcon(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) guard(w http.ResponseWriter, r *http.Request, need string) (store.User, string, bool) {
 	user, err := h.resolve(r)
 	if err != nil {
-		platform.WriteError(w, r, http.StatusUnauthorized, "unauthorized", "未登录")
+		platform.WriteAuthError(w, r, err)
 		return store.User{}, "", false
 	}
 	perm, err := h.spaces.SpacePerm(r.Context(), r.PathValue("id"), user.ID)

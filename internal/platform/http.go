@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/workagent/auto-agent/internal/cache"
 )
 
 type ctxKey string
@@ -94,6 +97,19 @@ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, msg st
 		Message:   msg,
 		RequestID: RequestIDFrom(r.Context()),
 	})
+}
+
+// WriteAuthError 把「还原身份失败」翻译成响应。
+//
+// 没登录是 401，缓存不可用是 503——两者混成一个，Redis 抖一下就会把所有人踢到
+// 登录页，而登录页也因为同一个原因进不去，表现为「突然全站掉线」。
+func WriteAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, cache.ErrUnavailable) {
+		WriteError(w, r, http.StatusServiceUnavailable, "session_store_unavailable",
+			"登录服务暂不可用，请稍后重试")
+		return
+	}
+	WriteError(w, r, http.StatusUnauthorized, "unauthenticated", "未登录或登录已过期")
 }
 
 // NewID 生成 n 字节的随机十六进制串。

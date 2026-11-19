@@ -328,7 +328,7 @@ func (h *Handler) revealMCPAppKey(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) requireAdmin(w http.ResponseWriter, r *http.Request) (store.User, bool) {
 	user, err := h.resolve(r)
 	if err != nil {
-		platform.WriteError(w, r, http.StatusUnauthorized, "unauthenticated", "未登录或登录已过期")
+		platform.WriteAuthError(w, r, err)
 		return store.User{}, false
 	}
 	if !h.spaces.IsAdmin(user) {
