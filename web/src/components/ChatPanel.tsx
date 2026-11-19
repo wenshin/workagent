@@ -15,18 +15,20 @@ import type {
   ChatSession,
   MessagePart,
   MessageToolPart,
+  SessionTask,
   SpaceFile,
   SpaceSkill,
   StreamItem,
   ToolCallRecord,
 } from '../api/types';
-import { decideApproval } from '../api/client';
+import { UPLOAD_ACCEPT, UPLOAD_ACCEPT_LABEL, decideApproval, firstOversize } from '../api/client';
 import { useAgents } from '../api/hooks';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
 import { SessionAgentIcon } from './AgentAvatar';
 import { PluginIcon } from './PluginVisual';
 import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
+import TaskPanel, { messageTaskIds, streamTaskIds, useSessionTasks } from './TaskPanel';
 
 const { Text } = Typography;
 
@@ -884,6 +886,37 @@ export default function ChatPanel({
   /** 实际要画出来的实时内容：流式中是真流，交接空窗期是按住的那份 */
   const liveView: StreamView | null = stream ?? heldStream;
 
+  // 派发出去的任务：卡片挂在派发它的那一轮后面，不占用会话顶部。
+  // 列表每 30 秒轮询一次；本轮刚派发完（实时轨迹里出现 task_create）时立刻补一次，
+  // 不用等下一轮轮询，也不用等这一轮落库。
+  const liveTaskIds = streamTaskIds(liveView?.items);
+  const { tasks: sessionTasks, reload: reloadTasks } = useSessionTasks(
+    session.id,
+    `${visibleMessages.length}:${liveTaskIds.length}`,
+  );
+  const tasksById = new Map(sessionTasks.map((task) => [task.id, task]));
+  const tasksOf = (ids: string[]): SessionTask[] =>
+    ids.reduce<SessionTask[]>((out, id) => {
+      const task = tasksById.get(id);
+      if (task) out.push(task);
+      return out;
+    }, []);
+  // 已挂在某条消息上的任务不再重复出现：消息落库后实时卡片应当被那一轮接手
+  const anchoredTaskIds = new Set<string>();
+  const turnTasks = new Map<string, SessionTask[]>();
+  for (const message of visibleMessages) {
+    if (message.role !== 'assistant') continue;
+    const ids = messageTaskIds(message.parts);
+    if (ids.length === 0) continue;
+    ids.forEach((id) => anchoredTaskIds.add(id));
+    const list = tasksOf(ids);
+    if (list.length > 0) turnTasks.set(message.id, list);
+  }
+  const liveTasks = tasksOf(liveTaskIds.filter((id) => !anchoredTaskIds.has(id)));
+  liveTasks.forEach((task) => anchoredTaskIds.add(task.id));
+  // 找不到派发轮次的任务（历史遗留、回执被截断）统一落到会话末尾，不能凭空消失
+  const looseTasks = sessionTasks.filter((task) => !anchoredTaskIds.has(task.id));
+
   useEffect(() => {
     setValue('');
     setError('');
@@ -946,14 +979,11 @@ export default function ChatPanel({
     const picked = Array.from(list ?? []);
     if (picked.length === 0) return;
     // 已知上限时先本地挡一次，省掉一次注定 413 的往返
-    if (uploadMaxMb) {
-      const limitBytes = uploadMaxMb * 1024 * 1024;
-      const tooBig = picked.find((f) => f.size > limitBytes);
-      if (tooBig) {
-        setError(`「${tooBig.name}」超过 ${uploadMaxMb}MB 上限`);
-        if (fileInputRef.current) fileInputRef.current.value = '';
-        return;
-      }
+    const tooBig = firstOversize(picked, uploadMaxMb);
+    if (tooBig) {
+      setError(`「${tooBig.name}」超过 ${uploadMaxMb}MB 上限`);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
     }
     setError('');
     setUploading(true);
@@ -1001,7 +1031,7 @@ export default function ChatPanel({
     const el = bodyRef.current;
     if (!el || !stickRef.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages, session.id, stream?.items, pendingUser, heldStream]);
+  }, [messages, session.id, stream?.items, pendingUser, heldStream, sessionTasks]);
 
   useEffect(() => {
     if (!busy) {
@@ -1163,54 +1193,59 @@ export default function ChatPanel({
             />
           </div>
         ) : (
-          visibleMessages.map((m) => (
-            <div key={m.id} className={`chat-msg chat-msg-${m.role}`}>
-              <div className="chat-msg-meta">
-                <span>
-                  {m.source === 'task_brief'
-                    ? '任务委托'
-                    : m.role === 'user'
-                      ? '我'
-                      : m.role === 'assistant'
-                        ? 'Agent'
-                        : '系统'}
-                </span>
-                {m.source === 'task_result' ? (
-                  <span className="chat-msg-time">任务回执</span>
-                ) : null}
-                {m.source === 'task_remind' ? (
-                  <span className="chat-msg-time">催办</span>
-                ) : null}
-                {m.interrupted ? <span className="chat-msg-time">已中断</span> : null}
-                <span className="chat-msg-time">{formatTime(m.created_at)}</span>
-                {m.role === 'assistant' ? (
-                  <MessageStats
-                    inTokens={m.in_tokens}
-                    outTokens={m.out_tokens}
-                    durationMs={m.duration_ms}
-                  />
-                ) : null}
-              </div>
-              {m.role === 'assistant' ? (
-                <AssistantBody
-                  content={m.content}
-                  reasoning={m.reasoning}
-                  parts={m.parts}
-                  spaceId={session.space_id}
-                  onSend={continueRun}
-                  onResume={onResume}
-                  onOpenFile={onOpenFile}
-                />
-              ) : m.source === 'task_brief' ? (
-                // 任务委托里有代码与编号清单，按 Markdown 渲染；普通输入仍走纯文本，避免误把用户打的符号当语法
-                <div className="chat-msg-content">
-                  <MarkdownView content={m.content} spaceId={session.space_id} />
+          visibleMessages.map((m) => {
+            // 这一轮派发出去的任务跟在这一轮后面：翻历史时「什么时候派了谁、结果是什么」都在原地
+            const turnTaskList = turnTasks.get(m.id);
+            return (
+              <div key={m.id} className={`chat-msg chat-msg-${m.role}`}>
+                <div className="chat-msg-meta">
+                  <span>
+                    {m.source === 'task_brief'
+                      ? '任务委托'
+                      : m.role === 'user'
+                        ? '我'
+                        : m.role === 'assistant'
+                          ? 'Agent'
+                          : '系统'}
+                  </span>
+                  {m.source === 'task_result' ? (
+                    <span className="chat-msg-time">任务回执</span>
+                  ) : null}
+                  {m.source === 'task_remind' ? (
+                    <span className="chat-msg-time">催办</span>
+                  ) : null}
+                  {m.interrupted ? <span className="chat-msg-time">已中断</span> : null}
+                  <span className="chat-msg-time">{formatTime(m.created_at)}</span>
+                  {m.role === 'assistant' ? (
+                    <MessageStats
+                      inTokens={m.in_tokens}
+                      outTokens={m.out_tokens}
+                      durationMs={m.duration_ms}
+                    />
+                  ) : null}
                 </div>
-              ) : (
-                <UserBody content={m.content} />
-              )}
-            </div>
-          ))
+                {m.role === 'assistant' ? (
+                  <AssistantBody
+                    content={m.content}
+                    reasoning={m.reasoning}
+                    parts={m.parts}
+                    spaceId={session.space_id}
+                    onSend={continueRun}
+                    onResume={onResume}
+                    onOpenFile={onOpenFile}
+                  />
+                ) : m.source === 'task_brief' ? (
+                  // 任务委托里有代码与编号清单，按 Markdown 渲染；普通输入仍走纯文本，避免误把用户打的符号当语法
+                  <div className="chat-msg-content">
+                    <MarkdownView content={m.content} spaceId={session.space_id} />
+                  </div>
+                ) : (
+                  <UserBody content={m.content} />
+                )}
+                {turnTaskList ? <TaskPanel tasks={turnTaskList} onReload={reloadTasks} /> : null}
+              </div>
+            );
+          })
         )}
 
         {pendingUser ? (
@@ -1249,6 +1284,20 @@ export default function ChatPanel({
                 onOpenFile={onOpenFile}
               />
             )}
+          </div>
+        ) : null}
+
+        {/* 本轮刚派发的任务：消息还没落库时先跟着实时气泡出现，落库后由上面那一轮接手 */}
+        {liveTasks.length > 0 ? (
+          <div className="chat-msg chat-msg-assistant">
+            <TaskPanel tasks={liveTasks} onReload={reloadTasks} />
+          </div>
+        ) : null}
+
+        {/* 找不到派发轮次的任务（历史遗留、回执被截断）落在会话末尾，不凭空消失 */}
+        {looseTasks.length > 0 ? (
+          <div className="chat-msg chat-msg-assistant">
+            <TaskPanel tasks={looseTasks} onReload={reloadTasks} />
           </div>
         ) : null}
       </div>
@@ -1314,11 +1363,11 @@ export default function ChatPanel({
                 type="file"
                 multiple
                 hidden
-                accept=".md,.json,.txt,.csv,.yaml,.yml"
+                accept={UPLOAD_ACCEPT}
                 onChange={(e) => void handleUpload(e.target.files)}
               />
               <Tooltip
-                content={`上传文件到当前空间（md / json / txt / csv / yaml，${
+                content={`上传文件到当前空间（${UPLOAD_ACCEPT_LABEL}，${
                   uploadMaxMb ? `单个 ≤ ${uploadMaxMb}MB` : '单个大小受服务端配置限制'
                 }）`}
                 position="topRight"

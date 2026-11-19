@@ -59,7 +59,7 @@ func (m *Manager) SeedBuiltinPlugins(ctx context.Context) error {
 			Name:        ag.Name,
 			Description: ag.Description,
 			Capability:  CapAgentUse,
-			Agent:       &AgentSpec{Entry: AgentEntry, Extends: ag.Extends},
+			Agent:       &AgentSpec{Entry: AgentEntry},
 			Extensible:  boolPtr(false),
 		}
 		if err := m.seedBuiltin(ctx, ownerID, sysID, meta, map[string]string{AgentEntry: ag.Doc}); err != nil {

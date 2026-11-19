@@ -3,8 +3,11 @@ package space
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/workagent/auto-agent/internal/platform"
@@ -54,9 +57,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /spaces/{id}/skills", h.listSkills)
 
 	// 树里的文件节点：/spaces/files 一次取全，/spaces/{id}/file 读正文。
-	// 这两个端点只读，且只暴露 md/json 等文本类型。
+	// 正文端点只读且只暴露 md/json 等文本类型；预览不了的类型走 download 取原始字节。
 	mux.HandleFunc("GET /spaces/files", h.listFiles)
 	mux.HandleFunc("GET /spaces/{id}/file", h.readFile)
+	mux.HandleFunc("GET /spaces/{id}/file/download", h.downloadFile)
 	// 上传只接受可预览的文本类型，落在空间 files/ 下（dir 可选，相对 files/）
 	mux.HandleFunc("POST /spaces/{id}/files", h.uploadFiles)
 	// 删除单个文件；目录走 /dirs，已安装插件与系统空间内置目录只读
@@ -449,6 +453,8 @@ type fileDTO struct {
 	Name    string `json:"name"`
 	Size    int64  `json:"size"`
 	ModTime string `json:"mod_time,omitempty"`
+	// Previewable=false 的文件前端只给下载入口：正文端点不认这些扩展名
+	Previewable bool `json:"previewable"`
 }
 
 // fileContentDTO 在文件元信息上追加正文，Truncated 表示超过读取上限被截断。
@@ -460,11 +466,12 @@ type fileContentDTO struct {
 
 func toFileDTO(f File) fileDTO {
 	dto := fileDTO{
-		SpaceID: f.SpaceID,
-		Path:    f.Path,
-		Dir:     f.Dir,
-		Name:    f.Name,
-		Size:    f.Size,
+		SpaceID:     f.SpaceID,
+		Path:        f.Path,
+		Dir:         f.Dir,
+		Name:        f.Name,
+		Size:        f.Size,
+		Previewable: f.Previewable,
 	}
 	if !f.ModTime.IsZero() {
 		dto.ModTime = f.ModTime.Format("2006-01-02T15:04:05Z07:00")
@@ -507,6 +514,39 @@ func (h *Handler) readFile(w http.ResponseWriter, r *http.Request) {
 			Truncated: fc.Truncated,
 		},
 	})
+}
+
+// downloadFile 把文件原始字节回给浏览器（预览不了的类型只有这一条取回路径）。
+//
+// 与 readFile 的两点差别：不看扩展名，也不按 256KB 截断——用户拿到的是本机上的完整文件，
+// 不是预览用的前 256KB。Content-Disposition 交给 mime.FormatMediaType 生成：
+// 中文名必须走 RFC 5987 的 filename*，直接拼 filename="中文" 浏览器会按 latin-1 解成乱码。
+func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	file, body, err := h.svc.DownloadFile(r.Context(), user.ID, r.PathValue("id"), rel)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	defer func() { _ = body.Close() }()
+
+	disposition := mime.FormatMediaType("attachment", map[string]string{"filename": file.Name})
+	if disposition == "" {
+		disposition = "attachment"
+	}
+	// 一律 octet-stream：下载端不做任何内联渲染，.html / .svg 不会被浏览器当页面执行
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	if _, err := io.Copy(w, body); err != nil {
+		h.log.Warn("文件下载中断", "space_id", file.SpaceID, "path", file.Path, "err", err)
+	}
 }
 
 // uploadFiles 接收 multipart/form-data：文件字段名 files，可选 dir 表示目标子目录。

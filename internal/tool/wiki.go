@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
@@ -97,7 +98,7 @@ func wikiAgentDir(raw string) (string, error) {
 	return name, nil
 }
 
-// wikiRel 校验 wiki 内的相对路径：复用工作区的越界与隐藏文件规则，再加深度与后缀。
+// wikiRel 校验 wiki 内的相对路径：复用工作区的越界与平台保留项规则，再加深度与后缀。
 func wikiRel(raw string, dir bool) (string, error) {
 	rel, err := cleanRelPath(raw)
 	if err != nil {
@@ -182,8 +183,8 @@ func walkWiki(ctx context.Context, env Env, agentDir, dirRel string) ([]wikiEntr
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
 		for _, e := range entries {
 			name := path.Base(e.Key)
-			// 隐藏文件是平台元数据，wiki 里也不暴露
-			if strings.HasPrefix(name, ".") {
+			// 平台保留的隐藏项是后端元数据，wiki 里也不暴露；用户自己的隐藏页面照常列出
+			if spacefs.Reserved(name) {
 				continue
 			}
 			child := name
@@ -363,7 +364,8 @@ func wikiWrite() Tool {
 			"覆盖已有页面时务必带上 wiki_read 返回的 if_version，被他人改过会报冲突；" +
 			"日志类内容用 append 追加到按日期命名的页面，天生不冲突。" +
 			"单次 content 建议不超过 12KB：模型单次输出有上限，写更长的内容会被截断；" +
-			"更大的页面请分块写（首页 create，其余 append；单页上限 128KB）。",
+			"更大的页面请分块写（首页 create，其余 append；单页上限 128KB）。" +
+			"wiki 报不可用（未绑定智能体、系统空间未初始化）时告知用户找管理员，不要改用 file_write 自建知识目录顶替。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {

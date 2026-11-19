@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -28,9 +29,10 @@ const (
 	maxUploadFiles = 10
 )
 
-// previewExts 是可在树中展示、右侧预览，并且 Agent 能通过 file_read 读到的文件类型。
-// 上传只接受这些类型：其余二进制文件既不能预览也进不了模型上下文，
-// 收下来只会变成空间里的死文件。
+// previewExts 是右侧面板能渲染、并且 Agent 能通过 file_read 读到正文的文件类型。
+// 用户自己的隐藏文件（.env / .gitignore 等）没有常规后缀，也按文本处理（见 previewable）。
+// 树里其余类型（图片、压缩包、脚本产物等）照常展示，但只提供「下载到本机」；
+// 上传仍只接受文本类型：预览不了的文件收下来对模型没用。
 var previewExts = map[string]bool{
 	".md":   true,
 	".json": true,
@@ -40,7 +42,7 @@ var previewExts = map[string]bool{
 	".yml":  true,
 }
 
-// File 是空间目录下的一个可预览文件。
+// File 是空间目录下的一个文件。
 type File struct {
 	SpaceID string
 	// Path 是相对空间 files/ 的路径，如 skills/空间管理/SKILL.md
@@ -50,6 +52,9 @@ type File struct {
 	Name    string
 	Size    int64
 	ModTime time.Time
+	// Previewable 表示能否在右侧面板渲染：白名单内的文本类型走预览，
+	// 其余（图片、压缩包、可执行产物等）只能下载到本机
+	Previewable bool
 }
 
 // FileContent 是文件正文；超出上限时截断。
@@ -59,7 +64,7 @@ type FileContent struct {
 	Truncated bool
 }
 
-// ListFiles 列出用户可见空间下所有可预览文件，一次取全供左侧树使用。
+// ListFiles 列出用户可见空间下的全部文件（平台保留的隐藏项除外），一次取全供左侧树使用。
 func (s *Service) ListFiles(ctx context.Context, userID string) ([]File, error) {
 	spaces, err := s.store.ListSpaces(ctx, userID)
 	if err != nil {
@@ -73,7 +78,9 @@ func (s *Service) ListFiles(ctx context.Context, userID string) ([]File, error) 
 	return out, nil
 }
 
-// walkFiles 深度优先收集文件：目录递归下钻，只收白名单扩展名。
+// walkFiles 深度优先收集文件：目录递归下钻，平台保留的隐藏项不进树，
+// 其余全部收集——用户自己的隐藏文件（.env 等）与预览不了的类型都留在树里，
+// 后者前端据此给下载入口。
 func (s *Service) walkFiles(ctx context.Context, spaceID, parent string, depth int) []File {
 	if depth > maxDirDepth {
 		return nil
@@ -95,8 +102,9 @@ func (s *Service) walkFiles(ctx context.Context, spaceID, parent string, depth i
 	out := make([]File, 0, len(entries))
 	for _, e := range entries {
 		name := path.Base(e.Key)
-		// 隐藏文件（如 skill 的 .meta.json）属于后端元数据，不进树也不可预览
-		if strings.HasPrefix(name, ".") {
+		// 平台保留的隐藏项（.meta.json / .install.json / .history）属于后端元数据，
+		// 不进树也不可预览；用户自己的隐藏文件（.env 等）照常展示。
+		if spacefs.Reserved(name) {
 			continue
 		}
 		rel := name
@@ -107,19 +115,17 @@ func (s *Service) walkFiles(ctx context.Context, spaceID, parent string, depth i
 			out = append(out, s.walkFiles(ctx, spaceID, rel, depth+1)...)
 			continue
 		}
-		if !previewExts[strings.ToLower(path.Ext(name))] {
-			continue
-		}
 		if len(out) >= maxFilesPerSpace {
 			break
 		}
 		out = append(out, File{
-			SpaceID: spaceID,
-			Path:    rel,
-			Dir:     parent,
-			Name:    name,
-			Size:    e.Size,
-			ModTime: e.ModTime,
+			SpaceID:     spaceID,
+			Path:        rel,
+			Dir:         parent,
+			Name:        name,
+			Size:        e.Size,
+			ModTime:     e.ModTime,
+			Previewable: previewable(name),
 		})
 	}
 
@@ -172,22 +178,70 @@ func (s *Service) ReadFile(ctx context.Context, userID, spaceID, rawPath string)
 
 	return FileContent{
 		File: File{
-			SpaceID: sp.ID,
-			Path:    rel,
-			Dir:     path.Dir(rel),
-			Name:    path.Base(rel),
-			Size:    entry.Size,
-			ModTime: entry.ModTime,
+			SpaceID:     sp.ID,
+			Path:        rel,
+			Dir:         path.Dir(rel),
+			Name:        path.Base(rel),
+			Size:        entry.Size,
+			ModTime:     entry.ModTime,
+			Previewable: true,
 		},
 		Content:   string(data),
 		Truncated: truncated,
 	}, nil
 }
 
+// DownloadFile 打开文件原始字节，供「下载到本机」使用。
+//
+// 与 ReadFile 的两处差别：不看扩展名（图片、压缩包、脚本产物都要能取回本机），
+// 也不按 256KB 截断。路径校验仍是同一套：越界、反斜杠、平台保留项、目录层级。
+func (s *Service) DownloadFile(ctx context.Context, userID, spaceID, rawPath string) (File, io.ReadCloser, error) {
+	// 与 ReadFile 一致：走 Get 完成存在性与成员权限校验
+	sp, err := s.Get(ctx, userID, spaceID)
+	if err != nil {
+		return File{}, nil, err
+	}
+
+	rel, err := normalizeAnyPath(rawPath)
+	if err != nil {
+		return File{}, nil, err
+	}
+
+	key := path.Join(s.filesKey(sp.ID), rel)
+	entry, err := s.storage.Stat(ctx, key)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return File{}, nil, ErrFileNotFound
+		}
+		return File{}, nil, err
+	}
+	if entry.IsDir {
+		return File{}, nil, ErrFileNotFound
+	}
+
+	rc, err := s.storage.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return File{}, nil, ErrFileNotFound
+		}
+		return File{}, nil, err
+	}
+
+	return File{
+		SpaceID:     sp.ID,
+		Path:        rel,
+		Dir:         path.Dir(rel),
+		Name:        path.Base(rel),
+		Size:        entry.Size,
+		ModTime:     entry.ModTime,
+		Previewable: previewable(rel),
+	}, rc, nil
+}
+
 // SaveFile 把上传内容写入空间的 files/ 目录，返回落盘后的文件元信息。
 //
 // 约束只有两条：
-//   - 只接受可预览的文本类型（previewExts）：二进制文件既预览不了，file_read 也读不到；
+//   - 只接受可预览的文本类型（previewable）：二进制文件既预览不了，file_read 也读不到；
 //   - 同名文件不覆盖：自动追加 -1、-2 后缀，避免上传把已有材料冲掉。
 //
 // 目录不设限（含 plugins/）：用户可以在空间里任何目录放材料。落在 plugins/ 下的
@@ -210,7 +264,7 @@ func (s *Service) SaveFile(ctx context.Context, userID, spaceID, rawDir, rawName
 	if err != nil {
 		return File{}, err
 	}
-	if !previewExts[strings.ToLower(path.Ext(name))] {
+	if !previewable(name) {
 		return File{}, ErrFileUnsupported
 	}
 
@@ -249,12 +303,13 @@ func (s *Service) SaveFile(ctx context.Context, userID, spaceID, rawDir, rawName
 	}
 
 	return File{
-		SpaceID: sp.ID,
-		Path:    rel,
-		Dir:     dir,
-		Name:    path.Base(rel),
-		Size:    entry.Size,
-		ModTime: entry.ModTime,
+		SpaceID:     sp.ID,
+		Path:        rel,
+		Dir:         dir,
+		Name:        path.Base(rel),
+		Size:        entry.Size,
+		ModTime:     entry.ModTime,
+		Previewable: true,
 	}, nil
 }
 
@@ -351,8 +406,33 @@ func (s *Service) uniqueFilePath(ctx context.Context, base, dir, name string) (s
 	return "", fmt.Errorf("%w：同名文件过多，请改名后重试", ErrNameInvalid)
 }
 
-// normalizeFilePath 校验相对 files/ 的文件路径：禁止越界、隐藏文件与不支持的扩展名。
+// previewable 报告文件能否在右侧面板渲染（以及 file_read 能否读到）：
+// 白名单内的文本类型，或用户自己的隐藏文件（.env / .gitignore 这类没有常规后缀的配置）。
+func previewable(name string) bool {
+	if spacefs.UserHidden(path.Base(name)) {
+		return true
+	}
+	return previewExts[strings.ToLower(path.Ext(name))]
+}
+
+// normalizeFilePath 校验相对 files/ 的文件路径：禁止越界、平台保留项与不可预览的扩展名。
+// 只有在「读正文」这条路上才限定扩展名——右侧预览与 file_read 都只吃文本。
 func normalizeFilePath(raw string) (string, error) {
+	rel, err := normalizeAnyPath(raw)
+	if err != nil {
+		return "", err
+	}
+	if !previewable(rel) {
+		return "", ErrFileUnsupported
+	}
+	return rel, nil
+}
+
+// normalizeAnyPath 只校验路径本身，不看扩展名：
+// 下载要能取到图片、压缩包这类预览不了的文件。
+//
+// 隐藏文件不在拒绝之列（用户可能就要看 .env）；只拦平台保留项。
+func normalizeAnyPath(raw string) (string, error) {
 	rel := strings.Trim(strings.TrimSpace(raw), "/")
 	if rel == "" || strings.Contains(rel, "..") || strings.Contains(rel, "\\") {
 		return "", ErrNameInvalid
@@ -363,13 +443,10 @@ func normalizeFilePath(raw string) (string, error) {
 		return "", ErrDirTooDeep
 	}
 	for _, seg := range segs {
-		if seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+		if seg == "." || seg == ".." || spacefs.Reserved(seg) {
 			return "", ErrNameInvalid
 		}
 	}
 
-	if !previewExts[strings.ToLower(path.Ext(rel))] {
-		return "", ErrFileUnsupported
-	}
 	return rel, nil
 }

@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/platform"
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -43,7 +44,7 @@ const (
 	// maxDirDepth 目录最多 5 层：空间下所有内容都是目录，但目录不允许无限嵌套
 	maxDirDepth = 5
 	// skillMetaFile 是 skill 目录下的元数据文件，隐藏、不参与树展示
-	skillMetaFile = ".meta.json"
+	skillMetaFile = spacefs.MetaFile
 	// skillType 是 .meta.json 中 type 的取值
 	skillType = "skill"
 
@@ -403,8 +404,8 @@ func (s *Service) walkDirs(ctx context.Context, spaceID, spaceType, parent strin
 			continue
 		}
 		name := path.Base(e.Key)
-		// 隐藏目录（含 .meta.json 所在层）不进树
-		if strings.HasPrefix(name, ".") {
+		// 平台保留的隐藏项（如插件备份 .history）不进树；用户自己的隐藏目录照常展示
+		if spacefs.Reserved(name) {
 			continue
 		}
 		rel := name
@@ -957,7 +958,8 @@ func normalizeName(raw string) (string, error) {
 	if utf8.RuneCountInString(name) > 64 {
 		return "", ErrNameInvalid
 	}
-	if strings.HasPrefix(name, ".") {
+	// 隐藏本身合法（.env / .github 都是用户的文件），只有平台保留项不能由用户创建或覆盖
+	if name == "." || name == ".." || spacefs.Reserved(name) {
 		return "", ErrNameInvalid
 	}
 	if strings.ContainsAny(name, "/\\") || strings.ContainsAny(name, "\r\n\t") {
@@ -978,7 +980,7 @@ func normalizeDirName(raw string) (string, error) {
 	return name, nil
 }
 
-// normalizeRelPath 校验多级目录路径（相对 files/），禁止空段、. 与 ..。
+// normalizeRelPath 校验多级目录路径（相对 files/），禁止空段、. / .. 与平台保留项。
 func normalizeRelPath(raw string) (string, error) {
 	rel := strings.Trim(strings.TrimSpace(raw), "/")
 	if rel == "" {

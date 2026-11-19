@@ -106,8 +106,15 @@ func (a *Agent) Budget() map[string]any {
 }
 
 // Run 执行一次带工具调用的对话，过程中通过 emit 推送增量事件。
-func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Event) error) (agent.Result, error) {
-	var res agent.Result
+func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Event) error) (res agent.Result, err error) {
+	// 模式只升不降：这一轮只要出现过编排动作就算编排档，否则事后统计会把
+	// 「派了子 agent、又在本轮收尾」算成问答档。defer 统一回填，各条 return 不用各写一遍。
+	mode := agent.ModeAnswer
+	defer func() {
+		if res.Mode == "" {
+			res.Mode = mode
+		}
+	}()
 	if !a.Ready() {
 		return res, fmt.Errorf("模型服务未配置：请设置 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL")
 	}
@@ -126,6 +133,16 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	// 派发能力只在允许且未到深度上限时暴露：子 Agent 也能派发，但层数有上限
 	if a.canDispatch(in) {
 		tools = append(tools, a.dispatchTool(in, tools))
+	}
+	// 任务清单只在顶层会话暴露：子 Agent 的边界由派发方给定，再建清单只会放大跑偏。
+	// 状态从上一个 checkpoint 恢复，续跑时接着走已完成的步骤。
+	planSeed := in.Plan
+	if in.Resume != nil && in.Resume.Plan != nil {
+		planSeed = in.Resume.Plan
+	}
+	plan := newPlanState(planSeed)
+	if in.Depth == 0 {
+		tools = append(tools, a.planTools(plan)...)
 	}
 	defs := tool.Definitions(tools)
 
@@ -177,6 +194,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			TotalTokens: totalTokens,
 			Query:       in.Query,
 			Pending:     pending,
+			Plan:        plan.snapshot(),
 		}
 		_ = in.Checkpoint(state)
 	}
@@ -454,6 +472,12 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			})
 		}
 
+		// 按这一轮实际调用的工具抬升档位：写操作算任务档，清单与派发算编排档。
+		// 只记录事实，不据此增删工具——收窄工具面会让模型连「想升档」都表达不出来。
+		for _, call := range out.ToolCalls {
+			mode = raiseMode(mode, modeOfTool(call.Function.Name))
+		}
+
 		// 本轮没有新信息时提醒模型换方法，而不是等它自己发现
 		if hint := guard.afterRound(records); hint != "" && lastToolMsg >= 0 {
 			messages[lastToolMsg].Content = hint + "\n\n" + messages[lastToolMsg].Content
@@ -464,6 +488,40 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	// 轮次用尽：不再静默返回半截内容，而是逼一次结论
 	return a.finish(ctx, &res, messages, emit, "budget",
 		fmt.Sprintf("已用完 %d 轮工具调用", maxRounds), true)
+}
+
+// modeOfTool 把一次工具调用映射到它代表的档位。
+//
+// 只看会造成外部状态变化、或提升编排复杂度的工具：读取类工具三个档都可能出现，
+// 拿它判档会把「问答时查了个文件」误记成任务档。
+func modeOfTool(name string) string {
+	switch name {
+	case planWriteToolName, dispatchToolName:
+		return agent.ModeOrchestrate
+	case "file_write", "wiki_write", "shell_exec":
+		return agent.ModeExec
+	}
+	return ""
+}
+
+// raiseMode 取两个档位里更高的那个：模式在一轮内只升不降。
+func raiseMode(cur, next string) string {
+	if modeRank(next) > modeRank(cur) {
+		return next
+	}
+	return cur
+}
+
+func modeRank(mode string) int {
+	switch mode {
+	case agent.ModeOrchestrate:
+		return 3
+	case agent.ModeExec:
+		return 2
+	case agent.ModeAnswer:
+		return 1
+	}
+	return 0
 }
 
 // dropPending 把一条已经拿到回执的调用从待办里移掉。

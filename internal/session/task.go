@@ -188,9 +188,19 @@ func (s *Service) Tasks(ctx context.Context, userID, sessionID string) ([]tool.T
 	if err != nil {
 		return nil, err
 	}
+	// 名册在这里补齐：session_task 只存 assignee 的 user id，前端没有「按 id 查人」的接口，
+	// 不补就只能显示一串 uuid（或退化成拿状态当名字用）。同一个人只查一次。
+	names := make(map[string]string, len(tasks))
 	out := make([]tool.TaskInfo, 0, len(tasks))
 	for _, t := range tasks {
-		out = append(out, toTaskInfo(t, ""))
+		name, ok := names[t.Assignee]
+		if !ok {
+			if u, err := s.store.GetUser(ctx, t.Assignee); err == nil {
+				name = u.Name
+			}
+			names[t.Assignee] = name
+		}
+		out = append(out, toTaskInfo(t, name))
 	}
 	return out, nil
 }
@@ -279,7 +289,11 @@ func (s *Service) RemindTask(ctx context.Context, userID, taskID string) (tool.T
 		}
 		_, _ = s.store.CreateMessageFrom(ctx, task.ChildSessionID, "user", text, "task_remind")
 	}
-	return toTaskInfo(task, ""), nil
+	name := ""
+	if u, err := s.store.GetUser(ctx, task.Assignee); err == nil {
+		name = u.Name
+	}
+	return toTaskInfo(task, name), nil
 }
 
 // ReplyTask 是子会话对被派发任务的正式回执：被派发人确认结论后由 Agent 调用。

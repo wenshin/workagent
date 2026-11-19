@@ -51,6 +51,8 @@ interface Props {
   onSelectFile: (space: Space, file: SpaceFile) => void;
   onAddDir: (space: Space, parent?: SpaceDir) => void;
   onAddSession: (space: Space, dir?: SpaceDir) => void;
+  /** 上传文件到空间根或指定目录：由外层弹系统文件选择框 */
+  onUploadFiles: (space: Space, dir?: SpaceDir) => void;
   /** 新建插件：插件类型在对话框里选 */
   onAddSkill: (space: Space) => void;
   onRename: (space: Space) => void;
@@ -125,6 +127,7 @@ export default function SpaceTree({
   onSelectFile,
   onAddDir,
   onAddSession,
+  onUploadFiles,
   onAddSkill,
   onRename,
   onDelete,
@@ -317,6 +320,33 @@ export default function SpaceTree({
     setExpandedKeys((keys) => Array.from(new Set([...keys, ...need])));
   }, [value]);
 
+  // 新出现的目录（新建目录、新建插件草稿）把父链展开：
+  // 折叠的空间 / 目录不会因为有新增子节点自动打开，用户会以为「没建上」。
+  const knownDirs = useRef<Set<string>>(new Set());
+  const dirsBaselined = useRef(false);
+  useEffect(() => {
+    if (!ready) return;
+    const known = knownDirs.current;
+    knownDirs.current = new Set(dirs.map((d) => dirKey(d.space_id, d.path)));
+    // 首屏只建基线：否则会把所有目录链一次性展开。
+    // 用独立标记而不是 known.size 判断：一个目录都没有的空间，第一次建目录也要展开
+    if (!dirsBaselined.current) {
+      dirsBaselined.current = true;
+      return;
+    }
+
+    const reveal = new Set<string>();
+    dirs.forEach((d) => {
+      if (known.has(dirKey(d.space_id, d.path))) return;
+      const cut = d.path.lastIndexOf('/');
+      const parents =
+        cut === -1 ? [d.space_id] : dirAncestorKeys(d.space_id, d.path.slice(0, cut));
+      parents.forEach((key) => reveal.add(key));
+    });
+    if (reveal.size === 0) return;
+    setExpandedKeys((keys) => Array.from(new Set([...keys, ...reveal])));
+  }, [ready, dirs]);
+
   // 增删会话/目录后触发树重建：已展开的节点不会自动补上新增子节点
   const treeSignature = [
     spaces.length,
@@ -382,6 +412,8 @@ export default function SpaceTree({
                   <Dropdown.Menu>
                     <Dropdown.Item onClick={() => onAddSession(owner, dir)}>新建会话</Dropdown.Item>
                     <Dropdown.Item onClick={() => onAddDir(owner, dir)}>新建目录</Dropdown.Item>
+                    {/* 上传直接落在当前目录，省掉「传完再移动」 */}
+                    <Dropdown.Item onClick={() => onUploadFiles(owner, dir)}>上传文件</Dropdown.Item>
                     {/* 插件草稿固定落在空间插件区，目录入口只是快捷方式，不跟随当前目录 */}
                     <Dropdown.Item onClick={() => onAddSkill(owner)}>新建插件</Dropdown.Item>
                   </Dropdown.Menu>
@@ -459,6 +491,8 @@ export default function SpaceTree({
                 <Dropdown.Menu>
                   <Dropdown.Item onClick={() => onAddDir(space)}>新建目录</Dropdown.Item>
                   <Dropdown.Item onClick={() => onAddSession(space)}>新建会话</Dropdown.Item>
+                  {/* 空间根目录上传：与目录级入口落到同一个 files/ 根下 */}
+                  <Dropdown.Item onClick={() => onUploadFiles(space)}>上传文件</Dropdown.Item>
                   {/* 六类插件共用「新建插件」，具体类型在对话框里选 */}
                   <Dropdown.Item onClick={() => onAddSkill(space)}>新建插件</Dropdown.Item>
                 </Dropdown.Menu>

@@ -105,7 +105,7 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - **本地插件默认停用**：`plugin_candidate.status=enabled` 才进入检索/工具/MCP/组件；安装副本默认启用，可停用、卸载。同 slug 的本地目录与安装记录互斥：安装检查目录，本地启用检查安装记录。
 - **平台内置 = 系统空间的安装**：`origin=system` 的插件只允许安装到系统空间，那份 `plugin_install` + `plugins/<slug>/` 副本就是「全局安装」；其他空间加载时并入快照，天然进检索池与工具列表。普通空间对内置件 `install` / `uninstall` / `enable|disable` 一律拒绝；**启停只在系统空间插件页做**（平台总开关），`uninstall` 仍不允许，`base` 智能体不允许停用（新建会话以它兜底）。
 - **停用必须是真停用**：`plugin_install.status=disabled` 要在每条读取路径上都生效，否则开关只是个标签。四条路各筛一次——加载快照 `ensureLoaded`（实例类：MCP / 组件 / 智能体 / 源）、检索合并 `space.MergedSources`（靠索引进池的技能，文件里的 `plugins/<slug>/` 副本还在，按 `Manager.DisabledSlugs` 摘）、Go 内置工具 `tool.Registry.Load`（执行体在 `internal/tool`，不查安装记录就停不掉）、搜索注册表（停用立即 `unregisterSource`）。系统空间的开关还带全局语义：缓存整片作废（`evictSpaces`，下次访问重建），`ensureLoaded` 的兜底也不会把「有停用记录」的内置件重新装回来。内置件换版重装时保留停用状态。
-- **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.extends` 指父智能体（最多 4 层、禁止成环，可指向旧版 `base`），`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体没有执行器，不允许写 `capabilities`；它不进 `plugin_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
+- **智能体是插件**：`kind=agent`，`agent.entry`（默认 `AGENT.md`）是提示词正文，`agent.requires` 是随包依赖，安装时一并装进同一空间（内置依赖跳过）。智能体之间**没有运行时继承**：正文只读自己那一份，父链拼接会把相反的要求放进同一层互相抵消，且父件发版会无声改变使用方行为；要复用就复制正文，要复用能力写 `requires`。智能体没有执行器，不允许写 `capabilities`；它不进 `plugin_search`，只在新建会话的选择器里出现。装在系统空间即全局可选。
 - **运行以空间副本为准**：已安装插件从发布件起 runtime，但空间 `plugins/<slug>/` 是只读展示副本；本地插件从 `plugins/<slug>/` 起 runtime。`extensible` 不再意味着安装后可编辑。
 - **组件是声明式 DSL，不是代码**：`ui.json`（`wa-ui/1`）只描述节点、绑定与动作，由前端 `UiView` 按白名单原生渲染——没有 JS/HTML/CSS 注入点，因此不用 iframe、也不用 Shadow DOM。节点/字段/绑定/动作在 dry-run、发布、读取时各校验一次（`internal/plugin/dsl.go`）。
 - **组件不直连接口**：消息里的 ` ```ui-block {"slug","version","props"} ` 由 `UiBlock` 取 `GET /spaces/{id}/plugins/{slug}/ui` 渲染；数据请求 `POST /spaces/{id}/plugins/{slug}/data` 经宿主转成依赖插件的工具调用，仍走 `Invoker`。只有已安装到当前空间的组件才能渲染。
@@ -121,14 +121,15 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 - **启动迁移**：`plugin.Manager.Bootstrap` 发布内置技能、把旧 `skills/` `tools/` `mcps/` 备份到 `plugins/.history/legacy/{ts}/` 后一次性迁移，已存在的空间不追溯默认安装集（只打标记）。内置件版本指纹 = `builtinSeedRevision` + **清单 JSON** + 文件内容：只按文件算指纹的话，改清单字段（例如下线 `capabilities[].paths`）不会发新版，库里那份旧清单会在加载时严格解析失败，表现为内置件「自己没了」。
 - 配置项：`PLUGIN_DEFAULT_INSTALL`（逗号分隔 slug，新空间首次初始化时安装一次）；没有「是否允许安装」开关，安装权固定为空间 `manage`（L4 另需系统管理员）。
 - 接口：`GET /spaces/{id}/plugins`、`GET|POST .../{slug}/{dry-run,publish,install,uninstall,enable,disable,baseline,baseline/reset,baseline/dismiss,data,ui}`、`GET /plugins`（市场目录，含待发布元数据与 `is_admin`）、`GET|PUT /spaces/{id}/plugins/{slug}/config`（安装级配置）、`GET|POST|DELETE /spaces/{id}/plugins/{slug}/icon`（智能体头像：读走 `read`，写走 `write`；`agent.icon` 是插件目录内的相对路径，上传时服务端裁正方形并压到 256×256 PNG，只允许改草稿——安装副本只读；读取地址带文件 mtime 做缓存失效）。`publish` 现在只允许系统管理员；组件产物不再对外暴露静态路由。
-- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场。清单声明了凭证但存储里还没配时，卡片显示「未启用 + 缺少凭证 scope/name」，并给「配置密钥」按钮直接打开 `SecretSettingsDialog` 预填那一条——凭证是平台级资源，按钮只对系统管理员生效，其他人得到「转给管理员」提示）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`（按后端 `ConfigField` 渲染表单：text/textarea/number/boolean/select/url/list/secret_ref，前端不写死字段名与 kind）、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能：`builtin_space` / `builtin_files` / `builtin_sessions` / `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）/ `builtin_coding`（编程实践：实现/调试/重构/审查四本子手册，正文以 `internal/space/coding_docs/` 下的 markdown 文件 embed 维护）。
+- 前端：空间页 `PluginPanel`（本地/已安装、启停、卸载、配置、试运行；安装入口在市场。清单声明了凭证但存储里还没配时，卡片显示「未启用 + 缺少凭证 scope/name」，并给「配置密钥」按钮直接打开 `SecretSettingsDialog` 预填那一条——凭证是平台级资源，按钮只对系统管理员生效，其他人得到「转给管理员」提示）、插件市场 `PluginCatalogPanel`（组织内待发布/已发布、平台内置、外部内部可见；系统管理员可发布，空间管理员可安装；类型筛选含智能体）、配置入口 `PluginConfigDialog`（按后端 `ConfigField` 渲染表单：text/textarea/number/boolean/select/url/list/secret_ref，前端不写死字段名与 kind）、会话 `UiBlock` + `UiView`（DSL 解释器）、空间头部智能体选择器（`GET /spaces/{id}/agents`）。内置技能：`builtin_space` / `builtin_files` / `builtin_sessions` / `builtin_plugin_dev`（插件开发总纲 + 技能/工具/MCP/组件/智能体子手册，组件 DSL 全表在其 `references/component.md`）/ `builtin_coding`（编程实践：实现/调试/重构/审查四本子手册，正文以 `internal/space/coding_docs/` 下的 markdown 文件 embed 维护）/ `builtin_answer`（问答档手册）/ `builtin_exec`（任务档手册）/ `builtin_orchestrate`（编排档手册：清单 + 子 agent 派发 + 上下文预算）。
 
 # 能力索引与会话技能
 
 - 每个空间文件根下有一个隐藏索引 `files/.meta.json`，只汇总 `plugins/` 下的四类插件。写操作（建/改/删插件目录、写文件、迁移、seed）后重建；读取时缺失或损坏则按磁盘现状重建。
+- **隐藏文件只保护平台自己的**：`.meta.json` / `.install.json` / `.history` 对用户与 Agent 都不可见、不可读写（判断收敛在 `internal/spacefs`）；其余 `.` 开头的文件与目录（`.env` / `.gitignore` / `.github/`）是用户内容，树、`file_*`、上传/下载、引用与 wiki 一视同仁，且没有常规后缀时按文本处理。
 - Agent 的能力源 = **已安装插件 + 当前空间草稿 + 系统空间草稿**，同名（Name）优先级：已安装 > 当前空间 > 系统空间。已安装件即使没有落副本（`extensible: false`）也会进检索池。
 - 资源总量不设上限，**不提供全量列举，也不常驻技能索引**：
-  1. 系统提示词只写「何时必须检索」的硬规则：闲聊 / 翻译 / 改写 / 计算 / 总结已有材料直接做；提到「我们的规范 / 流程 / 模板 / 制度」、产出正式文档、执行明确业务动作必须先检索；检索不到要明说，不得用常识冒充公司规定。
+  1. 系统提示词只写「何时必须检索」的硬规则：闲聊 / 翻译 / 改写 / 计算 / 总结已有材料直接做；提到「我们的规范 / 流程 / 模板 / 制度」、产出正式文档、执行明确业务动作必须先检索；检索不到要明说，不得用常识冒充公司规定。**工具怎么用不写进系统提示词**：`file_*` / `wiki_*` / `shell_exec` / `web_search` / `plan_*` / `agent_dispatch` 的使用约束（分块大小、路径范围、if_version、沙箱限制、触发条件）写在各自的 `Tool.Description` 里——能力面按插件安装与智能体裁剪，规则跟着工具一起出现或消失，不会出现「看得见规则、看不见工具」。基础规则只保留不依赖工具的策略：默认不产文件、必须检索、凭证不索要明文、输出格式。改工具用法时改 description，并同步 `internal/tool` 的 `TestToolDescriptionsCarryUsageRules`。
   2. `plugin_search`：`query` 可选，只给 `kind` 时按名称列出该类插件；`kind` ∈ `skills|tools|mcps|components`；默认 8 条、最多 20 条。
   3. `plugin_read` 读取正文：先当前空间，再系统空间；`published/{kind}/{slug}/{version}/...` 由插件层解析（已安装或 public 才可读），支持 `offset` / `limit`。
   4. 会话级技能：`session.skill_path` 绑定一个技能，每轮把 SKILL.md 正文注入系统提示词；`PUT /sessions/{id}/skill`，空 `path` 清除。路径是相对 `files/` 的 `plugins/<slug>/SKILL.md`，内置件是 `published/skills/<slug>/<version>/SKILL.md`。
@@ -139,15 +140,15 @@ make mock-dc # mock 大数据平台 :8322（表搜索 / Spark SQL 异步任务�
 
 - **搜索源也是插件**：`kind=source`，`source.protocol` 取 `spec`（`search.json` 声明式）或 `script`（`main.ts` plan/map 两段式）。它不是模型可调用的工具，而是 `web_search` 背后的实现：安装/启用即注册进 `search.Registry`，**不需要重启**；装在系统空间即全局可用，装在普通空间只对该空间生效。`source.endpoint` 决定 Guard 白名单，`allow_private` 放开 http 与私网（推导 L3），`secret` 只写凭证名。清单里不允许 `capabilities`——出网终点已由 endpoint 固定。`plugin_try` 工具用来试跑草稿（搜索源必须传 `query`），回执里的 `top_keys` 决定 `items` 路径怎么写。
 - **唯一来源是 `kind=agent` 插件**：系统空间安装的智能体全局可选，普通空间安装的只在该空间可选。旧版系统空间 `agents/<id>/` 目录已废弃，启动时由 `plugin.Manager` 迁移成智能体插件（发布为 `origin=system` 并全局安装），随后目录被备份到 `plugins/.history/legacy/<ts>/agents` 并删除。
-- 清单里 `agent` 段：`entry`（提示词正文，默认 `AGENT.md`）/ `extends`（父智能体 slug，可多层，最多 4 层、禁止成环）/ `requires`（依赖的技能、MCP、工具，安装本插件时一并装进同一空间）。
-- 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：`extends: "base"` 表示继承它；平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。
+- 清单里 `agent` 段：`entry`（提示词正文，默认 `AGENT.md`）/ `requires`（依赖的技能、MCP、工具，安装本插件时一并装进同一空间）。`extends` 已废弃：解析仍接受（兼容存量清单），运行时不再跟随父链，`plugin_try` 会提示它已不生效。
+- 平台默认智能体是 slug `base` 的内置插件（正文即「通用助理」）：平台基础规则仍写死在 `internal/agent/prompt.go`，只能追加。`base` 每轮先判「问答 / 任务 / 编排」三档，判据写在它的 `AGENT.md`（常驻），每档的操作细节拆成 `builtin_answer` / `builtin_exec` / `builtin_orchestrate` 三份独立技能按需 `plugin_search` + `plugin_read`——判据常驻才可能被执行，细节常驻只会挤占上下文。
 - **base 锁定（方案 A）**：平台基础规则写死在 `internal/agent/prompt.go`，智能体只能在其后追加，不能覆盖、不能删除；冲突时以基础规则为准。要改基础规则走平台发版。
 - **平台部署事实进提示词，不做成工具**：租户（企业）名称、IM 接入、当前用户与空间由 `session` 层填入 `RunInput.Platform`，`BuildSystemMessage` 渲染成 `## 平台（部署事实）`。理由：这些信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具会顺着猜而不调用；工具 schema 还会每轮常驻。新增同类事实（版本号、配额）优先走这里，只有「量大 / 需按权限裁剪 / 需审计」的才考虑工具。
 - 智能体是行为设定，**不是权限**：可见工具由插件安装/启用 + 策略 + 审批决定，`agent.json` 里不出现任何 endpoint / 密钥 / 命令字段。
 - **知识页按智能体分区**：`wiki_*` 只读写系统空间的 `files/wiki/<智能体 slug>/`，`path` 一律相对该目录，别的智能体的页面既看不到也写不进去。`tool.Env.AgentID` 由 `session` 层按会话固化的 `agent_id` 注入（空值落 `base`），所以同一个智能体在不同空间用的是同一份知识，不同智能体互不干扰。
-- **智能体内置技能与工具**：`agent.skills`（`.md` 文件或目录）/ `agent.tools`（工具插件目录）写相对智能体插件目录的路径，随智能体发布与安装，不单独发布、不写 `plugin_install`、不进插件面板与 `plugin_search`。内置技能按会话 `agent_id` 注入检索池与系统提示词，内置工具加载为 `<智能体>__<工具>` 并按 `tool.Tool.Agent` 过滤——`extends` 父子互不继承，停用智能体即失效。它们随 `buildInstanceAt` 的智能体实例一起构造，所以跨空间借用子会话也能用。
+- **智能体内置技能与工具**：`agent.skills`（`.md` 文件或目录）/ `agent.tools`（工具插件目录）写相对智能体插件目录的路径，随智能体发布与安装，不单独发布、不写 `plugin_install`、不进插件面板与 `plugin_search`。内置技能按会话 `agent_id` 注入检索池与系统提示词，内置工具加载为 `<智能体>__<工具>` 并按 `tool.Tool.Agent` 过滤——智能体之间没有继承，别的智能体看不到，停用即失效。它们随 `buildInstanceAt` 的智能体实例一起构造，所以跨空间借用子会话也能用。
 - **没有工具绑定**：`tool_binding` 表与 `Tool.HasBinding` 已删除（`0028_drop_tool_binding.sql`）。授权动作就是安装/启用插件（MCP 是注册），策略只做成员校验 + 空间写权限校验 + 命中审批动作时阻塞等确认。
-- 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。清单接口：`GET /spaces/{id}/agents`。
+- 会话创建时绑定（`POST /spaces/{id}/sessions` 的 `agent_id`，空值用 `base`），并把 `agent_id` / `agent_version` / `agent_prompt` **固化**在 `session` 行；管理员事后改智能体不影响已开会话。**内置件例外**：`origin=system` 的智能体不固化正文与版本，运行时按当前安装解析，插件卡片上的「提示词覆盖」改完即对新请求生效——它是运营对象，不是业务配置。清单接口：`GET /spaces/{id}/agents`。
 
 # 通用搜索与凭证
 
@@ -273,6 +274,7 @@ Agent 的「编排与循环」是唯一可替换的一层，按技术方案 §5.
 - **时间不再判死**：实现内部不再按墙钟中断（`deadline` 已删），时机交给会话层——`RUN_IDLE_TIMEOUT` 内没有任何事件才算卡住，`LLM_MAX_WALL_CLOCK` 只是总时长上限。长任务只要在推进就一直跑，轮次/工具次数/token 才是它的实际边界。
 - **轮内上下文压缩（`builtin/compact.go`）**：跨轮压缩在 `ctxmgr`（用户两次发言之间），轮内的工具往返折叠放在实现里——只有实现知道「哪几轮是一个完整的 `assistant(tool_calls)` + 回执」。判据用上一轮真实的 `input_tokens`（拿不到时按 `llm.EstimateTokens` 估），超过 `LLM_CONTEXT_TOKENS` 的 60% 就把较早的往返折成一条 system 进展记录，保留最近 3 轮原始回执与每轮的 assistant 正文。**折叠只丢过程、不丢结论，且不调模型**：压缩必须确定性、零失败，否则它自己就成了新的故障点。撞上模型的 context-length 错误时再折到只留 1 轮重试一次（只在「一个增量都没吐」时重试，吐过字重放会让用户看到重复的答案）。
 - **派发（`builtin/dispatch.go`）**：`agent_dispatch` 暴露为一个普通工具，子 Agent 跑同一套 `Invoker`（PDP / 审批 / 审计不变），上下文与轮次预算隔离，结论按 4KB 回填。规则：子 Agent 只能拿到父 Agent 已有的工具；深度受 `AGENT_MAX_DEPTH` 约束；**子 Agent 看不到父会话历史**，任务描述必须自包含。派发本身是 L2、无副作用，真正的权限判定发生在子 Agent 的每次工具调用上。
+- **任务清单（`builtin/plan.go`）**：`plan_write` 整份覆盖、`plan_read` 读回当前进度，只在顶层会话暴露（子 Agent 的任务边界由派发方给定，再建清单只会放大跑偏）。清单随 `ResumeState.Plan` 每轮落 `run_resume`，断点续跑接着走已完成的步骤而不是重新规划；`Result.Mode` 按本轮实际调用推断（`plan_write` / `agent_dispatch` = 编排，`file_write` / `wiki_write` / `shell_exec` = 任务，其余 = 问答），写入 `run.usage.mode` 供归因，**不参与权限判定**。
 - **黄金用例（`internal/golden`）**：harness 行为用脚本化模型跑成数据（`evals.json`），断言停止原因、工具序列、轮次与拦截次数；`internal/golden/testdata/harness.json` 是平台回归闸门。插件目录里的 `evals.json` 在**发布时**执行（`kind=tool` 走 `DryRun` 的确定性断言，`kind=agent` 用同一套脚本化执行），失败即 `409` 拒绝发布，审计记 `plugin.publish.eval_failed`。
 - **断点续跑（§5.7.5，已落地）**：`builtin` 每轮工具执行完通过 `RunInput.Checkpoint` 把完整消息序列（含 `tool_calls` 与回执）与已消耗预算写入 `run_resume`（每轮覆盖一次）；中断时**系统侧原因**（卡死、总时长到点、非预算类失败）保留断点，用户主动停止与预算/停滞则当场删除。`GET /sessions/{id}/resume` 探测、`POST /sessions/{id}/resume` 接着跑（SSE 与 chat 同形），已经执行过的工具不会重跑。`Capabilities.Resume` 由实现声明，`direct` 不支持。
 - **判活与清扫**：`run.heartbeat_at` 每 15s 随事件刷新，`active-run` 只认心跳新鲜的 run，并且**还要查一次进程内执行表**——查不到就答「没在跑」，心跳停超过 30s 的当场置 `failed` 并结算占位消息（`AbandonRun`）。只看库会假活：进程被 kill 后那行还挂着 `running`，前端每次刷新都会挂一条不会再来的流（先「思考中」再消失）。启动时 `SweepStaleRuns` 仍按心跳批量清扫。心跳停了才算死，跑得久不算。

@@ -4,7 +4,14 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
-import { api, getActiveRun, getResumable } from '../api/client';
+import {
+  UPLOAD_ACCEPT,
+  api,
+  firstOversize,
+  getActiveRun,
+  getResumable,
+  isPreviewable,
+} from '../api/client';
 import {
   invalidateAfterWrite,
   queryKeys,
@@ -42,7 +49,6 @@ import SecretSettingsDialog from '../components/SecretSettingsDialog';
 import SpaceDialog, { type DialogState } from '../components/SpaceDialog';
 import SpacePanel from '../components/SpacePanel';
 import SpaceTree, { FILE_KEY_PREFIX, SESSION_KEY_PREFIX } from '../components/SpaceTree';
-import TaskStrip from '../components/TaskStrip';
 
 export default function WorkspacePage() {
   const location = useLocation();
@@ -82,6 +88,44 @@ export default function WorkspacePage() {
   const setSessionSkill = useSetSessionSkill();
   const uploadFiles = useUploadFiles();
   const { data: agentInfo } = useAgentInfo();
+
+  // 文件树的上传入口：先记下目标空间/目录，再弹系统文件选择框（全树复用一个 input）
+  const treeUploadTarget = useRef<{ space: Space; dir?: string } | null>(null);
+  const treeFileInput = useRef<HTMLInputElement>(null);
+
+  const startTreeUpload = (space: Space, dir?: SpaceDir) => {
+    treeUploadTarget.current = { space, dir: dir?.path };
+    treeFileInput.current?.click();
+  };
+
+  const handleTreeUpload = async (input: HTMLInputElement) => {
+    const picked = Array.from(input.files ?? []);
+    // 清空才能再次选中同一个文件触发 change
+    input.value = '';
+    const target = treeUploadTarget.current;
+    treeUploadTarget.current = null;
+    if (!target || picked.length === 0) return;
+
+    const tooBig = firstOversize(picked, agentInfo?.upload_max_file_mb);
+    if (tooBig) {
+      Toast.error(`「${tooBig.name}」超过 ${agentInfo?.upload_max_file_mb}MB 上限`);
+      return;
+    }
+    try {
+      const saved = await uploadFiles.mutateAsync({
+        spaceId: target.space.id,
+        files: picked,
+        dir: target.dir,
+      });
+      Toast.success(
+        target.dir
+          ? `已上传 ${saved.length} 个文件到「${target.dir}」`
+          : `已上传 ${saved.length} 个文件到「${target.space.name}」`,
+      );
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : '上传失败，请重试');
+    }
+  };
 
   const personalId = useMemo(
     () => spaces.find((s) => s.type === 'personal' && !s.parent_id)?.id ?? '',
@@ -409,6 +453,15 @@ export default function WorkspacePage() {
               onClick={() => setDialog({ kind: 'create-root' })}
             />
           </div>
+          {/* 树里的「上传文件」共用这一个选择框：目标空间/目录由点击时记下的 ref 提供 */}
+          <input
+            ref={treeFileInput}
+            type="file"
+            multiple
+            hidden
+            accept={UPLOAD_ACCEPT}
+            onChange={(e) => void handleTreeUpload(e.currentTarget)}
+          />
           {spacesLoading ? (
             <div className="sider-loading">
               <Spin />
@@ -431,6 +484,7 @@ export default function WorkspacePage() {
               onAddSession={(space: Space, dir?: SpaceDir) =>
                 setNewSession({ space, dir: dir?.path })
               }
+              onUploadFiles={startTreeUpload}
               onRename={(space: Space) => setDialog({ kind: 'rename', target: space })}
               onDelete={(space: Space) => setDialog({ kind: 'delete', target: space })}
               onRenameDir={(space: Space, dir: SpaceDir) => setDialog({ kind: 'rename-dir', space, dir })}
@@ -484,7 +538,6 @@ export default function WorkspacePage() {
           <FilePanel space={selectedSpace} file={selectedFile} />
         ) : selectedSession ? (
           <div className="chat-shell">
-            <TaskStrip sessionId={selectedSession.id} />
             <ChatPanel
             session={selectedSession}
             spaceName={selectedSpace?.name}
@@ -507,8 +560,11 @@ export default function WorkspacePage() {
                 { onError: (e) => Toast.error(e instanceof Error ? e.message : '技能切换失败') },
               );
             }}
-            // 引用文件只列当前空间：跨空间的路径会被后端跳过，列出来只会误导
-            spaceFiles={files.filter((f) => f.space_id === selectedSession.space_id)}
+            // 引用文件只列当前空间、且只能预览的文本类型：
+            // 跨空间路径会被后端跳过，图片/压缩包这类模型 file_read 也读不到
+            spaceFiles={files.filter(
+              (f) => f.space_id === selectedSession.space_id && isPreviewable(f),
+            )}
             onUploadFiles={(list) =>
               uploadFiles.mutateAsync({
                 spaceId: selectedSession.space_id,

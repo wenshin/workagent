@@ -11,6 +11,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/workagent/auto-agent/internal/agentspec"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
 )
@@ -31,6 +32,9 @@ const (
 	// 键名与读取侧共用一个常量：内置工具的档位由 tool.builtinPolicy 读，
 	// 两边字面量漂移就会变成「配了但读不到」。
 	ConfigApprovalPolicy = tool.ApprovalPolicyKey
+	// ConfigAgentPrompt 是智能体正文的安装级覆盖（插件卡片上的「提示词覆盖」）。
+	// 空值表示用插件包里的 AGENT.md；它只改行为设定，改不了平台基础规则。
+	ConfigAgentPrompt = "prompt"
 )
 
 // 凭证名 / Header 名只允许标识符字符：不允许表达式、路径或空格的逃逸空间。
@@ -51,7 +55,7 @@ const maxConfigKeyLen = 64
 // 会让「表单里那个值到底谁生效」无法解释，所以发布时直接拒绝。
 var reservedConfigKeys = map[string]bool{
 	ConfigURL: true, ConfigAuthName: true, ConfigSecret: true,
-	ConfigApprovalCommands: true, ConfigApprovalPolicy: true,
+	ConfigApprovalCommands: true, ConfigApprovalPolicy: true, ConfigAgentPrompt: true,
 }
 
 // ConfigOption 是 select 型字段的一个选项。
@@ -159,6 +163,17 @@ func platformConfigFields(meta Manifest) []ConfigField {
 	// tool.builtinPolicy 从系统空间那份安装配置读，配置也写在同一处。
 	if meta.Kind == KindTool {
 		return []ConfigField{approvalField("")}
+	}
+	// 智能体只暴露正文覆盖：行为设定是发布方的意图，安装方可以按空间改，
+	// 但只能改这一段追加正文——平台基础规则不在插件里，改不到。
+	if meta.Kind == KindAgent {
+		return []ConfigField{{
+			Key:         ConfigAgentPrompt,
+			Label:       "提示词覆盖",
+			Type:        ConfigTypeTextarea,
+			Placeholder: "留空表示使用插件内置的 AGENT.md",
+			Help:        "只覆盖这个智能体的行为设定，改不了平台基础规则。保存后对新请求立即生效；已经固化了提示词的历史会话不受影响。",
+		}}
 	}
 	if meta.Kind != KindMCP || meta.Transport == nil {
 		return nil
@@ -552,7 +567,9 @@ func (m Manifest) ConfigDefaults() map[string]string {
 // 所以不存在「进程活着、读到的还是旧配置」这种窗口。
 func (m *Manager) effectiveConfig(ctx context.Context, spaceID, slug string, meta Manifest) map[string]string {
 	cfg := meta.ConfigDefaults()
-	if len(meta.Config) == 0 {
+	// 智能体的「提示词覆盖」是平台字段（不属于清单声明），这里要一并读出来：
+	// 否则内置 base 的覆盖永远读不到，卡片上改了也不生效。
+	if len(meta.Config) == 0 && meta.Kind != KindAgent {
 		return cfg
 	}
 	in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug)
@@ -566,6 +583,13 @@ func (m *Manager) effectiveConfig(ctx context.Context, spaceID, slug string, met
 	for _, item := range meta.Config {
 		if v, ok := stored[item.Key]; ok && v != "" {
 			cfg[item.Key] = v
+		}
+	}
+	// 提示词覆盖是平台字段，不在 meta.Config 里，必须单独取一次：
+	// 否则卡片上存进去了，ResolveAgentPlugin 读到的还是内置正文。
+	if meta.Kind == KindAgent {
+		if v, ok := stored[ConfigAgentPrompt]; ok && v != "" {
+			cfg[ConfigAgentPrompt] = v
 		}
 	}
 	return cfg
@@ -689,6 +713,16 @@ func normalizeConfig(meta Manifest, values map[string]string) (map[string]string
 					tool.ApprovalDeclared, tool.ApprovalAlways, tool.ApprovalOff)
 			}
 			clean[key] = level
+		case ConfigAgentPrompt:
+			// 空值 = 恢复默认，不落库；上限与 agentspec.MaxPromptBytes 对齐，
+			// 否则这里存得进去、读取时才报超长，用户看不出是哪一步错的。
+			if v == "" {
+				continue
+			}
+			if len(v) > agentspec.MaxPromptBytes {
+				return nil, fmt.Errorf("提示词不能超过 %d 字节", agentspec.MaxPromptBytes)
+			}
+			clean[key] = v
 		}
 	}
 	return clean, nil

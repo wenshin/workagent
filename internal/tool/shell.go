@@ -42,7 +42,8 @@ func shellExec() Tool {
 		Capability: "shell.exec",
 		Description: "在当前空间的文件目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
 			"只有当前空间目录可写，系统其它位置只读，默认没有网络访问，有超时与输出上限。" +
-			"适合做文件统计、批量改名、跑本地脚本；要查外网信息请用 web_search。",
+			"适合做文件统计、批量改名、跑本地脚本；要查外网信息请用 web_search。" +
+			"命令返回非零退出码或超时时，先看 stderr 再调整，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {

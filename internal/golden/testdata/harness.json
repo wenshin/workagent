@@ -101,6 +101,151 @@
         "max_rounds": 4,
         "content_contains": ["2 个文件"]
       }
+    },
+    {
+      "name": "问答档：不需要工具时一轮直接作答",
+      "kind": "agent",
+      "query": "解释一下什么是幂等",
+      "script": [
+        {"content": "幂等是指同一个操作执行多次，结果与执行一次相同。例如 HTTP 的 PUT 与 DELETE 按这个语义设计。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "max_rounds": 1,
+        "content_contains": ["执行多次"],
+        "content_not_contains": ["已写入", "已保存"]
+      }
+    },
+    {
+      "name": "问答档：检索插件后作答，不写文件",
+      "kind": "agent",
+      "query": "我们的发布流程是什么",
+      "tools": [
+        {"name": "plugin_search", "result": "命中 1 条：发布流程（plugins/release_flow/SKILL.md）"},
+        {"name": "plugin_read", "result": "1. 提测\n2. 灰度\n3. 全量"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "plugin_search", "args": {"query": "发布流程"}}]},
+        {"tool_calls": [{"name": "plugin_read", "args": {"path": "plugins/release_flow/SKILL.md"}}]},
+        {"content": "发布流程分三步：提测、灰度、全量。来源：plugins/release_flow/SKILL.md"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["plugin_search", "plugin_read"],
+        "max_rounds": 3,
+        "content_contains": ["提测", "灰度", "全量"]
+      }
+    },
+    {
+      "name": "任务档：一步写文件，不派子 Agent",
+      "kind": "agent",
+      "query": "把上面的结论存成 result.md",
+      "tools": [
+        {"name": "file_write", "result": "已写入 result.md（128 字节）"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "file_write", "args": {"path": "result.md", "content": "结论"}}]},
+        {"content": "已保存到 result.md。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["file_write"],
+        "max_rounds": 2,
+        "content_contains": ["result.md"]
+      }
+    },
+    {
+      "name": "编排档：串行派两个子任务后汇总",
+      "kind": "agent",
+      "query": "分别统计 data 和 reports 两个目录的文件数",
+      "tools": [
+        {"name": "file_list", "result": "a.md, b.md"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "agent_dispatch", "args": {"task": "统计 data 目录的文件数", "tools": ["file_list"]}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": "data"}}]},
+        {"content": "子结论：data 目录有 2 个文件。"},
+        {"tool_calls": [{"name": "agent_dispatch", "args": {"task": "统计 reports 目录的文件数", "tools": ["file_list"]}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": "reports"}}]},
+        {"content": "子结论：reports 目录有 2 个文件。"},
+        {"content": "两个目录各有 2 个文件。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["agent_dispatch", "agent_dispatch"],
+        "max_rounds": 7,
+        "content_contains": ["2 个文件"]
+      }
+    },
+    {
+      "name": "降级：能力面缺少工具时说明并收口，不重试",
+      "kind": "agent",
+      "query": "帮我把结果写成 result.md",
+      "tools": [
+        {"name": "file_read", "result": "结论"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "file_write", "args": {"path": "result.md", "content": "结论"}}]},
+        {"content": "当前会话没有写文件的能力，无法生成 result.md；需要交付文件请切换到通用助理。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["file_write"],
+        "max_rounds": 2,
+        "max_tool_calls": 1,
+        "content_contains": ["没有写文件的能力"]
+      }
+    },
+    {
+      "name": "降级：工具报错后如实说明，不反复重试",
+      "kind": "agent",
+      "query": "读一下 config.yaml 的内容",
+      "tools": [
+        {"name": "file_read", "error": "文件不存在：config.yaml"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "file_read", "args": {"path": "config.yaml"}}]},
+        {"content": "config.yaml 不存在，需要你确认路径或上传文件。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["file_read"],
+        "max_rounds": 2,
+        "content_contains": ["不存在"]
+      }
+    },
+    {
+      "name": "编排档：先建清单，再串行派子任务，最后更新清单",
+      "kind": "agent",
+      "query": "分别统计 data 和 reports 两个目录的文件数，最后汇总",
+      "tools": [
+        {"name": "file_list", "result": "a.md, b.md"}
+      ],
+      "script": [
+        {"tool_calls": [{"name": "plan_write", "args": {"goal": "统计两个目录的文件数并汇总", "items": [
+          {"title": "统计 data 目录的文件数", "status": "pending"},
+          {"title": "统计 reports 目录的文件数", "status": "pending"},
+          {"title": "汇总两个目录的结果", "status": "pending"}
+        ]}}]},
+        {"tool_calls": [{"name": "agent_dispatch", "args": {"task": "统计 data 目录的文件数，只回一个数字", "tools": ["file_list"]}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": "data"}}]},
+        {"content": "子结论：data 目录有 2 个文件。"},
+        {"tool_calls": [{"name": "agent_dispatch", "args": {"task": "统计 reports 目录的文件数，只回一个数字", "tools": ["file_list"]}}]},
+        {"tool_calls": [{"name": "file_list", "args": {"path": "reports"}}]},
+        {"content": "子结论：reports 目录有 3 个文件。"},
+        {"tool_calls": [{"name": "plan_write", "args": {"goal": "统计两个目录的文件数并汇总", "items": [
+          {"title": "统计 data 目录的文件数", "status": "done", "note": "2 个"},
+          {"title": "统计 reports 目录的文件数", "status": "done", "note": "3 个"},
+          {"title": "汇总两个目录的结果", "status": "done"}
+        ]}}]},
+        {"content": "data 有 2 个文件，reports 有 3 个文件，合计 5 个。"}
+      ],
+      "expect": {
+        "stop_reason": "done",
+        "tool_sequence": ["plan_write", "agent_dispatch", "agent_dispatch", "plan_write"],
+        "max_rounds": 9,
+        "content_contains": ["合计 5 个"]
+      }
     }
   ]
 }

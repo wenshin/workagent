@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
@@ -488,8 +489,9 @@ func fileList() Tool {
 			out := make([]map[string]any, 0, len(entries))
 			for _, e := range entries {
 				name := path.Base(e.Key)
-				// 隐藏文件（.meta.json 等）是平台元数据，不暴露给模型
-				if strings.HasPrefix(name, ".") {
+				// 平台保留的隐藏项（.meta.json / .install.json / .history）是后端元数据，不暴露给模型；
+				// 用户自己的隐藏文件（.env 等）正常列出，与普通文件一致。
+				if spacefs.Reserved(name) {
 					continue
 				}
 				entryPath := name

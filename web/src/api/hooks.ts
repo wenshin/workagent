@@ -186,7 +186,7 @@ export function useSpaceDirs() {
   });
 }
 
-/** 用户可见空间下的可预览文件（md/json 等），供左侧树展示 */
+/** 用户可见空间下的全部文件（平台保留的隐藏项除外），供左侧树展示；previewable 决定能否预览 */
 export function useSpaceFiles() {
   return useQuery({
     queryKey: queryKeys.files,
@@ -195,15 +195,22 @@ export function useSpaceFiles() {
   });
 }
 
-/** 单个文件正文：选中文件后才请求，避免拉起大文件 */
-export function useFileContent(spaceId: string | undefined, path: string | undefined) {
+/**
+ * 单个文件正文：选中文件后才请求，避免拉起大文件。
+ * previewable=false 的类型（图片、压缩包等）不请求：正文端点只认文本，请求只会回 400。
+ */
+export function useFileContent(
+  spaceId: string | undefined,
+  path: string | undefined,
+  previewable = true,
+) {
   return useQuery({
     queryKey: queryKeys.file(spaceId ?? '', path ?? ''),
     queryFn: () =>
       api<FileContentResponse>(
         `/spaces/${spaceId}/file?path=${encodeURIComponent(path ?? '')}`,
       ).then((r) => r.file),
-    enabled: Boolean(spaceId && path),
+    enabled: previewable && Boolean(spaceId && path),
     staleTime: 10_000,
   });
 }

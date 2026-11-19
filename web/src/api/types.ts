@@ -277,7 +277,7 @@ export interface DirsResponse {
   dirs: SpaceDir[];
 }
 
-/** 空间目录下的可预览文件：md / json 等文本类型，展示在左侧树与右侧面板 */
+/** 空间目录下的文件，展示在左侧树与右侧面板 */
 export interface SpaceFile {
   space_id: string;
   /** 相对空间 files/ 的路径，如 skills/空间管理/SKILL.md */
@@ -287,6 +287,11 @@ export interface SpaceFile {
   name: string;
   size: number;
   mod_time?: string;
+  /**
+   * 能否在右侧面板渲染（md / json 等文本类型）；false 时只给下载入口。
+   * 可选：老版本后端没有这个字段，前端按扩展名兜底（见 `isPreviewable`）。
+   */
+  previewable?: boolean;
 }
 
 export interface FilesResponse {

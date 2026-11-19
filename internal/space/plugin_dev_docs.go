@@ -374,6 +374,9 @@ const pluginDevComponentDoc = `# 组件插件（kind=component）
 会话里渲染的界面：声明式 DSL，不执行代码。平台前端按节点原生渲染，
 组件拿不到 window / cookie / 网络，也注入不了 CSS。
 
+**不要生成 TSX / HTML / CSS**：组件的唯一产物是 plugin.json 加 ui.json。
+用户要「自定义页面」也走 DSL 节点，不要让他上传或引用外部组件。
+
 ## 清单
 ~~~json
 {

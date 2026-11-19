@@ -187,15 +187,15 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 - 空间节点上的「+」下拉：**新建目录 / 新建会话 / 新建技能**。
 - 目录（含技能）节点上的「+」下拉：**新建会话 / 新建目录**；「…」菜单：**重命名 / 删除**。
 - 新建技能需要 `write` 及以上权限，创建后目录名即真实路径，`.meta.json` 中的 `name` 作为展示名。
-- Agent 可见的技能与工具定义 = **当前空间 + 系统空间**，同名以当前空间为准（用户定制的版本覆盖平台默认）；空间文件根的隐藏文件 `.meta.json` 汇总本空间的 skills / tools / mcps，供加载与技能选择器使用。
+- Agent 可见的技能与工具定义 = **当前空间 + 系统空间**，同名以当前空间为准（用户定制的版本覆盖平台默认）；空间文件根的隐藏索引 `.meta.json` 汇总本空间的 skills / tools / mcps，供加载与技能选择器使用（该文件是平台保留项，用户与 Agent 不可见、不可读写）。
 - 技能有两处生效：每轮对话注入技能索引（名称 + 描述 + 路径，正文按需读取）；会话可绑定一个技能，把 SKILL.md 正文直接注入当轮提示词。
 
 会话与空间/目录的关系：
 
 - 会话归属空间，并可额外指定所属目录（`session.dir`，相对 `spaces/{space_id}/files/`）；`dir` 为空表示直接挂在空间根。
 - 左侧树把会话渲染在其所属目录节点下；目录改名时会话路径同步迁移，目录删除时会话移回空间根而不是被删除。
-- **文件节点**：目录下的 `md` / `json`（以及 `txt` / `csv` / `yaml`）文件作为叶子节点展示在树中，点击后右侧内容面板只读预览；接口为 `GET /spaces/files`（清单）与 `GET /spaces/{id}/file?path=`（正文），路径限定在该空间 `files/` 下，隐藏文件与二进制类型不暴露。
-- **上传与引用**：会话输入框支持把文件上传到当前空间（`POST /spaces/{id}/files`，multipart，可选 `dir`；单个 ≤ `UPLOAD_MAX_FILE_MB`（默认 4MB）、一次 ≤ 10 个、只收可预览的文本类型；同名自动追加 `-1`、`-2` 后缀，不覆盖已有文件），上传成功即加入本轮引用。引用文件以路径随消息提交（`POST /sessions/{id}/chat` 的 `references`，最多 20 个），服务端校验后把清单以固定标记块（`[引用文件]`）拼进用户消息落库：模型据此用 `file_read` 读正文，前端据此把清单渲染成文件标签。输入框里直接打 `@` 也能就地搜索并引用：`@` 之后到光标前没有空白即按文件名/路径过滤，回车或点击选中，正文里的 `@query` 会被删掉并换成引用标签。引用只做存在性校验、不预读正文，避免一条消息把大文件塞进上下文。
+- **文件节点**：目录下的文件（平台保留的隐藏项除外）都作为叶子节点展示在树中，路径限定在该空间 `files/` 下。`md` / `json` / `txt` / `csv` / `yaml` 是**可预览**类型，用户自己的隐藏文件（`.env` / `.gitignore` 等，见 `internal/spacefs`）按文本处理、同样可预览；其余类型（图片、压缩包、脚本产物等）不渲染正文，面板给出「该文件类型不支持预览」+「下载到本机」。接口为 `GET /spaces/files`（清单）、`GET /spaces/{id}/file?path=`（正文，只认可预览类型、超 256KB 截断）与 `GET /spaces/{id}/file/download?path=`（原始字节，不截断，`Content-Disposition: attachment` + `octet-stream`，中文名走 RFC 5987）。
+- **上传与引用**：两个上传入口共用 `POST /spaces/{id}/files`（multipart，可选 `dir`；单个 ≤ `UPLOAD_MAX_FILE_MB`（默认 4MB）、一次 ≤ 10 个、只收可预览的文本类型；同名自动追加 `-1`、`-2` 后缀，不覆盖已有文件）——会话输入框传到当前空间（会话挂在目录下时落在该目录，上传成功即加入本轮引用）；文件树里空间与目录的「+」菜单选「上传文件」则直接落到该空间根或该目录（只读的已安装插件目录没有入口）。引用文件以路径随消息提交（`POST /sessions/{id}/chat` 的 `references`，最多 20 个），服务端校验后把清单以固定标记块（`[引用文件]`）拼进用户消息落库：模型据此用 `file_read` 读正文，前端据此把清单渲染成文件标签。输入框里直接打 `@` 也能就地搜索并引用：`@` 之后到光标前没有空白即按文件名/路径过滤，回车或点击选中，正文里的 `@query` 会被删掉并换成引用标签。引用只做存在性校验、不预读正文，避免一条消息把大文件塞进上下文。
 
 ### 4.2.1 系统空间（system）
 
@@ -311,7 +311,7 @@ autoagent/                                  # 存储根
 | 创建 | 工作台与左侧空间树均可创建；个人空间仅一个（系统预置），共享空间可创建多个；空间只有一级，空间节点的「+」下拉提供 **新建目录 / 新建会话 / 新建技能**，目录节点的「+」提供 **新建会话 / 新建目录**，根级「+」只建共享空间；空间与目录的区别见 §4.2 |
 | 布局 | 左右布局：左侧固定侧边栏（顶部 Logo 与企业名称、中部空间树、底部用户与退出），右侧内容区；不再使用顶部 Header |
 | 列表 | 左侧树：个人空间在前，共享空间在后，空间只有一级；目录可多级嵌套，普通目录与技能（skill）用不同图标区分；目录下的 md / json 文件以叶子节点展示；支持折叠。默认只展开个人空间的第一层，共享空间与系统空间默认折叠；用户在树里折叠/展开的状态在数据刷新后保留 |
-| 文件预览 | 点击树中的 md / json 文件，右侧内容面板展示正文：md 渲染为富文本，json 格式化后展示；只读，超出 256KB 截断；`.meta.json` 等隐藏元数据不出现在树中 |
+| 文件预览 | 点击树中的 md / json 文件，右侧内容面板展示正文：md 渲染为富文本，json 格式化后展示；只读，超出 256KB 截断；平台保留的隐藏元数据（`.meta.json` / `.install.json` / `.history`）不出现在树中，用户自己的隐藏文件（`.env` 等）正常展示 |
 | 删除 | 仅 `manage` 可删；二次确认需**输入空间名**；删除空间时显示将删除的成员数与资源数，软删进回收站；删除目录/技能直接作用于 fs（仅需输入名称确认），其中的会话移回空间根 |
 | 分享 | `manage` 可将空间分享给平台内用户，指定初始权限（默认 `view`），可设置有效期；可随时撤销；**目录不可单独分享**，随所属空间授权 |
 | 改权限 | 成员列表页可把成员从 `view` 调整为 `read`/`write`；降级/移除需提示“将失去 N 个资源的访问” |
@@ -337,7 +337,7 @@ autoagent/                                  # 存储根
 | 流式 | 首 token 尽快出现；生成中可「停止」；断线自动重连并补齐已生成内容 |
 | 操作 | 停止、重新生成、复制、编辑用户消息后重发、删除消息、导出会话（Markdown） |
 | 高危确认（补充） | 只有 Agent 出网写（非 GET/HEAD）或执行命中名单的命令时，工具卡片内出现确认条：本次同意 / 本轮都同意 / 本次拒绝 / 本轮都拒绝；「本轮」仅对当前一次执行有效，下一轮重新确认，超时 5 分钟按拒绝 |
-| 文件交互 | 当前实现：输入框可上传文件到当前空间 `files/`（会话挂在目录下时落在该目录），并可从当前空间文件里勾选引用；引用清单作为用户消息的一部分落库，Agent 先 `file_read` 再作答。未实现：独立附件目录 `attachments/{session_id}/`、拖拽上传、下载入口与大文件断点续传 |
+| 文件交互 | 当前实现：输入框可上传文件到当前空间 `files/`（会话挂在目录下时落在该目录），文件树的空间/目录「+」菜单也能直接上传到该空间根或该目录，并可从当前空间**可预览**文件里勾选引用（图片等读不到正文的类型不进引用候选）；引用清单作为用户消息的一部分落库，Agent 先 `file_read` 再作答；文件树的文件面板对所有文件提供「下载到本机」。未实现：独立附件目录 `attachments/{session_id}/`、拖拽上传、大文件断点续传 |
 | 验收 | ① 场景 1–4 的对话过程能完整呈现思考、工具调用与结果；② 停止生成后状态正确、可继续对话；③ 未确认的高危操作不会被执行；④ 刷新页面后消息与工具卡片完整还原 |
 
 ### FR-5 插件管理
@@ -363,6 +363,7 @@ autoagent/                                  # 存储根
 | 保密 | 发布后不展示原始 MCP 配置、tool 文件、DB 配置，接口只返回名称、版本、描述、权限与文件数/体积 | 版本级启停 |
 | 权限 | 发布仅系统管理员；安装 / 启停 / 卸载 / 安装级配置由空间管理员在目标空间执行，卸载不删审计 | 草稿创建者独立启停权（需先给草稿落作者记录） |
 | Agent 侧 | 未安装的发布件不进检索池；`plugin_search` 只返回已安装插件与空间草稿，`plugin_read` 可读 `published/...` 路径；停用后不再被检索；同名多来源返回 hint 让模型先问用户 | 发布件进常驻技能索引、会话级绑定发布件 |
+| 文件 | 树里展示全部文件（平台保留的隐藏项除外）：文本类型在线预览（隐藏配置按文本处理），其余类型给「该文件类型不支持预览 + 下载到本机」；下载取原始字节不截断；支持新建/重命名/删除目录、上传文本类型（单个 ≤ `UPLOAD_MAX_FILE_MB`）、删除文件 | 文件重命名与移动、图片/PDF 在线预览、单文件 100MB、断点续传 |
 
 ### FR-6 插件市场
 
@@ -407,7 +408,7 @@ autoagent/                                  # 存储根
 | └ 已知差距 | 该渲染器不支持嵌套列表（平铺成同级列表）、任务列表、斜体、图片与自动链接；需要完整 CommonMark 时按组件注释替换为 marked/markdown-it |
 | 编排实现可切换（2026-11） | 契约在 `internal/agent`（`Agent` 接口 + §7.3 事件协议），实现：`internal/agent/builtin`（ReAct，默认）、`internal/agent/direct`（无工具直答）；`AGENT_IMPL` 切换，未知实现回退 builtin，`GET /agent/info` 返回当前实现与能力，`run.budget.impl` 留痕。平台侧（审批判定、checkpoint、压缩、预算、SSE 契约）不因实现而变。差距：断点续跑（`Capabilities.Resume`）只声明未实现；审批只推 `approval.req`，没有审批记录与恢复入口；模型 failover 由 ModelRouter 提供，尚未按实现区分 |
 | 平台部署事实 | 租户（企业）名称、IM 接入方与登录是否已配置、当前用户（姓名/工号）与所在空间，由会话层填入系统提示词的 `## 平台（部署事实）` 段，**不做成工具**：这类信息必须恒真，而模型对「公司用什么 IM」有强先验，做成工具它会顺着猜而不调用，工具 schema 还要每轮常驻。任一字段拿不到时整段省略，模型如实说不知道；智能体设定只能排在其后，不能改写 |
-| 内置工具 | `time_now`、`space_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`plugin_search` / `plugin_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径/隐藏文件，只放行 md/json/txt/yaml，读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`plugin_search` 按关键词检索插件（无上限，不提供全量列举），`plugin_read` 读取正文并支持分页 |
+| 内置工具 | `time_now`、`space_list`、`session_list`、`fs.list` / `fs.read` / `fs.write`、`skill.create`、`plugin_search` / `plugin_read`。文件能力**只作用于会话所属空间**的 `files/` 下：路径禁止 `..`/绝对路径与平台保留的隐藏项（`.meta.json` / `.install.json` / `.history`），只放行 md/json/txt/yaml 与用户自己的隐藏配置（`.env` 等），读 24KB、写 256KB 上限；`fs.write` / `skill.create` 风险 L3 但副作用限定为 `write-workspace`，按空间 `write`/`manage` 权限放行，外部资源写入仍需绑定 + 审批。`skill_create` 复用 `space.CreateSkill`（名字校验、`.meta.json` 与 UI 新建技能一致），再写符合 Agent Skills 规范的 SKILL.md（frontmatter + 入口流程），上限 64KB。`plugin_search` 按关键词检索插件（无上限，不提供全量列举），`plugin_read` 读取正文并支持分页 |
 | Skill | MVP 内置 4 个：`创建数据库资源`、`创建 MCP 服务资源`、`find/创建工具资源`、`创建 UI 组件资源`；每个 Skill 定义询问参数清单与校验规则 |
 | **Skill 作为一等资产** | Skill 有独立版本，复用 Agent 的版本/发布/灰度/回滚机制；生成规则（组件白名单、禁止 API、追问话术、模板库）写在 Skill 里而非硬编码；**MVP 先交付可用版本，上线后直接在产品内迭代优化**，每轮优化产出新版本并对比“生成一次通过率” |
 | 搜索 | 空间内文件名搜索 + 会话标题搜索（MVP 不含全文检索） |
@@ -483,7 +484,7 @@ autoagent/                                  # 存储根
 | 认证 | `GET /auth/provider`、`GET /auth/login/url`、`GET /auth/login`、`GET\|POST /auth/callback`、`POST /auth/logout`、`GET /auth/me`（旧 `/auth/dingtalk/*` 为兼容别名） |
 | 空间 | `GET/POST /spaces`、`GET/PATCH/DELETE /spaces/{id}`、`GET /spaces/{id}/tree`、`POST /spaces/{id}/members`、`PATCH/DELETE /spaces/{id}/members/{userId}` |
 | 权限申请 | `POST /permission-requests`、`GET /permission-requests?role=applicant\|approver`、`POST /permission-requests/{id}/decision` |
-| 文件 | 已实现：`GET /spaces/files`（清单）、`GET /spaces/{id}/file?path=`（正文）、`POST /spaces/{id}/files`（上传，multipart + `dir`）。待实现：`GET /files/{id}/download`、`PATCH/DELETE /files/{id}`、`POST /files/{id}/move` |
+| 文件 | 已实现：`GET /spaces/files`（清单，带 `previewable`）、`GET /spaces/{id}/file?path=`（正文）、`GET /spaces/{id}/file/download?path=`（下载原始字节）、`POST /spaces/{id}/files`（上传，multipart + `dir`）、`DELETE /spaces/{id}/file?path=`（删除）；目录走 `/spaces/{id}/dirs`。待实现：`PATCH /files/{id}`（重命名）、`POST /files/{id}/move`（移动） |
 | 插件 | `GET /spaces/{id}/plugins`、`GET\|POST .../{slug}/dry-run\|publish\|install\|uninstall\|enable\|disable`、`GET /plugins`（市场）、`GET\|PUT .../{slug}/config`、`POST .../{slug}/try` |
 | 组件 | `GET .../plugins/{slug}/ui`、`POST .../plugins/{slug}/data` |
 | 会话 | `GET/POST /sessions`、`PATCH/DELETE /sessions/{id}`、`GET /sessions/{id}/messages` |

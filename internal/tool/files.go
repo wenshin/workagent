@@ -10,14 +10,16 @@ import (
 	"strings"
 
 	"github.com/workagent/auto-agent/internal/policy"
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
 // Agent 的空间文件边界：只能读写 spaces/{space_id}/files/ 下的文本文件。
 //
 // 三层约束：
-//   - 路径相对空间文件根，禁止绝对路径、`..` 与隐藏文件（.meta.json 由平台维护）
-//   - 只放行 md / json / txt / yaml 与插件脚本（ts / js），二进制不进模型上下文
+//   - 路径相对空间文件根，禁止绝对路径与 `..`；平台保留的隐藏项（.meta.json /
+//     .install.json / .history）不可读写，其余隐藏文件（.env / .gitignore）与普通文件一致
+//   - 只放行 md / json / txt / yaml 与插件脚本（ts / js），用户自己的隐藏文件按文本处理
 //   - 单次读写有字节上限，避免超长内容撑爆上下文
 //
 // 空间 ID 来自会话所属空间（tool.Env.SpaceID），工具自身不接受 space_id 参数，
@@ -45,7 +47,10 @@ var workspaceExts = map[string]bool{
 	".js": true,
 }
 
-// cleanRelPath 归一化并校验相对路径，拒绝越界与隐藏段。
+// cleanRelPath 归一化并校验相对路径，拒绝越界与平台保留的隐藏项。
+//
+// 隐藏本身不是拒绝理由：用户可能就要读写 .env / .gitignore / .github/。
+// 只有平台维护的隐藏文件（.meta.json 等）不在这条通道上开放。
 func cleanRelPath(raw string) (string, error) {
 	rel := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
 	if strings.HasPrefix(rel, "/") {
@@ -61,8 +66,8 @@ func cleanRelPath(raw string) (string, error) {
 			return "", fmt.Errorf("路径非法：不允许跳出空间文件目录")
 		case seg == "" || seg == ".":
 			return "", fmt.Errorf("路径非法")
-		case strings.HasPrefix(seg, "."):
-			return "", fmt.Errorf("路径非法：不允许访问隐藏文件（%s）", seg)
+		case spacefs.Reserved(seg):
+			return "", fmt.Errorf("路径非法：%s 是平台保留文件，不能访问", seg)
 		}
 	}
 	return rel, nil
@@ -82,10 +87,19 @@ func workspaceFilePath(raw string) (string, error) {
 	if rel == "" {
 		return "", fmt.Errorf("path 不能为空")
 	}
-	if !workspaceExts[strings.ToLower(path.Ext(rel))] {
+	if !workspaceTextFile(rel) {
 		return "", fmt.Errorf("仅支持 md / json / txt / csv / yaml / ts / js 文件")
 	}
 	return rel, nil
+}
+
+// workspaceTextFile 报告路径是否按文本内容处理：常规后缀走白名单，
+// 用户自己的隐藏文件（.env / .gitignore 这类没有常规后缀的配置）直接放行。
+func workspaceTextFile(rel string) bool {
+	if spacefs.UserHidden(path.Base(rel)) {
+		return true
+	}
+	return workspaceExts[strings.ToLower(path.Ext(rel))]
 }
 
 // workspaceKey 拼出存储 key：spaces/{space_id}/files/{rel}。
@@ -97,8 +111,9 @@ func fileRead() Tool {
 	return Tool{
 		Name:       "file_read",
 		Capability: "fs.read",
-		Description: "读取当前空间内的文本文件（md / json / txt / csv / yaml / ts / js）。path 相对空间文件根目录，" +
-			"如 plugins/weekly_report/SKILL.md。长文件可用 offset / limit 分段读取。",
+		Description: "读取当前空间内的文本文件（md / json / txt / csv / yaml / ts / js；.env 等隐藏配置按文本处理，" +
+			"平台保留的 .meta.json 除外）。path 相对空间文件根目录，" +
+			"如 plugins/weekly_report/SKILL.md；不要读空间文件根目录之外的路径。长文件可用 offset / limit 分段读取。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -220,11 +235,13 @@ func fileWrite() Tool {
 	return Tool{
 		Name:       "file_write",
 		Capability: "fs.write",
-		Description: "写入当前空间内的文本文件（md / json / txt / csv / yaml / ts / js），path 相对空间文件根目录，" +
-			"父目录不存在时自动创建。mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
+		Description: "写入当前空间内的文本文件（md / json / txt / csv / yaml / ts / js；.env 等隐藏配置按文本处理，" +
+			"平台保留的 .meta.json 除外），path 相对空间文件根目录，" +
+			"父目录不存在时自动创建；不要写空间文件根目录之外的路径。" +
+			"mode：overwrite 覆盖（默认）/ append 追加 / create 仅新建（已存在则失败）。" +
 			"单次 content 建议不超过 12KB：模型单次输出有上限，写更长的内容会被截断；" +
 			"更大的文件请分块写，第一块 mode=overwrite（或 create），其余用 mode=append 追加到同一路径，单文件上限 256KB。" +
-			"修改已有文件前建议先用 file_read 读取现有内容。" +
+			"修改已有文件前先 file_read 读一遍，避免覆盖用户内容。" +
 			"团队知识（口径、流程、结论）请用 wiki_write 沉淀，本工具只写当前空间的工作文件。",
 		Parameters: json.RawMessage(`{
   "type": "object",

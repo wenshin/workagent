@@ -447,10 +447,16 @@ func (s *Service) execute(
 	out.Reason = reason
 
 	finish := func(errMsg string) {
-		usage, err := json.Marshal(map[string]int{
+		metrics := map[string]any{
 			"in":  res.Usage.InputTokens,
 			"out": res.Usage.OutputTokens,
-		})
+		}
+		// 档位跟着 run 一起落库：排查「这单为什么没派子 agent」时看 usage.mode，
+		// 比回去翻当时的提示词快。只记录事实，不参与任何判定。
+		if res.Mode != "" {
+			metrics["mode"] = res.Mode
+		}
+		usage, err := json.Marshal(metrics)
 		if err != nil {
 			usage = []byte(`{}`)
 		}

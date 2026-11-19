@@ -195,6 +195,39 @@ export function viewShared(token: string): Promise<{
 }
 
 /**
+ * 上传允许的文件类型，必须与后端 `previewable` 一致：
+ * 上传口只收能预览、`file_read` 也读得到的文本类型，accept 只是把选择器过滤一遍。
+ * 隐藏配置没有常规后缀（.env / .gitignore），单独列出来，否则在选择器里根本看不到它们。
+ */
+export const UPLOAD_ACCEPT = '.md,.json,.txt,.csv,.yaml,.yml,.env,.gitignore,.gitattributes,.editorconfig,.npmrc,.dockerignore';
+/** 同一份白名单的展示文案，用在 tooltip 与菜单说明里 */
+export const UPLOAD_ACCEPT_LABEL = 'md / json / txt / csv / yaml 与 .env 等隐藏配置';
+
+/** 本地预挡超限文件：省掉一次注定 413 的往返；返回第一个超限文件 */
+export function firstOversize(files: File[], maxMb?: number): File | undefined {
+  if (!maxMb) return undefined;
+  const limit = maxMb * 1024 * 1024;
+  return files.find((f) => f.size > limit);
+}
+
+// 预览白名单与上传白名单同源：能传上来的文本类型就是能渲染的类型
+const PREVIEW_SUFFIXES = UPLOAD_ACCEPT.split(',')
+  .map((suffix) => suffix.trim().toLowerCase())
+  .filter(Boolean);
+
+/**
+ * 文件能否在右侧面板渲染（md 走 Markdown，其余按纯文本）。
+ *
+ * 服务端清单里的 `previewable` 是权威值（它认识 .env 这类隐藏配置）；
+ * 老版本后端没有这个字段时按扩展名兜底，否则 md / json 会被误判成「只能下载」。
+ */
+export function isPreviewable(file: Pick<SpaceFile, 'name' | 'previewable'>): boolean {
+  if (typeof file.previewable === 'boolean') return file.previewable;
+  const name = file.name.toLowerCase();
+  return PREVIEW_SUFFIXES.some((suffix) => name.endsWith(suffix));
+}
+
+/**
  * 上传文件到空间：multipart/form-data，字段名 files，dir 是相对空间 files/ 的目录。
  * 单独一个函数是因为 api() 只会发 JSON，而上传必须让浏览器自己带 boundary。
  */
@@ -226,6 +259,39 @@ export async function uploadSpaceFiles(
   }
 
   return (data as UploadFilesResponse).files ?? [];
+}
+
+/**
+ * 下载空间文件到本机：取原始字节（后端不截断），再用 <a download> 落盘。
+ * 不能把地址直接丢给浏览器——401/404 时会被当成一段 JSON 页面打开，用户看不到原因。
+ */
+export async function downloadSpaceFile(spaceId: string, path: string, name: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`/spaces/${spaceId}/file/download?path=${encodeURIComponent(path)}`);
+  } catch {
+    throw new ApiError('网络异常，请检查服务是否正常', 0, 'network_error');
+  }
+
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new ApiError('未登录或登录已过期', 401, 'unauthenticated');
+  }
+  if (!res.ok) {
+    const data: unknown = await res.json().catch(() => ({}));
+    const err = (data ?? {}) as ErrorBody;
+    throw new ApiError(err.message ?? `下载失败（${res.status}）`, res.status, err.code ?? 'unknown');
+  }
+
+  const url = URL.createObjectURL(await res.blob());
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // 立刻 revoke 会让部分浏览器的下载中断，等一帧后再释放
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /**

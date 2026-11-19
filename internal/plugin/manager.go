@@ -524,7 +524,9 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 		}
 		detail := fmt.Sprintf("提示词 %d 字节，首行：%s", len(body), firstLine(body))
 		if b.Meta.Agent != nil && b.Meta.Agent.Extends != "" {
-			detail += fmt.Sprintf("；继承 %s", b.Meta.Agent.Extends)
+			// 存量清单里还写着 extends：不报错（旧版本发布过），但必须让作者知道
+			// 它已经不生效了——否则会以为父智能体的约束还在。
+			detail += fmt.Sprintf("；agent.extends=%s 已不再生效，父链拼接已取消", b.Meta.Agent.Extends)
 		}
 		if b.Meta.Agent != nil && len(b.Meta.Agent.Requires) > 0 {
 			detail += fmt.Sprintf("；依赖 %d 个插件", len(b.Meta.Agent.Requires))

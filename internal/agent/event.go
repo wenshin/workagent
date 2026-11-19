@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/llm"
@@ -133,6 +135,108 @@ type Step struct {
 	DurationMS int64  `json:"duration_ms,omitempty"`
 }
 
+// 三档行为模式：问答 / 任务 / 编排。
+//
+// 模式不是权限：它只如实记录这一轮走到了哪一档，用于事后归因（多少任务被误判成
+// 编排、多少降级发生在第几轮）与前端展示。判定由模型按提示词完成，平台不替它选。
+const (
+	ModeAnswer      = "answer"
+	ModeExec        = "exec"
+	ModeOrchestrate = "orchestrate"
+)
+
+// 清单条目的状态。
+const (
+	PlanPending = "pending"
+	PlanDoing   = "doing"
+	PlanDone    = "done"
+	// PlanBlocked 表示这一步卡住了（缺信息、缺权限、等外部确认）。
+	// 它与 pending 的区别是「再等也不会有进展」，收尾时必须单独说明。
+	PlanBlocked = "blocked"
+)
+
+// PlanItem 是任务清单里的一条。
+type PlanItem struct {
+	Title  string `json:"title"`
+	Status string `json:"status,omitempty"`
+	Note   string `json:"note,omitempty"`
+}
+
+// Plan 是复杂任务的任务清单。
+//
+// 它随 checkpoint 落库（ResumeState.Plan），所以断点续跑后模型能接着走，而不是
+// 重新规划、把已经做完的步骤再做一遍。不建独立表：清单的生命周期就是一次 run，
+// 跟快照放在一起才不会出现「run 结束了清单还挂着待办」。
+type Plan struct {
+	Goal  string     `json:"goal,omitempty"`
+	Items []PlanItem `json:"items"`
+}
+
+// Empty 报告清单是否为空。
+func (p *Plan) Empty() bool { return p == nil || len(p.Items) == 0 }
+
+// Normalize 收敛模型给的值：多余空白、大小写、未知状态都改成可读的取值，
+// 否则清单里会出现提示词、前端与统计三边都读不懂的状态。
+func (p *Plan) Normalize() {
+	if p == nil {
+		return
+	}
+	p.Goal = strings.TrimSpace(p.Goal)
+	for i := range p.Items {
+		it := &p.Items[i]
+		it.Title = strings.TrimSpace(it.Title)
+		it.Note = strings.TrimSpace(it.Note)
+		switch strings.ToLower(it.Status) {
+		case PlanDoing:
+			it.Status = PlanDoing
+		case PlanDone:
+			it.Status = PlanDone
+		case PlanBlocked:
+			it.Status = PlanBlocked
+		default:
+			it.Status = PlanPending
+		}
+	}
+}
+
+// Render 把清单写成模型可读的文本。
+//
+// 提示词与工具回执共用这一份：两处各写一遍格式，最后一定会漂移成
+// 「提示词里是 [x]，回执里是 done」，模型照着旧格式继续写。
+func (p *Plan) Render() string {
+	if p.Empty() {
+		return ""
+	}
+	var b strings.Builder
+	if goal := strings.TrimSpace(p.Goal); goal != "" {
+		b.WriteString("目标：")
+		b.WriteString(goal)
+		b.WriteString("\n")
+	}
+	done := 0
+	for i, it := range p.Items {
+		mark := "[ ]"
+		switch it.Status {
+		case PlanDone:
+			mark = "[x]"
+			done++
+		case PlanDoing:
+			mark = "[~]"
+		case PlanBlocked:
+			mark = "[!]"
+		}
+		fmt.Fprintf(&b, "%s %d. %s", mark, i+1, strings.TrimSpace(it.Title))
+		if note := strings.TrimSpace(it.Note); note != "" {
+			b.WriteString("（")
+			b.WriteString(note)
+			b.WriteString("）")
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "进度：%d/%d 完成。", done, len(p.Items))
+	return strings.TrimSpace(b.String())
+}
+
 // RunInput 是一次 Agent 运行的输入。
 type RunInput struct {
 	// Env 决定工具能看到的资源范围与权限
@@ -162,6 +266,9 @@ type RunInput struct {
 	// 直接注入系统提示词。做成工具的话模型会凭先验抢答「我们用钉钉吧」，
 	// 而这类事实必须恒真，不能放在概率路径上。
 	Platform PlatformFacts
+	// Plan 是本轮开始前已有的任务清单（断点续跑时由快照带回来）。
+	// 顶层会话由内置实现注入 plan_write / plan_read 维护它；子 Agent 不建清单。
+	Plan *Plan
 
 	// Depth 是嵌套深度：0 表示用户发起的一轮，>0 表示由 agent_dispatch 派生的子 Agent。
 	// 实现必须据此限制派发层级，否则子 Agent 可以无限递归。
@@ -203,6 +310,8 @@ type ResumeState struct {
 	// tool_call，tool 消息只有 1 条。直接拿去问模型，它会重新规划、把做过的
 	// 副作用再做一遍；所以恢复时要先把这里补齐，再继续循环。
 	Pending []PendingCall `json:"pending,omitempty"`
+	// Plan 是中断时的任务清单：续跑要接着走已完成的步骤，而不是重新规划。
+	Plan *Plan `json:"plan,omitempty"`
 }
 
 // PendingCall 是一条等待回执的工具调用。
@@ -275,4 +384,7 @@ type Result struct {
 	// StopReason 是循环的收尾原因：done（正常作答）/ budget（预算用尽，已强制收尾）
 	// / stalled（判定再走一步也不会有新进展）。写入 run.budget 与日志，便于事后归因。
 	StopReason string
+	// Mode 是本次执行实际走到的档位（answer / exec / orchestrate），由实现按
+	// 实际调用推断。只用于观测，不改变权限：降级靠提示词与工具面，不靠改名。
+	Mode string
 }

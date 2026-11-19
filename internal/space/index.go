@@ -10,12 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 )
 
 // 空间根目录下的能力索引文件：汇总该空间的 skills / tools / mcps，
 // 供 Agent 与会话技能选择器使用。隐藏文件，不进左侧树。
-const spaceIndexFile = ".meta.json"
+const spaceIndexFile = spacefs.MetaFile
 
 const indexVersion = 2
 
@@ -335,18 +336,21 @@ func (s *Service) refreshIndex(ctx context.Context, spaceID string) {
 	}
 }
 
-// normalizeSourcePath 校验插件文件相对路径：禁止越界、反斜杠与隐藏文件，限定可读类型。
+// normalizeSourcePath 校验插件文件相对路径：禁止越界、反斜杠与平台保留项，限定可读类型。
+//
+// 隐藏文件不在拒绝之列：插件自己的 .env / .gitignore 与普通文件一样可读，
+// 只有平台写的 .meta.json / .install.json 这类不能被读到。
 func normalizeSourcePath(raw string) (string, error) {
 	rel := strings.Trim(strings.TrimSpace(raw), "/")
 	if rel == "" || strings.Contains(rel, "..") || strings.Contains(rel, "\\") {
 		return "", ErrNameInvalid
 	}
 	for _, seg := range strings.Split(rel, "/") {
-		if seg == "." || seg == ".." || strings.HasPrefix(seg, ".") {
+		if seg == "." || seg == ".." || spacefs.Reserved(seg) {
 			return "", ErrNameInvalid
 		}
 	}
-	if !previewExts[strings.ToLower(path.Ext(rel))] {
+	if !previewable(rel) {
 		return "", ErrFileUnsupported
 	}
 	return rel, nil

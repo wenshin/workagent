@@ -16,14 +16,16 @@ func wikiEnv(t *testing.T) Env {
 }
 
 func TestWikiPathRules(t *testing.T) {
-	valid := []string{"topics/报销制度.md", "log.md", "a/b/c.md"}
+	// 用户自己的隐藏页面（.hidden.md）与普通页面一致
+	valid := []string{"topics/报销制度.md", "log.md", "a/b/c.md", ".hidden.md"}
 	for _, p := range valid {
 		if _, err := wikiRel(p, false); err != nil {
 			t.Errorf("%q 应合法，却被拒绝: %v", p, err)
 		}
 	}
 
-	invalid := []string{"", "../x.md", "/etc/passwd", ".hidden.md", "a.png", "a/b/c/d.md", "a/../../b.md"}
+	// 平台保留项即使后缀合法也不允许读写
+	invalid := []string{"", "../x.md", "/etc/passwd", ".meta.json", "a.png", "a/b/c/d.md", "a/../../b.md"}
 	for _, p := range invalid {
 		if _, err := wikiRel(p, false); err == nil {
 			t.Errorf("%q 应被拒绝", p)

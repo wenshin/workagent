@@ -467,7 +467,10 @@ type SourceSpec struct {
 type AgentSpec struct {
 	// Entry 是提示词正文文件，默认 AGENT.md
 	Entry string `json:"entry,omitempty"`
-	// Extends 是父智能体 slug，只能指向另一个 agent 插件；空表示只追加到平台基础规则
+	// Extends 已废弃：父链拼接会取消，运行时不读这个字段。
+	//
+	// 保留它只为兼容存量清单（解析不报错），发布/试运行会提示它不再生效。
+	// 要复用别的工作方式就复制正文，要复用能力写 Requires。
 	Extends string `json:"extends,omitempty"`
 	// Requires 是随智能体一并安装的插件 slug（技能/工具/MCP）
 	Requires []string `json:"requires,omitempty"`

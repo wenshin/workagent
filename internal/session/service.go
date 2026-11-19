@@ -22,6 +22,7 @@ import (
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/spacefs"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -298,7 +299,13 @@ func (s *Service) Create(ctx context.Context, userID, spaceID, rawTitle, rawDir,
 		return store.Session{}, err
 	}
 
-	sess, err := s.store.CreateSession(ctx, spaceID, userID, title, dir, agent.ID, agent.Version, agent.Prompt)
+	// 内置智能体不固化正文与版本：它是运营对象，卡片上改了要立刻生效。
+	// 自建/安装的智能体继续固化，改版不会无声地改变已有会话的行为。
+	version, prompt := agent.Version, agent.Prompt
+	if agent.Builtin {
+		version, prompt = "", ""
+	}
+	sess, err := s.store.CreateSession(ctx, spaceID, userID, title, dir, agent.ID, version, prompt)
 	if err != nil {
 		return store.Session{}, err
 	}
@@ -611,14 +618,15 @@ func (s *Service) ResolveReferences(ctx context.Context, userID, sessionID strin
 		if rel == "" || strings.Contains(rel, "..") {
 			continue
 		}
-		hidden := false
+		// 平台保留的隐藏项不进引用（用户自己的 .env 等隐藏文件正常引用）
+		blocked := false
 		for _, seg := range strings.Split(rel, "/") {
-			if seg == "" || seg == "." || strings.HasPrefix(seg, ".") {
-				hidden = true
+			if seg == "" || seg == "." || seg == ".." || spacefs.Reserved(seg) {
+				blocked = true
 				break
 			}
 		}
-		if hidden || seen[rel] {
+		if blocked || seen[rel] {
 			continue
 		}
 		entry, err := s.storage.Stat(ctx, path.Join(base, rel))

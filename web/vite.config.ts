@@ -35,6 +35,8 @@ export default defineConfig({
         // 续流入口：刷新/切页回来靠它接上正在跑的那一轮。漏掉就会落到 SPA 路由，
         // 拿到 index.html —— 表现是「切页回来会话没了」，且不报任何错
         '/runs',
+        // 任务催办 / 取消按 task_id 定位，不挂在会话下；漏配的表现是点按钮 404
+        '/tasks',
         '/resources',
         '/admin',
         '/healthz',

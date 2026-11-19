@@ -223,8 +223,10 @@ func (m *Manager) migrateOneAgent(ctx context.Context, spaceID, dirKey, dirName 
 		Name:        name,
 		Description: desc,
 		Capability:  CapAgentUse,
-		Agent:       &AgentSpec{Entry: AgentEntry, Extends: strings.TrimSpace(spec.Extends)},
-		Extensible:  boolPtr(false),
+		// 旧版的 extends 不再展开：迁移后的正文就是它自己那一份，
+		// 父链已经在新模型里取消（见 ResolveAgentPlugin 的说明）。
+		Agent:      &AgentSpec{Entry: AgentEntry},
+		Extensible: boolPtr(false),
 	}
 	if err := m.seedBuiltin(ctx, spaceID, spaceID, meta, map[string]string{AgentEntry: body}); err != nil {
 		return err

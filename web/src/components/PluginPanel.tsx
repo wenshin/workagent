@@ -358,7 +358,7 @@ export default function PluginPanel({ space }: Props) {
                     </Button>
                   ) : null}
 
-                  {!local && item.configurable ? (
+                  {!local && item.configurable && (item.origin !== 'system' || isSystemSpace) ? (
                     <Button
                       size="small"
                       theme="borderless"

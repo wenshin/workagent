@@ -110,6 +110,8 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	res.Provider = provider
 	res.Model = out.Model
 	res.Usage = out.Usage
+	// 直答实现永远落在问答档：它不加载工具，也不存在「任务 / 编排」的可能。
+	res.Mode = agent.ModeAnswer
 	res.Content = content.String()
 	res.Reasoning = reasoning.String()
 	// Provider 可能只返回聚合结果而没有流式增量，补齐兜底

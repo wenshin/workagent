@@ -12,9 +12,6 @@ import (
 	"github.com/workagent/auto-agent/internal/store"
 )
 
-// maxAgentDepth 限制智能体继承层数：父链太长会让行为不可预测。
-const maxAgentDepth = 4
-
 // ListAgentPlugins 返回当前空间可选的智能体插件。
 //
 // 系统空间的安装是全局安装，因此「系统空间装了一个智能体」= 所有空间的会话都能选到它。
@@ -37,7 +34,6 @@ func (m *Manager) ListAgentPlugins(ctx context.Context, spaceID string) ([]agent
 			item.Name = inst.Slug
 		}
 		if inst.Manifest.Agent != nil {
-			item.Extends = inst.Manifest.Agent.Extends
 			// 头像地址带文件修改时间：草稿改完立刻换地址，列表不必等版本号变
 			item.IconURL = m.agentIconURL(ctx, spaceID, inst.Slug, inst.Dir, inst.Manifest.Agent.Icon)
 		}
@@ -112,10 +108,15 @@ func (m *Manager) AgentDependencies(ctx context.Context, spaceID, rawSlug string
 	return out, nil
 }
 
-// ResolveAgentPlugin 把智能体插件的父链拼成一段追加提示词。
+// ResolveAgentPlugin 读取一个智能体插件的提示词正文。
 //
-// 顺序是「祖先在前、自己在后」：父智能体定风格，子智能体补细节。
-// base 也是插件：`extends: "base"` 就是继承平台默认智能体，不再是特殊分支。
+// 只读这一个插件，不再沿 agent.extends 拼父链。理由：散文拼接会把「可以写文件」
+// 和「不要写文件」放进同一层互相抵消，结果取决于措辞与顺序；而父智能体发版会在
+// 使用方不知情时改变它的行为，排查时只能猜。要复用别人的工作方式就复制正文，
+// 要复用能力就写 agent.requires——两者都是显式的。
+//
+// 正文可以由安装级配置覆盖（插件卡片上的「提示词覆盖」）：内置件只有系统空间那
+// 一份安装记录，改它等于改所有空间；自建插件只影响当前空间的这份安装。
 func (m *Manager) ResolveAgentPlugin(ctx context.Context, spaceID, rawSlug string) (agentspec.Resolved, error) {
 	slug := strings.TrimSpace(rawSlug)
 	if slug == "" {
@@ -124,84 +125,46 @@ func (m *Manager) ResolveAgentPlugin(ctx context.Context, spaceID, rawSlug strin
 	if err := m.ensureLoaded(ctx, spaceID); err != nil {
 		return agentspec.Resolved{}, err
 	}
-	snap := m.snapshot(spaceID)
-
-	var chain []*instance
-	visited := map[string]bool{}
-	cur := slug
-	for {
-		if visited[cur] {
-			return agentspec.Resolved{}, fmt.Errorf("%w: 智能体 %s 的继承关系成环", agentspec.ErrInvalid, slug)
-		}
-		visited[cur] = true
-
-		inst, ok := snap[cur]
-		if !ok {
-			if len(chain) == 0 {
-				return agentspec.Resolved{}, store.ErrNotFound
-			}
-			// 父链落在 base 而 base 插件尚未就绪（系统空间还没初始化）：
-			// 当作链尾处理，只注入已有部分，不让会话创建失败。
-			if cur == agentspec.BaseID {
-				break
-			}
-			return agentspec.Resolved{}, fmt.Errorf("%w: 父智能体 %s 未安装", agentspec.ErrInvalid, cur)
-		}
-		if inst.Manifest.Kind != KindAgent {
-			if len(chain) == 0 {
-				return agentspec.Resolved{}, store.ErrNotFound
-			}
-			return agentspec.Resolved{}, fmt.Errorf("%w: %s 不是智能体插件", agentspec.ErrInvalid, cur)
-		}
-		chain = append(chain, inst)
-		if len(chain) > maxAgentDepth {
-			return agentspec.Resolved{}, fmt.Errorf("%w: 智能体继承不能超过 %d 层", agentspec.ErrInvalid, maxAgentDepth)
-		}
-
-		parent := ""
-		if inst.Manifest.Agent != nil {
-			parent = strings.TrimSpace(inst.Manifest.Agent.Extends)
-		}
-		if parent == "" {
-			break
-		}
-		cur = parent
+	inst, ok := m.snapshot(spaceID)[slug]
+	if !ok || inst.Manifest.Kind != KindAgent {
+		return agentspec.Resolved{}, store.ErrNotFound
 	}
 
-	var b strings.Builder
-	for i := len(chain) - 1; i >= 0; i-- {
-		entry := AgentEntry
-		if chain[i].Manifest.Agent != nil && chain[i].Manifest.Agent.Entry != "" {
-			entry = chain[i].Manifest.Agent.Entry
-		}
-		text, err := ReadFile(ctx, m.o.Storage, chain[i].Dir, entry)
-		if err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
-				continue
-			}
-			return agentspec.Resolved{}, err
-		}
-		text = strings.TrimSpace(text)
-		if text == "" {
-			continue
-		}
-		b.WriteString(text)
-		b.WriteString("\n\n")
+	entry := AgentEntry
+	if inst.Manifest.Agent != nil && inst.Manifest.Agent.Entry != "" {
+		entry = inst.Manifest.Agent.Entry
 	}
-	prompt := strings.TrimSpace(b.String())
+	text, err := ReadFile(ctx, m.o.Storage, inst.Dir, entry)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return agentspec.Resolved{}, err
+	}
+	prompt := strings.TrimSpace(text)
+
+	// 安装级覆盖：留空表示用插件自带的 AGENT.md。
+	// 与 shell 的命令名单相反——那里清空等于「都不确认」，这里清空必须等于「用默认」，
+	// 否则把输入框清空保存会把智能体变成空人格。
+	if override := strings.TrimSpace(inst.Config[ConfigAgentPrompt]); override != "" {
+		prompt = override
+	}
 	if len(prompt) > agentspec.MaxPromptBytes {
 		return agentspec.Resolved{}, fmt.Errorf("%w: 智能体提示词超过 %d 字节", agentspec.ErrInvalid, agentspec.MaxPromptBytes)
 	}
 
-	head := chain[0].Manifest
-	name := head.Name
+	name := inst.Manifest.Name
 	if name == "" {
 		name = slug
+	}
+	// 平台内置件（origin=system）与会话的关系是「运营对象 vs 业务配置」：
+	// 前者运行时解析正文，后者创建时固化。插件实例上看不到 origin，回查一次发布记录。
+	builtin := false
+	if p, err := m.o.Store.GetPluginBySlug(ctx, slug); err == nil {
+		builtin = p.Origin == store.PluginOriginSystem
 	}
 	return agentspec.Resolved{
 		ID:      slug,
 		Name:    name,
-		Version: chain[0].Version,
+		Version: inst.Version,
 		Prompt:  prompt,
+		Builtin: builtin,
 	}, nil
 }

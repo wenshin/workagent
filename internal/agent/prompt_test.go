@@ -13,8 +13,9 @@ func TestSystemMessageHasNoSkillIndex(t *testing.T) {
 	if strings.Contains(msg.Content, "可用技能（索引") {
 		t.Fatal("平台不再常驻技能索引，系统提示词里不应出现索引段")
 	}
-	// 索引删除后，判断规则必须写进系统提示词，否则模型不知道该检索
-	for _, want := range []string{"plugin_search", "plugin_read", "web_search"} {
+	// 索引删除后，判断规则必须写进系统提示词，否则模型不知道该检索。
+	// 外部检索不点 web_search：说明它在工具描述里，基础规则只说「实时信息必须查过再答」。
+	for _, want := range []string{"plugin_search", "plugin_read", "必须查过再答"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("系统提示词缺少检索规则 %q", want)
 		}
@@ -165,28 +166,19 @@ func TestBasePromptForbidsAskingForPlaintextSecrets(t *testing.T) {
 	}
 }
 
-// 知识沉淀必须改道 wiki_*：wiki 工具一直在工具列表里，但提示词不提它，
-// 模型就会用 file_write 在当前空间自建 knowledge/ 目录——那份知识只有本空间可见。
-func TestBasePromptRoutesKnowledgeToWiki(t *testing.T) {
-	msg := BuildSystemMessage(RunInput{})
-
-	for _, want := range []string{"wiki_search", "wiki_list", "wiki_read", "wiki_write", "不要为「沉淀知识」"} {
-		if !strings.Contains(msg.Content, want) {
-			t.Fatalf("基础规则缺少知识库指引 %q", want)
-		}
-	}
-	// 能力缺失（系统空间没初始化）时不能静默降级成写文件
-	if !strings.Contains(msg.Content, "系统空间未初始化") {
-		t.Fatal("基础规则缺少 wiki 不可用时的处理要求")
-	}
-}
+// 工具用法不再常驻基础规则：file_* / wiki_* / shell_exec / web_search / plan_* 的
+// 使用约束写在各自的工具描述里（能力面裁剪时规则跟着工具一起消失，不会出现
+// 「模型看得见 12KB 分块的规则，却看不到 file_write 这个工具」）。
+// 那些描述必须自带关键约束，由 internal/tool 的 TestToolDescriptionsCarryUsageRules 守。
 
 // 普通问答必须在对话里回答：模型手里有 file_write，提示词不说清就会把
 // 每个回答都落成 md 文件，用户在会话里只看到「已写入 xxx.md」。
 func TestBasePromptAnswersInChatByDefault(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{})
 
-	for _, want := range []string{"默认在对话里回答", "不要产出文件", "file_write", "wiki_write"} {
+	// 只认策略本身，不认工具名：工具名写进基础规则，等于假设这些工具一定在场，
+	// 而能力面是按插件安装与智能体裁剪的。
+	for _, want := range []string{"默认在对话里回答", "不要产出文件"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("基础规则缺少默认在对话里回答的约束 %q", want)
 		}
