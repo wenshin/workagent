@@ -1,0 +1,92 @@
+# 执行体：容器内的 bwrap 宿主。
+#
+# 安全上下文说明（每一项都有理由，别随手删）：
+#   SYS_ADMIN —— bwrap 要做 bind mount / proc / dev / tmpfs
+#   NET_ADMIN —— bwrap --unshare-net 后要拉起 lo，缺了会报
+#                "loopback: Failed RTM_NEWADDR: No child processes"
+#   seccompProfile: Unconfined —— 默认 RuntimeDefault 会拦 unshare/clone(CLONE_NEW*)
+#   没有给 privileged —— 上述两项能力已足够，privileged 会把节点设备全暴露
+#
+# 存储：本地单节点用 hostPath（OrbStack VM 内的 ext4）；生产换成每租户一个
+# local PV，挂载点必须与控制面看到的绝对路径完全一致（路径是跨进程契约）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-runner
+  namespace: workagent
+  labels:
+    app.kubernetes.io/name: sandbox-runner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandbox-runner
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: runner
+          image: workagent/sandbox-runner:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8323
+          env:
+            - name: SANDBOX_REQUIRE
+              value: "true"
+            - name: SANDBOX_AGENT_ROOT
+              value: /var/lib/workagent
+            - name: SANDBOX_RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-runner-token
+                  key: token
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            seccompProfile:
+              type: Unconfined
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN"]
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/workagent
+      volumes:
+        - name: storage
+          hostPath:
+            path: /var/lib/workagent
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-runner
+  namespace: workagent
+spec:
+  selector:
+    app.kubernetes.io/name: sandbox-runner
+  ports:
+    - name: http
+      port: 8323
+      targetPort: http

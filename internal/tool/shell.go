@@ -41,7 +41,14 @@ func shellExec() Tool {
 		Name:       "shell_exec",
 		Capability: "shell.exec",
 		Description: "在当前空间的文件目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
-			"只有当前空间目录可写，系统其它位置只读，默认没有网络访问，有超时与输出上限。" +
+			"系统其它位置只读，有超时与输出上限。" +
+			"命令里出现 curl/wget 或脚本解释器（sh/python/node）时，需要用户确认联网后再执行；" +
+			"装依赖（pip install / npm i / fnm install）不需要确认，直接装。" +
+			"联网执行时沙箱只挂 .deps 安装目录，当前空间的其它文件不可见——下载、安装和读文件的操作要分开写，" +
+			"不要写成一条 `curl ... && python ...`。" +
+			"依赖与运行时请装进 .deps（FNM_DIR / PIP_TARGET / NPM_CONFIG_PREFIX 已指向那里），" +
+			"例如 `pip install requests`、`npm i`、`fnm install 20`，装好后用 .deps 下的路径调用；" +
+			"不要往 /usr、/etc 装东西，也不要试图改系统包管理器。" +
 			"适合做文件统计、批量改名、跑本地脚本；要查外网信息请用 web_search。" +
 			"命令返回非零退出码或超时时，先看 stderr 再调整，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
@@ -102,11 +109,17 @@ func shellExec() Tool {
 				timeout = maxShellTimeout
 			}
 
+			// 要不要出网由命令本身决定：curl / 脚本解释器 / 包管理器需要，
+			// 其余（ls、grep、mv）不需要。出网时沙箱只挂 .deps，
+			// 工作区的其它文件在命令里根本不存在。
+			needsNet := shellNeedsNetwork(command)
 			res, runErr := env.Shell.Run(ctx, sandbox.Spec{
 				Cmd:     []string{"sh", "-c", command},
 				Dir:     workDir,
 				Mode:    sandbox.ModeWorkspaceWrite,
 				Timeout: timeout,
+				Network: needsNet,
+				Env:     installEnv(workDir),
 			})
 
 			// 超时与输出超限是「命令没跑完」，属于结果的一部分，回给模型让它调整；
@@ -119,6 +132,197 @@ func shellExec() Tool {
 			return formatShellResult(res, runErr, timeout), nil
 		},
 	}
+}
+
+// InstallMirrors 是安装源镜像地址。
+//
+// 出网边界已经交给 NetworkPolicy，这张表只决定「装得快不快」：
+// 按 region 换一整套源即可，不用重新编译。
+type InstallMirrors struct {
+	NPM  string // npm / pnpm / yarn
+	PyPI string // pip / uv
+	Node string // fnm 拉 node 二进制
+	Go   string // GOPROXY
+}
+
+var installMirror = InstallMirrors{
+	NPM: "https://registry.npmmirror.com",
+	// 与 deploy/runner/Dockerfile 的 PYPI_INDEX 保持一致：
+	// 镜像构建期装的包和运行时装来自同一源，出问题时才只有一个变量。
+	PyPI: "https://mirrors.aliyun.com/pypi/simple",
+	Node: "https://cdn.npmmirror.com/binaries/node",
+	Go:   "https://goproxy.cn",
+}
+
+// SetInstallMirrors 覆盖安装源，字段为空则保留原值。
+// 启动时按部署环境调用一次；不是每空间配置，因为镜像属于部署事实。
+func SetInstallMirrors(m InstallMirrors) {
+	if m.NPM != "" {
+		installMirror.NPM = m.NPM
+	}
+	if m.PyPI != "" {
+		installMirror.PyPI = m.PyPI
+	}
+	if m.Node != "" {
+		installMirror.Node = m.Node
+	}
+	if m.Go != "" {
+		installMirror.Go = m.Go
+	}
+}
+
+// CurrentInstallMirrors 返回当前生效的安装源。
+func CurrentInstallMirrors() InstallMirrors { return installMirror }
+
+// InstallMirrorSources 把当前安装源摊成提示词要的 map。
+//
+// 提示词里那行「安装源：npm→…」和 installEnv 注入的环境变量必须是同一份值：
+// 提示词说 A 源、命令实际走 B 源时，模型会照着提示词改配置，
+// 排查的人则一路往「模型是不是没听话」上找。
+func InstallMirrorSources() map[string]string {
+	m := installMirror
+	return map[string]string{
+		"npm":  m.NPM,
+		"pip":  m.PyPI,
+		"node": m.Node,
+		"go":   m.Go,
+	}
+}
+
+// installEnv 把安装源与安装目录写进环境变量。
+//
+// 安装目录固定在 .deps 下：出网执行时沙箱只挂这一个子目录，
+// 装进去的东西必须落在这里，否则下次调用就找不到了。
+func installEnv(workDir string) []string {
+	deps := sandbox.DepsDir(workDir)
+	if deps == "" {
+		return nil
+	}
+	m := installMirror
+	py := filepath.Join(deps, "py")
+	return []string{
+		"FNM_DIR=" + filepath.Join(deps, "node"),
+		"FNM_NODE_DIST_MIRROR=" + m.Node,
+		"NPM_CONFIG_PREFIX=" + filepath.Join(deps, "npm"),
+		"NPM_CONFIG_CACHE=" + filepath.Join(deps, "cache", "npm"),
+		"NPM_CONFIG_REGISTRY=" + m.NPM,
+		"PIP_TARGET=" + py,
+		// PIP_TARGET 装的包不在 sys.path 里，必须补 PYTHONPATH，
+		// 否则「装成功了但 import 不到」。
+		"PYTHONPATH=" + py,
+		"PIP_CACHE_DIR=" + filepath.Join(deps, "cache", "pip"),
+		"PIP_INDEX_URL=" + m.PyPI,
+		"GOPROXY=" + m.Go,
+		// 缓存也放进 .deps：出网档位下 HOME 是私有 tmp，放那里等于每次重下。
+		"XDG_CACHE_HOME=" + filepath.Join(deps, "cache"),
+	}
+}
+
+// shellNetRe 命中的命令意味着「这条命令有出网可能」。
+//
+// 口径故意宽：脚本解释器只看得到文件名，看不到里面有没有 urllib。
+// 多给一次网只是白跑一次，少给一次是功能直接坏掉。
+var shellNetRe = regexp.MustCompile(`\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|sh|bash|dash|zsh|ksh|python[0-9.]*|node|deno|bun|ruby|perl|php)\b`)
+
+// shellPkgNet 是包管理器的 install 类子命令：没网时它们 100% 失败。
+var shellPkgNet = []*regexp.Regexp{
+	regexp.MustCompile(`\b(npm|pnpm|yarn)\s+(i|install|ci|add|update|up)\b`),
+	regexp.MustCompile(`\b(pip|pip3)\s+(install|download)\b`),
+	regexp.MustCompile(`\bpython[0-9.]*\s+-m\s+pip\s+(install|download)\b`),
+	regexp.MustCompile(`\buv\s+(pip\s+install|sync|add|venv)\b`),
+	regexp.MustCompile(`\bcargo\s+(build|install|add|fetch)\b`),
+	regexp.MustCompile(`\bgo\s+(get|install|build|mod|generate)\b`),
+	regexp.MustCompile(`\bfnm\s+(install|use)\b`),
+}
+
+// shellOfflineForms 是「长得像上面那些词、但确实不需要网」的形态。
+//
+// 不加这一层的话，`python3 -m venv .venv` 会被判成要出网，于是只挂 .deps，
+// 结果虚拟环境建进 tmpfs，命令一结束就没了。
+var shellOfflineForms = []*regexp.Regexp{
+	regexp.MustCompile(`\bpython[0-9.]*\s+(-V|--version)\b`),
+	regexp.MustCompile(`\bpython[0-9.]*\s+-m\s+venv\b`),
+	regexp.MustCompile(`\bnode\s+(-v|--version)\b`),
+	regexp.MustCompile(`\bgo\s+(version|env)\b`),
+	regexp.MustCompile(`\b(npm|pnpm|yarn)\s+(run|ls|list|config|--version|-v)\b`),
+}
+
+// shellSplitPipeline 把命令按 `&&` `||` `;` `|` 切成子命令。
+//
+// 不处理引号：切错的后果只是多切一刀，每一段仍会被完整判断，不会漏掉危险命令；
+// 而按 shell 语义解析引号要写一个小型词法分析器，收益不足以抵消维护成本。
+func shellSplitPipeline(command string) []string {
+	return strings.FieldsFunc(command, func(r rune) bool {
+		return r == '&' || r == '|' || r == ';'
+	})
+}
+
+func isPkgInstall(cmd string) bool {
+	for _, re := range shellPkgNet {
+		if re.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+func isOfflineForm(cmd string) bool {
+	for _, re := range shellOfflineForms {
+		if re.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellNeedsNetwork 判断一条命令要不要出网。
+//
+// 这是唯一决定「沙箱能不能看到工作区」的开关：出网时只挂 .deps，
+// 非出网时挂整个 Dir。判错的两种后果不对称——判多只是白给一次网，
+// 判少是命令直接失败，所以口径偏宽（包管理器安装也算需要网）。
+func shellNeedsNetwork(command string) bool {
+	if strings.Contains(command, "/dev/tcp/") {
+		// bash 内置，不需要任何外部二进制就能发请求。
+		return true
+	}
+	for _, part := range shellSplitPipeline(command) {
+		if isOfflineForm(part) {
+			continue
+		}
+		if isPkgInstall(part) || shellNetRe.MatchString(part) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellNeedsApproval 判断这条命令要不要人工确认。
+//
+// 判据比 shellNeedsNetwork 窄：只有「能任意外发数据」的命令才算数——
+// 网络工具（curl / wget / nc / ssh ...）和脚本解释器（sh / python / node ...），
+// 目标地址由命令内容决定，一条被注入的命令就能把会话内容拼进 URL 带出去。
+//
+// 包管理器安装（pip install / npm i / fnm install）虽然也要网，但它是
+// 「装东西」不是「发东西」：默认终点由 PIP_INDEX_URL / NPM_CONFIG_REGISTRY
+// 指向镜像源，`--index-url` 仍能覆盖，这里不做强制。理由是这条路的收益极低——
+// 改源最多装进一个恶意包，而沙箱里既没有凭证也没有业务数据，拿不到有价值的东西。
+// 放宽的收益很实际：每次装依赖都弹确认，用户会养成无脑点「同意」的习惯，
+// 真正危险的命令反而被淹没。
+func shellNeedsApproval(command string) bool {
+	if strings.Contains(command, "/dev/tcp/") {
+		return true
+	}
+	for _, part := range shellSplitPipeline(command) {
+		// 安装与「确实不需要网」的形态先摘出去，剩下的部分再判：
+		// `pip install node-fetch` 摘完是空的，`curl x && pip install y` 还剩 curl。
+		if isOfflineForm(part) || isPkgInstall(part) {
+			continue
+		}
+		if shellNetRe.MatchString(part) {
+			return true
+		}
+	}
+	return false
 }
 
 // shellReadOnlyCommands 是「静态可判定为只读」的命令名单，只用于展示。

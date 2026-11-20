@@ -78,18 +78,42 @@ type Spec struct {
 	// MaxOutput 是 stdout / stderr 各自的上限，<=0 用 DefaultMaxOutput。
 	MaxOutput int
 	// Network 为 true 才允许出网；默认 false（ModeFull 下无意义）。
+	//
+	// 出网时不建代理、也不注入 HTTP_PROXY。应用层域名白名单在 share-net 下
+	// 本来就能被 --noproxy 绕过，留着只会让人误以为有边界；真正的边界交给
+	// 集群 NetworkPolicy 在网络层封禁私网段。
+	//
+	// 代价是出网时 Dir 不再整体挂载：只有 Dir/.deps 可见可写（见 DepsDirName），
+	// 空间里的其它文件在沙箱里不存在。这样即使命令被注入，也读不到业务数据。
 	Network bool
 	// Proxy 是出网代理的 unix socket 路径（见 internal/egress）。
 	//
 	// 非空时 Network 必须为 false：沙箱仍然 --unshare-net，这个 socket 是唯一的
 	// 对外通道，域名白名单在宿主侧判定。两者同时设置会直接报错——否则
 	// 「以为走了代理、其实直连」这种事故只会出现在线上。
+	//
+	// 目前只有插件运行时用它：Deno 能自己解析 unix: 前缀，npm / fnm / uv 不能。
 	Proxy string
 	// FS 是文件访问白名单。零值表示「系统只读基线 + Dir」，看不到任何业务数据。
 	FS FS
 	// Resident 表示这是长驻进程（插件运行时）：不施加墙钟上限，
 	// 生命周期由调用方 Close 决定，而不是靠 Timeout 杀掉。
 	Resident bool
+}
+
+// DepsDirName 是出网执行时唯一可见可写的子目录名。
+//
+// 放在空间工作目录下（Dir/.deps）：装进去的运行时与依赖跨调用保留，不用每次重装；
+// 而出网时其它目录不挂载，被注入的命令读不到业务文件。名字固定是为了让环境变量
+// （FNM_DIR / PIP_TARGET / NPM_CONFIG_PREFIX）和挂载路径有一个共同的出处。
+const DepsDirName = ".deps"
+
+// DepsDir 返回给定工作目录下的安装目录绝对路径。
+func DepsDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, DepsDirName)
 }
 
 // FS 是文件访问白名单。
@@ -403,6 +427,11 @@ func (r *runner) prepare(spec Spec) (prepared, error) {
 		return prepared{}, fmt.Errorf("创建临时目录失败: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(tmp) }
+
+	// 出网不再建代理：share-net 下沙箱可以直接绕过 HTTP_PROXY 直连，
+	// 应用层白名单只是「默认路径可达」，当成边界会误导。真正的封禁在
+	// NetworkPolicy（私网段不可达），数据面靠「出网时只挂 .deps」。
+
 	// macOS 上 /var 是指向 /private/var 的符号链接，内核按真实路径匹配策略，
 	// 不先解开就会出现「明明放开了写权限却 Operation not permitted」。
 	if real, evalErr := filepath.EvalSymlinks(tmp); evalErr == nil {
@@ -412,6 +441,14 @@ func (r *runner) prepare(spec Spec) (prepared, error) {
 	dir := spec.Dir
 	if real, evalErr := filepath.EvalSymlinks(dir); evalErr == nil {
 		dir = real
+	}
+	// 出网档位只挂 .deps，而 bwrap 的 --bind 要求目标已存在
+	// （不存在时它会建一个空目录，装进去的东西下次就找不到了）。
+	if spec.Network && spec.Dir != "" {
+		if mkErr := os.MkdirAll(DepsDir(spec.Dir), 0o755); mkErr != nil {
+			cleanup()
+			return prepared{}, fmt.Errorf("准备安装目录失败: %w", mkErr)
+		}
 	}
 
 	env := buildEnv(spec, tmp)
@@ -566,14 +603,27 @@ func interpreterDir(bin string) string {
 func (s Spec) fsPaths(baseline []string) (read, write []string) {
 	read = append(read, baseline...)
 	read = append(read, ExtraRead()...)
-	read = append(read, s.FS.Read...)
 	// 工作目录必须可读，否则连「脚本文件所在目录」都进不去。
 	if s.Dir != "" {
-		read = append(read, s.Dir)
+		if s.Network {
+			// 出网档位把可见面收窄到只剩 .deps：FS.Read / FS.Write 一律忽略，
+			// 因为那两条路的语义是「调用方显式声明要访问什么」，而 dir/.deps 之外
+			// 的任何路径在出网时都不该出现——一条被注入的 curl 就足以把整个工作区带走。
+			read = append(read, DepsDir(s.Dir))
+		} else {
+			read = append(read, s.FS.Read...)
+			read = append(read, s.Dir)
+		}
+	} else {
+		read = append(read, s.FS.Read...)
 	}
 	if s.Mode == ModeWorkspaceWrite {
-		write = append(write, s.FS.Write...)
-		write = append(write, s.Dir)
+		if s.Network {
+			write = append(write, DepsDir(s.Dir))
+		} else {
+			write = append(write, s.FS.Write...)
+			write = append(write, s.Dir)
+		}
 	}
 	return sortedUnique(read), sortedUnique(write)
 }
@@ -629,7 +679,14 @@ func sortedUnique(in []string) []string {
 
 // baseEnvKeys 是允许从父进程继承的环境变量：都是无害的本地化 / 路径信息。
 // 其余（含各类 *_KEY / *_TOKEN）一律不带，避免沙箱里的 cat / env 顺手把密钥读走。
-var baseEnvKeys = []string{"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"}
+var baseEnvKeys = []string{
+	"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+	// 安装源：镜像里写死的国内镜像地址。不带进沙箱，模型装老版本时会去连官方源，
+	// 在断网 / 白名单下表现为「卡住直到超时」，比直接报错更难排查。
+	// 只放地址，不放 FNM_DIR / UV_PYTHON_INSTALL_DIR 这类目录变量：
+	// 那些必须由调用方指到可写位置，从父进程继承过来只会指到只读的系统目录。
+	"NPM_CONFIG_REGISTRY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX", "FNM_NODE_DIST_MIRROR",
+}
 
 const fallbackPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -657,7 +714,38 @@ func buildEnv(spec Spec, tmp string) []string {
 		// 约定变量：插件与依赖从这里拿到唯一的出网地址。
 		env = append(env, "WA_EGRESS_PROXY="+spec.Proxy)
 	}
-	return append(env, spec.Env...)
+	return mergeEnv(env, spec.Env)
+}
+
+// mergeEnv 让 override 覆盖 base 里的同名键。
+//
+// 不能简单 append：execve 收到的是一维数组，getenv 取第一个匹配，
+// 后追加的同名项在 glibc / musl 下都不生效——表现是「设了但程序不认」。
+// 之前 XDG_CACHE_HOME 就栽在这上面：默认值指向私有 tmp，
+// 调用方想把它挪到 .deps/cache，结果缓存还是每次重下。
+func mergeEnv(base, override []string) []string {
+	if len(override) == 0 {
+		return base
+	}
+	idx := make(map[string]int, len(base))
+	for i, kv := range base {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			idx[k] = i
+		}
+	}
+	for _, kv := range override {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok || k == "" {
+			continue
+		}
+		if i, exists := idx[k]; exists {
+			base[i] = kv
+			continue
+		}
+		idx[k] = len(base)
+		base = append(base, kv)
+	}
+	return base
 }
 
 // capWriter 收集输出并在超限时触发终止。

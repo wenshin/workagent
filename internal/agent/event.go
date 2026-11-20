@@ -355,6 +355,41 @@ type PlatformFacts struct {
 	JobNumber string
 	// SpaceName 是当前会话所在空间名称
 	SpaceName string
+	// Exec 是执行容器自述的运行环境；未上报时为零值，提示词里整段省略。
+	Exec ExecFacts
+}
+
+// ExecFacts 是执行容器对自身运行环境的自述。
+//
+// 与 Tenant / IM 的区别：那两条来自部署配置，这一条来自执行体运行时上报。
+// 分开建模是因为判断「模型能不能用某个命令」必须看真实镜像，写死一份说明
+// 迟早会与镜像漂移，而漂移的表现是「模型反复执行不存在的命令」。
+type ExecFacts struct {
+	// Image 是镜像标识，仅用于排障对账
+	Image string
+	// OS 是发行版与架构，例如 debian 12 (linux/arm64)
+	OS string
+	// Tools 是镜像里确认可用的命令，未列出的按不可用处理
+	Tools []ExecTool
+	// Writable 是除空间目录外还可写的位置（如 deps 目录）
+	Writable []string
+	// Network 描述出网形态
+	Network string
+	// Sources 是安装源，键为生态，值为镜像 ID 或 URL
+	Sources map[string]string
+	// Persistent 表示容器重建后系统目录的改动是否保留
+	Persistent bool
+}
+
+// ExecTool 是一个可用命令及其版本。
+type ExecTool struct {
+	Name    string
+	Version string
+}
+
+// Empty 表示没有可说的内容，调用方据此整段省略而不是渲染空段落。
+func (e ExecFacts) Empty() bool {
+	return strings.TrimSpace(e.OS) == "" && len(e.Tools) == 0
 }
 
 // DirPlugin 是会话所在目录对应插件的画像，只取系统提示词需要的展示字段。

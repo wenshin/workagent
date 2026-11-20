@@ -48,6 +48,10 @@ func ListenHTTP(p string, opt Options) (*HTTPProxy, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newHTTPProxy(ln, p, opt)
+}
+
+func newHTTPProxy(ln net.Listener, p string, opt Options) (*HTTPProxy, error) {
 	if opt.Logger == nil {
 		opt.Logger = slog.Default()
 	}
@@ -119,7 +123,9 @@ func (h *HTTPProxy) Close() error {
 		close(h.closeOne)
 	}
 	err := h.srv.Close()
-	_ = os.Remove(h.path)
+	if h.path != "" {
+		_ = os.Remove(h.path)
+	}
 	return err
 }
 
@@ -235,11 +241,13 @@ func (h *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request, start 
 		return
 	}
 	ev.Port = 443
+	// 唯一来源是清单里显式声明的 ws.connect：隧道里看不见明文，
+	// 不能拿主域名白名单放宽。
 	if h.connect == nil || !h.connect.Allow(host) {
 		ev.Reason = "not_allowlisted"
 		ev.Duration = time.Since(start)
 		h.emit(ev)
-		http.Error(w, "隧道目标不在 ws.connect 白名单内："+host, http.StatusForbidden)
+		http.Error(w, "隧道目标不在白名单内："+host, http.StatusForbidden)
 		return
 	}
 

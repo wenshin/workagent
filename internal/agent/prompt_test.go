@@ -248,3 +248,61 @@ func TestPlatformFactsBeforeAgentPrompt(t *testing.T) {
 		t.Fatalf("平台事实应排在智能体设定之前: facts=%d extra=%d", facts, extra)
 	}
 }
+
+// 执行环境是模型写命令的前提：不说清楚它会 apt install、写 /usr、连外网，
+// 失败后换一种方式重试，白耗轮次。
+func TestExecFactsInjected(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{Exec: ExecFacts{
+		OS:      "debian 12 (linux/arm64)",
+		Tools:   []ExecTool{{Name: "git", Version: "2.39.5"}, {Name: "jq", Version: "1.6"}},
+		Network: "默认断网（--unshare-net），只有白名单域名经代理可达",
+	}}})
+
+	for _, want := range []string{
+		"执行环境",
+		"debian 12 (linux/arm64)",
+		"git 2.39.5、jq 1.6",
+		"没列出的命令按不可用处理",
+		"默认断网",
+		"容器重建后丢失",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("执行环境段缺少 %q:\n%s", want, msg.Content)
+		}
+	}
+}
+
+// 没上报就整段省略：宁可不说，也不能凭空写一句猜出来的边界。
+func TestExecFactsOmittedWhenUnknown(t *testing.T) {
+	if strings.Contains(BuildSystemMessage(RunInput{}).Content, "执行环境") {
+		t.Fatal("没有上报时不应出现执行环境段")
+	}
+}
+
+// 环境是现场事实，智能体不能改写「镜像里有什么」，所以必须排在它之前。
+func TestExecFactsBeforeAgentPrompt(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{
+		AgentPrompt: "AGENT-EXTRA",
+		Platform:    PlatformFacts{Exec: ExecFacts{OS: "debian 12"}},
+	})
+	exec := strings.Index(msg.Content, "执行环境")
+	extra := strings.Index(msg.Content, "AGENT-EXTRA")
+	if exec < 0 || extra < 0 || exec > extra {
+		t.Fatalf("执行环境应排在智能体设定之前: exec=%d extra=%d", exec, extra)
+	}
+}
+
+// 可写位置存在时，要教模型「自己查」而不是列一份会过期的清单。
+func TestExecFactsPointsToDepsInsteadOfListing(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{Exec: ExecFacts{
+		OS:       "debian 12",
+		Writable: []string{"/data/storage/tenants/t1/spaces/s1/deps"},
+	}}})
+
+	if !strings.Contains(msg.Content, "还可写：/data/storage/tenants/t1/spaces/s1/deps") {
+		t.Fatalf("缺少可写位置说明:\n%s", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "历史安装产物") {
+		t.Fatalf("可写目录存在时应提示「自己 ls 查」，而不是假设已装:\n%s", msg.Content)
+	}
+}

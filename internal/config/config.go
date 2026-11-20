@@ -83,6 +83,15 @@ type Config struct {
 	// 开发机保持默认（false），降级到 local 时日志里会有告警。
 	SandboxRequire bool
 
+	// SandboxBackend 选择执行面形态：
+	//   local  —— 在本进程里探测 bwrap / sandbox-exec（单机默认）
+	//   remote —— 连 SANDBOX_RUNNER_ADDR 上的执行体（容器化部署）
+	SandboxBackend string
+	// SandboxRunnerAddr 是远端执行体地址（host:port 或完整 URL）。
+	SandboxRunnerAddr string
+	// SandboxRunnerToken 是远端执行体的鉴权令牌；remote 后端下为空直接启动失败。
+	SandboxRunnerToken string
+
 	// 插件常驻进程池（只装声明了 runtime.resident 的插件，docs/插件安全基线.md §2.5）
 	// 空闲多久回收：0 用默认 600s；进程数上限：0 用默认 32。
 	PluginProcIdleSeconds int
@@ -92,6 +101,16 @@ type Config struct {
 	// 白名单挂载之后，装在非标准位置的运行时（npm 装的 deno 是 node 包装脚本、
 	// 自建 node / python 发行版）需要把安装前缀挂进去，否则会报「找不到模块」。
 	SandboxReadExtra []string
+
+	// 安装源镜像。空值使用内置默认（国内镜像），海外部署或走内网 Nexus 时覆盖。
+	//
+	// 只影响注入给命令的环境变量（PIP_INDEX_URL / NPM_CONFIG_REGISTRY 等），
+	// 不影响任何出网边界——边界由 NetworkPolicy 与沙箱挂载决定，
+	// 所以改这里不会让「多挂一个目录」这种事发生。
+	InstallMirrorNPM  string
+	InstallMirrorPyPI string
+	InstallMirrorNode string
+	InstallMirrorGo   string
 
 	// 上下文压缩与记忆（§5.7.2 / §5.7.4）
 	LLMSummaryModel string // 摘要用小模型，为空则复用主模型
@@ -327,9 +346,18 @@ func Load() (*Config, error) {
 
 		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
 
+		SandboxBackend:     getenv("SANDBOX_BACKEND", "local"),
+		SandboxRunnerAddr:  getenv("SANDBOX_RUNNER_ADDR", ""),
+		SandboxRunnerToken: getenv("SANDBOX_RUNNER_TOKEN", ""),
+
 		PluginProcIdleSeconds: getenvInt("PLUGIN_PROC_IDLE_SECONDS", 600),
 		PluginProcMax:         getenvInt("PLUGIN_PROC_MAX", 32),
 		SandboxReadExtra:      splitList(getenv("SANDBOX_READ_EXTRA", "")),
+
+		InstallMirrorNPM:  getenv("INSTALL_MIRROR_NPM", ""),
+		InstallMirrorPyPI: getenv("INSTALL_MIRROR_PYPI", ""),
+		InstallMirrorNode: getenv("INSTALL_MIRROR_NODE", ""),
+		InstallMirrorGo:   getenv("INSTALL_MIRROR_GO", ""),
 
 		LLMSummaryModel: getenv("LLM_SUMMARY_MODEL", ""),
 		LLMEmbedBaseURL: strings.TrimRight(getenv("LLM_EMBED_BASE_URL", ""), "/"),

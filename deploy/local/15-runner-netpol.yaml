@@ -1,0 +1,64 @@
+# 执行体的网络边界：能出公网，摸不到任何私网地址。
+#
+# 这一层是硬边界，和沙箱里的 Spec.Network 不是一回事：
+#   - Spec.Network 决定「给不给网」，以及「给网时只挂 .deps」；
+#   - 这份 NetworkPolicy 决定「给了网之后能连哪里」。
+#
+# 标准 NetworkPolicy 的 egress 只认 ipBlock / podSelector，不认域名，
+# 所以这里做的是「黑名单式封禁私网」而不是「白名单式只放安装源」。
+# 要按域名放行只能上 Cilium 的 toFQDNs。
+#
+# 注意：OrbStack 自带 k8s 没有 CNI，这份策略会被 API Server 接受但不生效。
+# 验证它必须用 kind + Calico，见 README 的验证脚本。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-runner-egress
+  namespace: workagent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-runner
+  policyTypes:
+    - Egress
+  egress:
+    # 公网可达，但把这几个段挖掉。
+    #
+    # 100.64.0.0/10 不能漏：阿里云 metadata 是 100.100.100.200，
+    # 腾讯云是 100.100.100.100，只封 169.254 的话在云上等于没写。
+    # 198.18.0.0/15 是 Service Mesh 常用的内部回环段。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 100.64.0.0/10
+              - 198.18.0.0/15
+              - 240.0.0.0/4
+    # IPv6 要单写：0.0.0.0/0 不覆盖 v6。
+    - to:
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+              - "fe80::/10"
+              - "::1/128"
+    # DNS 必须单独放行：它的 ClusterIP 落在 10.96.0.0/12，正好在上面被挖掉了。
+    # 不放行时的表现是「域名全部解析失败，但 curl 打 IP 通」，很容易归因到网络配置。
+    #
+    # 用 namespaceSelector + podSelector 而不是写死 ClusterIP：
+    # 后者会在 CNI 做 DNAT 时被绕过判定，也有集群换成别的 Service CIDR。
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

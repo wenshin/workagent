@@ -10,3 +10,4 @@ web/dist/
 .idea/
 .vscode/
 /mock-datacenter
+deploy/runner/bin/

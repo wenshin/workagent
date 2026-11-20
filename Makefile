@@ -3,7 +3,7 @@ GO ?= go
 NPM ?= npm
 NPM_REGISTRY ?= https://registry.npmmirror.com
 
-.PHONY: help tidy pg-up redis-up pg-down run build web fmt vet test mock-dc
+.PHONY: help tidy pg-up redis-up pg-down run build web fmt vet test mock-dc sandbox-up sandbox-check sandbox-down
 
 help:
 	@echo "tidy      拉齐依赖并生成 go.sum（首次必须执行）"
@@ -49,3 +49,14 @@ test:
 
 mock-dc:
 	$(GO) run ./cmd/mock-datacenter
+
+# 执行面（容器化沙箱）：构建镜像 → 部署执行体 → 跑部署后验。
+# 前置：kubectl 指向本地集群（OrbStack / kind / k3d），docker 可用。
+sandbox-up:
+	./scripts/sandbox-exec.sh up
+
+sandbox-check:
+	./scripts/sandbox-exec.sh check
+
+sandbox-down:
+	./scripts/sandbox-exec.sh down

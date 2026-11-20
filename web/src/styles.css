@@ -1089,6 +1089,8 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   white-space: pre-wrap;
   word-break: break-all;
   font-size: 12px;
+  /* 命令原文要能看出字符边界：URL 里的引号、$()、base64 都是靠字形分辨的 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   border-radius: 6px;
   background: var(--semi-color-fill-0);
 }

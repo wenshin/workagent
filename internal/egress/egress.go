@@ -117,6 +117,9 @@ type Options struct {
 	Verbs []string
 	// ConnectHosts 是允许 CONNECT 的域名（来自清单的 ws.connect）。
 	// 为空表示不允许隧道：默认拒绝，隧道是按插件开关的。
+	//
+	// 隧道里看不见明文，所以授权口径要收得比普通请求更窄：
+	// 只能由清单显式声明，不存在「复用主域名白名单」这种放宽开关。
 	ConnectHosts []string
 	// Dial 只在测试里注入，用来把「拨号」换成连本地 echo 服务；
 	// 生产路径永远走 dialChecked（解析后校验全部 IP，私网拒绝）。
@@ -137,6 +140,44 @@ type Server struct {
 	// 单独抽出来只为一个用途：测试时注入本地目标，把「策略—应答—转发」整条链路跑通，
 	// 而不必绕过 loopback 限制。
 	dialFn func(ctx context.Context, host string, port int) (net.Conn, string, error)
+}
+
+// ListenTCP 在 TCP 地址上监听。
+//
+// 与 unix socket 的取舍：unix socket 更严（路径要显式挂进沙箱，父目录不可见），
+// 但只有自己实现 HTTP 客户端的运行时（Deno）能用它。npm / fnm / uv / curl 这些
+// 只认 HTTP_PROXY 里的 http://host:port，而 --unshare-net 的沙箱连 loopback 都
+// 不可达，所以这类工具必须配 --share-net + TCP 代理。
+//
+// 代价要说清：share-net 之后沙箱能绕过代理直连。域名策略因此只在「客户端愿意
+// 遵守代理变量」时成立，不是内核级强制。需要硬边界时用 unix socket 那条路。
+func ListenTCP(addr string, opt Options) (*Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("监听 TCP 代理失败: %w", err)
+	}
+	if opt.Logger == nil {
+		opt.Logger = slog.Default()
+	}
+	if opt.MaxConns <= 0 {
+		opt.MaxConns = DefaultMaxConns
+	}
+	return &Server{
+		ln:      ln,
+		policy:  opt.Policy,
+		log:     opt.Logger,
+		onEvent: opt.OnEvent,
+		sem:     make(chan struct{}, opt.MaxConns),
+		allowIP: opt.AllowIPConnect,
+	}, nil
+}
+
+// Addr 返回实际监听地址（端口为 0 时由内核分配，只有这里能拿到真实值）。
+func (s *Server) Addr() string {
+	if s.ln == nil {
+		return ""
+	}
+	return s.ln.Addr().String()
 }
 
 // Listen 在 path 上创建 unix socket 并开始监听。
@@ -186,7 +227,8 @@ func Listen(p string, opt Options) (*Server, error) {
 	}, nil
 }
 
-// Path 返回 socket 路径：沙箱侧要把同一个路径挂进去并据此授权。
+// Path 返回 unix socket 路径：沙箱侧要把同一个路径挂进去并据此授权。
+// TCP 模式下为空，调用方应改用 Addr。
 func (s *Server) Path() string { return s.path }
 
 // Serve 接受连接直到 ctx 结束或 listener 被关闭。
@@ -222,7 +264,9 @@ func (s *Server) Close() error {
 	var err error
 	s.closeOne.Do(func() {
 		err = s.ln.Close()
-		_ = os.Remove(s.path)
+		if s.path != "" {
+			_ = os.Remove(s.path)
+		}
 	})
 	return err
 }

@@ -1,0 +1,21 @@
+# 执行面专用命名空间。
+# PSA 必须是 privileged：bwrap 需要 SYS_ADMIN（挂载）与 NET_ADMIN（配置 lo），
+# baseline / restricted 都过不去。所以这里只能放执行体，不能混业务负载。
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: workagent
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+# 本地开发令牌；生产用 ExternalSecret / sealed-secret 注入，不要进仓库。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sandbox-runner-token
+  namespace: workagent
+type: Opaque
+stringData:
+  token: dev-token-change-me

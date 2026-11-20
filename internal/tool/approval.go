@@ -184,25 +184,35 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 			Reason: reason,
 		}
 	}
-	if len(t.ShellApproval) == 0 {
-		return nil
-	}
 	var in struct {
 		Command string `json:"command"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Command) == "" {
 		return nil
 	}
-	hit := MatchApprovalCommand(in.Command, t.ShellApproval)
-	if hit == "" {
-		return nil
+	if len(t.ShellApproval) > 0 {
+		if hit := MatchApprovalCommand(in.Command, t.ShellApproval); hit != "" {
+			return &policy.Action{
+				Kind:   policy.ActionShell,
+				Key:    policy.ActionShell + ":" + hit,
+				Detail: in.Command,
+				Reason: "命令包含需要确认的操作：" + hit,
+			}
+		}
 	}
-	return &policy.Action{
-		Kind:   policy.ActionShell,
-		Key:    policy.ActionShell + ":" + hit,
-		Detail: in.Command,
-		Reason: "命令包含需要确认的操作：" + hit,
+	// 能把数据发出去的命令要人看一眼。出网时沙箱只挂 .deps，读不到工作区文件，
+	// 但会话内容还在模型上下文里：一条被注入的命令可以把它拼进 URL 带出去。
+	// 装依赖（pip / npm / fnm）不算——终点由安装源固定，见 shellNeedsApproval。
+	// Key 带参数指纹，同一条命令重试不会重复弹。
+	if shellNeedsApproval(in.Command) {
+		return &policy.Action{
+			Kind:   policy.ActionShell,
+			Key:    policy.ActionShell + ":net:" + ArgsHash(t.Name, args),
+			Detail: in.Command,
+			Reason: "此命令将访问网络。请检查命令中是否包含你的对话内容、文件内容或其他敏感信息",
+		}
 	}
+	return nil
 }
 
 // MatchApprovalCommand 返回命中的规则名，空表示不需要确认。

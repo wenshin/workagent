@@ -86,7 +86,10 @@ func TestBwrapArgs(t *testing.T) {
 			name: "只读档默认禁网且不挂全盘",
 			spec: Spec{Cmd: []string{"sh", "-c", "ls"}, Dir: ws, Mode: ModeReadOnly},
 			want: []string{"--unshare-net", "--clearenv", "--setenv PATH /bin", "--chdir " + ws,
-				"--ro-bind-try " + ws + " " + ws, "--ro-bind-try /usr /usr"},
+				"--ro-bind-try " + ws + " " + ws, "--ro-bind-try /usr /usr",
+				// 白名单之外的路径会作为挂载点父目录被创建：必须整体只读，
+				// 否则 root 能在 /etc 这类空目录里随便写。
+				"--remount-ro /"},
 			// 白名单挂载的核心：根目录不再整体挂进来，空间目录也不可写
 			notWant: []string{"--ro-bind / /", "--bind " + ws + " " + ws},
 		},
@@ -167,15 +170,31 @@ func TestSeatbeltProfile(t *testing.T) {
 		t.Errorf("读权限必须是 subpath 白名单\n%s", ro)
 	}
 
-	rw, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite, Network: true}, tmp)
+	rw, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite}, tmp)
 	if err != nil {
 		t.Fatalf("生成 profile 失败: %v", err)
 	}
 	if !strings.Contains(writeBlock(rw), `(subpath "`+ws+`")`) {
 		t.Errorf("workspace 档应放开 workspace 写权限\n%s", rw)
 	}
-	if strings.Contains(rw, "(deny network*)") {
-		t.Errorf("Network=true 时不该写死禁网\n%s", rw)
+	if !strings.Contains(rw, "(deny network*)") {
+		t.Errorf("不带 Network 时应该禁网\n%s", rw)
+	}
+
+	// 出网档位只露 .deps：工作区其它文件不可见可写。
+	net, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite, Network: true}, tmp)
+	if err != nil {
+		t.Fatalf("生成 profile 失败: %v", err)
+	}
+	deps := filepath.Join(ws, DepsDirName)
+	if !strings.Contains(writeBlock(net), `(subpath "`+deps+`")`) {
+		t.Errorf("出网档位应放开 .deps 写权限\n%s", net)
+	}
+	if strings.Contains(writeBlock(net), `(subpath "`+ws+`")`) {
+		t.Errorf("出网档位不该放开整个工作区\n%s", net)
+	}
+	if strings.Contains(net, "(deny network*)") {
+		t.Errorf("Network=true 时不该写死禁网\n%s", net)
 	}
 
 	if _, err := seatbeltProfile(Spec{Dir: `/evil"path`, Mode: ModeWorkspaceWrite}, "/tmp"); err == nil {

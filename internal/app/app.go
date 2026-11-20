@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/admin"
@@ -24,6 +25,7 @@ import (
 	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
+	"github.com/workagent/auto-agent/internal/sandbox/remote"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/securityscan"
@@ -134,19 +136,28 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	if !secretStore.Enabled() {
 		log.Warn("凭证存储未启用（未配置 SECRET_KEK），需要密钥的能力不可用")
 	}
-	// 命令执行沙箱：按平台挑最强后端（bwrap > sandbox-exec > local）。
-	// 降级到 local 就是没有任何隔离，必须显式告警——让它出现在日志里，
-	// 而不是等到出事才发现「沙箱」其实是裸跑。
-	shellRunner := sandbox.Detect()
-	// 生产环境应当打开 SANDBOX_REQUIRE：探测不到隔离后端就启动失败。
-	// 默认关闭是为了让开发机（可能没有 bwrap）能起来，但降级一定会留下告警。
-	if err := sandbox.Ensure(shellRunner, cfg.SandboxRequire); err != nil {
-		return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
-	}
-	if shellRunner.Name() == sandbox.NameLocal {
-		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）", "require", cfg.SandboxRequire)
-	} else {
-		log.Info("命令执行沙箱已就绪", "backend", shellRunner.Name())
+	// 安装源在进程内是全局状态：工具注入环境变量、提示词展示「安装源」都读它。
+	// 启动时按部署配置覆盖一次，之后不再改——它不是每空间配置。
+	tool.SetInstallMirrors(tool.InstallMirrors{
+		NPM:  cfg.InstallMirrorNPM,
+		PyPI: cfg.InstallMirrorPyPI,
+		Node: cfg.InstallMirrorNode,
+		Go:   cfg.InstallMirrorGo,
+	})
+	// 打出实际生效的值：配置项拼错时，日志里一眼能看出还是默认源，
+	// 而不是等模型装上依赖慢到怀疑人生。
+	mirrors := tool.CurrentInstallMirrors()
+	log.Info("安装源已配置",
+		"npm", mirrors.NPM, "pip", mirrors.PyPI, "node", mirrors.Node, "go", mirrors.Go)
+
+	// 命令执行沙箱：两种形态，二选一。
+	//   local  —— 在本进程里跑（bwrap > sandbox-exec > local），单机部署
+	//   remote —— 容器化部署：执行体在租户容器里，控制面只发请求
+	// 两者都要求「探测不到隔离就报错」，且都以后端自己报的名字为准：
+	// 远端执行体降级成 local 时，控制面必须知道，否则审计里会写成 bwrap。
+	shellRunner, err := newShellRunner(cfg, log)
+	if err != nil {
+		return nil, err
 	}
 
 	// 搜索注册表先于插件管理器构造：kind=source 的插件在安装/启用时直接注册进来，
@@ -244,11 +255,21 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	sessionSvc.SetSecrets(secretStore)
 	// 平台部署事实：租户兜底名来自配置（登录用户的通讯录资料更准），
 	// IM 以当前选定的身份接入实现为准；这些会随系统提示词注入，不做成工具
-	sessionSvc.SetPlatformFacts(agent.PlatformFacts{
+	platform := agent.PlatformFacts{
 		Tenant:       cfg.DingTalkCorpName,
 		IMName:       idp.DisplayName(),
 		IMConfigured: idp.Ready(),
-	})
+	}
+	// 执行环境由执行体上报（只有容器化部署才有）。本地后端没有「镜像」这个概念，
+	// 断言失败就整段省略：提示词里宁可不说，也不要写一句猜出来的边界。
+	if p, ok := shellRunner.(sandbox.EnvProvider); ok {
+		if f := p.Env(); !f.Empty() {
+			platform.Exec = toExecFacts(f)
+			log.Info("执行环境已注入提示词",
+				"image", f.Image, "tools", len(f.Tools), "env_hash", f.Hash())
+		}
+	}
+	sessionSvc.SetPlatformFacts(platform)
 
 	app := &App{
 		cfg:        cfg,
@@ -381,4 +402,62 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
+}
+
+// newShellRunner 按 SANDBOX_BACKEND 构造执行面。
+//
+// 两种形态共用同一套「必须真有隔离」的校验：远端执行体在握手时上报自己实际
+// 探测到的后端（bwrap / sandbox-exec / local），控制面不需要也不可能替它判断。
+func newShellRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
+	if strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "remote") {
+		client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
+		if err != nil {
+			return nil, fmt.Errorf("远端执行体不可用: %w", err)
+		}
+		if err := sandbox.Ensure(client, cfg.SandboxRequire); err != nil {
+			return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
+		}
+		if !client.Isolated() {
+			log.Warn("远端执行体降级到 local：容器是唯一边界，空间级隔离失效", "require", cfg.SandboxRequire)
+		} else {
+			log.Info("执行面已就绪", "transport", client.Transport(), "backend", client.Name())
+		}
+		return client, nil
+	}
+
+	runner := sandbox.Detect()
+	if err := sandbox.Ensure(runner, cfg.SandboxRequire); err != nil {
+		return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
+	}
+	if runner.Name() == sandbox.NameLocal {
+		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）", "require", cfg.SandboxRequire)
+	} else {
+		log.Info("命令执行沙箱已就绪", "backend", runner.Name())
+	}
+	return runner, nil
+}
+
+// toExecFacts 把执行体的自述转成契约层的结构。
+//
+// 两个包各自定义一份而不是直接复用，是为了让 internal/agent 不依赖 sandbox：
+// 契约层只描述「提示词需要什么」，执行层才关心「怎么探测出来的」。
+func toExecFacts(f sandbox.EnvFacts) agent.ExecFacts {
+	out := agent.ExecFacts{
+		Image:    f.Image,
+		OS:       f.OS,
+		Writable: f.Writable,
+		Network:  f.Network,
+		// 安装源以控制面注入的为准，不取执行体自述：
+		// 实际生效的是 installEnv 写进命令环境变量的那一份，
+		// 两个出处并存时提示词会和真实行为对不上。
+		Sources:    tool.InstallMirrorSources(),
+		Persistent: f.Persistent,
+	}
+	if len(f.Tools) > 0 {
+		out.Tools = make([]agent.ExecTool, 0, len(f.Tools))
+		for _, t := range f.Tools {
+			out.Tools = append(out.Tools, agent.ExecTool{Name: t.Name, Version: t.Version})
+		}
+	}
+	return out
 }

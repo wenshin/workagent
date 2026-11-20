@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/workagent/auto-agent/internal/llm"
@@ -76,6 +77,11 @@ func BuildSystemMessage(in RunInput) llm.Message {
 	// 这些是「必须恒真」的现场信息，直接写进提示词；如果做成工具，模型会凭先验
 	// 抢答（用户问「我们用的是企微吧」它顺着答），而且每轮都要白带一份工具 schema。
 	writePlatformFacts(&b, in.Platform)
+
+	// 执行环境：模型写 shell 命令前必须知道「这台机器上有什么」。
+	// 不写这段的后果很具体：它会按普通 Linux 的先验去 apt install、去写 /usr，
+	// 失败后换一种方式重试，白耗轮次。由执行体上报，不在这里写死。
+	writeExecFacts(&b, in.Platform.Exec)
 
 	// 智能体设定：结构上只能追加在基础规则之后，并显式声明优先级，
 	// 避免配置里写「忽略以上要求」就能改掉平台约束（方案 A）。
@@ -195,6 +201,93 @@ func writePlatformFacts(b *strings.Builder, p PlatformFacts) {
 	b.WriteString(strings.Join(parts, "；"))
 	b.WriteString("。\n")
 	b.WriteString("回答平台、租户、IM 相关问题时以这里为准；这里没有的信息就说不知道，不要凭常识或上下文猜测。")
+}
+
+// execToolsLimit 是提示词里列出的工具条数上限。
+//
+// 镜像自述应该只写「模型需要知道可用性」的工具（git / python / node / jq），
+// 不该把 coreutils 全塞进来。这个上限只是兜底，防止有人把整份 `compgen -c`
+// 写进 env.json 把上下文撑满。
+const execToolsLimit = 24
+
+// writeExecFacts 把执行环境写成一小段提示词。
+//
+// 与平台事实分开写，是因为两者的可信来源不同：租户 / IM 来自配置，
+// 执行环境来自执行容器自述。混在一段里，出问题时无法判断哪一条过期了。
+//
+// 没有上报（本地开发、老镜像）时整段省略：宁可不说，也不能凭空写一句
+// 「命令跑在容器里」——那会让模型按错误的边界行事。
+func writeExecFacts(b *strings.Builder, e ExecFacts) {
+	if e.Empty() {
+		return
+	}
+
+	b.WriteString("\n\n## 执行环境（shell_exec 所在的容器）\n")
+
+	lines := make([]string, 0, 5)
+	if osName := strings.TrimSpace(e.OS); osName != "" {
+		lines = append(lines, fmt.Sprintf("- 命令跑在 %s 容器里，不是宿主机。", osName))
+	} else {
+		lines = append(lines, "- 命令跑在容器里，不是宿主机。")
+	}
+	if !e.Persistent {
+		lines = append(lines, "容器是临时的：系统目录（/usr、/etc、/opt）的改动会在容器重建后丢失，不要往那里装东西。")
+	}
+
+	if len(e.Tools) > 0 {
+		names := make([]string, 0, len(e.Tools))
+		for i, t := range e.Tools {
+			if i >= execToolsLimit {
+				break
+			}
+			if t.Version != "" {
+				names = append(names, t.Name+" "+t.Version)
+			} else {
+				names = append(names, t.Name)
+			}
+		}
+		// 「未列出的按不可用处理」是这段的核心：只说有哪些，模型仍会猜还有别的
+		lines = append(lines, fmt.Sprintf("- 可用工具：%s。**没列出的命令按不可用处理**，用 `command -v` 确认后再换方案，"+
+			"不要尝试用系统包管理器安装。", strings.Join(names, "、")))
+	}
+
+	if len(e.Writable) > 0 {
+		lines = append(lines, fmt.Sprintf("- 除当前空间目录外，还可写：%s。", strings.Join(e.Writable, "、")))
+	}
+
+	if len(e.Sources) > 0 {
+		keys := make([]string, 0, len(e.Sources))
+		for k := range e.Sources {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			if v := strings.TrimSpace(e.Sources[k]); v != "" {
+				pairs = append(pairs, k+"→"+v)
+			}
+		}
+		if len(pairs) > 0 {
+			lines = append(lines, fmt.Sprintf("- 安装源：%s。安装依赖时用这些源，不要改成公网默认源。", strings.Join(pairs, "，")))
+		}
+	}
+
+	if net := strings.TrimSpace(e.Network); net != "" {
+		lines = append(lines, fmt.Sprintf("- 网络：%s。", net))
+	}
+
+	for _, line := range lines {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+
+	// deps 目录里的东西是运行时产物，随时会变，不能写进提示词——
+	// 给一句「怎么查」，比给一份很快过期的清单有用。
+	if len(e.Writable) > 0 {
+		b.WriteString("空间依赖目录里的命令是历史安装产物，用 `ls` 查一遍再决定，不要假设它一定在。")
+	} else {
+		b.WriteString("镜像里没有的命令就是没有，直接换实现方式，不要反复尝试安装。")
+	}
 }
 
 // TruncateText 按字节截断文本并标注，避免超长内容挤占上下文。
