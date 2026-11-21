@@ -195,6 +195,10 @@ func (d *Deno) Search(ctx context.Context, req Request) ([]Result, error) {
 }
 
 // run 执行一次脚本：JSON 进 stdin、JSON 出 stdout，全程在只读无网沙箱里。
+// 搜索脚本故意不设 DENO_DIR：它跑在只读档位里，没有可写目录，
+// 设了也写不进去（Deno 会报 "failed to write cache"）。
+// 脚本是平台自带的、无远程依赖，每次重新解析的代价只有几十毫秒，
+// 换来的是不用给这个执行体多开一条可写路径。
 func (d *Deno) run(ctx context.Context, in map[string]any, secret string) ([]byte, error) {
 	payload, err := json.Marshal(in)
 	if err != nil {

@@ -255,7 +255,7 @@ func TestExecFactsInjected(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{Exec: ExecFacts{
 		OS:      "debian 12 (linux/arm64)",
 		Tools:   []ExecTool{{Name: "git", Version: "2.39.5"}, {Name: "jq", Version: "1.6"}},
-		Network: "默认断网（--unshare-net），只有白名单域名经代理可达",
+		Network: "网络工具先请用户确认；脚本默认不联网；其余命令默认有网",
 	}}})
 
 	for _, want := range []string{
@@ -263,7 +263,7 @@ func TestExecFactsInjected(t *testing.T) {
 		"debian 12 (linux/arm64)",
 		"git 2.39.5、jq 1.6",
 		"没列出的命令按不可用处理",
-		"默认断网",
+		"脚本默认不联网",
 		"容器重建后丢失",
 	} {
 		if !strings.Contains(msg.Content, want) {

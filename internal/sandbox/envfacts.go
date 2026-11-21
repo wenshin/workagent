@@ -29,9 +29,10 @@ type EnvFacts struct {
 	OS string `json:"os,omitempty"`
 	// Tools 是镜像里确认可用的命令。没列出的按不可用处理。
 	Tools []ToolFact `json:"tools,omitempty"`
-	// Writable 是除空间目录之外还可写的位置（如 deps 目录）
+	// Writable 是除空间目录之外还可写的位置（如 .pkg）
 	Writable []string `json:"writable,omitempty"`
-	// Network 描述出网形态，例如 unshare-net + proxy(unix)
+	// Network 描述 shell 的网络档位，例如「网络工具审批 + 脚本默认无网 + 其余有网」。
+	// 它随平台策略变，不属于镜像镜像自述的稳定事实，收口方向见 docs/K8s容器沙箱方案.md
 	Network string `json:"network,omitempty"`
 	// Sources 是安装源，键为生态（npm/pip/go/cargo），值为镜像 ID 或 URL
 	Sources map[string]string `json:"sources,omitempty"`

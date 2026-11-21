@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/workagent/auto-agent/internal/egress"
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/sandbox/remote"
 )
@@ -62,12 +63,18 @@ func main() {
 		log.Info("执行环境已载入", "image", facts.Image, "tools", len(facts.Tools), "env_hash", facts.Hash())
 	}
 
+	// 出网代理由执行体自己建：控制面的 socket 在另一个容器的 /tmp 里，
+	// 路径传过来没有意义。控制面只把白名单（Spec.Egress）过线。
+	eg := egress.NewRegistry(log)
+	defer eg.Close()
+
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           remote.Handler(runner, token, *root, facts, log),
+		Handler:           remote.Handler(runner, token, *root, facts, eg, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		// 不设 WriteTimeout：单次执行的墙钟由 Spec.Timeout 决定（最长 30s 量级），
 		// 这里再压一个上限只会把合法的长命令截断，而且报错位于 HTTP 层、难排查。
+		// 常驻进程更依赖这一条：它的连接会一直开着。
 		IdleTimeout: 60 * time.Second,
 	}
 

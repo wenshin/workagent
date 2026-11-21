@@ -42,7 +42,64 @@ const (
 	// ModeFull 不套沙箱，只保留超时、输出上限、进程组回收与环境清理。
 	// 仅用于受信任的运维命令，审计里会是 name=none。
 	ModeFull Mode = "full"
+	// ModeSystemWrite 在 workspace-write 之上放开系统安装目录（/usr、/var/lib/dpkg 等），
+	// 用于 agent 在空间里直接 apt install / pip install / npm i -g。
+	//
+	// 装进容器的可写层，Pod 重建就丢，缺什么再装一次——这是"允许正常安装"的代价，
+	// 也是它成立的前提。缓存与索引由部署挂到租户缓存，重装才有意义。
+	ModeSystemWrite Mode = "system-write"
 )
+
+// systemWrite 是系统安装档位放开的路径。
+//
+// /etc 不整体放开：/etc/shadow、/etc/sudoers 必须留在只读侧，
+// 所以这里只列安装真正会写的子路径。
+// /var/lib/apt/lists 与 /var/cache/apt/archives 在部署里指向租户缓存，
+// 漏挂的表现是每次 Pod 重建都要重新 apt-get update。
+var (
+	systemWriteMu sync.RWMutex
+	systemWrite   = []string{
+		"/usr",
+		"/var/lib/dpkg",
+		"/var/lib/apt/lists",
+		"/var/cache/apt/archives",
+		"/etc/alternatives",
+		"/etc/ld.so.conf.d",
+	}
+)
+
+// SetSystemWritePaths 覆盖系统可写路径，传空恢复默认。
+// 只为适配非标准布局，正常部署不需要调用。
+func SetSystemWritePaths(paths []string) {
+	systemWriteMu.Lock()
+	defer systemWriteMu.Unlock()
+	if len(paths) == 0 {
+		systemWrite = []string{
+			"/usr",
+			"/var/lib/dpkg",
+			"/var/lib/apt/lists",
+			"/var/cache/apt/archives",
+			"/etc/alternatives",
+			"/etc/ld.so.conf.d",
+		}
+		return
+	}
+	clean := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" && filepath.IsAbs(p) {
+			clean = append(clean, filepath.Clean(p))
+		}
+	}
+	systemWrite = clean
+}
+
+// SystemWritePaths 返回当前系统可写路径（拷贝）。
+func SystemWritePaths() []string {
+	systemWriteMu.RLock()
+	defer systemWriteMu.RUnlock()
+	return append([]string(nil), systemWrite...)
+}
 
 // 默认值：命令是给人看的，30 秒足够；输出上限按工具层 16KB 的惯例放宽一档。
 const (
@@ -83,8 +140,9 @@ type Spec struct {
 	// 本来就能被 --noproxy 绕过，留着只会让人误以为有边界；真正的边界交给
 	// 集群 NetworkPolicy 在网络层封禁私网段。
 	//
-	// 代价是出网时 Dir 不再整体挂载：只有 Dir/.deps 可见可写（见 DepsDirName），
-	// 空间里的其它文件在沙箱里不存在。这样即使命令被注入，也读不到业务数据。
+	// 给网不改变文件可见面：Dir 始终整体挂载。外发风险由「网络工具先审批」
+	// 与 NetworkPolicy 承担——遮蔽工作区换来的那点纵深，代价是 `curl -o out.json`
+	// 写下的文件凭空消失、`curl … && python …` 必须拆成两条。
 	Network bool
 	// Proxy 是出网代理的 unix socket 路径（见 internal/egress）。
 	//
@@ -94,26 +152,21 @@ type Spec struct {
 	//
 	// 目前只有插件运行时用它：Deno 能自己解析 unix: 前缀，npm / fnm / uv 不能。
 	Proxy string
+	// Egress 非空表示「白名单在这里，代理要由执行的一方自己建在 Proxy 上」。
+	//
+	// 容器化之后控制面与执行体不在同一个文件系统命名空间：控制面建好的
+	// socket 在执行体里根本不存在，路径传过去只会得到 bind 失败。所以过线
+	// 的是白名单而不是已建好的通道。Proxy 仍然是路径——但它只是沙箱里的
+	// 挂载点，socket 文件由持有沙箱的那一侧创建。
+	//
+	// 本地模式下调用方自己建代理并可以顺手填上它；两种模式对后端没有区别，
+	// 后端只认 Proxy。
+	Egress *EgressSpec
 	// FS 是文件访问白名单。零值表示「系统只读基线 + Dir」，看不到任何业务数据。
 	FS FS
 	// Resident 表示这是长驻进程（插件运行时）：不施加墙钟上限，
 	// 生命周期由调用方 Close 决定，而不是靠 Timeout 杀掉。
 	Resident bool
-}
-
-// DepsDirName 是出网执行时唯一可见可写的子目录名。
-//
-// 放在空间工作目录下（Dir/.deps）：装进去的运行时与依赖跨调用保留，不用每次重装；
-// 而出网时其它目录不挂载，被注入的命令读不到业务文件。名字固定是为了让环境变量
-// （FNM_DIR / PIP_TARGET / NPM_CONFIG_PREFIX）和挂载路径有一个共同的出处。
-const DepsDirName = ".deps"
-
-// DepsDir 返回给定工作目录下的安装目录绝对路径。
-func DepsDir(dir string) string {
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, DepsDirName)
 }
 
 // FS 是文件访问白名单。
@@ -131,6 +184,19 @@ type FS struct {
 	// Write 是允许写入的路径。ModeReadOnly 下会被忽略：
 	// 「只读档位」是调用方的意图，不能被一个 FS.Write 悄悄推翻。
 	Write []string
+}
+
+// EgressSpec 是出网白名单，与 Spec.Proxy 配对使用。
+//
+// 分成三种名单而不是一张表：HTTP 请求、CONNECT 隧道、允许的方法各有各的
+// 判定口径，合成一张就只能取最宽的那个。
+type EgressSpec struct {
+	// Hosts 是 HTTP 请求的目标域名（absolute-form 与 CONNECT 之外）。
+	Hosts []string
+	// WSHosts 是允许 CONNECT 隧道的域名（清单的 ws.connect）。
+	WSHosts []string
+	// Verbs 是允许的 HTTP 方法；空表示不限制。
+	Verbs []string
 }
 
 // Result 是一次执行的结果。命令正常退出（含非零退出码）时 error 为 nil，
@@ -174,6 +240,35 @@ type Proc struct {
 	exited  chan struct{}
 	waitErr error
 	once    sync.Once
+	// remote 表示这是一个远端句柄：没有 cmd，终止靠 closeFn 断连接。
+	remote  bool
+	closeFn func()
+}
+
+// NewProc 用外部管道构造一个长驻进程句柄，供远端执行体实现使用。
+//
+// 为什么必须从这里构造：Proc 的字段绑在 *exec.Cmd 上，而远端实现手里
+// 只有两条流。让它们各自拼一个 Proc 就会漏掉 Close / Wait / Kill 的
+// 回收语义，而这正是上层（常驻池）唯一依赖的部分。
+//
+// closeFn 负责通知对端终止进程（关连接），必须可重复调用。
+func NewProc(name string, stdout io.Reader, stdin io.WriteCloser, closeFn func()) *Proc {
+	p := &Proc{
+		Stdout:  bufio.NewReaderSize(stdout, 64<<10),
+		Stdin:   stdin,
+		name:    name,
+		runCtx:  context.Background(),
+		cancel:  func() {},
+		cleanup: func() {},
+		start:   time.Now(),
+		remote:  true,
+		closeFn: closeFn,
+		exited:  make(chan struct{}),
+	}
+	// 远端进程的退出由流断开来表达，没有可等待的 exec.Cmd：
+	// 预关闭 exited 让 Wait 立刻返回，而不是永久阻塞。
+	close(p.exited)
+	return p
 }
 
 // Write 写入一个协议帧；调用方负责加换行。
@@ -189,11 +284,24 @@ func (p *Proc) Write(b []byte) error {
 func (p *Proc) Name() string { return p.name }
 
 // Stderr 返回目前已收集的错误输出。
-func (p *Proc) Stderr() string { return p.stderr.String() }
+//
+// 远端句柄没有本地管道可收集：错误由流断开时带回，这里返回空串。
+func (p *Proc) Stderr() string {
+	if p.stderr == nil {
+		return ""
+	}
+	return p.stderr.String()
+}
 
-// Kill 立即终止整棵进程树。
+// Kill 立即终止整棵进程树；远端句柄等价于断开连接。
 func (p *Proc) Kill() {
-	if p.cmd.Process != nil {
+	if p.remote {
+		if p.closeFn != nil {
+			p.closeFn()
+		}
+		return
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
 		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 	}
 }
@@ -430,7 +538,7 @@ func (r *runner) prepare(spec Spec) (prepared, error) {
 
 	// 出网不再建代理：share-net 下沙箱可以直接绕过 HTTP_PROXY 直连，
 	// 应用层白名单只是「默认路径可达」，当成边界会误导。真正的封禁在
-	// NetworkPolicy（私网段不可达），数据面靠「出网时只挂 .deps」。
+	// NetworkPolicy（私网段不可达），数据面靠「网络工具先审批」。
 
 	// macOS 上 /var 是指向 /private/var 的符号链接，内核按真实路径匹配策略，
 	// 不先解开就会出现「明明放开了写权限却 Operation not permitted」。
@@ -442,15 +550,6 @@ func (r *runner) prepare(spec Spec) (prepared, error) {
 	if real, evalErr := filepath.EvalSymlinks(dir); evalErr == nil {
 		dir = real
 	}
-	// 出网档位只挂 .deps，而 bwrap 的 --bind 要求目标已存在
-	// （不存在时它会建一个空目录，装进去的东西下次就找不到了）。
-	if spec.Network && spec.Dir != "" {
-		if mkErr := os.MkdirAll(DepsDir(spec.Dir), 0o755); mkErr != nil {
-			cleanup()
-			return prepared{}, fmt.Errorf("准备安装目录失败: %w", mkErr)
-		}
-	}
-
 	env := buildEnv(spec, tmp)
 	name := r.name
 	argv := spec.Cmd
@@ -506,7 +605,7 @@ func (s Spec) normalize() (Spec, error) {
 		s.Mode = ModeReadOnly
 	}
 	switch s.Mode {
-	case ModeReadOnly, ModeWorkspaceWrite, ModeFull:
+	case ModeReadOnly, ModeWorkspaceWrite, ModeSystemWrite, ModeFull:
 	default:
 		return s, fmt.Errorf("未知的执行模式 %q", s.Mode)
 	}
@@ -604,26 +703,27 @@ func (s Spec) fsPaths(baseline []string) (read, write []string) {
 	read = append(read, baseline...)
 	read = append(read, ExtraRead()...)
 	// 工作目录必须可读，否则连「脚本文件所在目录」都进不去。
+	// 给不给网不改变这里：网络工具审批通过后照样看得见 Dir，
+	// 它能不能把数据发出去由审批与 NetworkPolicy 决定，不由挂载表决定。
 	if s.Dir != "" {
-		if s.Network {
-			// 出网档位把可见面收窄到只剩 .deps：FS.Read / FS.Write 一律忽略，
-			// 因为那两条路的语义是「调用方显式声明要访问什么」，而 dir/.deps 之外
-			// 的任何路径在出网时都不该出现——一条被注入的 curl 就足以把整个工作区带走。
-			read = append(read, DepsDir(s.Dir))
-		} else {
-			read = append(read, s.FS.Read...)
-			read = append(read, s.Dir)
-		}
+		read = append(read, s.FS.Read...)
+		read = append(read, s.Dir)
 	} else {
 		read = append(read, s.FS.Read...)
 	}
-	if s.Mode == ModeWorkspaceWrite {
-		if s.Network {
-			write = append(write, DepsDir(s.Dir))
-		} else {
-			write = append(write, s.FS.Write...)
-			write = append(write, s.Dir)
-		}
+	if s.Mode == ModeWorkspaceWrite || s.Mode == ModeSystemWrite {
+		write = append(write, s.FS.Write...)
+		write = append(write, s.Dir)
+	}
+	// 系统安装档位：可写表追加 /usr、/var/lib/dpkg 等。
+	// 后挂的 --bind 会覆盖前面同路径的 --ro-bind，这是它能在
+	// "--remount-ro /" 之后仍然可写的原因。
+	//
+	// 注意这里刻意不做空间级隔离：可写层就是执行体自己的可写层，
+	// 空间之间共用。隔离靠的是「重建即回到基础镜像 + 安装命中租户缓存」，
+	// 不是靠每个空间一份 /usr。
+	if s.Mode == ModeSystemWrite {
+		write = append(write, SystemWritePaths()...)
 	}
 	return sortedUnique(read), sortedUnique(write)
 }
@@ -690,6 +790,13 @@ var baseEnvKeys = []string{
 
 const fallbackPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+// FallbackPath 是容器里最保守的 PATH。
+//
+// 调用方要往 PATH 前面拼自己的目录（venv、npm 全局包）时，
+// 必须以它为尾巴：--clearenv 之后 PATH 不一定能从父进程继承到，
+// 直接覆盖成一个只有私有目录的值会让 /bin/sh 都找不到。
+func FallbackPath() string { return fallbackPath }
+
 func buildEnv(spec Spec, tmp string) []string {
 	env := []string{
 		"HOME=" + tmp,
@@ -722,7 +829,7 @@ func buildEnv(spec Spec, tmp string) []string {
 // 不能简单 append：execve 收到的是一维数组，getenv 取第一个匹配，
 // 后追加的同名项在 glibc / musl 下都不生效——表现是「设了但程序不认」。
 // 之前 XDG_CACHE_HOME 就栽在这上面：默认值指向私有 tmp，
-// 调用方想把它挪到 .deps/cache，结果缓存还是每次重下。
+// 调用方想把它挪到租户缓存目录，结果缓存还是每次重下。
 func mergeEnv(base, override []string) []string {
 	if len(override) == 0 {
 		return base

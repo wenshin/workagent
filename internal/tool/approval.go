@@ -150,11 +150,13 @@ type ApprovalDecision struct {
 
 // ApprovalFor 返回这次调用是否需要人工确认；nil 表示直接执行。
 //
-// 只有两类动作会命中：
+// 三类动作会命中：
 //   - 会改动外部系统的调用：脚本插件按出网 verbs（非 GET/HEAD）判定，
 //     MCP 按清单里的 tools.writes 声明判定——远端工具对平台是黑盒，
 //     没有动词可看，只能由作者显式声明；
-//   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）。
+//   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）；
+//   - shell 网络准入：网络工具（curl / wget / nc / ssh）一律先确认，拒绝则不执行；
+//     脚本解释器声明了 network=true 才确认（默认无网执行）。判据见 ShellNetPlan。
 func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	// 安装方的档位先于声明生效：always 与调用内容无关，off 直接放行。
 	switch NormalizeApprovalLevel(t.ApprovalLevel) {
@@ -186,6 +188,7 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	}
 	var in struct {
 		Command string `json:"command"`
+		Network bool   `json:"network"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Command) == "" {
 		return nil
@@ -200,16 +203,17 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 			}
 		}
 	}
-	// 能把数据发出去的命令要人看一眼。出网时沙箱只挂 .deps，读不到工作区文件，
-	// 但会话内容还在模型上下文里：一条被注入的命令可以把它拼进 URL 带出去。
-	// 装依赖（pip / npm / fnm）不算——终点由安装源固定，见 shellNeedsApproval。
-	// Key 带参数指纹，同一条命令重试不会重复弹。
-	if shellNeedsApproval(in.Command) {
+	// 网络准入与执行必须是同一个判据（ShellNetPlan）：这里批了、执行时不给网，
+	// 或这里没问、执行时给了网，都是「用户以为没联网，实际联了」。
+	//
+	// 网络工具不批准就不执行；脚本默认无网，只有声明 network=true 才走到这里。
+	// Key 带参数指纹：同一条命令重试复用结论，改了 network 参数则算另一次调用。
+	if plan := ShellNetPlan(in.Command, in.Network); plan.NeedsApproval() {
 		return &policy.Action{
 			Kind:   policy.ActionShell,
 			Key:    policy.ActionShell + ":net:" + ArgsHash(t.Name, args),
 			Detail: in.Command,
-			Reason: "此命令将访问网络。请检查命令中是否包含你的对话内容、文件内容或其他敏感信息",
+			Reason: plan.Reason,
 		}
 	}
 	return nil

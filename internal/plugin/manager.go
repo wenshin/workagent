@@ -488,7 +488,10 @@ func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, inpu
 		out, err := m.rt.Call(ctx, invokeInput{
 			Dir: b.Dir, Entry: b.Meta.Runtime.Entry,
 			Limits: b.Meta.Limits, SpaceID: spaceID, UserID: userID, Slug: slug,
-			FS: fs, SpaceRoot: spaceDir, NetHosts: b.Meta.NetHosts(),
+			// 草稿用自己的缓存目录：和已安装版本混在一起，
+			// 试运行会拿到正式版本的编译产物。
+			Version: "draft",
+			FS:      fs, SpaceRoot: spaceDir, NetHosts: b.Meta.NetHosts(),
 			WSHosts: b.Meta.WSNetHosts(), OneShot: true,
 			Allow: allow, Verbs: verbs, Secrets: secrets,
 			// 试运行跑的是草稿：还没安装，拿不到安装值，只能是清单默认值
@@ -651,6 +654,12 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 		if err := validateBundleDSL(b); err != nil {
 			return store.PluginVersion{}, err
 		}
+	}
+	// 发布前跑一遍确定性用例：这是唯一能验证「声明的权限够不够用」的机制。
+	// 没配 evals.json 的插件直接放行（evalDraft 返回空报告），
+	// 配了就必须全过——否则装完才发现 NotCapable，问题已经进了发布区。
+	if _, err := m.evalDraft(ctx, b, spaceID, slug, userID); err != nil {
+		return store.PluginVersion{}, err
 	}
 	// 智能体没有正文就是空壳：宁可发布失败，也不要装出一个「什么都不追加」的智能体。
 	if b.Meta.Kind == KindAgent {
@@ -913,6 +922,10 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 		rollback()
 		return store.PluginInstall{}, err
 	}
+	// 依赖预热：装的时候有网，按 lock 一次性拉进 DENO_DIR，
+	// 运行期才能靠 --cached-only 在断网沙箱里跑起来。
+	// 失败不阻断安装——没有外部依赖的插件本来就不需要预热。
+	m.warmDeps(ctx, inst)
 	if err := m.registerTools(ctx, inst); err != nil {
 		rollback()
 		return store.PluginInstall{}, err
@@ -937,6 +950,23 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 	m.recordAudit(ctx, in.UserID, "plugin.install", in.Slug, v.Version,
 		map[string]any{"risk": risk, "space": in.SpaceID})
 	return install, nil
+}
+
+// warmDeps 预热插件的 Deno 依赖缓存。
+//
+// 同步执行并设上限：安装动作要保证"装完就能跑"，
+// 异步预热会让紧接着的第一次调用撞上 --cached-only。
+// 失败只记日志，不阻断安装。
+func (m *Manager) warmDeps(ctx context.Context, inst *instance) {
+	if m.rt == nil || inst.Manifest.Kind != KindTool || inst.Manifest.Runtime.Entry == "" {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if err := m.rt.warmDeps(cctx, inst.Dir, inst.Manifest.Runtime.Entry, inst.Slug, inst.Version); err != nil {
+		m.o.Logger.Warn("插件依赖预热失败，运行期可能缺依赖",
+			"slug", inst.Slug, "version", inst.Version, "err", err)
+	}
 }
 
 // Uninstall 卸载：先查引用，再摘运行时、删内容，审计保留。
@@ -1700,7 +1730,8 @@ func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawM
 	out, err := m.rt.Call(ctx, invokeInput{
 		Dir: inst.Dir, Entry: inst.Manifest.Runtime.Entry,
 		Limits: inst.Manifest.Limits, SpaceID: inst.SpaceID,
-		UserID: env.UserID, Slug: inst.Slug, FS: fs, SpaceRoot: spaceDir,
+		UserID: env.UserID, Slug: inst.Slug, Version: inst.Version,
+		FS: fs, SpaceRoot: spaceDir,
 		NetHosts: inst.Manifest.NetHosts(), WSHosts: inst.Manifest.WSNetHosts(),
 		Allow: allow, Verbs: verbs, Secrets: secrets,
 		Config: inst.Config,

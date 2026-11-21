@@ -36,6 +36,9 @@ var bwrapBaselineRead = []string{
 	"/etc/resolv.conf",
 	"/etc/localtime",
 	"/etc/timezone",
+	// apt 的源列表：只读挂进来，`apt update` / `apt install` 才能解析包名。
+	// 缺了的表现是 "Unable to locate package"，和「缓存里没有这个包」一模一样。
+	"/etc/apt",
 	// 证书：沙箱内自己做 TLS 时要用（走 host.call 时不需要）
 	"/etc/ssl",
 	"/etc/pki",
@@ -92,12 +95,6 @@ func bwrapBuild(bin string) buildFunc {
 			"--new-session", "--die-with-parent",
 			"--clearenv",
 		)
-		// 出网档位：整个工作目录先变成空 tmpfs，可写表里只剩下 .deps，
-		// 随后再被 --bind 接回来。不加这条的话，父目录虽然也会被 bwrap
-		// 自动建成空目录，但读挂载表将来万一又列进 Dir，就会静默退化成全可见。
-		if spec.Network && spec.Dir != "" {
-			args = append(args, "--tmpfs", spec.Dir)
-		}
 		// 可写路径后挂，覆盖前面同路径的只读挂载。
 		for _, p := range write {
 			if err := os.MkdirAll(p, 0o755); err != nil {

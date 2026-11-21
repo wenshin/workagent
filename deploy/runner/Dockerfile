@@ -45,6 +45,7 @@ RUN set -eux; \
         python3 \
         python3-pip \
         python3-dev \
+        python3-venv \
         tar \
         xz-utils \
         unzip \

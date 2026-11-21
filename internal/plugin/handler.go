@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/mcp"
 	"github.com/workagent/auto-agent/internal/platform"
@@ -51,6 +52,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/config", h.config)
 	mux.HandleFunc("PUT /spaces/{id}/plugins/{slug}/config", h.updateConfig)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/dry-run", h.dryRun)
+	// 插件开发执行体：在草稿目录里跑命令（装依赖、deno cache、试跑）。
+	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/dev/exec", h.devExec)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/publish", h.publish)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/install", h.install)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/uninstall", h.uninstall)
@@ -128,6 +131,39 @@ func (h *Handler) dryRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	platform.WriteJSON(w, http.StatusOK, res)
+}
+
+// devExec 在插件草稿目录里执行命令。
+//
+// 权限按空间 write 校验：能改草稿的人才能在里面跑命令。
+// 不做审批但记录执行结果，命令原文由调用方自己保存（前端展示用）。
+func (h *Handler) devExec(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.guard(w, r, "write")
+	if !ok {
+		return
+	}
+	var body struct {
+		Command        string `json:"command"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
+	}
+	if err := platform.DecodeJSON(r, &body); err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, "bad_request", "请求体格式错误")
+		return
+	}
+	res, err := h.mgr.DevExec(r.Context(), r.PathValue("id"), r.PathValue("slug"),
+		user.ID, body.Command, time.Duration(body.TimeoutSeconds)*time.Second)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	platform.WriteJSON(w, http.StatusOK, map[string]any{
+		"exit_code":   res.ExitCode,
+		"stdout":      res.Stdout,
+		"stderr":      res.Stderr,
+		"truncated":   res.Truncated,
+		"sandbox":     res.Sandbox,
+		"duration_ms": res.Duration.Milliseconds(),
+	})
 }
 
 func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {

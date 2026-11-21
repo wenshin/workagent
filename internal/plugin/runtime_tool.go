@@ -9,12 +9,15 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/storage"
+	"github.com/workagent/auto-agent/internal/tool"
 )
 
 // 单帧上限：正常一帧只有几 KB，超过基本意味着协议实现有问题。
@@ -62,6 +65,9 @@ type invokeInput struct {
 	SpaceID string
 	UserID  string
 	Slug    string
+	// Version 用于隔离 DENO_DIR：同一插件不同版本的缓存不能混，
+	// 否则回滚到旧版本会拿到新版本编译出来的产物。
+	Version string
 	// FS 是文件访问白名单（空间工作区 + 清单 fs 收紧后的结果）。
 	// 它同时喂给沙箱挂载和 deno 的 --allow-read/--allow-write：
 	// 挂载决定「路径存不存在」，权限决定「deno 允不允许读」，缺一层都算没管。
@@ -88,6 +94,63 @@ type invokeInput struct {
 // residentKey 是常驻进程的复用键：目录变化就是另一份代码，不能复用。
 func residentKey(spaceID, slug, dir string) string {
 	return spaceID + "|" + slug + "|" + dir
+}
+
+// denoDir 是该插件版本的 Deno 缓存目录。
+//
+// 放在租户缓存下而不是插件目录里：同一版本被多个空间安装时共用一份，
+// 而且插件目录是只读挂载，编译产物根本写不进去。
+func (r *toolRuntime) denoDir(slug, version string) string {
+	name := slug
+	if version != "" {
+		name = slug + "@" + version
+	}
+	return filepath.Join(tool.CacheRoot(), "deno", name)
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// warmDeps 按 lock 预热 Deno 依赖缓存。
+//
+// `deno cache` 只下载不执行，等价于 `apt-get --download-only`。
+// 装的时候有网，拉一次就够；运行期是断网沙箱，靠 `--cached-only`
+// 保证"缺依赖立刻失败"而不是等 DNS 超时。
+//
+// 在宿主进程里跑而不是起沙箱：安装是控制面动作，不该依赖用户空间的执行环境，
+// 也不能让插件代码在预热阶段被执行。
+func (r *toolRuntime) warmDeps(ctx context.Context, dir, entry, slug, version string) error {
+	if r.deno == "" {
+		return nil
+	}
+	entryPath := filepath.Join(dir, filepath.FromSlash(entry))
+	if !fileExists(entryPath) {
+		return fmt.Errorf("插件入口不存在: %s", entryPath)
+	}
+	denoDir := r.denoDir(slug, version)
+	if err := os.MkdirAll(denoDir, 0o755); err != nil {
+		return fmt.Errorf("创建 DENO_DIR 失败: %w", err)
+	}
+	args := []string{"cache", "--quiet", "--no-config"}
+	if lock := filepath.Join(dir, "deno.lock"); fileExists(lock) {
+		// --frozen：代码与 lock 不一致时直接失败。
+		// 作者改了依赖却忘了更新 lock，装的时候就该报错。
+		args = append(args, "--lock="+lock, "--frozen")
+	} else {
+		args = append(args, "--no-lock")
+	}
+	args = append(args, entryPath)
+
+	cmd := exec.CommandContext(ctx, r.deno, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "DENO_DIR="+denoDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("deno cache 失败: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 type rpcFrame struct {
@@ -165,17 +228,33 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	fs := in.FS
 	fs.Read = dedupePaths(append(append([]string{}, fs.Read...), r.runtimeDir))
 
+	// DENO_DIR 既要读（remote / npm）又要写（gen 编译产物），
+	// 两条白名单都得加，少一条表现为「缓存读到了但编译不了」。
+	denoDirPath := r.denoDir(in.Slug, in.Version)
+	fs.Read = dedupePaths(append(fs.Read, denoDirPath))
+	fs.Write = dedupePaths(append(append([]string{}, fs.Write...), denoDirPath))
+
+	args := []string{
+		r.deno, "run",
+		"--quiet", "--no-prompt",
+		// 不让插件自带 deno.json：作者能改自己的配置，等于绕过这里的门控。
+		"--no-config",
+		// 断网沙箱里绝不能尝试下载：缺依赖就立刻失败，
+		// 而不是等 DNS 超时（症状像网络故障，实际是依赖没预热）。
+		"--cached-only",
+	}
+	// lock 是依赖完整性的唯一凭据。有它就必须校验；
+	// --frozen 让「代码与声明不一致」变成硬错误，而不是静默装别的版本。
+	if lock := filepath.Join(abs, "deno.lock"); fileExists(lock) {
+		args = append(args, "--lock="+lock, "--frozen")
+	} else {
+		args = append(args, "--no-lock")
+	}
+	args = append(args, denoPermissionFlags(fs, proxy, len(in.WSHosts) > 0)...)
+	args = append(args, bootstrap, entryURL)
+
 	spec := sandbox.Spec{
-		Cmd: append(
-			[]string{
-				r.deno, "run",
-				"--quiet", "--no-prompt",
-				// 沙箱里没有可写工作目录，锁文件与配置会变成噪音甚至失败
-				"--no-lock", "--no-config",
-			},
-			append(denoPermissionFlags(fs, proxy, len(in.WSHosts) > 0),
-				bootstrap, entryURL)...,
-		),
+		Cmd:       args,
 		Dir:       abs,
 		Mode:      sandbox.ModeWorkspaceWrite,
 		FS:        fs,
@@ -185,7 +264,21 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 		Resident:  resident,
 		MaxOutput: maxFrameBytes * 4,
 	}
+	// 白名单跟着 Spec 走，而不是只留在本地代理里：远端执行体拿到的
+	// Proxy 只是一个路径，它必须在那个路径上按这份名单自己建代理。
+	// 本地模式下这份数据是冗余的（控制面已经建好），但不传的话容器化
+	// 部署里插件就完全出不了网，而这不会在单机上暴露出来。
+	if proxy != "" {
+		spec.Egress = &sandbox.EgressSpec{
+			Hosts:   cleanHosts(in.NetHosts),
+			WSHosts: cleanHosts(in.WSHosts),
+			Verbs:   verbsList(in.Verbs),
+		}
+	}
 	// 进程环境被 --clearenv 清空过，只有这里列出来的变量能进沙箱。
+	// DENO_DIR 默认落 $HOME/.cache，而 HOME 是每次调用新建的临时目录：
+	// 不显式指定，每次冷启动都要重新解析、重新编译，断网时远程依赖必然失败。
+	spec.Env = append(spec.Env, "DENO_DIR="+denoDirPath)
 	if in.SpaceRoot != "" {
 		spec.Env = append(spec.Env, "WA_SPACE_DIR="+in.SpaceRoot)
 	}

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -168,6 +170,35 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 脚本插件跑在同一个沙箱里，密钥只经宿主替换，插件进程里没有明文。
 	// 沙箱是白名单挂载：运行时装在非标准位置时，必须显式把安装前缀挂进去。
 	sandbox.SetExtraRead(cfg.SandboxReadExtra)
+
+	// 租户级缓存：apt 索引与 deb、npm / pip / go 的下载、Deno 的 DENO_DIR。
+	// 部署时挂到同一块盘上——它不保证"装好了"，只保证"重装不用下载"。
+	// 缺这个，Pod 重建后每次 apt install 都要重新走一遍网络。
+	if dir := strings.TrimSpace(os.Getenv("WA_CACHE_DIR")); dir != "" {
+		tool.SetCacheRoot(dir)
+		log.Info("租户缓存目录", "dir", tool.CacheRoot())
+	}
+	// 缓存保留天数，0 表示不回收。默认 30 天。
+	if days := strings.TrimSpace(os.Getenv("WA_CACHE_TTL_DAYS")); days != "" {
+		if n, err := strconv.Atoi(days); err == nil {
+			if n <= 0 {
+				tool.SetCacheTTL(0)
+			} else {
+				tool.SetCacheTTL(time.Duration(n) * 24 * time.Hour)
+			}
+		}
+	}
+	tool.StartCacheGC(log)
+
+	// 每空间磁盘软配额，单位 MiB；0 或空表示不限制。
+	// 软配额的语义是「执行前算一次，超了拒绝启动新命令」，
+	// 不做硬配额是因为硬配额要文件系统或 cgroup 配合，改不动。
+	if mb := strings.TrimSpace(os.Getenv("WA_SPACE_QUOTA_MB")); mb != "" {
+		if n, err := strconv.ParseInt(mb, 10, 64); err == nil {
+			tool.SetSpaceQuota(n << 20)
+			log.Info("空间磁盘配额", "limit", mb+"MiB")
+		}
+	}
 
 	// 发布扫描：规则与漏洞库都放在存储目录里，改规则不需要重启（每次发布前比对一次）。
 	scanner, err := securityscan.New(securityscan.Config{
@@ -344,6 +375,7 @@ func allowRules(ids []string) map[string]bool {
 // Close 释放后台资源。插件常驻进程必须显式关掉，否则服务重启后
 // 会留下上一版的 deno 子进程（它们没有 --die-with-parent 之外的生命周期）。
 func (a *App) Close() {
+	tool.StopCacheGC()
 	if a.pluginSvc != nil {
 		a.pluginSvc.Close()
 	}

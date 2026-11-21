@@ -29,6 +29,18 @@ spec:
         app.kubernetes.io/name: sandbox-runner
     spec:
       terminationGracePeriodSeconds: 60
+      # subPath 挂载要求目标目录在 volume 里已经存在，否则 Pod 起不来
+      # （CreateContainerConfigError）。
+      initContainers:
+        - name: init-cache
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - mkdir -p /cache/apt/lists /cache/apt/archives /cache/npm /cache/pip /cache/go/mod /cache/deno /cache/xdg
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
       containers:
         - name: runner
           image: workagent/sandbox-runner:dev
@@ -41,6 +53,10 @@ spec:
               value: "true"
             - name: SANDBOX_AGENT_ROOT
               value: /var/lib/workagent
+            # 租户级缓存根目录：与下面的 volumeMount 必须一致。
+            # apt 的索引与 deb、npm / pip / go 的下载、Deno 的 DENO_DIR 都落在这里。
+            - name: WA_CACHE_DIR
+              value: /cache
             - name: SANDBOX_RUNNER_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -72,10 +88,31 @@ spec:
           volumeMounts:
             - name: storage
               mountPath: /var/lib/workagent
+            # 租户级缓存：apt 索引与 deb、npm / pip / go 下载、Deno 的 DENO_DIR。
+            # 漏挂的表现是「装过的包重建后又要联网下载」，
+            # 而且 apt 会报 "Unable to locate package"——像包不存在，其实是索引没了。
+            - name: cache
+              mountPath: /cache
+            # apt 的索引和 deb 单独挂到持久盘。
+            #
+            # 漏挂 lists 时，deb 就在 /cache 里，`apt install` 却报
+            # "Unable to locate package"——apt 靠自己的索引解析包名，
+            # 没有索引就不知道 ffmpeg 对应哪个文件。这个报错和
+            # "确实没这个包"完全一样，很难查。
+            - name: cache
+              mountPath: /var/lib/apt/lists
+              subPath: apt/lists
+            - name: cache
+              mountPath: /var/cache/apt/archives
+              subPath: apt/archives
       volumes:
         - name: storage
           hostPath:
             path: /var/lib/workagent
+            type: DirectoryOrCreate
+        - name: cache
+          hostPath:
+            path: /var/cache/workagent
             type: DirectoryOrCreate
 ---
 apiVersion: v1

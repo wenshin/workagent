@@ -181,17 +181,14 @@ func TestSeatbeltProfile(t *testing.T) {
 		t.Errorf("不带 Network 时应该禁网\n%s", rw)
 	}
 
-	// 出网档位只露 .deps：工作区其它文件不可见可写。
+	// 给网不改变文件可见面：curl 在工作区里跑，下载与解析才能连着写。
+	// 外发风险由审批与 NetworkPolicy 承担，不由挂载表承担。
 	net, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite, Network: true}, tmp)
 	if err != nil {
 		t.Fatalf("生成 profile 失败: %v", err)
 	}
-	deps := filepath.Join(ws, DepsDirName)
-	if !strings.Contains(writeBlock(net), `(subpath "`+deps+`")`) {
-		t.Errorf("出网档位应放开 .deps 写权限\n%s", net)
-	}
-	if strings.Contains(writeBlock(net), `(subpath "`+ws+`")`) {
-		t.Errorf("出网档位不该放开整个工作区\n%s", net)
+	if !strings.Contains(writeBlock(net), `(subpath "`+ws+`")`) {
+		t.Errorf("出网档位同样要能写整个工作区\n%s", net)
 	}
 	if strings.Contains(net, "(deny network*)") {
 		t.Errorf("Network=true 时不该写死禁网\n%s", net)

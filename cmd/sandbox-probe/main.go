@@ -62,9 +62,10 @@ func main() {
 	res, err = run(client, "echo x > /etc/wa-probe 2>/dev/null; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, false)
 	results = append(results, verdict("系统目录只读", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
 
-	// 4. 默认断网
+	// 4. 不给网就真的没网：Network=false 时连不出去。
+	//    默认档位由 shell_exec 的策略决定（其他命令有网），这一项只验证执行体听从 Spec。
 	res, err = run(client, "curl -sS -m 3 -o /dev/null https://example.com; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, false)
-	results = append(results, verdict("默认断网", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
+	results = append(results, verdict("无网档位不可达", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
 
 	// 5. 看不到同级的其他空间（父目录只有自己这一项）
 	res, err = run(client, "ls -1 "+parent+" | wc -l", dir, sandbox.ModeReadOnly, fs, false)
@@ -81,12 +82,13 @@ func main() {
 	code := strings.TrimSpace(res.Stdout)
 	results = append(results, verdict("出网可达", err == nil && (code == "200" || code == "404"), detail(res, err)))
 
-	// 8. 出网时看不到工作区：只挂 .deps，第 2 项写的 .probe 必须不可见。
-	//    这条坏掉等于「装上依赖的同时把整个空间递给了一条 curl」。
+	// 8. 出网不改变文件可见面：第 2 项写的 .probe 依然看得见。
+	//    网络工具与普通命令跑在同一个工作区里，下载完才能就地处理；
+	//    外发风险由审批与 NetworkPolicy 拦，不靠遮蔽。
 	res, err = run(client, "ls -a "+dir+" | tr '\n' ' '", dir, sandbox.ModeWorkspaceWrite, fs, true)
 	out := strings.TrimSpace(res.Stdout)
-	results = append(results, verdict("出网不暴露工作区",
-		err == nil && !strings.Contains(out, ".probe") && strings.Contains(out, ".deps"), detail(res, err)))
+	results = append(results, verdict("出网仍可见工作区",
+		err == nil && strings.Contains(out, ".probe"), detail(res, err)))
 
 	// 9. 私网不可达：容器内 iptables 兜底，不依赖 CNI（OrbStack 上 NetworkPolicy
 	//    不生效，实测能直接访问同集群 Pod）。目标选执行体自己的 Service：
@@ -94,6 +96,14 @@ func main() {
 	//    这一条同时也验证了「只拒主动发起」没把回包一起打掉——否则 kubelet 探针会先挂。
 	res, err = run(client, "curl -s -m 4 -o /dev/null http://sandbox-runner:8323/healthz; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, true)
 	results = append(results, verdict("私网不可达", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
+
+	// 10. 系统安装可写：system-write 档位下 apt 能装进执行体的可写层。
+	//     写的是执行体自己的 /usr（不是空间目录），所以用完立刻删掉探针文件，
+	//     不在镜像可写层里留垃圾。
+	res, err = run(client, "echo ok > /usr/.wa-probe && rm -f /usr/.wa-probe && echo done",
+		dir, sandbox.ModeSystemWrite, fs, true)
+	results = append(results, verdict("系统安装可写",
+		err == nil && strings.Contains(res.Stdout, "done"), detail(res, err)))
 
 	failed := 0
 	for _, r := range results {

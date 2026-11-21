@@ -6,7 +6,7 @@ import "testing"
 // 追加同名项等于没设——这条曾经让 XDG_CACHE_HOME 静默失效。
 func TestMergeEnvOverridesInPlace(t *testing.T) {
 	base := []string{"HOME=/tmp/x", "XDG_CACHE_HOME=/tmp/x"}
-	got := mergeEnv(base, []string{"XDG_CACHE_HOME=/data/.deps/cache"})
+	got := mergeEnv(base, []string{"XDG_CACHE_HOME=/data/.pkg/cache"})
 
 	if len(got) != 2 {
 		t.Fatalf("覆盖不应产生重复键，得到 %v", got)
@@ -14,7 +14,7 @@ func TestMergeEnvOverridesInPlace(t *testing.T) {
 	if got[0] != "HOME=/tmp/x" {
 		t.Errorf("无关变量不该被改动：%v", got)
 	}
-	if got[1] != "XDG_CACHE_HOME=/data/.deps/cache" {
+	if got[1] != "XDG_CACHE_HOME=/data/.pkg/cache" {
 		t.Errorf("覆盖未生效：%v", got)
 	}
 }

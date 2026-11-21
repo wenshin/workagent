@@ -36,13 +36,29 @@ func (f *fakeRunner) Start(context.Context, sandbox.Spec) (*sandbox.Proc, error)
 
 func newTestClient(t *testing.T, runner sandbox.Runner, token, root string) (*Client, *httptest.Server) {
 	t.Helper()
-	srv := httptest.NewServer(Handler(runner, token, root, sandbox.EnvFacts{}, nil))
+	srv := httptest.NewServer(Handler(runner, token, root, sandbox.EnvFacts{}, nil, nil))
 	t.Cleanup(srv.Close)
 	c, err := New(srv.URL, token)
 	if err != nil {
 		t.Fatalf("构造客户端失败: %v", err)
 	}
 	return c, srv
+}
+
+// passthroughRunner 用本地后端真正起进程：常驻通道要验证的是「流能不能双向走」，
+// 用假 Runner 只能测到序列化，测不到 EOF 与背压。
+type passthroughRunner struct {
+	name string
+}
+
+func (p *passthroughRunner) Name() string { return p.name }
+
+func (p *passthroughRunner) Run(context.Context, sandbox.Spec) (sandbox.Result, error) {
+	return sandbox.Result{Sandbox: p.name}, nil
+}
+
+func (p *passthroughRunner) Start(ctx context.Context, spec sandbox.Spec) (*sandbox.Proc, error) {
+	return sandbox.NewLocal().Start(ctx, spec)
 }
 
 // Spec 必须原样穿过协议：Mode / Timeout / FS / Stdin 任何一项丢了，
@@ -112,7 +128,7 @@ func (w *wrapped) Unwrap() error { return w.base }
 
 func TestAuthRequired(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap}
-	srv := httptest.NewServer(Handler(runner, "right", "", sandbox.EnvFacts{}, nil))
+	srv := httptest.NewServer(Handler(runner, "right", "", sandbox.EnvFacts{}, nil, nil))
 	t.Cleanup(srv.Close)
 
 	// 令牌不对：握手就失败
@@ -142,12 +158,69 @@ func TestPathEscapesRootRejected(t *testing.T) {
 	}
 }
 
-// 常驻进程未实现时必须显式失败，不能退化成一次性进程。
-func TestStartUnsupported(t *testing.T) {
+// 常驻通道必须是真正的双向流：写一帧、读回同一帧。
+//
+// 这条坏掉的表现是插件「启动成功但永远不返回」——所以不能只测
+// 「Start 不报错」，必须跑一次往返。
+func TestStartDuplexRoundTrip(t *testing.T) {
+	c, _ := newTestClient(t, &passthroughRunner{name: sandbox.NameLocal}, "tk", "")
+	proc, err := c.Start(context.Background(), sandbox.Spec{
+		Cmd:      []string{"/bin/cat"},
+		Dir:      "/tmp",
+		Resident: true,
+	})
+	if err != nil {
+		t.Fatalf("启动常驻进程失败: %v", err)
+	}
+	defer proc.Close()
+
+	if err := proc.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	line, err := proc.Stdout.ReadString('\n')
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if line != "ping\n" {
+		t.Fatalf("往返内容不符: %q", line)
+	}
+
+	// Close 必须真的把远端进程断掉并能返回，否则常驻池会一直挂着连接。
+	done := make(chan struct{})
+	go func() {
+		proc.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close 没有返回")
+	}
+}
+
+// 执行体起不来进程时，错误必须原样回到控制面，而不是变成一个空结果。
+func TestStartPropagatesError(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap}
 	c, _ := newTestClient(t, runner, "tk", "")
-	if _, err := c.Start(context.Background(), sandbox.Spec{}); err == nil {
-		t.Fatal("Start 应该返回明确的未实现错误")
+	_, err := c.Start(context.Background(), sandbox.Spec{Cmd: []string{"sh"}})
+	if err == nil || !strings.Contains(err.Error(), "not implemented") {
+		t.Fatalf("错误没有透传: %v", err)
+	}
+}
+
+// 出网代理路径是执行体要 bind 的位置：不在白名单目录里必须拒绝，
+// 否则等于允许控制面在任意路径建文件。
+func TestEgressPathRejected(t *testing.T) {
+	runner := &fakeRunner{name: sandbox.NameBwrap}
+	c, _ := newTestClient(t, runner, "tk", "")
+	_, err := c.Run(context.Background(), sandbox.Spec{
+		Cmd:    []string{"sh", "-c", "true"},
+		Dir:    "/tmp",
+		Proxy:  "/etc/evil.sock",
+		Egress: &sandbox.EgressSpec{Hosts: []string{"example.com"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "允许的位置") {
+		t.Fatalf("非法代理路径应被拒绝: %v", err)
 	}
 }
 
@@ -171,7 +244,7 @@ func TestEnvFactsTravelWithHandshake(t *testing.T) {
 		Tools:   []sandbox.ToolFact{{Name: "git", Version: "2.39.5"}},
 		Network: "默认断网",
 	}
-	srv := httptest.NewServer(Handler(&fakeRunner{name: sandbox.NameBwrap}, "t", "", facts, nil))
+	srv := httptest.NewServer(Handler(&fakeRunner{name: sandbox.NameBwrap}, "t", "", facts, nil, nil))
 	t.Cleanup(srv.Close)
 
 	c, err := New(srv.URL, "t")

@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/workagent/auto-agent/internal/policy"
@@ -40,22 +43,25 @@ func shellExec() Tool {
 	return Tool{
 		Name:       "shell_exec",
 		Capability: "shell.exec",
-		Description: "在当前空间的文件目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
-			"系统其它位置只读，有超时与输出上限。" +
-			"命令里出现 curl/wget 或脚本解释器（sh/python/node）时，需要用户确认联网后再执行；" +
-			"装依赖（pip install / npm i / fnm install）不需要确认，直接装。" +
-			"联网执行时沙箱只挂 .deps 安装目录，当前空间的其它文件不可见——下载、安装和读文件的操作要分开写，" +
-			"不要写成一条 `curl ... && python ...`。" +
-			"依赖与运行时请装进 .deps（FNM_DIR / PIP_TARGET / NPM_CONFIG_PREFIX 已指向那里），" +
-			"例如 `pip install requests`、`npm i`、`fnm install 20`，装好后用 .deps 下的路径调用；" +
-			"不要往 /usr、/etc 装东西，也不要试图改系统包管理器。" +
+		Description: "在当前空间的工作目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
+			"系统其它位置只读，有超时与输出上限。网络按命令形态决定，调用前先看清楚：" +
+			"curl/wget/nc/ssh 这类网络工具会先请用户确认，用户拒绝就不执行。" +
+			"sh/bash/python/node/deno/go 这类脚本默认不联网，访问外网会失败；确实需要联网时传 `network: true`，" +
+			"会先请用户确认，批准后才联网执行。" +
+			"其余命令（ls/git/make/npm i/pip install/apt install）默认有网且不弹确认。" +
+			"下载与解析可以连着写，例如 `curl -o data.json <url> && python parse.py`。" +
+			"容器闲置会被回收，系统目录回到基础镜像：缺什么直接装，包在本地缓存里，重跑很快。" +
+			"Python 已预置 .pkg/venv 并在 PATH 里，直接 `pip install` 即可；" +
+			"npm 全局安装已指向 .pkg/npm，直接 `npm i -g` 即可，两者重建后都还在。" +
+			"系统级工具（apt install）装进可写层，重建后会消失，需要时再装一次。" +
 			"适合做文件统计、批量改名、跑本地脚本；要查外网信息请用 web_search。" +
 			"命令返回非零退出码或超时时，先看 stderr 再调整，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "要执行的命令，由 sh -c 执行"},
-    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"}
+    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"},
+    "network": {"type": "boolean", "description": "脚本需要联网时置 true，会先请用户确认、批准后才联网执行。只对 sh/python/node/deno/go 这类脚本有意义；curl/wget 等网络工具本来就会先确认，其他命令默认有网"}
   },
   "required": ["command"],
   "additionalProperties": false
@@ -73,6 +79,9 @@ func shellExec() Tool {
 			var in struct {
 				Command        string `json:"command"`
 				TimeoutSeconds int    `json:"timeout_seconds"`
+				// Network 是调用方替脚本档声明的「这次需要联网」。
+				// 它不是权限开关：声明之后仍要用户批准，批准之前不联网。
+				Network bool `json:"network"`
 			}
 			if err := json.Unmarshal(args, &in); err != nil {
 				return "", fmt.Errorf("参数解析失败: %w", err)
@@ -109,17 +118,30 @@ func shellExec() Tool {
 				timeout = maxShellTimeout
 			}
 
-			// 要不要出网由命令本身决定：curl / 脚本解释器 / 包管理器需要，
-			// 其余（ls、grep、mv）不需要。出网时沙箱只挂 .deps，
-			// 工作区的其它文件在命令里根本不存在。
-			needsNet := shellNeedsNetwork(command)
+			// 网络按命令形态分三档，判据只在 shellnet.go：
+			//   网络工具  有网 + 先审批
+			//   脚本     默认无网，声明 network=true 才有网 + 审批
+			//   其他     有网，不审批
+			//
+			// 审批已经在 Invoker 里做完（ApprovalFor 读的是同一个 ShellNetPlan），
+			// 这里只把结论落到沙箱上。两处各判一次必然漂移，而且「没批就联网」
+			// 是静默的——用户不会收到任何提示。
+			plan := ShellNetPlan(command, in.Network)
+			mode := sandbox.ModeWorkspaceWrite
+			if shellNeedsSystemWrite(command) {
+				mode = sandbox.ModeSystemWrite
+			}
+			if err := CheckSpaceQuota(spaceRoot); err != nil {
+				return "", err
+			}
+			ensureVenv(ctx, spaceRoot)
 			res, runErr := env.Shell.Run(ctx, sandbox.Spec{
 				Cmd:     []string{"sh", "-c", command},
 				Dir:     workDir,
-				Mode:    sandbox.ModeWorkspaceWrite,
+				Mode:    mode,
 				Timeout: timeout,
-				Network: needsNet,
-				Env:     installEnv(workDir),
+				Network: plan.NeedsNetwork(),
+				Env:     InstallEnv(spaceRoot, workDir),
 			})
 
 			// 超时与输出超限是「命令没跑完」，属于结果的一部分，回给模型让它调整；
@@ -129,7 +151,14 @@ func shellExec() Tool {
 				!errors.Is(runErr, sandbox.ErrOutputTooLarge) {
 				return "", runErr
 			}
-			return formatShellResult(res, runErr, timeout), nil
+			out := formatShellResult(res, runErr, timeout)
+			// 脚本默认无网：失败原因是网络时给一句可执行的下一步。
+			// 不给的话模型只能从 EAI_AGAIN 这类错误里猜「是不是沙箱的问题」。
+			if plan.Mode == ShellNetOff && looksLikeNetworkFailure(res.Stdout, res.Stderr) {
+				out += "\n[提示] 这次执行没有联网（脚本默认不联网）。" +
+					"如果失败与网络有关，确认后带 `network: true` 重新调用，会先请用户确认。\n"
+			}
+			return out, nil
 		},
 	}
 }
@@ -189,136 +218,116 @@ func InstallMirrorSources() map[string]string {
 	}
 }
 
-// installEnv 把安装源与安装目录写进环境变量。
+// CacheRoot 是租户级缓存根目录，部署时挂载，所有空间共享。
 //
-// 安装目录固定在 .deps 下：出网执行时沙箱只挂这一个子目录，
-// 装进去的东西必须落在这里，否则下次调用就找不到了。
-func installEnv(workDir string) []string {
-	deps := sandbox.DepsDir(workDir)
-	if deps == "" {
-		return nil
+// 只放"重装时能命中"的东西：apt 索引与 deb、npm / pip / go 的下载缓存。
+// 不放装好的包——那些属于空间目录（.pkg），共享会互相覆盖版本。
+var (
+	cacheRootMu sync.RWMutex
+	cacheRoot   = "/cache"
+)
+
+// SetCacheRoot 覆盖租户缓存根目录，启动时按部署环境调用一次。
+func SetCacheRoot(p string) {
+	p = strings.TrimSpace(p)
+	cacheRootMu.Lock()
+	if p != "" && filepath.IsAbs(p) {
+		cacheRoot = filepath.Clean(p)
 	}
+	cacheRootMu.Unlock()
+}
+
+// CacheRoot 返回当前租户缓存根目录。
+func CacheRoot() string {
+	cacheRootMu.RLock()
+	defer cacheRootMu.RUnlock()
+	return cacheRoot
+}
+
+// installEnv 把安装位置与下载缓存写进环境变量。
+//
+// 两类目录分工明确：
+//   - .pkg 在空间目录下，装进去的东西 Pod 重建后还在（npm 全局包、venv）
+//   - /cache 是租户级缓存，只保证"重装时不用下载"，不保证"装好了"
+//
+// pip 用 venv 不用 PIP_TARGET：后者只往目录塞包，console script、
+// 升级、卸载都不正常，长期用的环境就该是 venv。
+//
+// PATH 必须在这里拼好：--clearenv 之后沙箱只继承 baseEnvKeys 里的变量，
+// 在 shell 里 export 影响不到下一条命令。
+func InstallEnv(spaceRoot, workDir string) []string {
+	if spaceRoot == "" {
+		spaceRoot = filepath.Dir(workDir)
+	}
+	pkg := filepath.Join(spaceRoot, ".pkg")
+	venv := filepath.Join(pkg, "venv")
+	npm := filepath.Join(pkg, "npm")
+	cache := CacheRoot()
 	m := installMirror
-	py := filepath.Join(deps, "py")
+	path := strings.Join([]string{
+		filepath.Join(venv, "bin"),
+		filepath.Join(npm, "bin"),
+	}, ":") + ":" + sandbox.FallbackPath()
 	return []string{
-		"FNM_DIR=" + filepath.Join(deps, "node"),
-		"FNM_NODE_DIST_MIRROR=" + m.Node,
-		"NPM_CONFIG_PREFIX=" + filepath.Join(deps, "npm"),
-		"NPM_CONFIG_CACHE=" + filepath.Join(deps, "cache", "npm"),
+		"WA_SPACE_DIR=" + spaceRoot,
+		// npm 全局包装进空间目录，Pod 重建后还在。
+		"NPM_CONFIG_PREFIX=" + npm,
+		"NPM_CONFIG_CACHE=" + filepath.Join(cache, "npm"),
 		"NPM_CONFIG_REGISTRY=" + m.NPM,
-		"PIP_TARGET=" + py,
-		// PIP_TARGET 装的包不在 sys.path 里，必须补 PYTHONPATH，
-		// 否则「装成功了但 import 不到」。
-		"PYTHONPATH=" + py,
-		"PIP_CACHE_DIR=" + filepath.Join(deps, "cache", "pip"),
+		// venv 激活后 pip 装进 venv，同时天然绕开 PEP 668（不动系统 python）。
+		"VIRTUAL_ENV=" + venv,
+		"PIP_CACHE_DIR=" + filepath.Join(cache, "pip"),
 		"PIP_INDEX_URL=" + m.PyPI,
+		"PIP_DISABLE_PIP_VERSION_CHECK=1",
 		"GOPROXY=" + m.Go,
-		// 缓存也放进 .deps：出网档位下 HOME 是私有 tmp，放那里等于每次重下。
-		"XDG_CACHE_HOME=" + filepath.Join(deps, "cache"),
+		"GOMODCACHE=" + filepath.Join(cache, "go", "mod"),
+		"FNM_DIR=" + filepath.Join(cache, "fnm"),
+		"FNM_NODE_DIST_MIRROR=" + m.Node,
+		// HOME 是每次调用的私有 tmp，缓存放那里等于每次重下。
+		"XDG_CACHE_HOME=" + filepath.Join(cache, "xdg"),
+		"PATH=" + path,
 	}
 }
 
-// shellNetRe 命中的命令意味着「这条命令有出网可能」。
+// ensureVenv 保证 .pkg/venv 存在，建一次就够。
 //
-// 口径故意宽：脚本解释器只看得到文件名，看不到里面有没有 urllib。
-// 多给一次网只是白跑一次，少给一次是功能直接坏掉。
-var shellNetRe = regexp.MustCompile(`\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|sh|bash|dash|zsh|ksh|python[0-9.]*|node|deno|bun|ruby|perl|php)\b`)
-
-// shellPkgNet 是包管理器的 install 类子命令：没网时它们 100% 失败。
-var shellPkgNet = []*regexp.Regexp{
-	regexp.MustCompile(`\b(npm|pnpm|yarn)\s+(i|install|ci|add|update|up)\b`),
-	regexp.MustCompile(`\b(pip|pip3)\s+(install|download)\b`),
-	regexp.MustCompile(`\bpython[0-9.]*\s+-m\s+pip\s+(install|download)\b`),
-	regexp.MustCompile(`\buv\s+(pip\s+install|sync|add|venv)\b`),
-	regexp.MustCompile(`\bcargo\s+(build|install|add|fetch)\b`),
-	regexp.MustCompile(`\bgo\s+(get|install|build|mod|generate)\b`),
-	regexp.MustCompile(`\bfnm\s+(install|use)\b`),
+// 失败不阻断命令：没有 venv 时 pip 会落到系统 python 上，
+// 报错信息是 PEP 668，用户照样能看懂。真正要避免的是
+// "每条命令都试一次 python3 -m venv" 的开销。
+func ensureVenv(ctx context.Context, spaceRoot string) {
+	venv := filepath.Join(spaceRoot, ".pkg", "venv")
+	if _, err := os.Stat(filepath.Join(venv, "bin", "python")); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Join(spaceRoot, ".pkg"), 0o755); err != nil {
+		return
+	}
+	c, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(c, "python3", "-m", "venv", venv).CombinedOutput()
+	if err != nil {
+		slog.Warn("创建空间 venv 失败", "dir", venv, "err", err, "out", strings.TrimSpace(string(out)))
+	}
 }
 
-// shellOfflineForms 是「长得像上面那些词、但确实不需要网」的形态。
+// shellSysWriteRe 命中的命令要往系统目录装东西，必须放开 /usr、/var/lib/dpkg。
 //
-// 不加这一层的话，`python3 -m venv .venv` 会被判成要出网，于是只挂 .deps，
-// 结果虚拟环境建进 tmpfs，命令一结束就没了。
-var shellOfflineForms = []*regexp.Regexp{
-	regexp.MustCompile(`\bpython[0-9.]*\s+(-V|--version)\b`),
-	regexp.MustCompile(`\bpython[0-9.]*\s+-m\s+venv\b`),
-	regexp.MustCompile(`\bnode\s+(-v|--version)\b`),
-	regexp.MustCompile(`\bgo\s+(version|env)\b`),
-	regexp.MustCompile(`\b(npm|pnpm|yarn)\s+(run|ls|list|config|--version|-v)\b`),
+// 只有 apt / dpkg 在这里：pip 装进 .pkg/venv、npm 全局装进 .pkg/npm，
+// 两者都在空间目录里，不需要系统写权限。
+// 不放开的表现是 dpkg 报 "Read-only file system"、apt 报
+// "Unable to lock the administration directory"，都像权限问题其实是挂载问题。
+var shellSysWriteRe = []*regexp.Regexp{
+	regexp.MustCompile(`\bapt(-get)?\s+(install|reinstall|upgrade|dist-upgrade|purge|remove|update)\b`),
+	regexp.MustCompile(`\bdpkg\s+(-i|--install|--configure|-r|--remove)\b`),
 }
 
-// shellSplitPipeline 把命令按 `&&` `||` `;` `|` 切成子命令。
-//
-// 不处理引号：切错的后果只是多切一刀，每一段仍会被完整判断，不会漏掉危险命令；
-// 而按 shell 语义解析引号要写一个小型词法分析器，收益不足以抵消维护成本。
-func shellSplitPipeline(command string) []string {
-	return strings.FieldsFunc(command, func(r rune) bool {
-		return r == '&' || r == '|' || r == ';'
-	})
-}
+// NeedsSystemWrite 供其它执行体（插件开发会话）复用同一套判据，
+// 避免两处规则各写一遍、慢慢漂移。
+func NeedsSystemWrite(cmd string) bool { return shellNeedsSystemWrite(cmd) }
 
-func isPkgInstall(cmd string) bool {
-	for _, re := range shellPkgNet {
+func shellNeedsSystemWrite(cmd string) bool {
+	for _, re := range shellSysWriteRe {
 		if re.MatchString(cmd) {
-			return true
-		}
-	}
-	return false
-}
-
-func isOfflineForm(cmd string) bool {
-	for _, re := range shellOfflineForms {
-		if re.MatchString(cmd) {
-			return true
-		}
-	}
-	return false
-}
-
-// shellNeedsNetwork 判断一条命令要不要出网。
-//
-// 这是唯一决定「沙箱能不能看到工作区」的开关：出网时只挂 .deps，
-// 非出网时挂整个 Dir。判错的两种后果不对称——判多只是白给一次网，
-// 判少是命令直接失败，所以口径偏宽（包管理器安装也算需要网）。
-func shellNeedsNetwork(command string) bool {
-	if strings.Contains(command, "/dev/tcp/") {
-		// bash 内置，不需要任何外部二进制就能发请求。
-		return true
-	}
-	for _, part := range shellSplitPipeline(command) {
-		if isOfflineForm(part) {
-			continue
-		}
-		if isPkgInstall(part) || shellNetRe.MatchString(part) {
-			return true
-		}
-	}
-	return false
-}
-
-// shellNeedsApproval 判断这条命令要不要人工确认。
-//
-// 判据比 shellNeedsNetwork 窄：只有「能任意外发数据」的命令才算数——
-// 网络工具（curl / wget / nc / ssh ...）和脚本解释器（sh / python / node ...），
-// 目标地址由命令内容决定，一条被注入的命令就能把会话内容拼进 URL 带出去。
-//
-// 包管理器安装（pip install / npm i / fnm install）虽然也要网，但它是
-// 「装东西」不是「发东西」：默认终点由 PIP_INDEX_URL / NPM_CONFIG_REGISTRY
-// 指向镜像源，`--index-url` 仍能覆盖，这里不做强制。理由是这条路的收益极低——
-// 改源最多装进一个恶意包，而沙箱里既没有凭证也没有业务数据，拿不到有价值的东西。
-// 放宽的收益很实际：每次装依赖都弹确认，用户会养成无脑点「同意」的习惯，
-// 真正危险的命令反而被淹没。
-func shellNeedsApproval(command string) bool {
-	if strings.Contains(command, "/dev/tcp/") {
-		return true
-	}
-	for _, part := range shellSplitPipeline(command) {
-		// 安装与「确实不需要网」的形态先摘出去，剩下的部分再判：
-		// `pip install node-fetch` 摘完是空的，`curl x && pip install y` 还剩 curl。
-		if isOfflineForm(part) || isPkgInstall(part) {
-			continue
-		}
-		if shellNetRe.MatchString(part) {
 			return true
 		}
 	}

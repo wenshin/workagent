@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -25,28 +26,65 @@ func TestSetInstallMirrors(t *testing.T) {
 }
 
 // installEnv 是「提示词说用什么源」和「命令实际用什么源」的唯一出处。
-// 这里断言的路径必须落在 .deps 下——出网执行时那是唯一挂载的子目录，
-// 写到别处的依赖下次调用就没了。
-func TestInstallEnvStaysInsideDeps(t *testing.T) {
-	workDir := "/data/space/files"
-	deps := sandbox.DepsDir(workDir)
-	env := installEnv(workDir)
+//
+// 两类目录不能混：
+//   - 装好的包（npm 全局、venv）必须在空间目录的 .pkg 下，Pod 重建后还在
+//   - 下载缓存必须在租户缓存的 CacheRoot 下，跨空间共享
+//
+// 混了的表现：包被放进 /cache 后被另一个空间用同名版本覆盖，
+// 或者缓存落进空间目录，每个空间各存一份。
+func TestInstallEnvSplitsSpaceAndCache(t *testing.T) {
+	spaceRoot := "/data/space"
+	workDir := spaceRoot + "/files"
+	pkg := spaceRoot + "/.pkg"
+	cache := CacheRoot()
+
+	env := InstallEnv(spaceRoot, workDir)
 	if len(env) == 0 {
 		t.Fatal("installEnv 不应为空")
 	}
-	for _, kv := range env {
-		k, v, ok := strings.Cut(kv, "=")
+
+	// 装好的包：必须落在空间目录
+	for _, key := range []string{"NPM_CONFIG_PREFIX", "VIRTUAL_ENV"} {
+		v, ok := lookupEnv(env, key)
 		if !ok {
-			t.Errorf("环境变量格式不对：%q", kv)
-			continue
+			t.Fatalf("缺少 %s", key)
 		}
-		// 安装源是 URL，不是路径：这类变量按定义就指向外部。
-		if strings.Contains(k, "URL") || strings.Contains(k, "REGISTRY") ||
-			strings.Contains(k, "MIRROR") || strings.Contains(k, "INDEX") || k == "GOPROXY" {
-			continue
-		}
-		if !strings.HasPrefix(v, deps) {
-			t.Errorf("%s 指向 .deps 之外：%s", k, v)
+		if !strings.HasPrefix(v, pkg) {
+			t.Errorf("%s 应落在 %s 下，实际 %s", key, pkg, v)
 		}
 	}
+
+	// 下载缓存：必须落在租户缓存
+	for _, key := range []string{"NPM_CONFIG_CACHE", "PIP_CACHE_DIR", "XDG_CACHE_HOME", "GOMODCACHE"} {
+		v, ok := lookupEnv(env, key)
+		if !ok {
+			t.Fatalf("缺少 %s", key)
+		}
+		if !strings.HasPrefix(v, cache) {
+			t.Errorf("%s 应落在租户缓存 %s 下，实际 %s", key, cache, v)
+		}
+	}
+
+	// PATH 必须以 fallback 结尾：--clearenv 之后只拼私有目录，
+	// 连 /bin/sh 都找不到。
+	path, ok := lookupEnv(env, "PATH")
+	if !ok {
+		t.Fatal("缺少 PATH")
+	}
+	if !strings.HasSuffix(path, sandbox.FallbackPath()) {
+		t.Errorf("PATH 必须以 fallbackPath 结尾，实际 %q", path)
+	}
+	if !strings.HasPrefix(path, filepath.Join(pkg, "venv", "bin")) {
+		t.Errorf("venv 必须排在 PATH 最前，实际 %q", path)
+	}
+}
+
+func lookupEnv(env []string, key string) (string, bool) {
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v, true
+		}
+	}
+	return "", false
 }

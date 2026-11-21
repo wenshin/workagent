@@ -1,7 +1,7 @@
 # 执行体的网络边界：能出公网，摸不到任何私网地址。
 #
 # 这一层是硬边界，和沙箱里的 Spec.Network 不是一回事：
-#   - Spec.Network 决定「给不给网」，以及「给网时只挂 .deps」；
+#   - Spec.Network 决定「给不给网」；
 #   - 这份 NetworkPolicy 决定「给了网之后能连哪里」。
 #
 # 标准 NetworkPolicy 的 egress 只认 ipBlock / podSelector，不认域名，
