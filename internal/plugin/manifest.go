@@ -1025,6 +1025,12 @@ func (m *Manifest) Validate(publishing bool) error {
 		if strings.Contains(m.Runtime.Entry, "..") {
 			return fmt.Errorf("runtime.entry 不能包含 ..")
 		}
+		// 执行器只有 deno run：写成 .py / .sh 时清单能过、进程起不来，
+		// 错误会推迟到试运行并显示成「未知扩展名」，作者看不出这是规则限制。
+		// 与 source.entry 的 script 协议同口径。
+		if !strings.HasSuffix(m.Runtime.Entry, ".ts") && !strings.HasSuffix(m.Runtime.Entry, ".js") {
+			return fmt.Errorf("runtime.entry 必须是 .ts / .js：工具插件只能用 Deno 写，平台没有 Python / Node 运行时")
+		}
 		// 进程寿命由 runtime.resident 决定，单次调用的上限只有 limits 一个入口。
 		// runtime.timeout_ms 从未生效过，留着会让作者以为「进程只活 8 秒」。
 		if m.Runtime.TimeoutMS != 0 || m.Runtime.MaxRPC != 0 {

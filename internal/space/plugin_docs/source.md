@@ -108,7 +108,7 @@ Elasticsearch（嵌套 DSL，命中在 hits.hits）：
 
 命中任意一条再写脚本：请求要签名 / 时间戳 / 动态 token、响应不是 JSON、结果字段要计算、需要多步请求。
 
-脚本跑在 Deno 沙箱里，**没有网络权限**，分两段：
+脚本跑在 Deno 沙箱里，**只能用 TypeScript / JavaScript 写**（`main.ts`，平台没有 Python / Node 运行时），**没有网络权限**，分两段：
 
 - `plan(input)` 只输出 `{request:{method,url,headers,body}}`，不自己发请求；
 - `map(response)` 收 `{status, body}`，输出 `{results:[...]}`。

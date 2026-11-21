@@ -118,7 +118,11 @@ const pluginDevEvalsDoc = `# 发布前自测（evals.json）
 
 const pluginDevToolDoc = `# 工具插件（kind=tool）
 
-工具跑在沙箱里：文件按 fs 段挂载，出网只能走宿主代理（域名与动词由 capabilities 决定）。默认**一次性**：每次调用起一个进程、跑完即退，不占常驻池。
+**只能用 Deno（TypeScript / JavaScript）写**：执行器就是 deno run，平台没有 Python / Node / shell / Go 运行时，
+沙箱也不给 --allow-run，起不了自己的解释器。入口是单个 .ts 文件，runtime.entry 指向它。
+写成 .py / .sh 时清单仍能解析，但进程起不来——deno 只认 .ts / .js，这一步会在试运行时报错。
+
+工具跑在沙箱里：文件按 fs 段挂载，出网只能走平台代理（域名与动词由 capabilities 决定）。默认**一次性**：每次调用起一个进程、跑完即退，不占常驻池。
 
 ## 清单
 ~~~json

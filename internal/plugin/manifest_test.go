@@ -403,6 +403,28 @@ func TestWSConnectDerivesWriteRisk(t *testing.T) {
 	}
 }
 
+// 执行器只有 deno run：非 .ts / .js 的入口必须在解析期被拦下。
+//
+// 之前这里没有校验，写成 main.py 时清单能过、试运行前的静态检查也过，
+// 失败推迟到真正起进程时以「未知扩展名」出现——作者看不出这是语言限制。
+func TestToolEntryMustBeDenoScript(t *testing.T) {
+	for _, entry := range []string{"main.py", "main.sh", "main"} {
+		raw := strings.Replace(toolManifest(""), `"main.ts"`, `"`+entry+`"`, 1)
+		_, err := Parse([]byte(raw), false)
+		if err == nil {
+			t.Fatalf("%s 不应该通过解析", entry)
+		}
+		if !strings.Contains(err.Error(), "Deno") {
+			t.Fatalf("%s 的错误应说明只能用 Deno，实际: %v", entry, err)
+		}
+	}
+	// .js 与 .ts 一样是可执行入口，不能顺手拦掉。
+	raw := strings.Replace(toolManifest(""), `"main.ts"`, `"main.js"`, 1)
+	if _, err := Parse([]byte(raw), false); err != nil {
+		t.Fatalf(".js 入口应该通过解析: %v", err)
+	}
+}
+
 // 默认一次性：不写 runtime.resident 就不进常驻池。
 func TestResidentDefaultsOff(t *testing.T) {
 	m, err := Parse([]byte(toolManifest("")), false)
