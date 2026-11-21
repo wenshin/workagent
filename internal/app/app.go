@@ -214,18 +214,18 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	log.Info("发布扫描已就绪", "rules", scanner.RulesVersion(), "osv", string(cfg.ScanOsvMode))
 
 	pluginSvc, err := plugin.New(plugin.Options{
-		Store:          st,
-		Storage:        fs,
-		Runner:         shellRunner,
-		Secrets:        secretStore,
-		Logger:         log,
-		Invoker:        invoker,
-		RuntimeDir:     filepath.Join(cfg.StorageRoot, "plugin-runtime"),
-		DefaultInstall: cfg.PluginsDefaultInstall,
-		Sources:        searchReg,
-		Scanner:        scanner,
-		ProcIdle:       time.Duration(cfg.PluginProcIdleSeconds) * time.Second,
-		ProcMax:        cfg.PluginProcMax,
+		Store:           st,
+		Storage:         fs,
+		Runner:          shellRunner,
+		Secrets:         secretStore,
+		Logger:          log,
+		Invoker:         invoker,
+		RuntimeDir:      filepath.Join(cfg.StorageRoot, "plugin-runtime"),
+		DefaultInstall:  cfg.PluginsDefaultInstall,
+		Sources:         searchReg,
+		Scanner:         scanner,
+		ProcMax:         cfg.PluginProcMax,
+		ProcMaxRestarts: cfg.PluginProcMaxRestarts,
 		// 发布门禁跑插件自带的黄金用例：确定性用例总跑，行为用例用平台预算跑
 		Evals: golden.Runner{Options: golden.Options{
 			MaxRounds:    cfg.LLMMaxRounds,

@@ -15,14 +15,17 @@ const spaceFilesDir = "files"
 
 // sandboxFS 把「安装位置 + plugin.json 的 fs 声明」解析成沙箱白名单。
 //
-// 默认边界：整个空间工作区**只读**，空间之外一律不可见；写权限必须显式声明。
-// 清单里的 fs.read / fs.write 只在这个边界内收紧，永远不可能扩出去——
-// 所以这个字段不需要审批，也不可能被作者用来提权。
+// 默认边界：**空间工作区不挂**，插件目录可读写。扩展面只能来自清单的 fs 声明，
+// 且永远落在空间工作区内，越界一律拒绝——所以这个字段不需要审批，也不可能被
+// 作者用来提权。
 //
-// 插件自己的目录总是可读：已发布但不可扩展的插件，运行目录在 published/ 下，
+// 插件自己的目录总是挂：已发布但不可扩展的插件，运行目录在 published/ 下，
 // 不在空间工作区里，不加进去连入口脚本都读不到。
-// 返回值里的 spaceRoot 是挂载后的空间工作区绝对路径，会以 WA_SPACE_DIR
-// 注入沙箱——脚本要直接读文件，就得知道自己的相对路径挂在哪个前缀下。
+//
+// 返回值里的 spaceRoot 只在「确实挂了空间路径」时非空：它对应 WA_SPACE_DIR，
+// 没挂还注入的话 wa.path() 会拼出一个沙箱里不存在的路径，作者看到的只是
+// ENOENT，看不出「这个插件根本没有文件直连权限」。没声明 fs 就拿不到这个变量，
+// 读业务数据请用 file_read 这类工具。
 func (m *Manager) sandboxFS(spaceID, dirKey string, meta Manifest) (sandbox.FS, string, error) {
 	lp, ok := m.o.Storage.(localPathStore)
 	if !ok {
@@ -41,17 +44,33 @@ func (m *Manager) sandboxFS(spaceID, dirKey string, meta Manifest) (sandbox.FS, 
 	if err != nil {
 		return sandbox.FS{}, "", err
 	}
-	return fs, realPath(spaceRoot), nil
+	// 只有声明了空间路径才给 WA_SPACE_DIR：见上面的注释。
+	mounted := ""
+	if meta.FS != nil && (len(meta.FS.Read) > 0 || (!meta.FS.ReadOnly && len(meta.FS.Write) > 0)) {
+		mounted = realPath(spaceRoot)
+	}
+	return fs, mounted, nil
 }
 
 // buildSandboxFS 是纯路径计算，便于单测：调用方负责给出两个真实目录。
+//
+// 默认可见面只有插件自己的目录，**空间工作区不挂**：插件读业务数据走工具调用
+// （file_read 等经 Invoker），不靠文件系统直连。一个插件不应该因为「被装进了
+// 这个空间」就顺带看见这个空间的所有文件——那是安装带来的副作用，不是作者
+// 的显式要求。
+//
+// 清单里的 fs.read / fs.write 是显式例外：作者声明要直连某个子目录时才挂，
+// 路径仍然解析到空间工作区内，越界一律拒绝。
 func buildSandboxFS(spaceRoot, pluginDir string, meta Manifest) (sandbox.FS, error) {
-	// 插件自己的目录总是可读：入口脚本与随包资源都在这里，
-	// 已发布件的运行目录还在 published/ 下，不在空间工作区里。
+	// 插件自己的目录读写都要：入口脚本与随包资源在这里，运行时缓存（临时文件、
+	// 下载中转）也落这里——它是这个插件唯一「属于自己」的可写位置。
+	// 已发布件的运行目录在 published/ 下，同样按这个规则处理。
 	read := []string{realPath(pluginDir)}
-	if meta.FS == nil || len(meta.FS.Read) == 0 {
-		read = append(read, realPath(spaceRoot))
-	} else {
+	var write []string
+	if meta.FS == nil || !meta.FS.ReadOnly {
+		write = append(write, realPath(pluginDir))
+	}
+	if meta.FS != nil {
 		for _, rel := range meta.FS.Read {
 			p, err := resolveUnder(spaceRoot, rel)
 			if err != nil {
@@ -59,17 +78,14 @@ func buildSandboxFS(spaceRoot, pluginDir string, meta Manifest) (sandbox.FS, err
 			}
 			read = append(read, p)
 		}
-	}
-
-	// 写权限只在声明时给：没写 fs.write 就是完全只读（含自己的工作区）。
-	var write []string
-	if meta.FS != nil && !meta.FS.ReadOnly {
-		for _, rel := range meta.FS.Write {
-			p, err := resolveUnder(spaceRoot, rel)
-			if err != nil {
-				return sandbox.FS{}, err
+		if !meta.FS.ReadOnly {
+			for _, rel := range meta.FS.Write {
+				p, err := resolveUnder(spaceRoot, rel)
+				if err != nil {
+					return sandbox.FS{}, err
+				}
+				write = append(write, p)
 			}
-			write = append(write, p)
 		}
 	}
 	return sandbox.FS{Read: read, Write: write}, nil

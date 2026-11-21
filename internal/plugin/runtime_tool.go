@@ -68,7 +68,7 @@ type invokeInput struct {
 	// Version 用于隔离 DENO_DIR：同一插件不同版本的缓存不能混，
 	// 否则回滚到旧版本会拿到新版本编译出来的产物。
 	Version string
-	// FS 是文件访问白名单（空间工作区 + 清单 fs 收紧后的结果）。
+	// FS 是文件访问白名单（插件目录 + 清单 fs 声明的空间子目录）。
 	// 它同时喂给沙箱挂载和 deno 的 --allow-read/--allow-write：
 	// 挂载决定「路径存不存在」，权限决定「deno 允不允许读」，缺一层都算没管。
 	FS sandbox.FS
@@ -76,9 +76,11 @@ type invokeInput struct {
 	NetHosts []string
 	// SpaceRoot 是空间工作区的绝对路径，以 WA_SPACE_DIR 注入：
 	// 文件改直连后，脚本得知道自己的相对路径挂在哪。
+	// 只有清单 fs 声明了空间路径时才非空——空间工作区默认不挂。
 	SpaceRoot string
 	// OneShot 为 true 时不起常驻进程：试运行必须跑完就退，
-	// 否则草稿代码会一直挂在池里，改一次就要等空闲回收。
+	// 否则草稿会一直挂在池里，而常驻进程不按空闲回收——改一次就永远占着一个名额，
+	// 还得等草稿变更的 killPrefix 才清掉。
 	OneShot bool
 	// WSHosts 是 ws.connect 声明的域名：非空才注入 HTTPS_PROXY 并放行 CONNECT。
 	WSHosts []string
@@ -98,8 +100,9 @@ func residentKey(spaceID, slug, dir string) string {
 
 // denoDir 是该插件版本的 Deno 缓存目录。
 //
-// 放在租户缓存下而不是插件目录里：同一版本被多个空间安装时共用一份，
-// 而且插件目录是只读挂载，编译产物根本写不进去。
+// 放在租户缓存下而不是插件目录里：同一版本被多个空间安装时共用一份。
+// 插件目录对运行时是可写的（作者可能往里写缓存），但那是「每个安装副本一份」，
+// 而 DENO_DIR 要按 slug@version 跨空间复用，两者的生命周期不同。
 func (r *toolRuntime) denoDir(slug, version string) string {
 	name := slug
 	if version != "" {
@@ -174,6 +177,8 @@ type rpcReply struct {
 //
 // 声明了 runtime.resident 的插件复用常驻进程：冷启动约 50–180ms，
 // 连接、缓存、模块级状态跨调用保留，代价是常占内存与一个池名额。
+// 常驻进程不按空闲回收（见 resident.go 的说明），所以试运行一律 OneShot，
+// 草稿代码不能留在池里。
 // OneShot 走一次性执行，用于试运行与不方便持有进程的场景。
 func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
 	if r.deno == "" {
@@ -190,12 +195,34 @@ func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMe
 		return "", err
 	}
 	out, err := rp.invoke(ctx, in, input)
-	if err != nil && rp.dead() {
-		// 进程已经死了就从池里摘掉，下一次调用重新起一个，
-		// 否则每个后续调用都会先撞一次「进程已退出」。
-		r.pool.drop(key, rp)
+	if err == nil || !rp.dead() {
+		// 进程活着就算健康：插件正常返回业务错误不算崩溃。
+		// 真崩了（含超时被杀）由守护协程重启，这里不摘——摘掉它守护就找不到这个键了。
+		r.pool.markHealthy(key)
 	}
 	return out, err
+}
+
+// Warm 在安装/启用后立刻把常驻进程拉起来。
+//
+// 运行期不能依赖「第一次调用时冷启动」：那一次调用要多付 100–300ms，
+// 更糟的是插件常在启动时建连接、加载字典或预热模型——让第一个业务请求
+// 承担这段初始化，失败就是一次真实的业务失败。
+//
+// 只对声明了 runtime.resident 的工具生效：一次性插件没有「空闲进程」可言，
+// 进程就是调用本身。调用方（安装/启用）失败只记日志，不阻断安装。
+func (r *toolRuntime) Warm(ctx context.Context, in invokeInput) error {
+	if r.deno == "" {
+		return errors.New("当前环境没有 deno，无法启动常驻插件")
+	}
+	if r.pool == nil || in.OneShot {
+		return nil
+	}
+	key := residentKey(in.SpaceID, in.Slug, in.Dir)
+	_, err := r.pool.acquire(key, r, func() (*sandbox.Proc, error) {
+		return r.startProc(ctx, in, true)
+	})
+	return err
 }
 
 // procSpec 是启动插件进程的静态参数，一次性与常驻共用。

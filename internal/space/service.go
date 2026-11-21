@@ -680,7 +680,7 @@ func draftScaffold(kind, slug, name, desc string) (map[string]string, error) {
 export default async function (input: Record<string, unknown>) {
   // 出网：先在 plugin.json 的 capabilities 里声明 hosts，再用 wa.fetch（走宿主代理）
   //   const res = await wa.fetch("https://api.example.com/x");
-  // 读文件：沙箱里已经按 fs 段挂载，直接读
+  // 读文件：清单声明了 fs.read 才有 WA_SPACE_DIR，否则拿不到空间文件
   //   const text = await Deno.readTextFile(wa.path("data/x.json"));
   return { ok: true, input };
 }

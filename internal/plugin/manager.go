@@ -57,10 +57,13 @@ type Options struct {
 	// Scanner 是发布前的安全扫描器（docs/插件安全基线.md）。为 nil 时不扫描，
 	// 也不落扫描记录——「没配」必须和「扫过且干净」区分开。
 	Scanner *securityscan.Engine
-	// ProcIdle 是插件常驻进程的空闲回收时间，<=0 用 DefaultProcIdle。
-	ProcIdle time.Duration
 	// ProcMax 是常驻进程上限，<=0 用 DefaultProcMax。
+	// 上限只在池满时淘汰最久未用的空闲进程，不是空闲回收。
 	ProcMax int
+	// ProcMaxRestarts 是常驻进程连续崩溃后自动重启的次数上限，<0 用默认 5。
+	// 超过就熔断：不再重启，调用直接返回「插件不可用」，等重新安装/改配置
+	// 走 closePrefix 清掉计数后恢复。
+	ProcMaxRestarts int
 	// Evals 用于跑插件自带的 agent 类黄金用例；为 nil 时这类用例跳过并记入报告，
 	// 不阻塞发布——发布门禁不能依赖外部模型可用。
 	Evals EvalRunner
@@ -204,7 +207,7 @@ func New(o Options) (*Manager, error) {
 	}
 	// 每个插件一个常驻进程：安装/停用/卸载/重载都会把对应进程关掉，
 	// 保证「跑着的代码 = 现在磁盘上的代码」。
-	m.rt.pool = newResidentPool(o.ProcIdle, o.ProcMax, o.Logger)
+	m.rt.pool = newResidentPool(o.ProcMax, o.ProcMaxRestarts, o.Logger)
 	return m, nil
 }
 
@@ -947,6 +950,9 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 	if inst.Source != nil {
 		m.registerSource(in.SpaceID, sysID, inst)
 	}
+	// 装完就起常驻进程：运行期不能依赖「第一次调用时冷启动」。
+	// 同步创建进程（模块加载在后台继续），失败只记日志、不阻断安装。
+	m.warmResident(ctx, inst)
 	m.recordAudit(ctx, in.UserID, "plugin.install", in.Slug, v.Version,
 		map[string]any{"risk": risk, "space": in.SpaceID})
 	return install, nil
@@ -1059,6 +1065,8 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 		if err := m.reloadSpace(ctx, spaceID); err != nil {
 			m.o.Logger.Warn("重载空间失败", "space", spaceID, "err", err)
 		}
+		// 停用时进程被杀了：重新启用要立刻拉起来，不能等下一次调用。
+		m.warmResidentFor(ctx, spaceID, slug)
 	} else {
 		// 停用是 kill switch：先把源摘掉，不等下一次重载
 		m.unregisterSource(spaceID, slug, global)
@@ -1721,27 +1729,100 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 	return out
 }
 
-func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawMessage, env tool.Env) (string, error) {
+// toolInvokeInput 把实例组装成一次脚本调用的参数。
+//
+// 预热与正式调用必须走同一个函数：否则会出现「装完预热的 FS 是 A，
+// 真调用时是 B」这种只在某个路径上暴露的错，且两边都看着没问题。
+func (m *Manager) toolInvokeInput(inst *instance, userID string) (invokeInput, error) {
 	allow, verbs, secrets := inst.Manifest.HostAllow()
-	fs, spaceDir, fsErr := m.sandboxFS(inst.SpaceID, inst.Dir, inst.Manifest)
-	if fsErr != nil {
-		return "", fsErr
+	fs, spaceDir, err := m.sandboxFS(inst.SpaceID, inst.Dir, inst.Manifest)
+	if err != nil {
+		return invokeInput{}, err
 	}
-	out, err := m.rt.Call(ctx, invokeInput{
+	return invokeInput{
 		Dir: inst.Dir, Entry: inst.Manifest.Runtime.Entry,
 		Limits: inst.Manifest.Limits, SpaceID: inst.SpaceID,
-		UserID: env.UserID, Slug: inst.Slug, Version: inst.Version,
+		UserID: userID, Slug: inst.Slug, Version: inst.Version,
 		FS: fs, SpaceRoot: spaceDir,
 		NetHosts: inst.Manifest.NetHosts(), WSHosts: inst.Manifest.WSNetHosts(),
 		Allow: allow, Verbs: verbs, Secrets: secrets,
 		Config: inst.Config,
 		// 默认一次性：跑完即退，不占常驻池。声明 runtime.resident 才复用进程。
 		OneShot: !inst.Manifest.Runtime.Resident,
-	}, args)
+	}, nil
+}
+
+func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawMessage, env tool.Env) (string, error) {
+	in, err := m.toolInvokeInput(inst, env.UserID)
+	if err != nil {
+		return "", err
+	}
+	out, err := m.rt.Call(ctx, in, args)
 	if err != nil {
 		return "", err
 	}
 	return truncate(out, inst.Manifest.Limits.MaxResultBytes), nil
+}
+
+// warmResident 在安装/启用后立刻拉起常驻工具进程。
+//
+// 试运行、草稿、一次性插件都不在这里：试运行必须跑完即退，一次性插件
+// 没有「空闲进程」可言。
+//
+// 失败只记日志，不阻断安装：开发机上没有 deno、或插件启动即崩都很常见，
+// 那种情况下装成功、首次调用再试一次更符合预期；连续失败会由守护协程熔断。
+func (m *Manager) warmResident(ctx context.Context, inst *instance) {
+	if m.rt == nil || inst == nil || inst.Manifest.Kind != KindTool {
+		return
+	}
+	if !inst.Manifest.Runtime.Resident {
+		return
+	}
+	in, err := m.toolInvokeInput(inst, "")
+	if err != nil {
+		m.o.Logger.Warn("常驻插件预热失败：文件白名单不可用", "slug", inst.Slug, "err", err)
+		return
+	}
+	// 用独立的 ctx：安装请求随时可能结束，但预热出来的进程要活下去。
+	// startProc 对常驻会把父 ctx 换成 Background，这里的超时只约束冷启动本身。
+	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m.rt.Warm(cctx, in); err != nil {
+		m.o.Logger.Warn("常驻插件预热失败，首次调用时将重试",
+			"slug", inst.Slug, "version", inst.Version, "err", err)
+		return
+	}
+	m.o.Logger.Info("常驻插件已启动", "space", inst.SpaceID, "slug", inst.Slug, "version", inst.Version)
+}
+
+// warmResidentFor 预热本空间已加载的某个插件（启用后调用）。
+func (m *Manager) warmResidentFor(ctx context.Context, spaceID, slug string) {
+	m.mu.RLock()
+	inst := m.inst[spaceID][slug]
+	m.mu.RUnlock()
+	if inst == nil {
+		return
+	}
+	m.warmResident(ctx, inst)
+}
+
+// warmSpaceResident 预热本空间所有常驻工具。
+//
+// 空间首次加载（服务重启后第一个访问）与空间重载都走这里：常驻是「运行期
+// 常在线」的承诺，不能拖到某个业务请求上才兑现。异步执行——加载路径不该
+// 被 N 个插件的冷启动拖住。
+func (m *Manager) warmSpaceResident(ctx context.Context, spaceID string) {
+	m.mu.RLock()
+	list := make([]*instance, 0, len(m.inst[spaceID]))
+	for _, inst := range m.inst[spaceID] {
+		list = append(list, inst)
+	}
+	m.mu.RUnlock()
+	for _, inst := range list {
+		if inst.Manifest.Kind == KindTool && inst.Manifest.Runtime.Resident {
+			m.warmResident(ctx, inst)
+		}
+	}
 }
 
 // registerTools 把插件工具注册进能力与工具两层，让策略与 Invoker 自动生效。
@@ -1910,6 +1991,11 @@ func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
 			m.registerSource(spaceID, sysID, inst)
 		}
 	}
+
+	// 空间加载完成就拉起常驻工具：服务重启后第一个访问这个空间的人，
+	// 不应该成为第一个替所有人付冷启动的人。异步做——加载路径不该被
+	// N 个插件的启动时间串起来。
+	go m.warmSpaceResident(context.Background(), spaceID)
 	return nil
 }
 

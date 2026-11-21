@@ -145,7 +145,7 @@ type Server struct {
 // ListenTCP 在 TCP 地址上监听。
 //
 // 与 unix socket 的取舍：unix socket 更严（路径要显式挂进沙箱，父目录不可见），
-// 但只有自己实现 HTTP 客户端的运行时（Deno）能用它。npm / fnm / uv / curl 这些
+// 但只有自己实现 HTTP 客户端的运行时（Deno）能用它。mise / npm / curl 这些
 // 只认 HTTP_PROXY 里的 http://host:port，而 --unshare-net 的沙箱连 loopback 都
 // 不可达，所以这类工具必须配 --share-net + TCP 代理。
 //

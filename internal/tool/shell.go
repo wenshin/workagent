@@ -169,8 +169,8 @@ func shellExec() Tool {
 // 按 region 换一整套源即可，不用重新编译。
 type InstallMirrors struct {
 	NPM  string // npm / pnpm / yarn
-	PyPI string // pip / uv
-	Node string // fnm 拉 node 二进制
+	PyPI string // pip
+	Node string // mise 拉 node 二进制
 	Go   string // GOPROXY
 }
 
@@ -263,10 +263,15 @@ func InstallEnv(spaceRoot, workDir string) []string {
 	venv := filepath.Join(pkg, "venv")
 	npm := filepath.Join(pkg, "npm")
 	cache := CacheRoot()
+	mise := filepath.Join(cache, "mise")
 	m := installMirror
+	// mise 装的运行时通过 shims 暴露成普通命令：`mise use -g node@22` 会写 shims，
+	// PATH 里有它就能直接用 node，不需要 source 任何脚本（shell_exec 是独立的
+	// 非交互 sh -c，靠 shell 集成改 PATH 的做法在这里不成立）。
 	path := strings.Join([]string{
 		filepath.Join(venv, "bin"),
 		filepath.Join(npm, "bin"),
+		filepath.Join(mise, "shims"),
 	}, ":") + ":" + sandbox.FallbackPath()
 	return []string{
 		"WA_SPACE_DIR=" + spaceRoot,
@@ -281,8 +286,17 @@ func InstallEnv(spaceRoot, workDir string) []string {
 		"PIP_DISABLE_PIP_VERSION_CHECK=1",
 		"GOPROXY=" + m.Go,
 		"GOMODCACHE=" + filepath.Join(cache, "go", "mod"),
-		"FNM_DIR=" + filepath.Join(cache, "fnm"),
-		"FNM_NODE_DIST_MIRROR=" + m.Node,
+		// mise 的数据 / 配置必须在这里给：它们依赖 CacheRoot，父进程不知道。
+		// HOME 是每次调用的私有 tmp，放默认位置等于每次重装、全局版本配置丢失。
+		"MISE_DATA_DIR=" + mise,
+		"MISE_CACHE_DIR=" + filepath.Join(mise, "cache"),
+		"MISE_CONFIG_DIR=" + filepath.Join(mise, "config"),
+		"MISE_NODE_MIRROR=" + m.Node,
+		// python 走预编译包，不编译源码（否则一次 mise use python@3.12 要几分钟）。
+		"MISE_PYTHON_COMPILE=false",
+		"MISE_YES=1",
+		// 沙箱里 agent 可能写 mise.toml；信任提示只会让它卡住，且容器本身就是一次性的。
+		"MISE_TRUSTED_CONFIG_PATHS=/",
 		// HOME 是每次调用的私有 tmp，缓存放那里等于每次重下。
 		"XDG_CACHE_HOME=" + filepath.Join(cache, "xdg"),
 		"PATH=" + path,

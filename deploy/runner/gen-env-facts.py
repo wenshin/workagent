@@ -18,10 +18,10 @@ import sys
 
 # 只列会影响「能写什么命令」的工具。加新工具时同步加到这里。
 # 不列 bwrap：模型不会直接调用它，写进提示词只是白占 token。
-# uv / corepack 要列：它们是「装老版本」的入口，模型不知道就不会用。
+# mise 必须列：node / 其他 python 版本全靠它装，模型不知道就会去解压 tarball。
+# node 不在列表里：镜像不预装，由 mise 按需装到租户缓存。
 TOOLS = [
-    "python3", "pip3", "uv",
-    "node", "npm", "pnpm", "fnm", "deno",
+    "python3", "pip3", "mise", "deno",
     "git", "jq", "curl", "bash", "tar", "unzip", "gcc", "make", "pkg-config",
 ]
 
@@ -66,8 +66,7 @@ def clean(name: str, line: str) -> str:
         "make": lambda s: s.split()[-1],
         "unzip": lambda s: s.split()[1] if len(s.split()) > 1 else s,
         "deno": lambda s: s.split()[1] if len(s.split()) > 1 else s,
-        "uv": lambda s: s.split()[1] if len(s.split()) > 1 else s,
-        "fnm": lambda s: s.split()[1] if len(s.split()) > 1 else s,
+        "mise": lambda s: s.split()[0],
         "pip3": lambda s: s.split()[1] if len(s.split()) > 1 else s,
     }
     f = rules.get(name)

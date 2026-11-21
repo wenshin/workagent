@@ -64,12 +64,12 @@
 |---|---|---|---|
 | 空间 shell | 一个空间 | 基础镜像，`apt` 装进执行体可写层 | 一次命令一个进程 |
 | 插件开发 | 一个草稿目录 | 基础镜像，同空间规则 | 一次命令一个进程 |
-| 插件运行 | 一个空间 | 基础镜像 + 按 `deno.lock` 预热 | 常驻池，空闲回收 |
+| 插件运行 | 一个空间 | 基础镜像 + 按 `deno.lock` 预热 | 常驻池：安装即启、崩溃重启、连续失败熔断 |
 
 三者**不共用沙箱实例**。空间 shell 里 agent 可以 `apt install` 任何东西，插件运行必须保证不受影响——靠的不是 Pod 边界，是这两条：
 
-- 插件沙箱不挂空间目录，代码只读挂载，数据走 host SDK
-- 两者只共享租户缓存（`DENO_DIR` 与包缓存），不共享文件系统
+- 插件沙箱**不挂空间工作区**（清单 `fs` 显式声明才挂子目录），插件目录本身可读写，业务数据走工具调用
+- 两者只共享租户缓存（`DENO_DIR` 与包缓存），不共享空间文件
 
 `apt install` 装进的是执行体自己的可写层，所有空间共用这一层——这是接受的设计，持久性靠缓存重装，不靠隔离。风险由 `apt` / `dpkg` 的审批兜住。
 
@@ -231,7 +231,7 @@ mise ls --installed
 
 | 位置 | 现状 | 目标 |
 |---|---|---|
-| `deploy/runner/gen-env-facts.py` | `TOOLS` 17 项；硬编码 `network` / `persistent`；`os` 里混着架构 | 只留 `mise` / `python3` / `deno`；删 `network` / `persistent`；`arch` 拆成独立字段 |
+| `deploy/runner/gen-env-facts.py` | `TOOLS` 13 项；硬编码 `network` / `persistent`；`os` 里混着架构 | 只留 `mise` / `python3` / `deno`；删 `network` / `persistent`；`arch` 拆成独立字段 |
 | `internal/sandbox/envfacts.go` | 有 `Writable` / `Sources` / `Persistent` / `Network` 字段 | 失去来源，可删；`writeExecFacts` 与 `envfacts_test.go` 跟着调 |
 | `internal/agent/prompt.go` | `execToolsLimit = 24` | 降到 3，或按"只允许三项"校验 |
 
@@ -319,7 +319,7 @@ npm i -g typescript     → <空间>/.pkg/npm          → 不用管
 
 > 容器闲置会被回收，系统目录回到基础镜像。缺什么直接装，包在本地缓存里，不需要联网。
 
-放在「平台」段，和"空闲 5 分钟回收"写在一起。
+放在「平台」段，和「容器闲置会被回收」写在一起。
 
 ### 为什么不记清单
 
@@ -353,9 +353,14 @@ apt install ffmpeg=7:5.1.6-0+deb12u1
 
 ```
 MISE_DATA_DIR=/cache/mise
+MISE_CONFIG_DIR=/cache/mise/config
 ```
 
 版本目录天然持久，容器重建后 `mise` 直接识别，不用重装也不用打包。
+
+`MISE_CONFIG_DIR` 不能省：`mise use -g node@22` 的「全局默认版本」记在配置目录里，跟着容器 HOME 走就会每次丢失——版本文件还在缓存里，但 `mise` 不知道哪个版本是默认，shims 也不会生成。
+
+PATH 里必须加 `$MISE_DATA_DIR/shims`：`shell_exec` 是独立的非交互 `sh -c`，`mise activate` 那种改 shell 环境的做法在这里不成立，只能走 shims。插件侧不用关心 mise——工具与搜索源只能用 Deno，不需要装任何运行时。
 
 为什么不放空间目录：同一个租户的 20 个空间装同一个 `node@22`，放空间目录就是 20 份、20 次下载；放租户缓存是 1 份。展开见「依赖缓存」。
 
@@ -388,14 +393,13 @@ MISE_DATA_DIR=/cache/mise
 │   │   └── archives/             .deb
 │   ├── mise/
 │   │   ├── downloads/            原始 tarball
-│   │   └── installs/             解压后的运行时（各版本共存）
-│   ├── tarballs/                 node / deno / go / python 官方包
+│   │   ├── installs/             解压后的运行时（各版本共存）
+│   │   └── config/               全局版本配置（MISE_CONFIG_DIR）
 │   ├── go/
 │   │   ├── mod/                  GOMODCACHE
 │   │   └── build/                GOCACHE
 │   ├── npm/
 │   ├── pip/
-│   ├── uv/
 │   ├── deno/<slug>@<version>/    DENO_DIR，按插件版本分，跨空间共享
 │   └── xdg/                      XDG_CACHE_HOME
 └── spaces/<space>/               空间目录
@@ -413,12 +417,10 @@ MISE_DATA_DIR=/cache/mise
 | 层 | 缓存内容 | 接入方式 | 需挂载 |
 |---|---|---|---|
 | apt | `.deb` + 索引 | 两个目录都挂载 | **是** |
-| mise | tarball + 解压产物 | `MISE_DATA_DIR` | 否 |
-| node / deno / go | 官方 tarball | 安装脚本先查缓存 | 否 |
+| mise | tarball + 解压产物 + 全局版本配置 | `MISE_DATA_DIR` / `MISE_CONFIG_DIR` | 否 |
 | Go | 模块 + 编译产物 | `GOMODCACHE` / `GOCACHE` | 否 |
 | npm | 包 tarball | `NPM_CONFIG_CACHE` | 否 |
 | pip | wheel | `PIP_CACHE_DIR` | 否 |
-| uv | wheel | `UV_CACHE_DIR` | 否 |
 
 **只有 apt 不认环境变量**，两种接法：
 
@@ -439,11 +441,12 @@ Dir::Cache::archives "/cache/apt/archives";
 
 ```bash
 export MISE_DATA_DIR=/cache/mise
+export MISE_CONFIG_DIR=/cache/mise/config
+export MISE_CACHE_DIR=/cache/mise/cache
 export GOMODCACHE=/cache/go/mod
 export GOCACHE=/cache/go/build
 export NPM_CONFIG_CACHE=/cache/npm
 export PIP_CACHE_DIR=/cache/pip
-export UV_CACHE_DIR=/cache/uv
 ```
 
 ### 语言包的全局安装
@@ -558,7 +561,7 @@ apt install -y jq && ls /cache/apt/archives/*.deb
 | apt | `partial/` + rename，同包并发会有一方失败重试，可接受 |
 | mise | `locks/` 目录 flock |
 | Go mod / GOCACHE | 内部加锁 + 内容哈希命名 + 原子 rename |
-| npm / pip / uv | 各自有锁 |
+| npm / pip | 各自有锁 |
 
 apt 是唯一需要留意的。它的锁在 `/var/lib/dpkg/lock`，是**容器内**的，跨容器不共享。所以两个空间同时下同一个 deb 时，后到的那个会写 `partial/` 并 rename 覆盖——结果正确，只是重复下载了一次。
 
@@ -572,9 +575,8 @@ apt 是唯一需要留意的。它的锁在 `/var/lib/dpkg/lock`，是**容器�
 |---|---|
 | apt archives + lists | 630M（约 20 个常用包 + 30M 索引） |
 | mise installs | 300M（node + python） |
-| tarballs | 100M |
 | go mod + build | 1～3G |
-| npm / pip / uv | 800M |
+| npm / pip | 800M |
 | **合计** | **约 3～5G** |
 
 Go 的两块最大，但 Go 自己会在 `GOCACHE` 超过 10G 时自动淘汰最旧的，基本不用管。
@@ -584,8 +586,8 @@ Go 的两块最大，但 Go 自己会在 `GOCACHE` 超过 10G 时自动淘汰最
 | 缓存 | 方式 |
 |---|---|
 | apt | 按 mtime 删 90 天未访问 |
-| mise / tarballs | 保留最近 N 个版本 |
-| npm / pip / uv | 各自 `cache clean` |
+| mise | 保留最近 N 个版本 |
+| npm / pip | 各自 `cache clean` |
 | GOCACHE | 交给 Go |
 
 **缓存满了不是"不省了"，是故障。** PVC 写满后 `apt install` 直接报 `No space left on device`，而这个错误出现在挂载点上，和"容器磁盘满"无法区分，排查成本很高。
@@ -754,7 +756,10 @@ shell 出网一律 `share-net` 直连，不建代理：`apt` / `pip` / `npm` 只
 | `NPM_CONFIG_CACHE` | `/cache/npm` | 每次重下 |
 | `VIRTUAL_ENV` | `<空间>/.pkg/venv` | pip 落到系统 python，撞 PEP 668 |
 | `PIP_CACHE_DIR` | `/cache/pip` | 每次重下 |
-| `PATH` | `venv/bin` + `npm/bin` + 基线 | 装了也找不到命令 |
+| `MISE_DATA_DIR` | `/cache/mise` | `mise use` 装进临时 HOME，重建后丢 |
+| `MISE_CONFIG_DIR` | `/cache/mise/config` | 全局默认版本丢失，shims 不生成 |
+| `MISE_NODE_MIRROR` | 镜像源 | 装 node 时连官方源，白名单下卡到超时 |
+| `PATH` | `venv/bin` + `npm/bin` + `mise/shims` + 基线 | 装了也找不到命令（`sh -c` 没有 shell 集成） |
 
 `PATH` 必须以基线收尾：`--clearenv` 之后只拼私有目录，连 `/bin/sh` 都会找不到。
 
@@ -778,7 +783,7 @@ shell 出网一律 `share-net` 直连，不建代理：`apt` / `pip` / `npm` 只
 | | 开发时 | 运行时 |
 |---|---|---|
 | 能起子进程 | 能 | **不能**（没有 `--allow-run`） |
-| 能读写任意路径 | 能（执行体内） | 只能访问挂载进来的路径 |
+| 文件面 | 草稿目录（可写）+ `system-write` 档位 | 插件目录（可写）+ 清单声明的空间子目录 |
 | 网络 | 总是给网（人为操作） | 只有 socket 代理 |
 
 这个差异必须在开发阶段就暴露，不能等到发布后才发现 `NotCapable`。现在有两道：
@@ -796,11 +801,13 @@ shell 出网一律 `share-net` 直连，不建代理：`apt` / `pip` / `npm` 只
 
 | 路径 | 权限 | 说明 |
 |---|---|---|
-| 插件目录 | 只读 | 代码 + `deno.lock` |
+| 插件目录 | **可写** | 代码 + `deno.lock`；运行时缓存（临时文件、下载中转）也落这里 |
 | `DENO_DIR` | 可写 | `/cache/deno/<slug>@<version>`，只有 `gen/` 会写 |
-| 空间工作区 | 只读 | 插件用 `wa.path()` + `Deno.readTextFile` 直连 |
+| 空间工作区 | **不挂** | 默认零可见；清单 `fs.read` / `fs.write` 声明后才挂对应子目录 |
 
-空间工作区是**只读挂载**而不是不挂：文件改直连之后（`buildSandboxFS` 默认把 `spaceRoot` 放进读表），插件读业务数据不必经 RPC 搬一遍，而写仍然只能来自清单的 `fs.write`——越权写被挂载表与 `--allow-write` 两层同时挡住。之前「数据一律走 host SDK」的描述已经过时。
+空间工作区**默认不挂**：插件看不见这个空间的文件，读业务数据走 `file_*` 工具（经 `Invoker`，带策略、审批与审计）。安装一个插件不该顺带把整个空间的文件交出去——可见面必须来自作者的显式声明，而不是安装动作的副作用。清单里写了 `fs.read` / `fs.write` 才挂那些子目录，且仍然只能落在空间工作区内。
+
+插件目录**可写**：入口与随包资源在这里，运行时缓存也需要一个属于自己的可写位置（`DENO_DIR` 只装 Deno 自己的缓存，插件业务缓存放不进去）。已安装插件从 `published/` 起 runtime，那份目录跨空间共享，写进去会落在共享件上——插件来自系统管理员审核过的发布包，这个取舍是可接受的；`fs.read_only` 可以把它彻底关掉。
 
 ### 常驻进程
 
@@ -810,9 +817,12 @@ shell 出网一律 `share-net` 直连，不建代理：`apt` / `pip` / `npm` 只
 |---|---|
 | 传输 | `POST /v1/procs`：请求体 = 4 字节长度 + JSON `Spec` + 上行 NDJSON，响应体 = 下行 NDJSON |
 | 复用键 | `空间\|slug\|目录`，同一个键在执行体内只有一个进程 |
+| 一次性插件 | 不声明 `runtime.resident` 就每次起一个进程，`defer Close()` 跑完即回收，不进池 |
+| 启动时机 | **安装/升级/重新启用就拉起**（同步创建进程，模块加载在后台继续）；服务重启后空间首次加载时异步拉起。不在「第一次调用」时才冷启动 |
 | 终止 | 任一方向关闭连接即杀进程；没有额外的心跳或注册表 |
-| 空闲回收 | 控制面 `residentPool`（默认 10 分钟 / 上限 32），执行体不自己回收 |
-| 崩溃恢复 | 流断开 → 控制面 `residentProc.done` → 下次调用重起一个 |
+| 空闲回收 | **不回收**：常驻的收益是摊掉冷启动与保留进程内状态，空闲几分钟就杀等于退回一次性；只在池满（`PLUGIN_PROC_MAX`，默认 32）时淘汰最久未用的空闲进程，执行体不自己回收 |
+| 崩溃恢复 | 流断开 → 控制面 `residentProc.done`（`crashed`）→ 守护协程按指数退避重启（300ms→5s）；那一枪不重放，后续调用可用 |
+| 熔断 | 连续崩溃超过 `PLUGIN_PROC_MAX_RESTARTS`（默认 5）次停止重启，调用直接报「插件不可用」；成功一次即清零，重装/改配置/改草稿清掉熔断 |
 
 为什么不是「每插件一个容器」：常驻的收益是摊掉 Deno 50～180ms 冷启动，每插件一个 Pod 要等调度、挂镜像、建网络，冷启动回到秒级；`DENO_DIR` 也没法按 `slug@version` 跨空间共享。隔离仍然靠 bwrap——同一执行体里每个插件进程的挂载表、网络命名空间各不相同。
 
@@ -1069,7 +1079,9 @@ if spec.Proxy != "" && spec.HostRPC != nil {
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| 插件常驻回收 | **5 分钟** | 只有常驻 deno 进程有回收；沙箱是单次进程 |
+| 插件常驻回收 | **不回收** | 常驻就是为摊掉冷启动与保留进程内状态；只在池满（上限 32）时淘汰最久未用的空闲进程，一次性插件跑完即回收 |
+| 常驻启动 | 安装/启用即起 | 不在第一次调用时冷启动；服务重启后空间首次加载时异步拉起 |
+| 常驻崩溃 | 自动重启 + 熔断 | 指数退避 300ms→5s，连续 5 次（`PLUGIN_PROC_MAX_RESTARTS`）后停止并报「插件不可用」 |
 | 单执行体内存 limit | 2Gi | 见 `deploy/local/10-runner.yaml` |
 | 并发沙箱上限 | 按节点容量 | 超限排队，不直接失败 |
 | 空间磁盘配额 | 每空间 5Gi（`WA_SPACE_QUOTA_MB`） | 含 `.pkg`（全局包 + venv 约 100MB） |
@@ -1087,7 +1099,7 @@ if spec.Proxy != "" && spec.HostRPC != nil {
 | 项 | 决定 |
 |---|---|
 | 容器密度 | 单执行体多沙箱；扩容加执行体副本 |
-| 启动方式 | 沙箱按需起进程（毫秒级）；插件常驻进程空闲 5 分钟回收 |
+| 启动方式 | 沙箱按需起进程（毫秒级）；插件常驻进程安装/启用即启动，不按空闲回收，崩溃自动重启（连续 5 次熔断），池满淘汰 |
 | 插件运行执行体 | 与空间 shell 同一套 bwrap、独立 Spec；不挂空间目录，改不到别人的环境 |
 | 系统安装 | `system-write` 档位直接 bind 执行体可写层；持久性靠 `/cache` 里的 deb 重装，不靠隔离 |
 | 运行时管理 | `mise` 统一管理，基础镜像只预装 `deno` 与系统 `python3` |
@@ -1102,6 +1114,6 @@ if spec.Proxy != "" && spec.HostRPC != nil {
 | Deno 依赖 | 只带 `deno.lock`；安装期 `deno cache --frozen` 预热到 `/cache/deno/<slug>@<version>`，运行期 `--cached-only` |
 | pip 限制 | venv 已预置在 `.pkg/venv` 且在 `PATH` 最前，`pip install` 直接可用，绕开 PEP 668 |
 | 基础镜像 | 钉 digest，从公共或已有镜像源拉，不自建 registry |
-| 环境自述 | `/etc/wa/env.json` 只描述基础镜像（`os` / `arch` / `mise` / `python3` / `deno`），运行时不更新；其余能力由 agent 用 `shell_exec` 探测 |
-| 依赖缓存 | 租户级共享（apt / mise / go / npm / pip / uv），租户间隔离 |
+| 环境自述 | `/etc/wa/env.json` 只描述基础镜像（`os` / `arch` / `mise` / `python3` / `deno` / `git` / `jq` 等常用命令），运行时不更新；其余能力由 agent 用 `shell_exec` 探测 |
+| 依赖缓存 | 租户级共享（apt / mise / go / npm / pip / deno），租户间隔离 |
 | 缓存回源 | 直连内部源；节点数过 10 或需要审计时加代理服务 |

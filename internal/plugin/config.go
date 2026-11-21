@@ -314,6 +314,9 @@ func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string
 		return ConfigView{}, err
 	}
 
+	// 常驻进程的启动参数里捕获了配置（invokeInput），配置一变必须换进程，
+	// 否则改完配置、跑的还是旧值，而且怎么看都不像配置没生效。
+	m.closeSlugProcs(spaceID, slug)
 	// 配置变了就整空间重载：只删单个 slug 会让 ensureLoaded 误以为已加载。
 	m.mu.Lock()
 	delete(m.inst, spaceID)

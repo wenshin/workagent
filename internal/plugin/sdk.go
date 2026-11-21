@@ -201,10 +201,17 @@ const readBody = async (r: SockReader, headers: Headers): Promise<Uint8Array> =>
 export const wa = {
   /**
    * 把「相对空间工作区的路径」拼成绝对路径，直接喂给 Deno.readTextFile 等。
-   * 没声明的目录在沙箱里根本不存在，报的是 ENOENT。
+   * 前提是清单 fs 段声明过对应目录：空间工作区默认不挂，没声明时连
+   * WA_SPACE_DIR 都不会注入，这里直接报错而不是拼一个不存在的路径。
    */
   path(rel: string) {
-    const root = Deno.env.get("WA_SPACE_DIR") || "";
+    const root = Deno.env.get("WA_SPACE_DIR");
+    if (!root) {
+      throw new Error(
+        "插件没有空间文件权限：清单 fs 段没有声明要访问的目录（未声明时空间工作区不挂）；" +
+        "读业务数据请改用 file_read 这类工具，或在该目录对应的 fs 项里声明"
+      );
+    }
     return root + "/" + String(rel).replace(/^\/+/, "");
   },
 

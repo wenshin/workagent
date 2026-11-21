@@ -16,7 +16,9 @@ func contains(paths []string, want string) bool {
 	return false
 }
 
-// 不声明 fs：整个空间工作区可读，但**不可写**，插件目录可读。
+// 不声明 fs：空间工作区不挂（读业务数据走工具调用），插件目录可读写。
+// 插件目录为什么可写：运行时缓存（临时文件、下载中转）需要一个属于自己的位置，
+// 而 DENO_DIR 只放 Deno 自己的缓存，插件业务缓存放不进去。
 func TestBuildSandboxFSDefault(t *testing.T) {
 	space := t.TempDir()
 	dir := t.TempDir()
@@ -25,11 +27,17 @@ func TestBuildSandboxFSDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("默认不应报错: %v", err)
 	}
-	if !contains(got.Read, space) || !contains(got.Read, dir) {
-		t.Fatalf("默认读范围应含空间与插件目录: %#v", got.Read)
+	if contains(got.Read, space) {
+		t.Fatalf("默认不该挂空间工作区: %#v", got.Read)
 	}
-	if len(got.Write) != 0 {
-		t.Fatalf("没有声明 fs.write 就不该有任何可写路径: %#v", got.Write)
+	if !contains(got.Read, dir) {
+		t.Fatalf("插件目录必须可读: %#v", got.Read)
+	}
+	if !contains(got.Write, dir) {
+		t.Fatalf("插件目录应可写（运行时缓存）: %#v", got.Write)
+	}
+	if contains(got.Write, space) {
+		t.Fatalf("插件目录可写不等于空间可写: %#v", got.Write)
 	}
 }
 
@@ -55,9 +63,13 @@ func TestBuildSandboxFSNarrowsRead(t *testing.T) {
 	if !contains(got.Read, dir) {
 		t.Fatalf("插件目录必须可读: %#v", got.Read)
 	}
-	// 只声明 read 不影响写权限：没写 fs.write 仍然不可写
-	if len(got.Write) != 0 {
-		t.Fatalf("未声明 fs.write 时不该有写权限: %#v", got.Write)
+	// 只声明 read 不影响空间写权限：没写 fs.write 就不能写空间。
+	// 插件目录仍然可写——那是它自己的缓存位置，与业务数据权限无关。
+	if contains(got.Write, space) {
+		t.Fatalf("未声明 fs.write 时不该给空间写权限: %#v", got.Write)
+	}
+	if !contains(got.Write, dir) {
+		t.Fatalf("插件目录应始终可写: %#v", got.Write)
 	}
 }
 

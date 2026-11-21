@@ -13,14 +13,32 @@ import (
 	"github.com/workagent/auto-agent/internal/sandbox"
 )
 
-// 常驻进程的默认策略。
+// 常驻进程的策略。
 //
-// 空闲回收是必须的：插件不是常驻服务，没人用的时候没必要占着一个 deno 进程
-// （每个进程大约 40–80MB）。10 分钟覆盖「连续对话里的多次调用」这个真实场景，
-// 又不至于把机器撑爆。
+// 常驻进程**不按空闲回收**：声明 runtime.resident 的插件之所以常驻，就是为了
+// 跨调用保留连接、缓存与模块级状态；空闲几分钟就杀掉，等于把「常驻」退化成
+// 「碰巧复用过一次」，下一次调用又付 50–180ms 冷启动，还会丢掉进程内状态。
+//
+// 但「不回收」不等于「不守护」：常驻进程会自己退出（插件抛未捕获异常、
+// OOM、连接被对端关闭后没兜住）。业务侧不能依赖「下一次调用碰巧会重建」——
+// 那一次调用本身就是失败。所以这里做两层：
+//
+//  1. 崩溃即重启，带指数退避（300ms → 5s）；
+//  2. 连续崩溃超过 MaxRestarts 次就停下并熔断，不再每次调用都付一遍
+//     冷启动 + 崩溃的开销，改为直接把「插件不可用」报给调用方。
+//
+// 熔断不是终点：重新安装/升级/改配置/改草稿都会走 closePrefix 清掉计数，
+// 修好的插件下一次调用就会重新拉起。
 const (
-	DefaultProcIdle = 10 * time.Minute
-	DefaultProcMax  = 32
+	DefaultProcMax = 32
+	// DefaultProcMaxRestarts 是连续崩溃的重启上限。单次崩溃很常见（插件里
+	// 一个未捕获异常就够），5 次给「偶发崩溃」留足恢复机会，又不至于让一个
+	// 确定坏掉的插件无限重启。
+	DefaultProcMaxRestarts = 5
+	// 重启退避：第一次几乎立刻起，之后翻倍。等太久会让「进程刚崩过一次」
+	// 的正常业务请求排队，等太短会让反复崩溃的插件把 CPU 打满。
+	procRestartBase = 300 * time.Millisecond
+	procRestartCap  = 5 * time.Second
 	// 单次 invoke 的墙钟兜底：manifest 的 limits.timeout_ms 才是正式上限，
 	// 这里只在清单没写时提供一个安全值。
 	defaultInvokeTimeout = 30 * time.Second
@@ -32,34 +50,41 @@ const (
 // 不复用旧代码。同一个键永远只有一个进程，并发调用在进程内串行——
 // 这与插件侧 SDK 的 invoke 队列语义一致，不会因为常驻而改变可见行为。
 type residentPool struct {
-	mu     sync.Mutex
-	procs  map[string]*residentProc
-	idle   time.Duration
-	max    int
-	logger *slog.Logger
-	stop   chan struct{}
-	once   sync.Once
+	mu    sync.Mutex
+	procs map[string]*residentProc
+	// starters 保存每个键的启动闭包，守护重启时复用同一份参数（目录、FS、
+	// 出网名单、配置）。参数一变（改配置/换版本/改草稿）就走 closePrefix
+	// 把这条一起清掉——否则会「用旧参数重启新代码」。
+	starters map[string]func() (*residentProc, error)
+	// fails 记录每个键**连续**崩溃次数，成功执行一次就清零。
+	// 用连续而不是累计：一个稳定跑几天偶尔崩一次的插件不该被熔断。
+	fails       map[string]int
+	max         int
+	maxRestarts int
+	stop        chan struct{}
+	once        sync.Once
+	logger      *slog.Logger
 }
 
-func newResidentPool(idle time.Duration, max int, log *slog.Logger) *residentPool {
-	if idle <= 0 {
-		idle = DefaultProcIdle
-	}
+func newResidentPool(max, maxRestarts int, log *slog.Logger) *residentPool {
 	if max <= 0 {
 		max = DefaultProcMax
+	}
+	if maxRestarts < 0 {
+		maxRestarts = DefaultProcMaxRestarts
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	p := &residentPool{
-		procs:  map[string]*residentProc{},
-		idle:   idle,
-		max:    max,
-		logger: log,
-		stop:   make(chan struct{}),
+	return &residentPool{
+		procs:       map[string]*residentProc{},
+		starters:    map[string]func() (*residentProc, error){},
+		fails:       map[string]int{},
+		max:         max,
+		maxRestarts: maxRestarts,
+		stop:        make(chan struct{}),
+		logger:      log,
 	}
-	go p.reap()
-	return p
 }
 
 // acquire 取一个可用的常驻进程；没有就现起一个。
@@ -73,7 +98,13 @@ func (p *residentPool) acquire(key string, rt *toolRuntime, start func() (*sandb
 		p.mu.Unlock()
 		return rp, nil
 	}
-	// 满了就先回收最久没用的（只回收空闲的，正在跑的不动）
+	if n := p.fails[key]; n > p.maxRestarts {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("插件常驻进程连续崩溃 %d 次，已停止自动重启；重新安装或修改插件后恢复", n)
+	}
+	// 到达上限时腾一个位置：淘汰最久没被调用过的**空闲**进程，在跑的不动。
+	// 这不等于空闲回收——没有「多久没用就杀」的阈值，只在池满时发生。
+	// 如果全部都在跑，宁可控不住上限也不打断正在执行的调用。
 	var victim *residentProc
 	if len(p.procs) >= p.max {
 		var victimKey string
@@ -89,15 +120,24 @@ func (p *residentPool) acquire(key string, rt *toolRuntime, start func() (*sandb
 		}
 		if victim != nil {
 			delete(p.procs, victimKey)
+			delete(p.starters, victimKey)
+			delete(p.fails, victimKey)
 		}
 	}
 	p.mu.Unlock()
 	if victim != nil {
 		victim.close()
+		p.logger.Info("插件常驻进程达到上限，淘汰最久未用", "key", victim.key, "max", p.max)
 	}
+	return p.spawn(key, rt, start)
+}
 
+// spawn 起第一个进程并交给守护协程。
+func (p *residentPool) spawn(key string, rt *toolRuntime, start func() (*sandbox.Proc, error)) (*residentProc, error) {
 	proc, err := start()
 	if err != nil {
+		// 起不来也是一次失败：一个启动就崩的插件不能每次调用都重付启动开销。
+		p.noteFailure(key, nil)
 		return nil, err
 	}
 	rp := newresidentProc(key, proc, rt, p.logger)
@@ -109,19 +149,163 @@ func (p *residentPool) acquire(key string, rt *toolRuntime, start func() (*sandb
 		return existing, nil
 	}
 	p.procs[key] = rp
+	p.starters[key] = func() (*residentProc, error) {
+		proc, err := start()
+		if err != nil {
+			return nil, err
+		}
+		return newresidentProc(key, proc, rt, p.logger), nil
+	}
 	p.mu.Unlock()
+
+	go p.supervise(key, rp)
 	return rp, nil
 }
 
-func (p *residentPool) drop(key string, rp *residentProc) {
-	p.mu.Lock()
-	if cur, ok := p.procs[key]; ok && cur == rp {
-		delete(p.procs, key)
+// spawnFrom 用已保存的启动闭包重启（守护专用）。
+func (p *residentPool) spawnFrom(key string, starter func() (*residentProc, error)) (*residentProc, error) {
+	rp, err := starter()
+	if err != nil {
+		p.noteFailure(key, nil)
+		return nil, err
 	}
+	p.mu.Lock()
+	if existing, ok := p.procs[key]; ok && !existing.dead() {
+		// 并发下别的调用已经拉起了一个：用现成的，别留两个进程
+		p.mu.Unlock()
+		rp.close()
+		return existing, nil
+	}
+	p.procs[key] = rp
+	p.mu.Unlock()
+
+	go p.supervise(key, rp)
+	return rp, nil
+}
+
+// supervise 等一个进程结束，异常退出就按退避策略重启。
+//
+// 主动关闭（停用/卸载/换版本/空间重载/池满淘汰/服务退出）不重启——那些是
+// 管理动作，不是故障。区分靠 residentProc.crashed：只有 fail() 会置位。
+func (p *residentPool) supervise(key string, rp *residentProc) {
+	<-rp.done
+	if !rp.isCrashed() {
+		return
+	}
+
+	p.mu.Lock()
+	cur, ok := p.procs[key]
+	if !ok || cur != rp {
+		// 已被替换或已被 closePrefix 摘掉：不是我们要管的那个进程
+		p.mu.Unlock()
+		return
+	}
+	delete(p.procs, key)
+	p.fails[key]++
+	attempts := p.fails[key]
+	starter := p.starters[key]
+	stop := p.stop
+	p.mu.Unlock()
+
+	if attempts > p.maxRestarts {
+		p.logger.Error("插件常驻进程反复崩溃，停止自动重启",
+			"key", key, "attempts", attempts, "max", p.maxRestarts, "err", rp.exitErr())
+		return
+	}
+	if starter == nil {
+		return
+	}
+
+	p.logger.Warn("插件常驻进程异常退出，将自动重启",
+		"key", key, "attempt", attempts, "delay", restartDelay(attempts), "err", rp.exitErr())
+	go p.restartLoop(key, starter, stop, restartDelay(attempts))
+}
+
+// restartLoop 反复尝试拉起，直到成功、被摘掉或达到重启上限。
+//
+// 单独成一个循环而不是「失败就交给下一次调用」：插件崩在启动阶段
+// 是常见的（缺依赖、配置错），没有这层就等于永远起不来。
+func (p *residentPool) restartLoop(key string, starter func() (*residentProc, error), stop <-chan struct{}, delay time.Duration) {
+	for {
+		t := time.NewTimer(delay)
+		select {
+		case <-stop:
+			t.Stop()
+			return
+		case <-t.C:
+		}
+
+		p.mu.Lock()
+		if _, ok := p.starters[key]; !ok {
+			// 期间被 closePrefix 清掉（停用/卸载/换版本）：别再拉了
+			p.mu.Unlock()
+			return
+		}
+		if cur, ok := p.procs[key]; ok && !cur.dead() {
+			p.mu.Unlock()
+			return
+		}
+		broken := p.fails[key] > p.maxRestarts
+		p.mu.Unlock()
+		if broken {
+			return
+		}
+
+		if _, err := p.spawnFrom(key, starter); err == nil {
+			return
+		} else {
+			p.logger.Warn("插件常驻进程重启失败", "key", key, "err", err)
+		}
+
+		delay *= 2
+		if delay > procRestartCap {
+			delay = procRestartCap
+		}
+	}
+}
+
+// restartDelay 返回第 n 次连续崩溃后的等待时间。
+func restartDelay(attempts int) time.Duration {
+	d := procRestartBase
+	for i := 1; i < attempts; i++ {
+		d *= 2
+		if d >= procRestartCap {
+			return procRestartCap
+		}
+	}
+	return d
+}
+
+// noteFailure 记一次启动失败。err 为 nil 表示进程已经起过但立刻崩了。
+func (p *residentPool) noteFailure(key string, err error) {
+	p.mu.Lock()
+	p.fails[key]++
+	n := p.fails[key]
+	p.mu.Unlock()
+	if n > p.maxRestarts {
+		p.logger.Error("插件常驻进程连续启动失败，停止自动重启",
+			"key", key, "attempts", n, "max", p.maxRestarts, "err", err)
+	}
+}
+
+// markHealthy 清零连续崩溃计数：跑成功一次就说明插件是好的，
+// 后面偶发崩溃从 1 开始数，不继承历史。
+func (p *residentPool) markHealthy(key string) {
+	p.mu.Lock()
+	delete(p.fails, key)
 	p.mu.Unlock()
 }
 
-// closePrefix 关闭键前缀匹配的进程（空间级失效）。
+// failed 返回该键是否已熔断（连续崩溃超过上限）。
+func (p *residentPool) failed(key string) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := p.fails[key]
+	return n, n > p.maxRestarts
+}
+
+// closePrefix 关闭键前缀匹配的进程（空间级失效），并清掉守护状态：
+// 参数可能已经变了，不能再拿旧闭包重启。
 func (p *residentPool) closePrefix(prefix string) int {
 	p.mu.Lock()
 	var list []*residentProc
@@ -131,6 +315,16 @@ func (p *residentPool) closePrefix(prefix string) int {
 			delete(p.procs, k)
 		}
 	}
+	for k := range p.starters {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			delete(p.starters, k)
+		}
+	}
+	for k := range p.fails {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			delete(p.fails, k)
+		}
+	}
 	p.mu.Unlock()
 	for _, rp := range list {
 		rp.close()
@@ -138,7 +332,7 @@ func (p *residentPool) closePrefix(prefix string) int {
 	return len(list)
 }
 
-// CloseAll 关闭全部进程并停止回收协程（服务退出）。
+// CloseAll 关闭全部进程并停掉待重启的守护协程（服务退出）。
 func (p *residentPool) CloseAll() {
 	p.once.Do(func() { close(p.stop) })
 	p.mu.Lock()
@@ -147,6 +341,8 @@ func (p *residentPool) CloseAll() {
 		list = append(list, rp)
 		delete(p.procs, k)
 	}
+	p.starters = map[string]func() (*residentProc, error){}
+	p.fails = map[string]int{}
 	p.mu.Unlock()
 	for _, rp := range list {
 		rp.close()
@@ -157,35 +353,6 @@ func (p *residentPool) size() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.procs)
-}
-
-func (p *residentPool) reap() {
-	t := time.NewTicker(30 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-p.stop:
-			return
-		case <-t.C:
-			now := time.Now()
-			p.mu.Lock()
-			var list []*residentProc
-			for k, rp := range p.procs {
-				if rp.busy() {
-					continue
-				}
-				if now.Sub(rp.lastSeen()) >= p.idle {
-					list = append(list, rp)
-					delete(p.procs, k)
-				}
-			}
-			p.mu.Unlock()
-			for _, rp := range list {
-				rp.close()
-				p.logger.Info("插件常驻进程空闲回收", "key", rp.key)
-			}
-		}
-	}
 }
 
 // residentProc 是一个常驻的插件进程。
@@ -208,6 +375,8 @@ type residentProc struct {
 	overflow string
 	lastUsed time.Time
 	inflight int
+	// crashed 区分「异常退出」与「主动关闭」：只有前者才触发守护重启。
+	crashed bool
 
 	replies chan rpcFrame
 	done    chan struct{}
@@ -254,6 +423,12 @@ func (p *residentProc) dead() bool {
 	default:
 		return false
 	}
+}
+
+func (p *residentProc) isCrashed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.crashed
 }
 
 func (p *residentProc) exitErr() error {
@@ -348,8 +523,8 @@ func (p *residentProc) overflowText() string {
 
 // invoke 发一个 invoke 帧并等它的结果。
 //
-// 超时即杀进程并从池里摘掉：协议可能停在半截（插件还没回 return），
-// 留着复用会得到「上一个请求的返回值」这种最难查的错。
+// 超时即杀进程：协议可能停在半截（插件还没回 return），留着复用会得到
+// 「上一个请求的返回值」这种最难查的错。杀掉的进程由守护协程重启。
 func (p *residentProc) invoke(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
 	p.imu.Lock()
 	defer p.imu.Unlock()
@@ -420,7 +595,7 @@ func (p *residentProc) invoke(ctx context.Context, in invokeInput, input json.Ra
 	case <-p.done:
 		return "", p.exitErr()
 	case <-ictx.Done():
-		// 进程状态未知：杀掉，下次调用重新起一个
+		// 进程状态未知：杀掉，交给守护重启
 		p.fail(fmt.Errorf("插件执行超时（%dms）", in.Limits.TimeoutMS))
 		return "", fmt.Errorf("插件执行超时（%dms）", in.Limits.TimeoutMS)
 	}
@@ -436,16 +611,19 @@ func (p *residentProc) write(v any) error {
 	return p.proc.Write(append(body, '\n'))
 }
 
+// fail 是异常退出：置 crashed 让守护协程重启。
 func (p *residentProc) fail(err error) {
 	p.mu.Lock()
 	if p.err == nil {
 		p.err = err
 	}
+	p.crashed = true
 	p.mu.Unlock()
 	p.proc.Kill()
 	p.once.Do(func() { close(p.done) })
 }
 
+// close 是主动关闭：不置 crashed，守护协程不会重启它。
 func (p *residentProc) close() {
 	p.proc.Close()
 	p.once.Do(func() {

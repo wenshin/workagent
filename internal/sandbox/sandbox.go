@@ -783,9 +783,9 @@ var baseEnvKeys = []string{
 	"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
 	// 安装源：镜像里写死的国内镜像地址。不带进沙箱，模型装老版本时会去连官方源，
 	// 在断网 / 白名单下表现为「卡住直到超时」，比直接报错更难排查。
-	// 只放地址，不放 FNM_DIR / UV_PYTHON_INSTALL_DIR 这类目录变量：
+	// 只放地址，不放 MISE_DATA_DIR / MISE_CONFIG_DIR 这类目录变量：
 	// 那些必须由调用方指到可写位置，从父进程继承过来只会指到只读的系统目录。
-	"NPM_CONFIG_REGISTRY", "PIP_INDEX_URL", "UV_DEFAULT_INDEX", "FNM_NODE_DIST_MIRROR",
+	"NPM_CONFIG_REGISTRY", "PIP_INDEX_URL", "MISE_NODE_MIRROR",
 }
 
 const fallbackPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

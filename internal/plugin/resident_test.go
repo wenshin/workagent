@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,18 +25,41 @@ while IFS= read -r line; do
 done
 `
 
-// crashPlugin 收到 invoke 就退出，用来验证「进程死了能从池里摘掉」。
+// crashPlugin 收到 invoke 就退出，每次启动都是这样。
 const crashPlugin = `
 read -r line
 exit 3
 `
 
+// crashOncePlugin 只在第一次启动时崩，之后正常回包。
+// 用标记文件区分「第几次启动」——进程内变量随进程一起没了。
+const crashOncePlugin = `
+mark="$1"
+if [ -f "$mark" ]; then
+  n=0
+  while IFS= read -r line; do
+    n=$((n+1))
+    printf '{"op":"return","data":"ok%s"}\n' "$n"
+  done
+fi
+touch "$mark"
+read -r line
+exit 7
+`
+
 func startShell(t *testing.T, script string) func() (*sandbox.Proc, error) {
 	t.Helper()
+	return startShellArgs(t, script)
+}
+
+// startShellArgs 允许向脚本传位置参数（$1 起），供「第 N 次启动」这类场景用。
+func startShellArgs(t *testing.T, script string, args ...string) func() (*sandbox.Proc, error) {
+	t.Helper()
 	dir := t.TempDir()
+	cmd := append([]string{"/bin/sh", "-c", script, "wa"}, args...)
 	return func() (*sandbox.Proc, error) {
 		return sandbox.NewLocal().Start(context.Background(), sandbox.Spec{
-			Cmd:      []string{"/bin/sh", "-c", script},
+			Cmd:      cmd,
 			Dir:      dir,
 			Resident: true,
 		})
@@ -52,7 +76,7 @@ func invokeInputForTest() invokeInput {
 
 // 同一个键必须复用同一个进程：常驻的全部意义在这里。
 func TestResidentReusesProcess(t *testing.T) {
-	pool := newResidentPool(time.Minute, 4, slog.Default())
+	pool := newResidentPool(4, 3, slog.Default())
 	defer pool.CloseAll()
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
@@ -91,7 +115,7 @@ func TestResidentReusesProcess(t *testing.T) {
 
 // 并发调用必须串行化在进程内，不能拿到别人的返回值。
 func TestResidentSerializesCalls(t *testing.T) {
-	pool := newResidentPool(time.Minute, 4, slog.Default())
+	pool := newResidentPool(4, 3, slog.Default())
 	defer pool.CloseAll()
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
@@ -128,36 +152,105 @@ func TestResidentSerializesCalls(t *testing.T) {
 	}
 }
 
-// 进程崩溃后必须报错，并且能从池里摘掉，而不是每个后续调用都撞同一个死进程。
-func TestResidentCrashIsDropped(t *testing.T) {
-	pool := newResidentPool(time.Minute, 4, slog.Default())
+// 崩溃的那一次调用必须报错（不自动重放，避免重复副作用），
+// 但进程要由守护协程拉起来——后续调用不能一直撞死进程。
+func TestResidentRestartsAfterCrash(t *testing.T) {
+	pool := newResidentPool(4, 3, slog.Default())
 	defer pool.CloseAll()
 	rt := testRuntime()
 	const key = "s|b|d"
-	p, err := pool.acquire(key, rt, startShell(t, crashPlugin))
+	mark := filepath.Join(t.TempDir(), "started")
+	start := startShellArgs(t, crashOncePlugin, mark)
+
+	p1, err := pool.acquire(key, rt, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if _, err := p.invoke(context.Background(), invokeInputForTest(), json.RawMessage(`{}`)); err == nil {
+	if _, err := p1.invoke(context.Background(), invokeInputForTest(), json.RawMessage(`{}`)); err == nil {
 		t.Fatal("进程退出时调用应报错")
 	}
-	// 等待读循环发现 EOF
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !p.dead() {
-		time.Sleep(10 * time.Millisecond)
+
+	// 守护重启是异步的（300ms 退避），轮询等到一个活的新进程
+	var p2 *residentProc
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rp, err := pool.acquire(key, rt, start)
+		if err == nil && rp != p1 && !rp.dead() {
+			p2 = rp
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if !p.dead() {
-		t.Fatal("进程已退出但状态没更新")
+	if p2 == nil {
+		t.Fatal("崩溃后没有自动重启")
 	}
-	pool.drop(key, p)
+	out, err := p2.invoke(context.Background(), invokeInputForTest(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("重启后的进程应该能正常调用: %v", err)
+	}
+	// 第二次启动进入正常循环，进程内计数从 1 开始
+	if out != "ok1" {
+		t.Fatalf("拿到的是旧进程的结果: %q", out)
+	}
+}
+
+// 连续崩溃超过上限就熔断：不再重启，调用直接报「插件不可用」，
+// 避免每次调用都赔一遍冷启动。
+func TestResidentStopsRestartAfterTooManyCrashes(t *testing.T) {
+	pool := newResidentPool(4, 1, slog.Default())
+	defer pool.CloseAll()
+	rt := testRuntime()
+	const key = "s|f|d"
+	start := startShell(t, crashPlugin)
+
+	var hit error
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		rp, err := pool.acquire(key, rt, start)
+		if err != nil {
+			hit = err
+			break
+		}
+		if _, err := rp.invoke(context.Background(), invokeInputForTest(), json.RawMessage(`{}`)); err != nil && strings.Contains(err.Error(), "停止自动重启") {
+			hit = err
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if hit == nil || !strings.Contains(hit.Error(), "停止自动重启") {
+		t.Fatalf("连续崩溃后应熔断，实际 %v", hit)
+	}
+	if n, broken := pool.failed(key); !broken || n < 2 {
+		t.Fatalf("熔断状态不对：attempts=%d broken=%v", n, broken)
+	}
+}
+
+// 主动关闭（停用/卸载/空间重载）不能触发守护重启，否则停用就成了摆设。
+func TestResidentNoRestartAfterClose(t *testing.T) {
+	pool := newResidentPool(4, 3, slog.Default())
+	defer pool.CloseAll()
+	rt := testRuntime()
+	const key = "s1|k|d"
+	if _, err := pool.acquire(key, rt, startShell(t, counterPlugin)); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	pool.closePrefix("s1|")
+	time.Sleep(500 * time.Millisecond)
 	if pool.size() != 0 {
-		t.Fatalf("死进程没被摘掉，池内 %d", pool.size())
+		t.Fatalf("主动关闭后被重启了，池内 %d", pool.size())
+	}
+	// 清掉的是启动闭包：下一次调用按新参数重新拉起
+	if _, err := pool.acquire(key, rt, startShell(t, counterPlugin)); err != nil {
+		t.Fatalf("重新调用应能起新进程: %v", err)
+	}
+	if pool.size() != 1 {
+		t.Fatalf("应该只有一个进程，实际 %d", pool.size())
 	}
 }
 
 // 停用 / 卸载 / 空间重载都走 closePrefix：前缀必须能精确匹配到目标插件。
 func TestResidentClosePrefix(t *testing.T) {
-	pool := newResidentPool(time.Minute, 8, slog.Default())
+	pool := newResidentPool(8, 3, slog.Default())
 	defer pool.CloseAll()
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
@@ -202,7 +295,7 @@ func TestResidentProcIgnoresTimeout(t *testing.T) {
 			Timeout:  50 * time.Millisecond,
 		})
 	}
-	pool := newResidentPool(time.Minute, 2, slog.Default())
+	pool := newResidentPool(2, 3, slog.Default())
 	defer pool.CloseAll()
 	p, err := pool.acquire("s|c|d", testRuntime(), start)
 	if err != nil {
@@ -269,7 +362,7 @@ func TestResidentRejectsGarbageFrame(t *testing.T) {
 			Resident: true,
 		})
 	}
-	pool := newResidentPool(time.Minute, 2, slog.Default())
+	pool := newResidentPool(2, 3, slog.Default())
 	defer pool.CloseAll()
 	p, err := pool.acquire("s|e|d", testRuntime(), start)
 	if err != nil {

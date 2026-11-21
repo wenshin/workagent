@@ -92,10 +92,11 @@ type Config struct {
 	// SandboxRunnerToken 是远端执行体的鉴权令牌；remote 后端下为空直接启动失败。
 	SandboxRunnerToken string
 
-	// 插件常驻进程池（只装声明了 runtime.resident 的插件，docs/插件安全基线.md §2.5）
-	// 空闲多久回收：0 用默认 600s；进程数上限：0 用默认 32。
-	PluginProcIdleSeconds int
-	PluginProcMax         int
+	// 插件常驻进程池（只装声明了 runtime.resident 的插件，docs/插件安全基线.md §2.5）。
+	// 常驻进程不按空闲回收，只在池满时淘汰最久未用的空闲进程；0 用默认 32。
+	PluginProcMax int
+	// 常驻进程连续崩溃多少次后停止自动重启（熔断）；<0 用默认 5，0 表示不重启。
+	PluginProcMaxRestarts int
 
 	// 沙箱额外只读路径（逗号分隔，绝对路径）。
 	// 白名单挂载之后，装在非标准位置的运行时（npm 装的 deno 是 node 包装脚本、
@@ -350,8 +351,8 @@ func Load() (*Config, error) {
 		SandboxRunnerAddr:  getenv("SANDBOX_RUNNER_ADDR", ""),
 		SandboxRunnerToken: getenv("SANDBOX_RUNNER_TOKEN", ""),
 
-		PluginProcIdleSeconds: getenvInt("PLUGIN_PROC_IDLE_SECONDS", 600),
 		PluginProcMax:         getenvInt("PLUGIN_PROC_MAX", 32),
+		PluginProcMaxRestarts: getenvInt("PLUGIN_PROC_MAX_RESTARTS", 5),
 		SandboxReadExtra:      splitList(getenv("SANDBOX_READ_EXTRA", "")),
 
 		InstallMirrorNPM:  getenv("INSTALL_MIRROR_NPM", ""),
