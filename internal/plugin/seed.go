@@ -270,7 +270,6 @@ func builtinToolSlug(name string) string {
 
 // builtinToolLabel 是市场里展示的名称：工具名对业务用户没有意义。
 var builtinToolLabels = map[string]string{
-	"time_now":       "当前时间",
 	"space_list":     "空间列表",
 	"plugin_search":  "检索插件",
 	"plugin_read":    "读取插件",

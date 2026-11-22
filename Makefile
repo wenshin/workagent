@@ -28,9 +28,12 @@ redis-up:
 pg-down:
 	docker compose down
 
-# 本机调试固定 dev 形态：server 形态强制远端执行体，没有执行体时起不来。
+# 服务端执行 agent 一律走远端沙箱（开发 / CI / 生产一致）：先 make sandbox-up 起执行体，
+# 再导出 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN；缺任一项服务会直接启动失败，不退回本机执行。
 run:
-	WA_ROLE=dev $(GO) run ./cmd/server
+	@[ -n "$$SANDBOX_RUNNER_ADDR" ] && [ -n "$$SANDBOX_RUNNER_TOKEN" ] || \
+		echo "提示：需要 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN（见 README 快速开始）"
+	$(GO) run ./cmd/server
 
 build:
 	mkdir -p bin && $(GO) build -o bin/server ./cmd/server

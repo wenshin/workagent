@@ -66,7 +66,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		log.Info("身份接入已就绪", "provider", idp.Name(), "display", idp.DisplayName())
 	}
 	spaceSvc := space.NewService(st, fs, log, cfg.AdminJobs)
-	// 上传上限按 MB 配置，0 表示沿用默认值（4MB）
+	// 上传上限按 MB 配置，0 表示沿用默认值（100MB）
 	spaceSvc.SetUploadMaxBytes(int64(cfg.UploadMaxFileMB) << 20)
 	// 管理员可能尚未登录过：启动时按配置工号尽量把系统空间准备好
 	spaceSvc.BootstrapSystemSpace(context.Background())
@@ -153,7 +153,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		"npm", mirrors.NPM, "pip", mirrors.PyPI, "node", mirrors.Node, "go", mirrors.Go)
 
 	// 命令执行沙箱：两种形态，二选一。
-	//   local  —— 在本进程里跑（bwrap > sandbox-exec > local），单机部署
+	//   local  —— 在本进程里跑（只能是 bwrap；探测不到就失败），客户端 runtime
 	//   remote —— 容器化部署：执行体在租户容器里，控制面只发请求
 	// 两者都要求「探测不到隔离就报错」，且都以后端自己报的名字为准：
 	// 远端执行体降级成 local 时，控制面必须知道，否则审计里会写成 bwrap。
@@ -436,28 +436,27 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 	platform.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok", "db": "ok"})
 }
 
-// newShellRunner 按 SANDBOX_BACKEND 构造执行面。
-//
-// 两种形态共用同一套「必须真有隔离」的校验：远端执行体在握手时上报自己实际
-// 探测到的后端（bwrap / sandbox-exec / local），控制面不需要也不可能替它判断。
 // newShellRunner 按运行形态构造执行面。
 //
-// 形态是硬约束，不是「探测到什么用什么」：
+// 两种形态共用同一套「必须真有隔离」的校验：远端执行体在握手时上报自己实际
+// 探测到的后端（bwrap / local），控制面不需要也不可能替它判断。
 //
-//	server —— 只能远端执行体。服务端节点的内核、镜像与安全上下文都不由我们决定，
-//	          不能假设 bwrap 可用；执行体自己报告没有隔离后端时直接启动失败，
-//	          不存在「容器是唯一边界，先跑起来」的降级档。
+// 判定口径是「谁在执行 agent」，不是「这是不是开发环境」：
+//
+//	server —— 只能远端执行体。服务端进程（生产、CI、本机调试一视同仁）执行 agent，
+//	          节点的内核、镜像与安全上下文都不由我们决定，不能假设 bwrap 可用；
+//	          执行体自己报告没有隔离后端时直接启动失败，不存在「容器是唯一边界，
+//	          先跑起来」的降级档，也不存在「本机调试就裸跑」的例外。
 //	client —— 只能本进程起 bwrap。装在用户机器上的 runtime 必须自带真隔离，
 //	          连远端执行体等于把用户目录交给另一个进程。
-//	dev    —— 本机调试与 CI，允许自动探测与无隔离降级（由 SANDBOX_REQUIRE 兜底）。
 func newShellRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
 	switch cfg.Role {
+	case config.RoleServer:
+		return newServerRunner(cfg, log)
 	case config.RoleClient:
 		return newClientRunner(cfg, log)
-	case config.RoleDev:
-		return newDevRunner(cfg, log)
 	default:
-		return newServerRunner(cfg, log)
+		return nil, fmt.Errorf("未知运行形态 %q：只能是 server / client（dev 已删除，本机调试同样连远端执行体）", cfg.Role)
 	}
 }
 
@@ -466,15 +465,16 @@ func newServerRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, erro
 	if !strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "remote") {
 		return nil, fmt.Errorf(
 			"服务端（WA_ROLE=server）只能用远端执行体：SANDBOX_BACKEND 必须为 remote（当前 %q）；"+
-				"本机调试请用 WA_ROLE=dev", cfg.SandboxBackend)
+				"本机调试同样如此，先 make sandbox-up 并把 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN 传进来",
+			cfg.SandboxBackend)
 	}
 	client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
 	if err != nil {
 		return nil, fmt.Errorf("远端执行体不可用: %w", err)
 	}
-	// require 恒为 true：执行体报告只有容器、没有 bwrap 时不能启动。
-	// 服务端没有「降级可接受」的档位——那等于把空间隔离寄托在镜像恰好装了 bwrap 上。
-	if err := sandbox.Ensure(client, true); err != nil {
+	// 执行体报告只有容器、没有 bwrap 时不能启动：服务端没有「降级可接受」的档位，
+	// 那等于把空间隔离寄托在镜像恰好装了 bwrap 上。
+	if err := sandbox.Ensure(client); err != nil {
 		return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
 	}
 	log.Info("执行面已就绪", "role", config.RoleServer, "transport", client.Transport(), "backend", client.Name())
@@ -497,52 +497,14 @@ func newClientRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, erro
 	return runner, nil
 }
 
-// newDevRunner 是唯一允许「自动探测 + 无隔离降级」的形态。
-func newDevRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
-	switch strings.ToLower(strings.TrimSpace(cfg.SandboxBackend)) {
-	case "", "local":
-		runner := sandbox.Detect()
-		if err := sandbox.Ensure(runner, cfg.SandboxRequire); err != nil {
-			return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
-		}
-		if runner.Name() == sandbox.NameLocal {
-			log.Warn("开发模式没有可用的沙箱后端，shell_exec 将不受隔离", "require", cfg.SandboxRequire)
-		} else {
-			log.Info("命令执行沙箱已就绪", "role", config.RoleDev, "backend", runner.Name())
-		}
-		return runner, nil
-	case "remote":
-		// 开发机上想连执行体也允许：调试远端链路时不必改 WA_ROLE。
-		client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
-		if err != nil {
-			return nil, fmt.Errorf("远端执行体不可用: %w", err)
-		}
-		if err := sandbox.Ensure(client, cfg.SandboxRequire); err != nil {
-			return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
-		}
-		log.Info("执行面已就绪", "role", config.RoleDev, "transport", client.Transport(), "backend", client.Name())
-		return client, nil
-	default:
-		return nil, fmt.Errorf("dev 形态下 SANDBOX_BACKEND 只能是 local / remote，当前 %q", cfg.SandboxBackend)
-	}
-}
-
 // toExecFacts 把执行体的自述转成契约层的结构。
 //
 // 两个包各自定义一份而不是直接复用，是为了让 internal/agent 不依赖 sandbox：
 // 契约层只描述「提示词需要什么」，执行层才关心「怎么探测出来的」。
 func toExecFacts(f sandbox.EnvFacts) agent.ExecFacts {
-	out := agent.ExecFacts{
-		Image:    f.Image,
-		OS:       f.OS,
-		Writable: f.Writable,
-		Network:  f.Network,
-		// 安装源以控制面注入的为准，不取执行体自述：
-		// 实际生效的是 installEnv 写进命令环境变量的那一份，
-		// 两个出处并存时提示词会和真实行为对不上。
-		Sources:    tool.InstallMirrorSources(),
-		Persistent: f.Persistent,
-	}
+	// 只转「写进提示词的两项」：可写目录、出网形态与容器持久性不再进提示词，
+	// 它们由 shell_exec 的描述承载（见 internal/tool/shell.go）。
+	out := agent.ExecFacts{Image: f.Image, OS: f.OS}
 	if len(f.Tools) > 0 {
 		out.Tools = make([]agent.ExecTool, 0, len(f.Tools))
 		for _, t := range f.Tools {

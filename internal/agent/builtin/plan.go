@@ -34,6 +34,9 @@ const (
 type planState struct {
 	mu   sync.Mutex
 	plan agent.Plan
+	// rev 每次整份覆盖时 +1：运行层据此判断「这一轮要不要推一条 plan.updated」。
+	// 工具的执行体（Invoke）拿不到 emit，所以由循环在批次结束后比对版本号再推。
+	rev int
 }
 
 func newPlanState(seed *agent.Plan) *planState {
@@ -43,6 +46,13 @@ func newPlanState(seed *agent.Plan) *planState {
 		s.plan.Normalize()
 	}
 	return s
+}
+
+// revision 返回当前版本号；配合 emitPlan 判「清单是否变过」。
+func (s *planState) revision() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rev
 }
 
 // snapshot 返回可安全落库的副本；空清单返回 nil（不往快照里塞空对象）。
@@ -67,6 +77,7 @@ func (s *planState) replace(p agent.Plan) agent.Plan {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.plan = p
+	s.rev++
 	return s.plan
 }
 
@@ -158,9 +169,15 @@ func writePlan(state *planState, args json.RawMessage) (string, error) {
 	}
 	plan := state.replace(agent.Plan{Goal: in.Goal, Items: in.Items})
 
+	// 回执只给进度摘要，不回显整份清单。
+	//
+	// 上下文里的旧回执会被压缩（compactKeepRounds 之后折进摘要、单条截到 160 字），
+	// 但清单状态本身另存在 run_resume 里、由 plan_read 读回。两边都写全文的话，
+	// 同一份清单在上下文里占两遍，压缩后还会变成一份读不懂的半截副本。
 	var b strings.Builder
-	b.WriteString("清单已更新：\n")
-	b.WriteString(plan.Render())
-	b.WriteString("\n\n按清单继续；每完成一步就再调用一次 plan_write 更新状态。收尾时未完成的条目要单独说明。")
+	b.WriteString("清单已更新：")
+	b.WriteString(plan.Summary())
+	b.WriteString("\n需要回顾完整清单时用 plan_read；每完成一步就再调用一次 plan_write 更新状态。")
+	b.WriteString("收尾时未完成的条目要单独说明。")
 	return b.String(), nil
 }

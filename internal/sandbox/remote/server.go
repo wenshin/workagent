@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -24,11 +25,19 @@ import (
 //
 // eg 是出网代理注册表：控制面过线的是白名单（Spec.Egress），代理由执行体
 // 在自己的命名空间里建——容器之间不共享 /tmp，路径传过来没有意义。
-func Handler(r sandbox.Runner, token, root string, facts sandbox.EnvFacts, eg *egress.Registry, logger *slog.Logger) http.Handler {
+func Handler(r sandbox.Runner, token, root, cacheRoot string, facts sandbox.EnvFacts, eg *egress.Registry, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &server{runner: r, token: token, root: filepath.Clean(root), facts: facts, egress: eg, logger: logger}
+	s := &server{
+		runner:    r,
+		token:     token,
+		root:      filepath.Clean(root),
+		cacheRoot: filepath.Clean(cacheRoot),
+		facts:     facts,
+		egress:    eg,
+		logger:    logger,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthPath, s.health)
 	mux.HandleFunc(readyPath, s.auth(s.ready))
@@ -40,10 +49,13 @@ func Handler(r sandbox.Runner, token, root string, facts sandbox.EnvFacts, eg *e
 type server struct {
 	runner sandbox.Runner
 	token  string
-	root   string
-	facts  sandbox.EnvFacts
-	egress *egress.Registry
-	logger *slog.Logger
+	// root 是存储根：Mount.Key 相对它解析。控制面的 STORAGE_ROOT 与它不必相同。
+	root string
+	// cacheRoot 是租户缓存根：Mount.Root == RootCache 的 key 相对它解析。
+	cacheRoot string
+	facts     sandbox.EnvFacts
+	egress    *egress.Registry
+	logger    *slog.Logger
 }
 
 type healthResponse struct {
@@ -105,11 +117,12 @@ func (s *server) run(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, http.StatusBadRequest, wireError{Kind: "decode", Msg: "解析执行请求失败: " + err.Error()})
 		return
 	}
-	if err := s.checkPaths(in.Spec); err != nil {
+	spec, err := s.resolveMounts(in.Spec)
+	if err != nil {
 		writeJSON(w, http.StatusForbidden, wireError{Kind: "path", Msg: err.Error()})
 		return
 	}
-	spec, err := s.prepareEgress(in.Spec)
+	spec, err = s.prepareEgress(spec)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, wireError{Kind: "egress", Msg: err.Error()})
 		return
@@ -154,11 +167,12 @@ func (s *server) start(w http.ResponseWriter, req *http.Request) {
 		writeJSON(w, http.StatusBadRequest, wireError{Kind: "decode", Msg: "解析 Spec 失败: " + err.Error()})
 		return
 	}
-	if err := s.checkPaths(in.Spec); err != nil {
+	spec, err := s.resolveMounts(in.Spec)
+	if err != nil {
 		writeJSON(w, http.StatusForbidden, wireError{Kind: "path", Msg: err.Error()})
 		return
 	}
-	spec, err := s.prepareEgress(in.Spec)
+	spec, err = s.prepareEgress(spec)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, wireError{Kind: "egress", Msg: err.Error()})
 		return
@@ -231,14 +245,20 @@ func (s *server) prepareEgress(spec sandbox.Spec) (sandbox.Spec, error) {
 		spec.Proxy = ""
 		return spec, nil
 	}
-	if !egress.IsSocketPath(spec.Proxy) {
-		return spec, fmt.Errorf("出网代理路径 %q 不在允许的位置", spec.Proxy)
-	}
 	if s.egress == nil {
 		return spec, errors.New("执行体未启用出网代理，无法满足插件的出网声明")
 	}
 	digest := egress.Digest(spec.Egress.Hosts, spec.Egress.WSHosts, spec.Egress.Verbs)
-	path, err := s.egress.Ensure(spec.Proxy, egress.Options{
+	// socket 路径在这台机器上现算：控制面清空了 Proxy（它的 /tmp 与本容器无关），
+	// 沙箱里挂的是固定的 sandbox.EgressProxy，所以两边不需要同一路径。
+	sock, err := egress.SocketPath(digest)
+	if err != nil {
+		return spec, err
+	}
+	if !egress.IsSocketPath(sock) {
+		return spec, fmt.Errorf("出网代理路径 %q 不在允许的位置", sock)
+	}
+	path, err := s.egress.Ensure(sock, egress.Options{
 		Policy:       egress.NewAllowlist(spec.Egress.Hosts),
 		ConnectHosts: spec.Egress.WSHosts,
 		Verbs:        spec.Egress.Verbs,
@@ -256,35 +276,49 @@ func (s *server) prepareEgress(spec sandbox.Spec) (sandbox.Spec, error) {
 	return spec, nil
 }
 
-// checkPaths 保证请求里的路径不跳出存储根。
-func (s *server) checkPaths(spec sandbox.Spec) error {
-	if s.root == "" || s.root == "." {
-		return nil
-	}
-	check := func(p string) error {
-		if p == "" {
-			return nil
+// resolveMounts 把请求里的「相对根的 key」解析成本容器里的真实路径。
+//
+// 过线的是 Key + Target 而不是宿主路径：控制面不需要知道执行体把存储挂在哪里，
+// 执行体也不需要知道控制面的目录结构。解析结果只落在 Mount.Source 上，
+// 不会回给控制面，所以报错里也不会出现对方的路径。
+func (s *server) resolveMounts(spec sandbox.Spec) (sandbox.Spec, error) {
+	for i := range spec.Mounts {
+		m := &spec.Mounts[i]
+		if m.Key == "" && m.Root == sandbox.RootStorage {
+			// 系统挂载（解释器、平台脚本）：容器内路径，两侧本来就一致。
+			if !filepath.IsAbs(m.Source) {
+				return spec, fmt.Errorf("系统挂载 %q 需要绝对路径", m.Target)
+			}
+			continue
 		}
-		clean := filepath.Clean(p)
-		if clean == s.root || strings.HasPrefix(clean, s.root+string(filepath.Separator)) {
-			return nil
+		base := s.root
+		if m.Root == sandbox.RootCache {
+			base = s.cacheRoot
 		}
-		return fmt.Errorf("路径 %q 不在执行体允许的根目录 %q 之下", p, s.root)
-	}
-	if err := check(spec.Dir); err != nil {
-		return err
-	}
-	for _, p := range spec.FS.Write {
-		if err := check(p); err != nil {
-			return err
+		if base == "" || base == "." {
+			return spec, fmt.Errorf("执行体没有配置对应的根目录，无法解析挂载 %q", m.Key)
 		}
-	}
-	for _, p := range spec.FS.Read {
-		if err := check(p); err != nil {
-			return err
+		for _, seg := range strings.Split(m.Key, "/") {
+			if seg == ".." {
+				return spec, fmt.Errorf("挂载 key %q 越界", m.Key)
+			}
 		}
+		clean := filepath.Clean(string(filepath.Separator) + m.Key)
+		source := base
+		if clean != "/" {
+			source = filepath.Join(base, clean)
+		}
+		if source != base && !strings.HasPrefix(source, base+string(filepath.Separator)) {
+			return spec, fmt.Errorf("挂载 key %q 越界", m.Key)
+		}
+		if m.Write {
+			if err := os.MkdirAll(source, 0o755); err != nil {
+				return spec, fmt.Errorf("准备挂载目录失败（key=%s）: %w", m.Key, err)
+			}
+		}
+		m.Source = source
 	}
-	return nil
+	return spec, nil
 }
 
 func classify(err error) *wireError {

@@ -382,6 +382,11 @@ type Store interface {
 	FinishMessage(ctx context.Context, id, content, reasoning string, parts []byte, stats MessageStats, interrupted bool) (Message, error)
 	// CreateAssistantMessage 写入带思考过程与工具轨迹的助手消息，并记录这一轮的用量与耗时。
 	CreateAssistantMessage(ctx context.Context, sessionID, content, reasoning string, parts []byte, stats MessageStats) (Message, error)
+	// MessageOfRun 读出某次执行写下的那条助手消息。
+	//
+	// 续跑要接着同一条写：一轮只有一条回答，暂停只是把它切成两段；
+	// 找不到（旧数据、清扫已收尾）时返回 ok=false，调用方按新建处理。
+	MessageOfRun(ctx context.Context, runID string) (Message, bool, error)
 	ListMessages(ctx context.Context, sessionID string) ([]Message, error)
 	CountMessages(ctx context.Context, sessionID string) (int, error)
 

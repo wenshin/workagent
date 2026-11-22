@@ -5,9 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/workagent/auto-agent/internal/policy"
 )
@@ -38,9 +38,6 @@ func normalizeArgs(args json.RawMessage) string {
 	}
 	return string(b)
 }
-
-// DefaultApprovalTimeout 是一次审批请求的等待上限；超时按拒绝处理。
-const DefaultApprovalTimeout = 5 * time.Minute
 
 // 插件的审批级别：安装方在插件卡片上定，作用范围是这个插件的全部工具调用。
 //
@@ -110,10 +107,21 @@ var shellWrappers = map[string]bool{
 	"timeout": true, "exec": true, "stdbuf": true, "time": true,
 }
 
-// Approver 是审批通道：命中审批动作时阻塞等待用户决策。
+// ErrApprovalParked 表示「这一轮已经停在等人确认上」。
+//
+// 它不是一个错误结论，也不该被翻译成「用户拒绝」：审批是会话的暂停点，
+// 执行体收到它就把本轮结束（断点里留着那条没执行的调用），
+// 等用户点了同意，由决策驱动的续跑把这条调用重新发出来。
+var ErrApprovalParked = errors.New("本轮已暂停，等待人工确认")
+
+// Approver 是审批通道：命中审批动作时登记待办，并把本轮停在这里。
 // 实现由会话层提供（谁发起、谁能批、事件怎么推都在那一层）。
 type Approver interface {
-	// Decide 返回本轮记忆里的结论，或阻塞等待用户点击（超时按拒绝）。
+	// Decide 返回本轮记忆里的结论；没有可复用的结论时登记待办并返回
+	// ErrApprovalParked，由调用方结束本轮。
+	//
+	// 不设等待上限，也不阻塞：审批是会话的暂停点，不是一次有超时的询问。
+	// 用户不点，这一轮就一直停在那里（待办与断点同寿命），他回来点同意再接着跑。
 	Decide(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error)
 }
 
@@ -135,8 +143,6 @@ type ApprovalRequest struct {
 	// Reason 是给用户看的一句话：为什么要确认这个动作。
 	Reason string
 	Risk   int
-	// Timeout 为零时用 DefaultApprovalTimeout。
-	Timeout time.Duration
 }
 
 // ApprovalDecision 是用户的选择。
@@ -155,8 +161,8 @@ type ApprovalDecision struct {
 //     MCP 按清单里的 tools.writes 声明判定——远端工具对平台是黑盒，
 //     没有动词可看，只能由作者显式声明；
 //   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）；
-//   - shell 网络准入：网络工具（curl / wget / nc / ssh）一律先确认，拒绝则不执行；
-//     脚本解释器声明了 network=true 才确认（默认无网执行）。判据见 ShellNetPlan。
+//   - shell 网络准入：出现网络工具，或装依赖与脚本混在一起时先确认（判据见 ShellNetPlan）。
+//     纯脚本不确认：它先无网执行，失败且像网络问题时由 Invoker 再申请一次联网重跑。
 func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	// 安装方的档位先于声明生效：always 与调用内容无关，off 直接放行。
 	switch NormalizeApprovalLevel(t.ApprovalLevel) {
@@ -188,7 +194,6 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	}
 	var in struct {
 		Command string `json:"command"`
-		Network bool   `json:"network"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Command) == "" {
 		return nil
@@ -206,12 +211,12 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	// 网络准入与执行必须是同一个判据（ShellNetPlan）：这里批了、执行时不给网，
 	// 或这里没问、执行时给了网，都是「用户以为没联网，实际联了」。
 	//
-	// 网络工具不批准就不执行；脚本默认无网，只有声明 network=true 才走到这里。
-	// Key 带参数指纹：同一条命令重试复用结论，改了 network 参数则算另一次调用。
-	if plan := ShellNetPlan(in.Command, in.Network); plan.NeedsApproval() {
+	// Key 带参数指纹：同一条命令重试复用结论，改了命令则算另一次调用。
+	// Invoker 用同一个 Key 认出「用户拒的是联网」，从而按 plan.OnDeny 决定继续无网跑还是整条不执行。
+	if plan := ShellNetPlan(in.Command); plan.NeedsApproval() {
 		return &policy.Action{
 			Kind:   policy.ActionShell,
-			Key:    policy.ActionShell + ":net:" + ArgsHash(t.Name, args),
+			Key:    shellNetApprovalKey(t.Name, args),
 			Detail: in.Command,
 			Reason: plan.Reason,
 		}

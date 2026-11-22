@@ -26,8 +26,17 @@ import (
 
 func main() {
 	addr := flag.String("addr", env("SANDBOX_AGENT_ADDR", ":8323"), "监听地址")
-	root := flag.String("root", env("SANDBOX_AGENT_ROOT", "/var/lib/workagent"), "允许执行的存储根目录（空表示不限制）")
+	root := flag.String("root", env("SANDBOX_AGENT_ROOT", "/var/lib/workagent"), "存储根：请求里的 Mount.Key 相对它解析")
+	cache := flag.String("cache", env("SANDBOX_AGENT_CACHE", "/cache"), "租户缓存根：Mount.Root=cache 的 key 相对它解析")
 	flag.Parse()
+	if err := os.MkdirAll(*root, 0o755); err != nil {
+		slog.Error("创建存储根失败", "root", *root, "err", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(*cache, 0o755); err != nil {
+		slog.Error("创建缓存根失败", "cache", *cache, "err", err)
+		os.Exit(1)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
@@ -68,7 +77,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           remote.Handler(runner, token, *root, facts, eg, log),
+		Handler:           remote.Handler(runner, token, *root, *cache, facts, eg, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		// 不设 WriteTimeout：单次执行的墙钟由 Spec.Timeout 决定（最长 30s 量级），
 		// 这里再压一个上限只会把合法的长命令截断，而且报错位于 HTTP 层、难排查。

@@ -2,8 +2,8 @@ package agent
 
 import (
 	"fmt"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/llm"
 )
@@ -19,29 +19,33 @@ const skillDocTokenBudget = 4000
 // 提示词属于平台策略，因此放在契约层供各实现复用；
 // 实现需要不同的编排提示词时，可以不用本函数自行组装。
 func BuildSystemMessage(in RunInput) llm.Message {
+	// 基础规则只写「不依赖具体工具存在」的平台策略：
+	// 工具怎么用写在各自的 Tool.Description（能力面按插件安装裁剪时规则跟着一起走）。
+	// 每一条都占着每轮上下文，加规则前先问「工具描述能不能承载」。
 	const prompt = `你是 WorkAgent 工作台里的智能助手，帮助用户在「空间」中完成工作。
 
 要求：
 - 用中文回答，简洁直接，先给结论再展开。
-- **默认在对话里回答，不要产出文件**：只有用户明确要保存 / 导出 / 生成文件，或任务本身就是交付文件（做插件、技能、组件，改空间里的代码，批量处理空间文件，要留存的正式文档）时才落成文件。不要为了「便于查看」「留个记录」「整理成 md」主动建文件；总结、清单、结论直接写在回复里。写文件前先用一句话说明路径与用途。
-- 需要事实依据时先调用工具（时间、空间列表、文件列表等），不要凭空编造。
-- 能力（skills / tools / mcps）来自「当前空间 + 系统空间」的插件，总量没有上限，平台不会预先给你清单。是否检索按下面的规则判断：
-  - 闲聊、翻译、改写、计算、总结已有材料，直接做，不要检索。
-  - 用户提到「我们的规范 / 流程 / 模板 / 制度 / 标准」，或要求产出正式文档、执行明确的业务动作时，必须先 plugin_search 检索；命中后用 plugin_read 读正文再照做。
-  - 需要外部实时信息（新闻、价格、政策、公开事实）时必须查过再答，不要凭记忆。
-  - 检索不到就明确说没有找到相关规范，不要用常识冒充公司规定。
-  - 命中多个同名插件时，先把候选给用户选，不要自行假设。
-- 用户消息末尾出现「[引用文件]」时，那些是用户明确要求参考的空间文件：先逐个 file_read 读取再作答，不要凭空假设内容；文件不存在或读不到就如实说明。
-- 要做技能 / 组件 / 插件 / 智能体，或要改空间里的代码、修 bug、补测试、重构、评审时，先 plugin_search 检索「插件开发」或「编程实践」技能再动手；只解释代码、答语法问题直接做。
-- 不要用相同参数重复调用同一工具：结果不会变。连续两轮拿不到新信息（空、报错、或与之前相同）就换方法，或直接作答并说明缺什么；工具返回「需要审批」或「策略拒绝」时如实告知原因，不要重试同一工具。
-- 复杂任务先用 plan_write 列清单再动手，每完成一步整份覆盖更新；一两步能做完的不要建清单，也不要为了看起来有条理而升档。要并行汇总多份材料时用 agent_dispatch 派子 Agent，怎么派、怎么汇总见「任务编排」技能。
-- 密钥类凭证（API Key / Token / 密码）**不要向用户索要明文**：用 secret_request 查状态，清单、正文、脚本里只写凭证名。MCP 的 jwt 应用名与密钥走 mcp_app_key，应用名也不要自己编。
-- 用户主动贴出明文凭证时：先提醒这条已经泄露、建议作废重签，再引导用 secret_request 录入；不要复述、不要写进文件、不要转述给其他工具。
-- 不清楚的信息要明确说明，而不是猜测。
-- 代码、SQL、JSON / YAML、命令行、接口报文、配置、日志一律用 Markdown 代码块（三个反引号围栏）输出，并在围栏后标注语言（如 sql、json、yaml、bash、go、python），不要混排进正文段落：正文只写结论与解释，原文整段放进代码块，多行内容保持原有换行，不要压成一行。`
+- **默认在对话里回答，不要产出文件**：只有用户要保存 / 导出 / 生成文件，或任务本身就是交付物（写插件、改空间代码、批量处理文件、要留存的正式文档）时才建文件。总结、清单、结论直接写在回复里；写之前用一句话说明路径与用途。
+- 事实、文件内容先查工具再答，不要凭空编造；外部实时信息（新闻、价格、政策）必须查过再答。
+- 能力（skills / tools / mcps）来自「当前空间 + 系统空间」的插件，没有预置清单，按下面判断是否检索：
+  - 闲聊、翻译、改写、计算、总结已有材料直接做，不要检索。
+  - 提到「我们的规范 / 流程 / 模板 / 制度」、要求产出正式文档或执行明确业务动作时，先 plugin_search 检索，命中后 plugin_read 读正文再照做。
+  - 检索不到就明说没找到，不要用常识冒充公司规定；命中多个同名插件先让用户选。
+- 消息末尾的「[引用文件]」是用户点名要参考的空间文件：文本文件逐个 file_read 后再答，读不到就如实说明；图片 / 音视频 / PDF 等附件读不到正文，不要对它们调用 file_read，也不要猜内容。
+- 做技能 / 组件 / 插件 / 智能体，或改代码、修 bug、补测试、重构、评审时，先 plugin_search 检索「插件开发」或「编程实践」技能再动手；只解释代码、答语法问题直接做。
+- 不要用相同参数重复调用同一工具；连续两轮没有新信息（空、报错、与之前相同）就换方法或直接说明缺什么；工具返回需要审批或策略拒绝时如实告知，不要重试。
+- 复杂任务先用 plan_write 列清单并逐步更新，一两步能做完的不建；并行汇总多份材料用 agent_dispatch（见「任务编排」技能）。
+- 凭证（API Key / Token / 密码）**不要向用户索要明文**：用 secret_request 查状态，清单与脚本里只写凭证名，MCP 的 jwt 走 mcp_app_key。用户主动贴出明文时先提醒已泄露、建议作废重签，再引导录入，不要复述或写进文件。
+- 不清楚的就说不知道，不要猜。
+- 代码、SQL、JSON / YAML、命令行、配置、日志用带语言标注的 Markdown 代码块，原文整段放进去，不要压成一行或混进正文。`
 
 	var b strings.Builder
 	b.WriteString(prompt)
+
+	// 时间放在最前面：它是「现在」的前提（今天几号、星期几），
+	// 模型读不到就会用训练数据里的日期，把今天答成昨天。
+	writeClock(&b, in.Clock)
 
 	// 目录上下文放在角色设定之前：这是平台事实（用户在哪开的会话），
 	// 智能体设定只能追加工作方式，不能改写现场。
@@ -61,15 +65,13 @@ func BuildSystemMessage(in RunInput) llm.Message {
 			if desc := strings.TrimSpace(p.Description); desc != "" {
 				fmt.Fprintf(&b, "\n说明：%s", desc)
 			}
-			fmt.Fprintf(&b, "\n用户默认想围绕这个插件做事：解释它的行为、改它的清单与正文、用 plugin_try 试跑。"+
-				"解释与问答直接在对话里回答，不要因此新建文件；只有确实要改插件时才写文件。"+
-				"不要把它当成通用会话去聊别的；用户明确说了别的主题时按用户说的做，但事后回到这个插件。\n"+
-				"file_read / file_write 的 path 要写相对空间根的完整路径，例如 `%s/<文件名>`；不要写到别的插件目录。", dir)
+			fmt.Fprintf(&b, "\n默认围绕这个插件做事：解释行为、改清单与正文、用 plugin_try 试跑；"+
+				"问答直接在对话里回答，只有确实要改插件时才写文件。\n"+
+				"file_read / file_write 的 path 写相对空间根的完整路径，例如 `%s/<文件名>`，不要写到别的插件目录。", dir)
 		} else {
-			fmt.Fprintf(&b, "本会话是在空间目录 `%s` 下创建的。用户默认在这个目录里工作：优先使用该目录下的文件，"+
-				"需要跨目录取用材料时先说明理由。\n"+
+			fmt.Fprintf(&b, "本会话创建在空间目录 `%s` 下，优先使用这里的文件，跨目录取材料先说明理由。\n"+
 				"真要产出文件时放到这个目录，路径写相对空间根的完整路径，例如 `%s/<文件名>`；"+
-				"不需要交付文件的问题直接在对话里回答，不要为了用上这个目录而建文件。", dir, dir)
+				"只是回答问题就不要为了用上这个目录而建文件。", dir, dir)
 		}
 	}
 
@@ -113,7 +115,7 @@ func BuildSystemMessage(in RunInput) llm.Message {
 		doc, truncated := llm.TruncateByTokens(in.ActiveSkill.Doc, skillDocTokenBudget)
 		b.WriteString("\n\n## 本轮选中的技能：")
 		b.WriteString(in.ActiveSkill.Name)
-		b.WriteString("\n用户已为本会话选择该技能，优先按下面的步骤执行；如果与当前任务无关，说明原因后按常规处理。\n\n")
+		b.WriteString("\n优先按下面步骤执行；与当前任务无关就说明原因后按常规处理。\n\n")
 		b.WriteString(doc)
 		b.WriteString("\n")
 		if truncated {
@@ -151,7 +153,7 @@ func writeAgentSkills(b *strings.Builder, skills []SkillRef) {
 		return
 	}
 	b.WriteString("\n\n## 本智能体内置技能\n")
-	b.WriteString("这些技能随当前智能体一起安装，只对本次会话可见。需要细节时用 plugin_read 读对应路径；与当前任务无关就不要读。\n")
+	b.WriteString("随当前智能体安装，只对本次会话可见；需要细节用 plugin_read 读对应路径，无关就不要读。\n")
 	for _, line := range lines {
 		b.WriteString(line)
 		b.WriteString("\n")
@@ -165,6 +167,54 @@ func clipPromptText(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// weekdayCN 是提示词里的星期写法：中文日期里「周日」比「Sunday」更好读。
+var weekdayCN = [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+
+// writeClock 把本轮「现在」写成一小段提示词。
+//
+// 只说两件事：用户本地是几点、UTC 是几点，剩下的重点在「以哪个为准」——
+// 不说清的话，模型会拿 UTC 日期去判断「今天」，UTC+8 的凌晨就变成了前一天。
+func writeClock(b *strings.Builder, c ClockFacts) {
+	if c.Now.IsZero() {
+		return
+	}
+	now := c.Now
+	offset := formatUTCOffset(now)
+	zone := strings.TrimSpace(c.Zone)
+	if zone == "" {
+		// 用户端没给时区名时退到 Location 自带的缩写；仍为空就只写数字偏移
+		if name, _ := now.Zone(); name != "" {
+			zone = name
+		}
+	}
+	// 缩写有歧义（CST 既是中国标准时间也是美国中部时间），所以永远带数字偏移
+	where := offset
+	if zone != "" && zone != offset {
+		where = zone + "，" + offset
+	}
+	local := fmt.Sprintf("%s %s（%s）", now.Format("2006-01-02 15:04"), weekdayCN[int(now.Weekday())], where)
+	utc := now.UTC().Format("2006-01-02 15:04")
+
+	b.WriteString("\n\n## 当前时间\n")
+	if c.Source == ClockClient {
+		fmt.Fprintf(b, "用户本地时间是 %s；UTC 是 %s。\n", local, utc)
+		b.WriteString("判断「今天 / 昨天 / 本周 / 几点了」一律以用户本地时间为准，不要用训练数据里的日期推断现在。")
+		return
+	}
+	fmt.Fprintf(b, "用户端没有上报本地时间，以服务器时间为准：%s；UTC 是 %s。\n", local, utc)
+	b.WriteString("判断「今天 / 昨天 / 本周」以这里为准；用户问起时说明这是服务器时间，可能与其所在时区不同。")
+}
+
+// formatUTCOffset 把时区偏移写成 UTC+08:00：缩写有歧义，数字不会。
+func formatUTCOffset(t time.Time) string {
+	_, secs := t.Zone()
+	sign := "+"
+	if secs < 0 {
+		sign, secs = "-", -secs
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, secs/3600, secs%3600/60)
 }
 
 // writePlatformFacts 把平台部署事实写成一小段提示词。
@@ -200,7 +250,7 @@ func writePlatformFacts(b *strings.Builder, p PlatformFacts) {
 	b.WriteString("\n\n## 平台（部署事实）\n")
 	b.WriteString(strings.Join(parts, "；"))
 	b.WriteString("。\n")
-	b.WriteString("回答平台、租户、IM 相关问题时以这里为准；这里没有的信息就说不知道，不要凭常识或上下文猜测。")
+	b.WriteString("以这里为准；没有的信息就说不知道，不要凭常识猜测。")
 }
 
 // execToolsLimit 是提示词里列出的工具条数上限。
@@ -210,28 +260,19 @@ func writePlatformFacts(b *strings.Builder, p PlatformFacts) {
 // 写进 env.json 把上下文撑满。
 const execToolsLimit = 24
 
-// writeExecFacts 把执行环境写成一小段提示词。
+// writeExecFacts 只写「工具描述里推不出来的镜像事实」：什么系统、有哪些命令。
 //
-// 与平台事实分开写，是因为两者的可信来源不同：租户 / IM 来自配置，
-// 执行环境来自执行容器自述。混在一段里，出问题时无法判断哪一条过期了。
-//
-// 没有上报（本地开发、老镜像）时整段省略：宁可不说，也不能凭空写一句
-// 「命令跑在容器里」——那会让模型按错误的边界行事。
+// 容器临时、装到哪、网络怎么判这些都不在这里重复——shell_exec 的描述已经写了，
+// 而那段会随工具一起出现或消失；写两遍既占上下文，又会在改策略时只改一处。
 func writeExecFacts(b *strings.Builder, e ExecFacts) {
 	if e.Empty() {
 		return
 	}
 
-	b.WriteString("\n\n## 执行环境（shell_exec 所在的容器）\n")
+	b.WriteString("\n\n## 执行环境\n")
 
-	lines := make([]string, 0, 5)
 	if osName := strings.TrimSpace(e.OS); osName != "" {
-		lines = append(lines, fmt.Sprintf("- 命令跑在 %s 容器里，不是宿主机。", osName))
-	} else {
-		lines = append(lines, "- 命令跑在容器里，不是宿主机。")
-	}
-	if !e.Persistent {
-		lines = append(lines, "容器是临时的：系统目录（/usr、/etc、/opt）的改动会在容器重建后丢失，不要往那里装东西。")
+		fmt.Fprintf(b, "命令跑在 %s 容器里，不是宿主机。\n", osName)
 	}
 
 	if len(e.Tools) > 0 {
@@ -247,46 +288,8 @@ func writeExecFacts(b *strings.Builder, e ExecFacts) {
 			}
 		}
 		// 「未列出的按不可用处理」是这段的核心：只说有哪些，模型仍会猜还有别的
-		lines = append(lines, fmt.Sprintf("- 可用工具：%s。**没列出的命令按不可用处理**，用 `command -v` 确认后再换方案，"+
-			"不要尝试用系统包管理器安装。", strings.Join(names, "、")))
-	}
-
-	if len(e.Writable) > 0 {
-		lines = append(lines, fmt.Sprintf("- 除当前空间目录外，还可写：%s。", strings.Join(e.Writable, "、")))
-	}
-
-	if len(e.Sources) > 0 {
-		keys := make([]string, 0, len(e.Sources))
-		for k := range e.Sources {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		pairs := make([]string, 0, len(keys))
-		for _, k := range keys {
-			if v := strings.TrimSpace(e.Sources[k]); v != "" {
-				pairs = append(pairs, k+"→"+v)
-			}
-		}
-		if len(pairs) > 0 {
-			lines = append(lines, fmt.Sprintf("- 安装源：%s。安装依赖时用这些源，不要改成公网默认源。", strings.Join(pairs, "，")))
-		}
-	}
-
-	if net := strings.TrimSpace(e.Network); net != "" {
-		lines = append(lines, fmt.Sprintf("- 网络：%s。", net))
-	}
-
-	for _, line := range lines {
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-
-	// deps 目录里的东西是运行时产物，随时会变，不能写进提示词——
-	// 给一句「怎么查」，比给一份很快过期的清单有用。
-	if len(e.Writable) > 0 {
-		b.WriteString("空间依赖目录里的命令是历史安装产物，用 `ls` 查一遍再决定，不要假设它一定在。")
-	} else {
-		b.WriteString("镜像里没有的命令就是没有，直接换实现方式，不要反复尝试安装。")
+		fmt.Fprintf(b, "可用工具：%s。**没列出的命令按不可用处理**，用 `command -v` 确认后再换方案。\n",
+			strings.Join(names, "、"))
 	}
 }
 

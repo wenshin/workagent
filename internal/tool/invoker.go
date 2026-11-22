@@ -32,6 +32,11 @@ type InvokeResult struct {
 	// Cached 表示这条结果来自续跑回放，而不是这次真的执行了一遍。
 	// 前端与审计据此区分「做过」与「又做了一次」。
 	Cached bool
+	// Parked 表示这次调用没执行：它命中了审批，本轮停在这里等人确认。
+	//
+	// 它不是一条工具回执，不落库、也不进消息序列——调用本身留在断点的
+	// Pending 里，用户点同意后由续跑把它重新发出来（结论按参数复用）。
+	Parked bool
 	// Args 是本次调用的原始参数，落库时一并写入（续跑按参数认调用）。
 	Args json.RawMessage
 }
@@ -126,30 +131,71 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 		return i.finish(ctx, env, replayed, start, cached.Status, cached.Content)
 	}
 
-	if decision.NeedApproval {
-		approved, reason := i.askApproval(ctx, t, call, env, decision)
-		if !approved {
-			return i.finish(ctx, env, result, start, StatusDenied, reason)
-		}
-	}
-
 	if t.Invoke == nil {
 		return i.finish(ctx, env, result, start, StatusError, "工具未实现")
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, i.timeout)
-	defer cancel()
+	// shell 的网络准入：判据在 ShellNetPlan（工具挂在 NetPlan 上把参数换算成策略），
+	// 编排在这里——工具内部等人点按钮会被下面 30s 的墙钟掐断。
+	// granted 表示这次落给沙箱的 Spec.Network。
+	plan := ShellNetPolicy{}
+	if t.NetPlan != nil {
+		plan = t.NetPlan(args)
+	}
+	netKey := ""
+	if plan.NeedsApproval() {
+		netKey = shellNetApprovalKey(t.Name, args)
+	}
+	granted := plan.Mode == ShellNetOn
+	deniedNote := ""
 
-	out, runErr := t.Invoke(runCtx, args, env)
+	if decision.NeedApproval {
+		approved, reason, parked := i.askApproval(ctx, t, call, env, decision)
+		if parked {
+			// 审批是会话的暂停点：这次调用不执行、不产回执，本轮到此为止。
+			// 调用留在断点的 Pending 里，用户点同意后由续跑重新发出来。
+			result.Parked = true
+			return result
+		}
+		if approved {
+			granted = true
+		} else {
+			// 只有「用户拒的是联网」且策略允许降级时才继续：网络工具拒绝即不执行，
+			// 装依赖 + 脚本则按无网跑完（用户拒的是网，不是这个任务）。
+			netDenied := netKey != "" && decision.Action != nil && decision.Action.Key == netKey
+			if !netDenied || plan.OnDeny == DenyRefuse {
+				return i.finish(ctx, env, result, start, StatusDenied, reason+"（未执行）")
+			}
+			deniedNote = reason + "；本次按无网执行。\n"
+		}
+	} else if netKey != "" && NormalizeApprovalLevel(t.ApprovalLevel) == ApprovalOff {
+		// 安装方显式关掉确认：网络准入视为已批准，否则这条命令永远拿不到网
+		granted = true
+	}
+
+	out, runErr := i.execute(ctx, t, args, env, granted)
 	if runErr != nil {
-		if errors.Is(runErr, context.DeadlineExceeded) {
+		var need errNetNeeded
+		if errors.As(runErr, &need) {
+			// 纯脚本因断网失败：按规则申请联网重跑一次（审批在墙钟之外）。
+			// 这次许可同样可能是暂停点：那这次调用的结果就整体延后，不留半截无网回执。
+			retried, parked := i.escalateNetwork(ctx, t, call, env, args, out)
+			if parked {
+				result.Parked = true
+				return result
+			}
+			out = retried
+		} else if errors.Is(runErr, context.DeadlineExceeded) {
 			return i.finish(ctx, env, result, start, StatusError, fmt.Sprintf("工具执行超时（%s）", i.timeout))
-		}
-		if errors.Is(runErr, context.Canceled) {
+		} else if errors.Is(runErr, context.Canceled) {
 			return i.finish(ctx, env, result, start, StatusError, "调用已取消")
+		} else {
+			i.log.Warn("工具执行失败", "tool", t.Name, "err", runErr)
+			return i.finish(ctx, env, result, start, StatusError, "工具执行失败："+runErr.Error())
 		}
-		i.log.Warn("工具执行失败", "tool", t.Name, "err", runErr)
-		return i.finish(ctx, env, result, start, StatusError, "工具执行失败："+runErr.Error())
+	}
+	if deniedNote != "" {
+		out = deniedNote + out
 	}
 
 	out = Mask(out)
@@ -159,10 +205,8 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	return i.finish(ctx, env, result, start, StatusOK, out)
 }
 
-// ErrApprovalTimeout 表示等待人工确认超时（按拒绝处理）。
-var ErrApprovalTimeout = errors.New("等待审批超时")
-
-// askApproval 阻塞等待用户决策。返回 false 时 reason 是要回给模型的说明。
+// askApproval 取用户决策。返回 false 时 reason 是要回给模型的说明；
+// parked 为 true 表示本轮停在这里等人确认，调用方应当整体结束这一轮。
 //
 // 没有审批通道时按拒绝处理：命中规则却没人能批，静默执行才是真正危险的默认值。
 func (i *Invoker) askApproval(
@@ -171,14 +215,11 @@ func (i *Invoker) askApproval(
 	call llm.ToolCall,
 	env Env,
 	decision policy.Decision,
-) (bool, string) {
+) (allow bool, reason string, parked bool) {
 	if decision.Action == nil {
-		return false, fmt.Sprintf("调用 %s 需要人工确认，但没有说明确认什么，已拒绝执行", t.Name)
+		return false, fmt.Sprintf("调用 %s 需要人工确认，但没有说明确认什么，已拒绝执行", t.Name), false
 	}
-	if env.Approvals == nil {
-		return false, fmt.Sprintf("调用 %s 需要人工确认（%s），但审批通道未配置，已拒绝执行", t.Name, decision.Reason)
-	}
-	d, err := env.Approvals.Decide(ctx, ApprovalRequest{
+	return i.decide(ctx, t, env, ApprovalRequest{
 		ID:        ApprovalID(env.RunID, call.ID),
 		RunID:     env.RunID,
 		SessionID: env.SessionID,
@@ -190,26 +231,89 @@ func (i *Invoker) askApproval(
 		Detail:    decision.Action.Detail,
 		Reason:    decision.Reason,
 		// 确认卡上的徽标与工具卡一致：同样按这次实参细化
-		Risk:    t.EffectiveRisk(json.RawMessage(call.Function.Arguments)),
-		Timeout: DefaultApprovalTimeout,
+		Risk: t.EffectiveRisk(json.RawMessage(call.Function.Arguments)),
 	})
+}
+
+// decide 把一条审批请求交给通道，并统一处理暂停 / 中断 / 拒绝的措辞。
+func (i *Invoker) decide(ctx context.Context, t Tool, env Env, req ApprovalRequest) (bool, string, bool) {
+	if env.Approvals == nil {
+		return false, fmt.Sprintf("调用 %s 需要人工确认（%s），但审批通道未配置，已拒绝执行", t.Name, req.Reason), false
+	}
+	d, err := env.Approvals.Decide(ctx, req)
 	switch {
-	case err == nil:
-	case errors.Is(err, ErrApprovalTimeout), errors.Is(err, context.DeadlineExceeded):
-		return false, fmt.Sprintf("等待确认超时（%s），这次调用已取消。可以稍后重试。", DefaultApprovalTimeout)
-	case errors.Is(err, context.Canceled):
-		return false, "等待确认时运行被取消，这次调用没有执行"
-	default:
-		return false, "等待确认失败：" + err.Error()
+	case errors.Is(err, ErrApprovalParked):
+		// 本轮到此为止：这不是结论，别翻译成拒绝记进回执
+		return false, "", true
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return false, "等待确认时这一轮被中断，这次调用没有执行", false
+	case err != nil:
+		return false, "等待确认失败：" + err.Error(), false
 	}
 	if d.Allow {
-		return true, ""
+		return true, "", false
 	}
 	reason := d.Reason
 	if reason == "" {
 		reason = "用户拒绝了这次调用"
 	}
-	return false, reason + "（未执行）"
+	return false, reason, false
+}
+
+// execute 跑一次工具，并告知它这次是否已获准联网。
+//
+// 每次尝试单独计时：升级重跑是第二次执行，不该和前一次共享 30s 预算。
+func (i *Invoker) execute(ctx context.Context, t Tool, args json.RawMessage, env Env, netGrant bool) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, i.timeout)
+	defer cancel()
+	env.NetGrant = netGrant
+	return t.Invoke(runCtx, args, env)
+}
+
+// escalateNetwork 实现「只有脚本时先无网跑，失败且像网络问题再申请联网重跑」。
+//
+// offline 是那次无网执行的回执：拿不到许可就把它原样回给模型（并注明仍是无网），
+// 批准后才真的重跑一次——所以拒绝的代价只是一次失败，不是一条被放行的命令。
+// parked 为 true 表示这次许可还在等人：无网回执先不发，等续跑重放这一条调用。
+func (i *Invoker) escalateNetwork(
+	ctx context.Context,
+	t Tool,
+	call llm.ToolCall,
+	env Env,
+	args json.RawMessage,
+	offline string,
+) (string, bool) {
+	// 没人可问的情况：安装方关掉了确认，或平台没有审批通道。保持无网结果。
+	if NormalizeApprovalLevel(t.ApprovalLevel) == ApprovalOff || env.Approvals == nil {
+		return offline + ShellNetRetryDeniedNote, false
+	}
+	approved, reason, parked := i.decide(ctx, t, env, ApprovalRequest{
+		// 与首次审批不同 ID：同一次调用的两种许可（先问装依赖、后问联网重跑）
+		// 不能互相覆盖，否则第二次点击会落在已终态的记录上。
+		ID:        ApprovalID(env.RunID, call.ID) + ":net",
+		RunID:     env.RunID,
+		SessionID: env.SessionID,
+		CallID:    call.ID,
+		Tool:      t.Name,
+		Kind:      policy.ActionShell,
+		Key:       shellNetRetryKey(t.Name, args),
+		ArgsHash:  ArgsHash(t.Name, args) + ":net",
+		Detail:    shellCommandOf(args),
+		Reason:    ShellNetRetryReason,
+		Risk:      t.EffectiveRisk(args),
+	})
+	if parked {
+		return "", true
+	}
+	if !approved {
+		return offline + reason + ShellNetRetryDeniedNote, false
+	}
+	retried, err := i.execute(ctx, t, args, env, true)
+	if err != nil {
+		i.log.Warn("联网重跑失败", "tool", t.Name, "err", err)
+		return offline + "\n[提示] 用户批准了联网重跑，但重跑失败：" + err.Error() + "\n", false
+	}
+	return retried + ShellNetRetryDoneNote, false
 }
 
 // ApprovalID 由 run 与 call 派生稳定 ID：前端点按钮时原样回传。

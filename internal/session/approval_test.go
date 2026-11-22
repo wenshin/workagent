@@ -88,14 +88,6 @@ func (f *fakeApprovalStore) FindApprovalGrant(_ context.Context, runID, actionKe
 	return out, found, nil
 }
 
-// SetRunStatus 记录状态变化，用来断言「等人的时候真的落成 waiting_approval」。
-func (f *fakeApprovalStore) SetRunStatus(_ context.Context, runID, status string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.statuses = append(f.statuses, status)
-	return nil
-}
-
 func (f *fakeApprovalStore) MarkApprovalExpired(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -126,11 +118,11 @@ func newTestApprover(st *fakeApprovalStore, runID string) *runApprover {
 	}
 }
 
-func approvalReq(id, key string, timeout time.Duration) tool.ApprovalRequest {
-	return approvalReqWithArgs(id, key, "", timeout)
+func approvalReq(id, key string) tool.ApprovalRequest {
+	return approvalReqWithArgs(id, key, "")
 }
 
-func approvalReqWithArgs(id, key, argsHash string, timeout time.Duration) tool.ApprovalRequest {
+func approvalReqWithArgs(id, key, argsHash string) tool.ApprovalRequest {
 	return tool.ApprovalRequest{
 		ID:       id,
 		RunID:    "r1",
@@ -140,50 +132,58 @@ func approvalReqWithArgs(id, key, argsHash string, timeout time.Duration) tool.A
 		Key:      key,
 		ArgsHash: argsHash,
 		Detail:   "rm -rf data/",
-		Timeout:  timeout,
 	}
 }
 
-// 超时按拒绝：记录要落成 expired，不能留在 pending 变成幽灵待办。
-func TestDecideTimeoutExpiresRecord(t *testing.T) {
+// 命中审批不再阻塞：登记待办、回「已暂停」，由调用方结束本轮。
+func TestDecideParksInsteadOfBlocking(t *testing.T) {
 	st := newFakeApprovalStore()
 	a := newTestApprover(st, "r1")
 
-	_, err := a.Decide(context.Background(), approvalReq("ap1", "shell:rm", 30*time.Millisecond))
-	if !errors.Is(err, tool.ErrApprovalTimeout) {
-		t.Fatalf("期望超时，实际 %v", err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Decide(context.Background(), approvalReq("ap1", "shell:rm"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, tool.ErrApprovalParked) {
+			t.Fatalf("期望暂停，实际 %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Decide 不该阻塞等人")
 	}
+
 	got, ok, _ := st.GetApproval(context.Background(), "ap1")
-	if !ok || got.Status != store.ApprovalExpired {
-		t.Fatalf("超时后记录应为 expired，实际 %+v", got)
+	if !ok || got.Status != store.ApprovalPending {
+		t.Fatalf("应留下一条 pending 待办，实际 %+v", got)
+	}
+	// 待办与断点同寿命：过期就把「点了同意却接不上」做成了常态
+	if left := time.Until(got.ExpireAt); left < approvalTTL-time.Minute {
+		t.Fatalf("待办有效期应与断点一致，实际剩 %s", left)
+	}
+	if ids := a.parkedIDs(); len(ids) != 1 || ids[0] != "ap1" {
+		t.Fatalf("应记下这一轮挂起的待办，实际 %v", ids)
 	}
 }
 
 // 「本轮都同意」落库后，同一键的后续调用直接放行，不再弹第二次。
 func TestDecideReusesTurnGrant(t *testing.T) {
 	st := newFakeApprovalStore()
+	ctx := context.Background()
 	a := newTestApprover(st, "r1")
 
-	// 模拟 HTTP 决策路径：先落库（scope=turn），再唤醒执行体
-	go func() {
-		for i := 0; i < 100; i++ {
-			time.Sleep(5 * time.Millisecond)
-			if _, ok, _ := st.GetApproval(context.Background(), "ap1"); ok {
-				_, _, _ = st.DecideApproval(context.Background(), "ap1", store.ApprovalApproved, "turn", "u1")
-				a.hub.resolve("ap1", tool.ApprovalDecision{Allow: true, Remember: true})
-				return
-			}
-		}
-	}()
-
-	first, err := a.Decide(context.Background(), approvalReq("ap1", "shell:rm", 2*time.Second))
-	if err != nil || !first.Allow || !first.Remember {
-		t.Fatalf("第一次应被同意并记住本轮: %+v err=%v", first, err)
+	if _, err := a.Decide(ctx, approvalReq("ap1", "shell:rm")); !errors.Is(err, tool.ErrApprovalParked) {
+		t.Fatalf("第一次应暂停，实际 %v", err)
+	}
+	// 模拟 HTTP 决策路径：结论落库（scope=turn）
+	if _, ok, _ := st.DecideApproval(ctx, "ap1", store.ApprovalApproved, "turn", "u1"); !ok {
+		t.Fatal("决策应落库")
 	}
 
-	// 第二次是不同 id 的新调用，靠库里的 turn 结论直接返回，不会阻塞
-	second, err := a.Decide(context.Background(), approvalReq("ap2", "shell:rm", 50*time.Millisecond))
-	if err != nil || !second.Allow {
+	// 续跑后同键的新调用靠库里结论直接放行：不再暂停、不再问第二遍
+	second, err := a.Decide(ctx, approvalReq("ap2", "shell:rm"))
+	if err != nil || !second.Allow || !second.Remember {
 		t.Fatalf("本轮已同意应直接放行: %+v err=%v", second, err)
 	}
 }
@@ -191,76 +191,32 @@ func TestDecideReusesTurnGrant(t *testing.T) {
 // 单次同意不产生本轮记忆：下一次同键仍要确认。
 func TestDecideOnceDoesNotGrantTurn(t *testing.T) {
 	st := newFakeApprovalStore()
+	ctx := context.Background()
 	a := newTestApprover(st, "r1")
 
-	go func() {
-		for i := 0; i < 100; i++ {
-			time.Sleep(5 * time.Millisecond)
-			if _, ok, _ := st.GetApproval(context.Background(), "ap1"); ok {
-				_, _, _ = st.DecideApproval(context.Background(), "ap1", store.ApprovalApproved, "once", "u1")
-				a.hub.resolve("ap1", tool.ApprovalDecision{Allow: true, Remember: false})
-				return
-			}
-		}
-	}()
-
-	if d, err := a.Decide(context.Background(), approvalReq("ap1", "shell:rm", 2*time.Second)); err != nil || !d.Allow {
-		t.Fatalf("单次同意应放行: %+v err=%v", d, err)
+	if _, err := a.Decide(ctx, approvalReq("ap1", "shell:rm")); !errors.Is(err, tool.ErrApprovalParked) {
+		t.Fatalf("第一次应暂停，实际 %v", err)
 	}
-	if _, err := a.Decide(context.Background(), approvalReq("ap2", "shell:rm", 30*time.Millisecond)); !errors.Is(err, tool.ErrApprovalTimeout) {
-		t.Fatalf("单次同意不应复用，期望再次等待超时，实际 %v", err)
+	if _, ok, _ := st.DecideApproval(ctx, "ap1", store.ApprovalApproved, "once", "u1"); !ok {
+		t.Fatal("决策应落库")
 	}
-}
-
-// 等人的时候状态要落成 waiting_approval：前端据此显示「等待确认」，
-// 清扫也不会把这一轮当成崩溃收掉；拿到决策后必须切回 running。
-func TestDecideMarksWaitingApproval(t *testing.T) {
-	st := newFakeApprovalStore()
-	a := newTestApprover(st, "r1")
-
-	seen := make(chan []string, 1)
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		st.mu.Lock()
-		seen <- append([]string{}, st.statuses...)
-		st.mu.Unlock()
-	}()
-
-	_, err := a.Decide(context.Background(), approvalReq("ap1", "shell:rm", 60*time.Millisecond))
-	if !errors.Is(err, tool.ErrApprovalTimeout) {
-		t.Fatalf("期望超时，实际 %v", err)
-	}
-
-	got := <-seen
-	if len(got) == 0 || got[0] != store.RunWaitingApproval {
-		t.Fatalf("等待期间应为 waiting_approval，实际 %v", got)
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if last := st.statuses[len(st.statuses)-1]; last != store.RunRunning {
-		t.Fatalf("等待结束后应切回 running，实际 %s", last)
+	// 不同参数的下一次调用：单次同意不该被复用，仍需确认
+	if _, err := a.Decide(ctx, approvalReqWithArgs("ap2", "shell:rm", "h-other")); !errors.Is(err, tool.ErrApprovalParked) {
+		t.Fatalf("单次同意不应复用，期望再次暂停，实际 %v", err)
 	}
 }
 
 // 续跑换了 run：审批记录挂在旧 run 上，靠参数指纹也要能复用。
 func TestDecideReusesApprovedByArgsAcrossRuns(t *testing.T) {
 	st := newFakeApprovalStore()
+	ctx := context.Background()
 	a := newTestApprover(st, "r1")
 
-	go func() {
-		for i := 0; i < 100; i++ {
-			time.Sleep(5 * time.Millisecond)
-			if _, ok, _ := st.GetApproval(context.Background(), "ap1"); ok {
-				_, _, _ = st.DecideApproval(context.Background(), "ap1", store.ApprovalApproved, "once", "u1")
-				a.hub.resolve("ap1", tool.ApprovalDecision{Allow: true})
-				return
-			}
-		}
-	}()
-
-	if d, err := a.Decide(context.Background(),
-		approvalReqWithArgs("ap1", "shell:rm", "h-rm", 2*time.Second)); err != nil || !d.Allow {
-		t.Fatalf("第一次应被同意: %+v err=%v", d, err)
+	if _, err := a.Decide(ctx, approvalReqWithArgs("ap1", "shell:rm", "h-rm")); !errors.Is(err, tool.ErrApprovalParked) {
+		t.Fatalf("第一次应暂停，实际 %v", err)
+	}
+	if _, ok, _ := st.DecideApproval(ctx, "ap1", store.ApprovalApproved, "once", "u1"); !ok {
+		t.Fatal("决策应落库")
 	}
 
 	// 续跑：新 run 接替 r1，模型重新生成了调用（新 id），但参数一字不差
@@ -270,8 +226,7 @@ func TestDecideReusesApprovedByArgsAcrossRuns(t *testing.T) {
 		parentRunID: "r1",
 		sessionID:   "s1",
 	}
-	d, err := next.Decide(context.Background(),
-		approvalReqWithArgs("ap2", "shell:rm", "h-rm", 30*time.Millisecond))
+	d, err := next.Decide(ctx, approvalReqWithArgs("ap2", "shell:rm", "h-rm"))
 	if err != nil || !d.Allow {
 		t.Fatalf("同参调用应复用旧结论，实际 %+v err=%v", d, err)
 	}

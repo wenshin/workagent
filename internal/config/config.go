@@ -10,15 +10,13 @@ import (
 	"time"
 )
 
-// 运行形态。三档互斥，由部署显式声明，不按「探测到什么」推断——
-// 推断会让生产环境的沙箱形态取决于镜像里有没有装 bwrap。
+// 运行形态。两档互斥，由部署显式声明，不按「探测到什么」推断，也不分开发/生产——
+// 推断会让 server 的沙箱形态取决于镜像里有没有装 bwrap，或者取决于这次是不是本机调试。
 const (
-	// RoleServer 是服务端：沙箱只能走远端执行体。
+	// RoleServer 是服务端（含本机调试与 CI）：沙箱只能走远端执行体。
 	RoleServer = "server"
 	// RoleClient 是客户端本地 runtime：沙箱只能是本进程的 bwrap。
 	RoleClient = "client"
-	// RoleDev 是开发机：自动探测，允许无隔离降级。
-	RoleDev = "dev"
 )
 
 // Config 保存服务运行所需的全部配置，全部来源于环境变量（支持 .env 文件）。
@@ -51,7 +49,7 @@ type Config struct {
 	StorageRoot string
 
 	// UploadMaxFileMB 是会话上传单个文件的大小上限（MB），环境变量 UPLOAD_MAX_FILE_MB。
-	// 0 表示沿用默认 4MB（负数启动报错）；单次上传的文件数上限仍是 10 个。
+	// 0 表示沿用默认 100MB（负数启动报错）；单次上传的文件数上限仍是 10 个。
 	UploadMaxFileMB int
 
 	// 系统管理员工号（逗号分隔）：只有这些用户能看到并编辑「系统空间」。
@@ -90,21 +88,15 @@ type Config struct {
 	PluginsDefaultInstall []string
 
 	// Role 是运行形态，决定沙箱能且只能用哪一种（docs/本地空间与双端架构.md §5.7）：
-	//   server —— 服务端：只能连远端执行体（SANDBOX_BACKEND=remote）。
+	//   server —— 服务端（含本机调试与 CI）：只能连远端执行体（SANDBOX_BACKEND=remote）。
 	//   client —— 客户端本地 runtime：只能在本进程起 bwrap。
-	//   dev    —— 开发机：自动探测 bwrap → sandbox-exec → local，仅本机调试与 CI。
-	// 三档互斥且必须显式声明：沙箱形态不能取决于「这台机器上恰好装了什么」，
-	// 否则同一份配置换台机器就从隔离变成裸跑。
+	// 两档互斥且必须显式声明：沙箱形态不能取决于「这台机器上恰好装了什么」，
+	// 也不能取决于「这次是不是开发环境」，否则同一份配置换台机器就从隔离变成裸跑。
 	Role string
-
-	// SandboxRequire 要求命令执行必须有真实隔离后端（bwrap / sandbox-exec）。
-	// 只对 dev 生效：server 与 client 各自强制要求隔离，不受这个开关影响。
-	SandboxRequire bool
 
 	// SandboxBackend 选择执行面形态，取值由 Role 决定：
 	//   server —— 只能是 remote（默认）
 	//   client —— 只能是 local（默认），且必须是 bwrap
-	//   dev    —— local（自动探测）或 remote
 	SandboxBackend string
 	// SandboxRunnerAddr 是远端执行体地址（host:port 或完整 URL）。
 	SandboxRunnerAddr string
@@ -185,11 +177,11 @@ func Load() (*Config, error) {
 	// 是比「没配」更难查的故障。
 	role := strings.ToLower(strings.TrimSpace(getenv("WA_ROLE", RoleServer)))
 	switch role {
-	case RoleServer, RoleClient, RoleDev:
+	case RoleServer, RoleClient:
 	default:
-		return nil, fmt.Errorf("WA_ROLE 只能是 server / client / dev，当前 %q", role)
+		return nil, fmt.Errorf("WA_ROLE 只能是 server / client，当前 %q（dev 已删除：本机调试同样连远端执行体）", role)
 	}
-	// 服务端没有本机执行面，默认连执行体；客户端与开发机默认本机起进程。
+	// 服务端没有本机执行面，默认连执行体；客户端默认本机起进程。
 	backendDefault := "remote"
 	if role != RoleServer {
 		backendDefault = "local"
@@ -330,8 +322,8 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("LLM_MAX_WALL_CLOCK 不能小于 RUN_IDLE_TIMEOUT（%s < %s）：总上限比无进展阈值还短会误杀正常的长回答", wallClock, idleTimeout)
 	}
 
-	// 上传单文件上限：按 MB 配，乘 2^20 落到字节；0 表示用 space 包的默认值（4MB）。
-	uploadMaxFileMB := 4
+	// 上传单文件上限：按 MB 配，乘 2^20 落到字节；0 表示用 space 包的默认值（100MB）。
+	uploadMaxFileMB := 100
 	if v := getenv("UPLOAD_MAX_FILE_MB", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &uploadMaxFileMB); err != nil || uploadMaxFileMB < 0 {
 			return nil, fmt.Errorf("UPLOAD_MAX_FILE_MB 必须是非负整数")
@@ -379,8 +371,6 @@ func Load() (*Config, error) {
 		PluginsDefaultInstall: splitList(getenv("PLUGIN_DEFAULT_INSTALL", "")),
 
 		Role: role,
-
-		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
 
 		SandboxBackend:     getenv("SANDBOX_BACKEND", backendDefault),
 		SandboxRunnerAddr:  getenv("SANDBOX_RUNNER_ADDR", ""),

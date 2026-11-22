@@ -6,6 +6,7 @@ import type {
   SessionTask,
   SharesResponse,
   SpaceFile,
+  FilePreviewKind,
   TasksResponse,
   UploadFilesResponse,
 } from './types';
@@ -195,13 +196,34 @@ export function viewShared(token: string): Promise<{
 }
 
 /**
- * 上传允许的文件类型，必须与后端 `previewable` 一致：
- * 上传口只收能预览、`file_read` 也读得到的文本类型，accept 只是把选择器过滤一遍。
- * 隐藏配置没有常规后缀（.env / .gitignore），单独列出来，否则在选择器里根本看不到它们。
+ * 用户端此刻的本地时间与时区，随对话请求发给服务端。
+ *
+ * 「今天」由用户在哪个时区决定：服务端按自己的时区算，会把 UTC+8 的凌晨算成前一天，
+ * 于是模型把今天答成昨天。时间按「本地墙上时间 + 偏移」发（RFC3339），时区名另发
+ * IANA 名——只有偏移时 DST 换算不回去，只有时区名时又依赖服务端有没有 tzdata。
  */
-export const UPLOAD_ACCEPT = '.md,.json,.txt,.csv,.yaml,.yml,.env,.gitignore,.gitattributes,.editorconfig,.npmrc,.dockerignore';
-/** 同一份白名单的展示文案，用在 tooltip 与菜单说明里 */
-export const UPLOAD_ACCEPT_LABEL = 'md / json / txt / csv / yaml 与 .env 等隐藏配置';
+export function clientClock(): { client_time: string; timezone: string } {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const offset = -now.getTimezoneOffset(); // 分钟，东区为正
+  const abs = Math.abs(offset);
+  const local =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}` +
+    `${offset >= 0 ? '+' : '-'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+
+  let timezone = '';
+  try {
+    timezone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? '';
+  } catch {
+    // 老浏览器取不到 IANA 名：偏移已经够服务端算对日期，只是没有时区名
+    timezone = '';
+  }
+  return { client_time: local, timezone };
+}
+
+/** 上传提示文案：类型不再受限，只受单文件大小约束 */
+export const UPLOAD_HINT = '任意文件（文本、图片、音视频、PDF、压缩包等）';
 
 /** 本地预挡超限文件：省掉一次注定 413 的往返；返回第一个超限文件 */
 export function firstOversize(files: File[], maxMb?: number): File | undefined {
@@ -210,13 +232,29 @@ export function firstOversize(files: File[], maxMb?: number): File | undefined {
   return files.find((f) => f.size > limit);
 }
 
-// 预览白名单与上传白名单同源：能传上来的文本类型就是能渲染的类型
-const PREVIEW_SUFFIXES = UPLOAD_ACCEPT.split(',')
-  .map((suffix) => suffix.trim().toLowerCase())
-  .filter(Boolean);
+/**
+ * 能读正文的文本类型，与后端 `previewExts` 同源。
+ * 图片 / 音视频 / PDF 能上传、能预览、能作为附件引用，只是模型读不到正文。
+ * 隐藏配置没有常规后缀（.env / .gitignore），单独列出来，否则会漏判。
+ */
+const TEXT_PREVIEW_SUFFIXES = [
+  '.md',
+  '.json',
+  '.txt',
+  '.csv',
+  '.yaml',
+  '.yml',
+  '.env',
+  '.gitignore',
+  '.gitattributes',
+  '.editorconfig',
+  '.npmrc',
+  '.dockerignore',
+];
 
 /**
- * 文件能否在右侧面板渲染（md 走 Markdown，其余按纯文本）。
+ * 文件能否读取正文（md 走 Markdown，其余按纯文本）；决定面板是否取正文、
+ * 以及引用标签是否标「附件」（不决定能否引用：任何文件都能引用）。
  *
  * 服务端清单里的 `previewable` 是权威值（它认识 .env 这类隐藏配置）；
  * 老版本后端没有这个字段时按扩展名兜底，否则 md / json 会被误判成「只能下载」。
@@ -224,7 +262,58 @@ const PREVIEW_SUFFIXES = UPLOAD_ACCEPT.split(',')
 export function isPreviewable(file: Pick<SpaceFile, 'name' | 'previewable'>): boolean {
   if (typeof file.previewable === 'boolean') return file.previewable;
   const name = file.name.toLowerCase();
-  return PREVIEW_SUFFIXES.some((suffix) => name.endsWith(suffix));
+  return TEXT_PREVIEW_SUFFIXES.some((suffix) => name.endsWith(suffix));
+}
+
+/** 浏览器能原生渲染的扩展名，与后端 `mediaPreviewExts` 白名单同源 */
+const MEDIA_PREVIEW_SUFFIXES: Array<[string, FilePreviewKind]> = [
+  ['.png', 'image'],
+  ['.jpg', 'image'],
+  ['.jpeg', 'image'],
+  ['.gif', 'image'],
+  ['.webp', 'image'],
+  ['.avif', 'image'],
+  ['.bmp', 'image'],
+  ['.ico', 'image'],
+  ['.svg', 'image'],
+  ['.mp4', 'video'],
+  ['.m4v', 'video'],
+  ['.webm', 'video'],
+  ['.ogv', 'video'],
+  ['.mp3', 'audio'],
+  ['.wav', 'audio'],
+  ['.ogg', 'audio'],
+  ['.oga', 'audio'],
+  ['.m4a', 'audio'],
+  ['.aac', 'audio'],
+  ['.flac', 'audio'],
+  ['.weba', 'audio'],
+  ['.pdf', 'pdf'],
+];
+
+/**
+ * 右侧面板的渲染方式。
+ *
+ * 服务端 `preview_kind` 是权威值（MIME 白名单在服务端）；老版本后端没有这个字段时，
+ * 先按文本白名单、再按浏览器原生媒体扩展名兜底，最后才是「只能下载」。
+ */
+export function previewKindOf(
+  file: Pick<SpaceFile, 'name' | 'previewable' | 'preview_kind'>,
+): FilePreviewKind {
+  if (file.preview_kind) return file.preview_kind;
+  if (isPreviewable(file)) return 'text';
+  const name = file.name.toLowerCase();
+  return MEDIA_PREVIEW_SUFFIXES.find(([suffix]) => name.endsWith(suffix))?.[1] ?? 'none';
+}
+
+/**
+ * 浏览器直接渲染的文件地址（图片 / 音视频 / PDF）。
+ *
+ * 同源请求自动带登录 Cookie；服务端按白名单给 Content-Type 并支持 Range，
+ * 因此视频可以直接交给 <video>，不用先整段读进内存。
+ */
+export function spaceFileRawUrl(spaceId: string, path: string): string {
+  return `/spaces/${spaceId}/file/raw?path=${encodeURIComponent(path)}`;
 }
 
 /**

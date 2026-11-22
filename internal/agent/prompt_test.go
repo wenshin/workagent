@@ -3,6 +3,7 @@ package agent
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/llm"
 )
@@ -79,10 +80,9 @@ func TestSystemMessageSkillDocIsTruncatedWithNotice(t *testing.T) {
 		Doc:  doc,
 	}})
 
-	// 预算只约束技能正文本身；固定基础规则大约占 1350 tokens（含检索、知识库按
-	// 智能体分区、默认在对话里回答与编程任务判断规则），因此这里给的是「正文预算
-	// + 基础规则」的余量，微调措辞时不用同步调数字。基础规则成规模增长时要重新
-	// 审视预算分配，而不是继续抬这里。
+	// 预算只约束技能正文本身；固定基础规则大约占 540 tokens（TestBasePromptStaysSmall
+	// 守着 750 的上限），因此这里给的是「正文预算 + 基础规则」的余量，微调措辞时不用
+	// 同步调数字。基础规则成规模增长时要重新审视预算分配，而不是继续抬这里。
 	if got := llm.EstimateTokens(msg.Content); got > skillDocTokenBudget+1400 {
 		t.Fatalf("技能正文超预算：%d tokens", got)
 	}
@@ -159,7 +159,7 @@ func TestNoDirContextWhenRoot(t *testing.T) {
 func TestBasePromptForbidsAskingForPlaintextSecrets(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{})
 
-	for _, want := range []string{"不要向用户索要明文", "secret_request", "已经泄露"} {
+	for _, want := range []string{"不要向用户索要明文", "secret_request", "已泄露"} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("基础规则缺少凭证约束 %q", want)
 		}
@@ -208,7 +208,7 @@ func TestPlatformFactsInjected(t *testing.T) {
 		"IM 接入是钉钉（登录已配置）",
 		"张三，工号 E001",
 		"当前空间是「研发空间」",
-		"不要凭常识或上下文猜测",
+		"不要凭常识猜测",
 	} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("平台事实缺少 %q\n%s", want, msg.Content)
@@ -217,6 +217,65 @@ func TestPlatformFactsInjected(t *testing.T) {
 	// 信息已注入，不应再给模型一个查询同名事实的工具
 	if strings.Contains(msg.Content, "platform_info") {
 		t.Fatal("平台事实已注入，基础规则里不应再提 platform_info 工具")
+	}
+}
+
+// 时间是每轮的前提，直接进提示词而不是做成工具：模型对「今天是几号」有训练期
+// 先验，做成工具它会不查就答。这条用例同时守住时区问题——用户本地 11-22 的凌晨，
+// UTC 还是 11-21，按 UTC 判「今天」就会答成昨天。
+func TestClockInjected(t *testing.T) {
+	now := time.Date(2026, 11, 22, 0, 30, 0, 0, time.FixedZone("CST", 8*3600))
+	msg := BuildSystemMessage(RunInput{Clock: ClockFacts{Now: now, Zone: "Asia/Shanghai", Source: ClockClient}})
+
+	for _, want := range []string{
+		"## 当前时间",
+		"用户本地时间是 2026-11-22 00:30 周日（Asia/Shanghai，UTC+08:00）",
+		"UTC 是 2026-11-21 16:30",
+		"以用户本地时间为准",
+		"不要用训练数据里的日期",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("当前时间段缺少 %q:\n%s", want, msg.Content)
+		}
+	}
+}
+
+// 回落服务器时间时必须说明来源：用户端没上报，模型不能把服务器时区当成用户的。
+func TestClockServerFallbackSaysSo(t *testing.T) {
+	now := time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)
+	msg := BuildSystemMessage(RunInput{Clock: ClockFacts{Now: now, Source: ClockServer}})
+
+	for _, want := range []string{
+		"用户端没有上报本地时间",
+		"以服务器时间为准",
+		"UTC+00:00",
+	} {
+		if !strings.Contains(msg.Content, want) {
+			t.Fatalf("服务器时间兜底缺少 %q:\n%s", want, msg.Content)
+		}
+	}
+	if strings.Contains(msg.Content, "用户本地时间是") {
+		t.Fatalf("没有用户端时间就不能写成用户本地时间:\n%s", msg.Content)
+	}
+}
+
+// 没有时间就不写这一段：宁可不说，也不能凭空编一个「现在」。
+func TestClockOmittedWhenUnknown(t *testing.T) {
+	if strings.Contains(BuildSystemMessage(RunInput{}).Content, "## 当前时间") {
+		t.Fatal("没有时间语义时不应注入当前时间段")
+	}
+}
+
+// 时间是现场事实，智能体不能改写「今天几号」，所以必须排在设定之前。
+func TestClockBeforeAgentPrompt(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{
+		AgentPrompt: "AGENT-EXTRA",
+		Clock:       ClockFacts{Now: time.Now(), Source: ClockServer},
+	})
+	clock := strings.Index(msg.Content, "## 当前时间")
+	extra := strings.Index(msg.Content, "AGENT-EXTRA")
+	if clock < 0 || extra < 0 || clock > extra {
+		t.Fatalf("当前时间应排在智能体设定之前: clock=%d extra=%d", clock, extra)
 	}
 }
 
@@ -249,13 +308,13 @@ func TestPlatformFactsBeforeAgentPrompt(t *testing.T) {
 	}
 }
 
-// 执行环境是模型写命令的前提：不说清楚它会 apt install、写 /usr、连外网，
-// 失败后换一种方式重试，白耗轮次。
+// 执行环境只写「工具描述里推不出来的镜像事实」：什么系统、有哪些命令。
+// 网络档位、容器临时、安装源都在 shell_exec 的描述或环境变量里，
+// 提示词再写一遍只是白占每轮上下文，还会在改策略时漂移。
 func TestExecFactsInjected(t *testing.T) {
 	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{Exec: ExecFacts{
-		OS:      "debian 12 (linux/arm64)",
-		Tools:   []ExecTool{{Name: "git", Version: "2.39.5"}, {Name: "jq", Version: "1.6"}},
-		Network: "网络工具先请用户确认；脚本默认不联网；其余命令默认有网",
+		OS:    "debian 12 (linux/arm64)",
+		Tools: []ExecTool{{Name: "git", Version: "2.39.5"}, {Name: "jq", Version: "1.6"}},
 	}}})
 
 	for _, want := range []string{
@@ -263,11 +322,14 @@ func TestExecFactsInjected(t *testing.T) {
 		"debian 12 (linux/arm64)",
 		"git 2.39.5、jq 1.6",
 		"没列出的命令按不可用处理",
-		"脚本默认不联网",
-		"容器重建后丢失",
 	} {
 		if !strings.Contains(msg.Content, want) {
 			t.Fatalf("执行环境段缺少 %q:\n%s", want, msg.Content)
+		}
+	}
+	for _, avoid := range []string{"脚本默认不联网", "安装源", "还可写"} {
+		if strings.Contains(msg.Content, avoid) {
+			t.Fatalf("执行环境段不该重复 %q（已在工具描述或环境变量里）:\n%s", avoid, msg.Content)
 		}
 	}
 }
@@ -292,17 +354,36 @@ func TestExecFactsBeforeAgentPrompt(t *testing.T) {
 	}
 }
 
-// 可写位置存在时，要教模型「自己查」而不是列一份会过期的清单。
-func TestExecFactsPointsToDepsInsteadOfListing(t *testing.T) {
-	msg := BuildSystemMessage(RunInput{Platform: PlatformFacts{Exec: ExecFacts{
-		OS:       "debian 12",
-		Writable: []string{"/data/storage/tenants/t1/spaces/s1/deps"},
-	}}})
+// 提示词是每轮固定成本：基础规则 + 执行环境要留在这个量级内。
+// 超了先看是不是把工具用法又搬回提示词了——那部分该由 Tool.Description 承载。
+func TestBasePromptStaysSmall(t *testing.T) {
+	msg := BuildSystemMessage(RunInput{
+		Clock: ClockFacts{
+			Now:    time.Date(2026, 11, 22, 14, 5, 0, 0, time.FixedZone("CST", 8*3600)),
+			Zone:   "Asia/Shanghai",
+			Source: ClockClient,
+		},
+		Platform: PlatformFacts{
+			Tenant: "测试公司", IMName: "钉钉", IMConfigured: true,
+			UserName: "张三", JobNumber: "E001", SpaceName: "研发空间",
+			Exec: ExecFacts{
+				OS: "debian 12 (arm64)",
+				Tools: []ExecTool{
+					{Name: "python3", Version: "3.11.2"}, {Name: "pip3", Version: "23.0.1"},
+					{Name: "mise", Version: "2026.11.11"}, {Name: "deno", Version: "2.9.8"},
+					{Name: "git", Version: "2.39.5"}, {Name: "jq", Version: "1.6"},
+					{Name: "curl", Version: "7.88.1"}, {Name: "bash", Version: "5.2.15"},
+					{Name: "tar", Version: "1.34"}, {Name: "unzip", Version: "6.00"},
+					{Name: "gcc", Version: "12.2.0"}, {Name: "make", Version: "4.3"},
+					{Name: "pkg-config", Version: "1.8.1"},
+				},
+			},
+		},
+	})
 
-	if !strings.Contains(msg.Content, "还可写：/data/storage/tenants/t1/spaces/s1/deps") {
-		t.Fatalf("缺少可写位置说明:\n%s", msg.Content)
-	}
-	if !strings.Contains(msg.Content, "历史安装产物") {
-		t.Fatalf("可写目录存在时应提示「自己 ls 查」，而不是假设已装:\n%s", msg.Content)
+	// 750 tokens 是「基础规则 + 平台事实 + 执行环境」的预算线。
+	// 加规则前先问：能不能写进工具描述，让它在工具不在场时一起消失。
+	if got := llm.EstimateTokens(msg.Content); got > 750 {
+		t.Fatalf("系统提示词 %d tokens 超出预算 750，先检查是否重复了工具描述的内容", got)
 	}
 }

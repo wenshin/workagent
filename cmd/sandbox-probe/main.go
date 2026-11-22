@@ -27,7 +27,7 @@ type check struct {
 func main() {
 	addr := flag.String("addr", os.Getenv("SANDBOX_RUNNER_ADDR"), "执行体地址")
 	token := flag.String("token", os.Getenv("SANDBOX_RUNNER_TOKEN"), "执行体令牌")
-	space := flag.String("space", "/var/lib/workagent/storage/tenants/default/spaces/probe/files", "探针工作目录（执行体内的绝对路径）")
+	space := flag.String("space", "spaces/probe/files", "探针工作区（相对执行体存储根的 key）")
 	flag.Parse()
 
 	client, err := remote.New(*addr, *token)
@@ -37,55 +37,53 @@ func main() {
 	}
 	fmt.Printf("执行体: %s  backend=%s  isolated=%v\n\n", *addr, client.Name(), client.Isolated())
 
-	dir := filepath.Clean(*space)
-	parent := filepath.Dir(dir)
-	// 探针自己把目录建出来：它和执行体挂的是同一个 hostPath，
-	// 生产里这步由空间初始化完成，这里只是让本地流程不依赖手工准备。
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "准备工作目录失败: %v\n", err)
-		os.Exit(1)
-	}
-	fs := sandbox.FS{Read: []string{dir}, Write: []string{dir}}
+	// 工作区用过线的 key 表达，宿主路径由执行体自己解析并建目录：
+	// 探针不需要、也不应该知道执行体把存储挂在哪里。
+	mounts := []sandbox.Mount{{
+		Key:    strings.Trim(filepath.ToSlash(*space), "/"),
+		Target: sandbox.WorkspaceDir,
+		Write:  true,
+	}}
 
 	var results []check
 	results = append(results, check{name: "不是 local 后端", ok: client.Name() != sandbox.NameLocal, detail: client.Name()})
 
 	// 1. 能跑
-	res, err := run(client, "echo hello", dir, sandbox.ModeReadOnly, fs, false)
+	res, err := run(client, "echo hello", sandbox.ModeReadOnly, mounts, false)
 	results = append(results, verdict("能执行命令", err == nil && strings.Contains(res.Stdout, "hello"), detail(res, err)))
 
 	// 2. 能写自己的工作区
-	res, err = run(client, "echo data > .probe && cat .probe", dir, sandbox.ModeWorkspaceWrite, fs, false)
+	res, err = run(client, "echo data > .probe && cat .probe", sandbox.ModeWorkspaceWrite, mounts, false)
 	results = append(results, verdict("可写空间工作区", err == nil && strings.TrimSpace(res.Stdout) == "data", detail(res, err)))
 
 	// 3. 写不了系统目录（基线只读）
-	res, err = run(client, "echo x > /etc/wa-probe 2>/dev/null; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, false)
+	res, err = run(client, "echo x > /etc/wa-probe 2>/dev/null; echo $?", sandbox.ModeWorkspaceWrite, mounts, false)
 	results = append(results, verdict("系统目录只读", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
 
 	// 4. 不给网就真的没网：Network=false 时连不出去。
 	//    默认档位由 shell_exec 的策略决定（其他命令有网），这一项只验证执行体听从 Spec。
-	res, err = run(client, "curl -sS -m 3 -o /dev/null https://example.com; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, false)
+	res, err = run(client, "curl -sS -m 3 -o /dev/null https://example.com; echo $?", sandbox.ModeWorkspaceWrite, mounts, false)
 	results = append(results, verdict("无网档位不可达", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
 
-	// 5. 看不到同级的其他空间（父目录只有自己这一项）
-	res, err = run(client, "ls -1 "+parent+" | wc -l", dir, sandbox.ModeReadOnly, fs, false)
-	results = append(results, verdict("看不到同级空间", err == nil && strings.TrimSpace(res.Stdout) == "1", detail(res, err)))
+	// 5. 看不到宿主目录结构：/workspace 的父目录（沙箱根）里不该出现 spaces
+	res, err = run(client, "test -e /workspace/../spaces; echo $?", sandbox.ModeReadOnly, mounts, false)
+	results = append(results, verdict("宿主路径不可见", err == nil && strings.TrimSpace(res.Stdout) == "1", detail(res, err)))
 
 	// 6. 超时会被整组回收
 	start := time.Now()
-	_, err = run(client, "sleep 30", dir, sandbox.ModeWorkspaceWrite, fs, false)
+	_, err = run(client, "sleep 30", sandbox.ModeWorkspaceWrite, mounts, false)
 	results = append(results, verdict("超时生效", err != nil && time.Since(start) < 20*time.Second, fmt.Sprintf("cost=%s err=%v", time.Since(start).Round(time.Millisecond), err)))
 
 	// 7. 出网可达：出网档位下能连公网。这里只验证「通」，
 	//    私网封禁由 NetworkPolicy 负责，沙箱这一层看不到那条规则。
-	res, err = run(client, "curl -s -m 8 -o /dev/null -w '%{http_code}' https://cdn.npmmirror.com/binaries/deno/", dir, sandbox.ModeWorkspaceWrite, fs, true)
+	res, err = run(client, "curl -s -m 8 -o /dev/null -w '%{http_code}' https://cdn.npmmirror.com/binaries/deno/", sandbox.ModeWorkspaceWrite, mounts, true)
 	code := strings.TrimSpace(res.Stdout)
 	results = append(results, verdict("出网可达", err == nil && (code == "200" || code == "404"), detail(res, err)))
 
 	// 8. 出网不改变文件可见面：第 2 项写的 .probe 依然看得见。
 	//    网络工具与普通命令跑在同一个工作区里，下载完才能就地处理；
 	//    外发风险由审批与 NetworkPolicy 拦，不靠遮蔽。
-	res, err = run(client, "ls -a "+dir+" | tr '\n' ' '", dir, sandbox.ModeWorkspaceWrite, fs, true)
+	res, err = run(client, "ls -a /workspace | tr '\n' ' '", sandbox.ModeWorkspaceWrite, mounts, true)
 	out := strings.TrimSpace(res.Stdout)
 	results = append(results, verdict("出网仍可见工作区",
 		err == nil && strings.Contains(out, ".probe"), detail(res, err)))
@@ -94,14 +92,14 @@ func main() {
 	//    不生效，实测能直接访问同集群 Pod）。目标选执行体自己的 Service：
 	//    规则生效时是 connection refused（exit 7），没生效是 200。
 	//    这一条同时也验证了「只拒主动发起」没把回包一起打掉——否则 kubelet 探针会先挂。
-	res, err = run(client, "curl -s -m 4 -o /dev/null http://sandbox-runner:8323/healthz; echo $?", dir, sandbox.ModeWorkspaceWrite, fs, true)
+	res, err = run(client, "curl -s -m 4 -o /dev/null http://sandbox-runner:8323/healthz; echo $?", sandbox.ModeWorkspaceWrite, mounts, true)
 	results = append(results, verdict("私网不可达", err == nil && strings.TrimSpace(res.Stdout) != "0", detail(res, err)))
 
 	// 10. 系统安装可写：system-write 档位下 apt 能装进执行体的可写层。
 	//     写的是执行体自己的 /usr（不是空间目录），所以用完立刻删掉探针文件，
 	//     不在镜像可写层里留垃圾。
 	res, err = run(client, "echo ok > /usr/.wa-probe && rm -f /usr/.wa-probe && echo done",
-		dir, sandbox.ModeSystemWrite, fs, true)
+		sandbox.ModeSystemWrite, mounts, true)
 	results = append(results, verdict("系统安装可写",
 		err == nil && strings.Contains(res.Stdout, "done"), detail(res, err)))
 
@@ -123,14 +121,14 @@ func main() {
 
 // run 用与线上一致的 Spec 形状执行一条命令：超时走默认档（30s），
 // 探针自己的墙钟比它短一点，避免「探针卡住」和「执行体卡住」混在一起。
-func run(c *remote.Client, script, dir string, mode sandbox.Mode, fs sandbox.FS, network bool) (sandbox.Result, error) {
+func run(c *remote.Client, script string, mode sandbox.Mode, mounts []sandbox.Mount, network bool) (sandbox.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	return c.Run(ctx, sandbox.Spec{
 		Cmd:     []string{"sh", "-c", script},
-		Dir:     dir,
+		Dir:     sandbox.WorkspaceDir,
 		Mode:    mode,
-		FS:      fs,
+		Mounts:  mounts,
 		Network: network,
 		Timeout: 10 * time.Second,
 	})

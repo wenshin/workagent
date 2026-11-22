@@ -5,13 +5,13 @@
 // 目标不是防住所有攻击，而是把 agent 执行命令的最坏情况变成可控：
 // 文件系统只读（workspace 可写）、默认不出网、超时、输出上限、进程组整体回收。
 //
-// 三个后端，隔离强度递减：
+// 两个后端：
 //
-//	bwrap         Linux，bubblewrap（user namespace + bind mount）
-//	sandbox-exec  macOS，Seatbelt profile
-//	local         无隔离，仅用于开发或明确降级；Name() 会如实报告
+//	bwrap  Linux，bubblewrap（user namespace + bind mount）
+//	local  无隔离，只给测试与本机工具用；Name() 会如实报告
 //
-// 调用方必须自己检查 Name()：把 local 当成沙箱用是错误用法。
+// 路径也由这一层统一虚拟化：宿主目录只出现在 Mount.Source 里，沙箱内一律是
+// /workspace、/pkg、/cache 这类固定路径，模型与环境变量看不到宿主结构。
 package sandbox
 
 import (
@@ -116,12 +116,70 @@ var (
 	ErrOutputTooLarge = errors.New("命令输出超过上限")
 )
 
+// 沙箱内的固定路径。宿主的真实目录不出现在命令行、环境变量与工作目录里：
+// 模型看到的永远是这一组虚拟路径，空间在磁盘上的位置只有执行面自己知道。
+const (
+	// WorkspaceDir 是空间工作区（spaces/<id>/files）的挂载点与默认工作目录。
+	WorkspaceDir = "/workspace"
+	// PkgDir 是空间内的安装目录（spaces/<id>/.pkg）：venv 与 npm 全局包。
+	PkgDir = "/pkg"
+	// CacheDir 是租户缓存根（WA_CACHE_DIR）。
+	CacheDir = "/cache"
+	// HomeDir 是本次调用的私有 HOME / TMPDIR / XDG_CACHE_HOME。
+	HomeDir = "/tmp/wa-home"
+	// EgressProxy 是出网代理 socket 在沙箱里的固定路径。
+	EgressProxy = "/tmp/wa-egress.sock"
+	// PluginDir 是插件自己的目录（可写，运行时缓存落这里）。
+	PluginDir = "/plugin"
+	// SpaceDir 是插件声明 fs.read / fs.write 之后看到的空间工作区根。
+	SpaceDir = "/space"
+	// RuntimeDir 是注入的 bootstrap.ts / host_sdk.ts 所在目录。
+	RuntimeDir = "/runtime"
+	// DenoDir 是该插件版本的 DENO_DIR。
+	DenoDir = "/deno"
+)
+
+// MountRoot 指明 Mount.Key 相对哪个根解析。
+type MountRoot string
+
+const (
+	// RootStorage 是存储根（控制面的 STORAGE_ROOT / 执行体的 SANDBOX_AGENT_ROOT）。
+	RootStorage MountRoot = ""
+	// RootCache 是租户缓存根（WA_CACHE_DIR）。
+	RootCache MountRoot = "cache"
+)
+
+// Mount 是一个要挂进沙箱的目录。
+//
+// 两种形态：
+//
+//	空间数据：Key（相对 Root）非空。过线的是 Key，两侧各自解析成自己的绝对路径，
+//	          所以控制面与执行体不需要看到同一个路径；沙箱里只出现 Target。
+//	系统路径：Key 为空，Source 是容器内一致的路径（解释器、平台脚本），
+//	          原样挂到 Target（通常等于 Source）。这类路径不含业务数据。
+type Mount struct {
+	// Source 是本机真实绝对路径。本地执行时必须填；过线前会被清空，由执行体解析 Key。
+	Source string
+	// Key 是相对 Root 的路径，如 spaces/<id>/files。
+	Key string
+	// Root 决定 Key 相对哪个根解析。
+	Root MountRoot
+	// Target 是沙箱内挂载点，必须是绝对路径。
+	Target string
+	// Write 为 true 时可写；ModeReadOnly 下会被忽略。
+	Write bool
+}
+
 // Spec 描述一次命令执行。
 type Spec struct {
 	// Cmd 是要执行的命令，第一个元素是程序名；不做 shell 解释。
 	Cmd []string
-	// Dir 是工作目录，必须是绝对路径。ModeWorkspaceWrite 下它也是唯一可写目录。
+	// Dir 是沙箱内的工作目录（如 /workspace），默认 WorkspaceDir；
+	// 没有工作区挂载时是 /。
 	Dir string
+	// Mounts 是要挂进沙箱的目录：工作区、安装目录、租户缓存、插件目录都在这里。
+	// 路径的解析与挂载点见 Mount。
+	Mounts []Mount
 	// Env 是追加/覆盖的环境变量（KEY=VALUE）。
 	// 父进程环境不会继承，只有 PATH 等少数无害变量会带进去，避免密钥泄漏。
 	Env []string
@@ -140,7 +198,7 @@ type Spec struct {
 	// 本来就能被 --noproxy 绕过，留着只会让人误以为有边界；真正的边界交给
 	// 集群 NetworkPolicy 在网络层封禁私网段。
 	//
-	// 给网不改变文件可见面：Dir 始终整体挂载。外发风险由「网络工具先审批」
+	// 给网不改变文件可见面：Mounts 始终整体挂载。外发风险由「网络工具先审批」
 	// 与 NetworkPolicy 承担——遮蔽工作区换来的那点纵深，代价是 `curl -o out.json`
 	// 写下的文件凭空消失、`curl … && python …` 必须拆成两条。
 	Network bool
@@ -151,6 +209,10 @@ type Spec struct {
 	// 「以为走了代理、其实直连」这种事故只会出现在线上。
 	//
 	// 目前只有插件运行时用它：Deno 能自己解析 unix: 前缀，npm / fnm / uv 不能。
+	//
+	// 这里填的是「建 socket 的那一侧」的真实路径，沙箱里它被挂到固定的
+	// EgressProxy，环境变量 WA_EGRESS_PROXY 也指向那个固定路径——
+	// 插件因此永远看不到宿主的临时目录。
 	Proxy string
 	// Egress 非空表示「白名单在这里，代理要由执行的一方自己建在 Proxy 上」。
 	//
@@ -162,28 +224,9 @@ type Spec struct {
 	// 本地模式下调用方自己建代理并可以顺手填上它；两种模式对后端没有区别，
 	// 后端只认 Proxy。
 	Egress *EgressSpec
-	// FS 是文件访问白名单。零值表示「系统只读基线 + Dir」，看不到任何业务数据。
-	FS FS
 	// Resident 表示这是长驻进程（插件运行时）：不施加墙钟上限，
 	// 生命周期由调用方 Close 决定，而不是靠 Timeout 杀掉。
 	Resident bool
-}
-
-// FS 是文件访问白名单。
-//
-// 语义是「列出来的才能碰」，不是「排除掉这些」：没列出的路径在沙箱里
-// 根本不存在。这个区别在运维上是决定性的——黑名单漏一项是静默泄露，
-// 白名单漏一项是一跑就报错。
-//
-// 路径必须是绝对路径，且必须是宿主机上的真实路径（调用方负责
-// EvalSymlinks，否则 macOS 上 /var → /private/var 会对不上）。
-type FS struct {
-	// Read 是额外允许读取的路径。系统只读基线（/usr、/lib、证书等）由后端补，
-	// 不需要在这里列。
-	Read []string
-	// Write 是允许写入的路径。ModeReadOnly 下会被忽略：
-	// 「只读档位」是调用方的意图，不能被一个 FS.Write 悄悄推翻。
-	Write []string
 }
 
 // EgressSpec 是出网白名单，与 Spec.Proxy 配对使用。
@@ -208,7 +251,7 @@ type Result struct {
 	Duration time.Duration
 	// Truncated 表示输出被截断过（超限时进程已被终止）。
 	Truncated bool
-	// Sandbox 是实际生效的后端名：bwrap / sandbox-exec / local / none。
+	// Sandbox 是实际生效的后端名：bwrap / local / none。
 	Sandbox string
 }
 
@@ -312,7 +355,7 @@ func (p *Proc) Kill() {
 func (p *Proc) Wait() (Result, error) {
 	<-p.exited
 	res := Result{
-		Stderr:   p.stderr.String(),
+		Stderr:   p.Stderr(),
 		Duration: time.Since(p.start),
 		Sandbox:  p.name,
 	}
@@ -344,42 +387,43 @@ func (p *Proc) Close() {
 }
 
 // 后端名。判定「有没有真隔离」是安全语义的一部分，不要用字面量比较。
+//
+// 只有 bwrap 一种隔离后端：路径虚拟化需要挂载命名空间，sandbox-exec 做不到，
+// 而它本来就是「开发机自动探测」时代的遗留（该档位已删除）。
 const (
-	NameBwrap    = "bwrap"
-	NameSeatbelt = "sandbox-exec"
-	NameLocal    = "local"
+	NameBwrap = "bwrap"
+	NameLocal = "local"
 )
 
 // ErrNotIsolated 表示当前没有可用的隔离后端，只有无隔离的 local。
 var ErrNotIsolated = errors.New("sandbox: 没有可用的隔离后端")
 
 // Detect 返回当前平台最强的可用后端；都不可用时回退 local。
-// 调用方应检查 Name() 并记录告警，不要假设一定隔离。
+// 只给测试与本机工具用：控制面（internal/app）不得调用它——
+// 在服务端执行 agent 一律走远端执行体，形态不能由「这台机器装了什么」决定。
 func Detect() Runner {
 	if r, err := NewBwrap(); err == nil {
-		return r
-	}
-	if r, err := NewSeatbelt(); err == nil {
 		return r
 	}
 	return NewLocal()
 }
 
-// Ensure 校验探测结果。requireIsolation 为真时，降级到 local 直接报错，
+// Ensure 校验执行面真的是隔离后端，降级到 local 直接报错，
 // 把「以为有沙箱、其实在裸跑」挡在启动阶段，而不是等出事才发现。
-func Ensure(r Runner, requireIsolation bool) error {
+// 没有「允许降级」的参数：控制面不接受无隔离执行面，任何形态都不例外。
+func Ensure(r Runner) error {
 	if r == nil {
 		return fmt.Errorf("%w：没有可用的执行器", ErrNotIsolated)
 	}
-	if requireIsolation && r.Name() == NameLocal {
-		return fmt.Errorf("%w：探测不到 bwrap / sandbox-exec（Linux 需安装 bubblewrap 且内核允许 user namespace）；"+
-			"开发机可设 SANDBOX_REQUIRE=false 跳过该校验", ErrNotIsolated)
+	if r.Name() == NameLocal {
+		return fmt.Errorf("%w：探测不到 bwrap（Linux 需安装 bubblewrap 且内核允许 user namespace）",
+			ErrNotIsolated)
 	}
 	return nil
 }
 
 // NewLocal 是不做任何隔离的执行器，只保留超时 / 输出上限 / 环境清理。
-// 它存在的意义是让开发机和 CI 能跑通，不是给生产用的。
+// 只用于测试与本机工具，不是控制面的可选执行面。
 func NewLocal() Runner {
 	return &runner{name: NameLocal, build: nil}
 }
@@ -545,12 +589,17 @@ func (r *runner) prepare(spec Spec) (prepared, error) {
 	if real, evalErr := filepath.EvalSymlinks(tmp); evalErr == nil {
 		tmp = real
 	}
-	// 同理：workspace 也统一成真实路径，才能和挂载点 / 策略里的路径对上。
-	dir := spec.Dir
-	if real, evalErr := filepath.EvalSymlinks(dir); evalErr == nil {
-		dir = real
+	// 有挂载命名空间时 HOME/TMPDIR 指向沙箱内的固定路径：宿主的临时目录
+	// （/Users/.../TMPDIR、/var/folders/...）不进入任何环境变量与报错。
+	virtual := r.build != nil && spec.Mode != ModeFull
+	home := tmp
+	dir := spec.realDir(tmp)
+	if virtual {
+		home = HomeDir
+		// 外层进程不需要工作目录：bwrap 自己 --chdir 到沙箱内路径。
+		dir = ""
 	}
-	env := buildEnv(spec, tmp)
+	env := buildEnv(spec, home)
 	name := r.name
 	argv := spec.Cmd
 	if spec.Mode == ModeFull {
@@ -587,19 +636,16 @@ func (s Spec) normalize() (Spec, error) {
 	if len(s.Cmd) == 0 || strings.TrimSpace(s.Cmd[0]) == "" {
 		return s, fmt.Errorf("命令为空")
 	}
-	if s.Dir == "" {
-		wd, err := os.Getwd()
-		if err != nil {
-			return s, fmt.Errorf("无法确定工作目录: %w", err)
-		}
-		s.Dir = wd
+	mounts, err := normalizeMounts(s.Mounts)
+	if err != nil {
+		return s, err
 	}
-	if !filepath.IsAbs(s.Dir) {
-		abs, err := filepath.Abs(s.Dir)
-		if err != nil {
-			return s, fmt.Errorf("工作目录 %q 需要绝对路径: %w", s.Dir, err)
-		}
-		s.Dir = abs
+	s.Mounts = mounts
+	if s.Dir == "" {
+		s.Dir = s.defaultDir()
+	}
+	if !filepath.IsAbs(s.Dir) || filepath.Clean(s.Dir) != s.Dir {
+		return s, fmt.Errorf("工作目录 %q 必须是沙箱内的绝对路径（如 %s）", s.Dir, WorkspaceDir)
 	}
 	if s.Mode == "" {
 		s.Mode = ModeReadOnly
@@ -622,63 +668,89 @@ func (s Spec) normalize() (Spec, error) {
 			return s, fmt.Errorf("Proxy 与 Network 不能同时设置：有代理时必须断网")
 		}
 		if !filepath.IsAbs(s.Proxy) {
-			abs, err := filepath.Abs(s.Proxy)
-			if err != nil {
-				return s, fmt.Errorf("代理 socket 路径 %q 需要绝对路径: %w", s.Proxy, err)
-			}
-			s.Proxy = abs
-		}
-		// 策略按真实路径匹配：macOS 上 /tmp 是 /private/tmp 的符号链接，
-		// 不展开会让 seatbelt 的放行规则对不上，表现为 connect 直接被拒。
-		if real, err := filepath.EvalSymlinks(s.Proxy); err == nil {
-			s.Proxy = real
+			return s, fmt.Errorf("代理 socket 路径 %q 需要绝对路径", s.Proxy)
 		}
 	}
-	fixed, err := normalizeFS(s.FS)
-	if err != nil {
-		return s, err
-	}
-	// 解释器本身必须在沙箱里可见：deno 装在 /opt/deno/bin 这类非基线路径时，
-	// 不自动加进去会得到「找不到文件」这种与权限完全无关、极难排查的报错。
-	if dir := interpreterDir(s.Cmd[0]); dir != "" {
-		fixed.Read = append(fixed.Read, dir)
-	}
-	s.FS = fixed
 	return s, nil
 }
 
-// normalizeFS 校验白名单路径：必须绝对、必须干净。
-//
-// 相对路径不在这里 "解析成绝对" 而是直接报错：沙箱的工作目录由 Spec.Dir 决定，
-// 悄悄按它拼路径会让调用方以为自己限制的是空间 A、实际限制的是空间 B。
-func normalizeFS(fs FS) (FS, error) {
-	cleanList := func(in []string) ([]string, error) {
-		out := make([]string, 0, len(in))
-		for _, p := range in {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
-			if !filepath.IsAbs(p) {
-				return nil, fmt.Errorf("文件白名单路径必须是绝对路径: %q", p)
-			}
-			abs := filepath.Clean(p)
-			if abs != p {
-				p = abs
-			}
-			out = append(out, p)
+// normalizeMounts 校验并去重挂载表：Target 唯一（可写优先），Key 不能越界。
+func normalizeMounts(in []Mount) ([]Mount, error) {
+	idx := make(map[string]int, len(in))
+	out := make([]Mount, 0, len(in))
+	for _, m := range in {
+		m.Source = strings.TrimSpace(m.Source)
+		m.Target = strings.TrimSpace(m.Target)
+		rawKey := strings.TrimSpace(m.Key)
+		if strings.HasPrefix(rawKey, "/") {
+			return nil, fmt.Errorf("挂载 key %q 必须是相对路径", rawKey)
 		}
-		return out, nil
+		m.Key = strings.Trim(rawKey, "/")
+		if m.Target == "" {
+			return nil, fmt.Errorf("挂载点不能为空")
+		}
+		if !filepath.IsAbs(m.Target) || filepath.Clean(m.Target) != m.Target || m.Target == "/" {
+			return nil, fmt.Errorf("挂载点 %q 必须是干净的绝对路径（且不能是 /）", m.Target)
+		}
+		switch m.Root {
+		case RootStorage, RootCache:
+		default:
+			return nil, fmt.Errorf("未知的挂载根 %q", m.Root)
+		}
+		if m.Key == "" && m.Root == RootStorage {
+			// 系统路径：两侧路径一致，必须给出本机绝对路径。
+			if !filepath.IsAbs(m.Source) {
+				return nil, fmt.Errorf("系统挂载 %q 需要绝对路径", m.Target)
+			}
+		} else if m.Key != "" {
+			for _, seg := range strings.Split(m.Key, "/") {
+				if seg == ".." {
+					return nil, fmt.Errorf("挂载 key %q 不能越界", m.Key)
+				}
+			}
+		}
+		// Key 为空且 Root=RootCache 表示「缓存根本身」，允许。
+		if m.Source != "" && !filepath.IsAbs(m.Source) {
+			return nil, fmt.Errorf("挂载源 %q 必须是绝对路径", m.Source)
+		}
+		if m.Source != "" {
+			if real, err := filepath.EvalSymlinks(m.Source); err == nil {
+				m.Source = real
+			}
+		}
+		// 同一个挂载点只留一条：可写的那条赢，否则「先只读后可写」取决于顺序，
+		// 而顺序是调用方随手写的。
+		if i, ok := idx[m.Target]; ok {
+			if m.Write && !out[i].Write {
+				out[i] = m
+			}
+			continue
+		}
+		idx[m.Target] = len(out)
+		out = append(out, m)
 	}
-	read, err := cleanList(fs.Read)
-	if err != nil {
-		return FS{}, err
+	return out, nil
+}
+
+// defaultDir 没有显式指定工作目录时用工作区挂载点；没有工作区就是根。
+func (s Spec) defaultDir() string {
+	for _, m := range s.Mounts {
+		if m.Target == WorkspaceDir {
+			return WorkspaceDir
+		}
 	}
-	write, err := cleanList(fs.Write)
-	if err != nil {
-		return FS{}, err
+	return "/"
+}
+
+// realDir 是没有挂载命名空间时（local 后端 / ModeFull）的进程工作目录。
+// 沙箱内的虚拟路径在那种模式下不存在，必须落回真实路径。
+func (s Spec) realDir(fallback string) string {
+	for _, m := range s.Mounts {
+		if m.Target == s.Dir && m.Source != "" {
+			return m.Source
+		}
 	}
-	return FS{Read: read, Write: write}, nil
+	return fallback
 }
 
 // interpreterDir 返回可执行文件的绝对目录；命令是相对名（依赖 PATH）时返回空。
@@ -695,25 +767,36 @@ func interpreterDir(bin string) string {
 	return ""
 }
 
-// fsPaths 把 Spec 与后端基线合成最终的读 / 写挂载列表。
+// bind 是一次 bind mount 的参数对：源（宿主真实路径）与目标（沙箱内路径）。
+type bind struct {
+	source string
+	target string
+}
+
+// plan 把 Spec 与后端基线合成最终的读 / 写挂载表。
 //
 // 去重后排序：后端命令行的稳定性对排障很重要（同样的 Spec 应该得到同样的 argv），
 // 也让单测可以直接比字符串。
-func (s Spec) fsPaths(baseline []string) (read, write []string) {
-	read = append(read, baseline...)
-	read = append(read, ExtraRead()...)
-	// 工作目录必须可读，否则连「脚本文件所在目录」都进不去。
-	// 给不给网不改变这里：网络工具审批通过后照样看得见 Dir，
-	// 它能不能把数据发出去由审批与 NetworkPolicy 决定，不由挂载表决定。
-	if s.Dir != "" {
-		read = append(read, s.FS.Read...)
-		read = append(read, s.Dir)
-	} else {
-		read = append(read, s.FS.Read...)
+func (s Spec) plan(baseline []string) (read, write []bind) {
+	for _, p := range baseline {
+		read = append(read, bind{p, p})
 	}
-	if s.Mode == ModeWorkspaceWrite || s.Mode == ModeSystemWrite {
-		write = append(write, s.FS.Write...)
-		write = append(write, s.Dir)
+	// 解释器本身必须在沙箱里可见：deno 装在 /opt/deno/bin 这类非基线路径时，
+	// 不自动加进去会得到「找不到文件」这种与权限完全无关、极难排查的报错。
+	// 在执行的这一侧解析，所以不用过线。
+	for _, p := range ExtraRead() {
+		read = append(read, bind{p, p})
+	}
+	if dir := interpreterDir(s.Cmd[0]); dir != "" {
+		read = append(read, bind{dir, dir})
+	}
+	writable := s.Mode == ModeWorkspaceWrite || s.Mode == ModeSystemWrite
+	for _, m := range s.Mounts {
+		if m.Write && writable {
+			write = append(write, bind{m.Source, m.Target})
+			continue
+		}
+		read = append(read, bind{m.Source, m.Target})
 	}
 	// 系统安装档位：可写表追加 /usr、/var/lib/dpkg 等。
 	// 后挂的 --bind 会覆盖前面同路径的 --ro-bind，这是它能在
@@ -723,9 +806,35 @@ func (s Spec) fsPaths(baseline []string) (read, write []string) {
 	// 空间之间共用。隔离靠的是「重建即回到基础镜像 + 安装命中租户缓存」，
 	// 不是靠每个空间一份 /usr。
 	if s.Mode == ModeSystemWrite {
-		write = append(write, SystemWritePaths()...)
+		for _, p := range SystemWritePaths() {
+			write = append(write, bind{p, p})
+		}
 	}
-	return sortedUnique(read), sortedUnique(write)
+	return dedupeBind(read), dedupeBind(write)
+}
+
+// dedupeBind 去重并排序：同一目标只留一条（可写表里重复的源按目标合并）。
+func dedupeBind(in []bind) []bind {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]bind, 0, len(in))
+	for _, b := range in {
+		if b.source == "" || b.target == "" {
+			continue
+		}
+		key := b.source + "\x00" + b.target
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].source != out[j].source {
+			return out[i].source < out[j].source
+		}
+		return out[i].target < out[j].target
+	})
+	return out
 }
 
 // extraRead 是运维补丁位：白名单化之后，装在非标准位置的运行时
@@ -797,13 +906,13 @@ const fallbackPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 // 直接覆盖成一个只有私有目录的值会让 /bin/sh 都找不到。
 func FallbackPath() string { return fallbackPath }
 
-func buildEnv(spec Spec, tmp string) []string {
+func buildEnv(spec Spec, home string) []string {
 	env := []string{
-		"HOME=" + tmp,
-		"TMPDIR=" + tmp,
+		"HOME=" + home,
+		"TMPDIR=" + home,
 		"TERM=dumb",
 		// 关掉语言运行时往 HOME 之外写缓存的行为，减少只读档位下的假失败
-		"XDG_CACHE_HOME=" + tmp,
+		"XDG_CACHE_HOME=" + home,
 	}
 	hasPath := false
 	for _, k := range baseEnvKeys {
@@ -818,8 +927,9 @@ func buildEnv(spec Spec, tmp string) []string {
 		env = append(env, "PATH="+fallbackPath)
 	}
 	if spec.Proxy != "" {
-		// 约定变量：插件与依赖从这里拿到唯一的出网地址。
-		env = append(env, "WA_EGRESS_PROXY="+spec.Proxy)
+		// 约定变量：插件与依赖从这里拿到唯一的出网地址。指向沙箱内的固定路径，
+		// 不是建 socket 那一侧的临时路径。
+		env = append(env, "WA_EGRESS_PROXY="+EgressProxy)
 	}
 	return mergeEnv(env, spec.Env)
 }

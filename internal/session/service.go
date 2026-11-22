@@ -83,6 +83,11 @@ const (
 	// ReasonStalled 循环守卫判定「再做也不会产生新进展」而提前收尾。
 	// 与 budget_exceeded 分开记：前者说明任务还有活没干完，后者说明方法本身没效。
 	ReasonStalled = "stalled"
+	// ReasonAwaitingApproval 这一轮停在人工确认上：不是失败，也不是取消。
+	//
+	// 待办与断点都还在，用户点同意/拒绝后由决策驱动的续跑接着走；
+	// 一直不点，会话就一直是「已暂停」——没有超时，也不会自己挑一个默认答案。
+	ReasonAwaitingApproval = "awaiting_approval"
 )
 
 // RunBudgetExceededMessage 是总时长上限到点时的用户可见文案。
@@ -113,6 +118,8 @@ func cancelDetail(reason string, runErr error) string {
 		return RunBudgetExceededMessage
 	case ReasonUserCancelled:
 		return "已按用户请求停止"
+	case ReasonAwaitingApproval:
+		return "等待人工确认，已暂停"
 	}
 	if errors.Is(runErr, agent.ErrBudgetExceeded) || errors.Is(runErr, agent.ErrStalled) {
 		return runErr.Error()
@@ -653,11 +660,22 @@ func referenceFree(content string) string {
 // ComposeContent 把引用文件清单拼到用户消息末尾。
 //
 // 用一个稳定的标记块而不是各写各的自然语言：前端据此把清单渲染成文件标签，
-// 模型据此知道这些文件是用户明确要求参考的、需要先 file_read 再作答。
+// 模型据此知道这些文件是用户明确要求参考的材料。引用不限类型，但它读不到二进制：
+// 清单行保持纯路径（前端按 "- " 行切标签），可读性说明放到清单之后——
+// 文本才要求 file_read，图片 / 音视频 / 压缩包按附件对待，明确让它不要读。
 func ComposeContent(text string, refs []string) string {
 	if len(refs) == 0 {
 		return text
 	}
+	hasReadable, hasAttachment := false, false
+	for _, ref := range refs {
+		if space.Readable(ref) {
+			hasReadable = true
+		} else {
+			hasAttachment = true
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString(text)
 	b.WriteString(ReferenceMarker)
@@ -667,7 +685,15 @@ func ComposeContent(text string, refs []string) string {
 		b.WriteString(ref)
 		b.WriteString("\n")
 	}
-	b.WriteString("回答前先逐个 file_read 读取这些文件，以文件内容为准；读不到时如实说明。")
+	if hasReadable {
+		b.WriteString("回答前先逐个 file_read 读取上面的文本文件，以文件内容为准；读不到时如实说明。")
+	}
+	if hasAttachment {
+		if hasReadable {
+			b.WriteString("\n")
+		}
+		b.WriteString("清单里其余的是非文本附件（图片 / 音视频 / PDF / 压缩包等），平台不提供正文读取：不要对它们调用 file_read，也不要假设其内容；用户问起时说明只能预览或下载。")
+	}
 	return b.String()
 }
 
@@ -689,9 +715,10 @@ type ChatOutcome struct {
 func (s *Service) Chat(
 	ctx context.Context,
 	userID, sessionID, content string,
+	clock ClientClock,
 	emit func(agent.Event, int) error,
 ) (ChatOutcome, error) {
-	return s.chat(ctx, userID, sessionID, content, chatOptions{source: "user"}, emit)
+	return s.chat(ctx, userID, sessionID, content, chatOptions{source: "user", clock: clock}, emit)
 }
 
 // ChatWithSource 与 Chat 相同，但标记这条用户消息的来源（task_result / external）。
@@ -709,6 +736,9 @@ func (s *Service) ChatWithSource(
 // chatOptions 是内部执行开关，不对外暴露：来源影响渲染与提示词包装，不影响权限。
 type chatOptions struct {
 	source string
+	// clock 是用户端上报的时间与时区；零值表示没有上报，注入时回落服务器时间。
+	// 只影响系统提示词里的「当前时间」，不参与权限与业务判定。
+	clock ClientClock
 	// skipUser 表示用户消息已经落库（回执是「先落消息、再起 run」），这一轮不要再写一次
 	skipUser bool
 }
@@ -783,6 +813,10 @@ func (s *Service) chat(
 		return out, err
 	}
 
+	// 上一轮若停在审批上，这一句就是「翻篇」：待办与它的断点一起作废，
+	// 免得几天前的半截执行被一张旧卡片续起来，还和新一轮抢同一个会话
+	s.expireSessionApprovals(sessionID)
+
 	// 一次 run 为根：预算、步骤与断点都落库，进程重启后能看出走到哪、能接着走（§5.7.5）
 	run, err := s.createRun(ctx, sessionID)
 	if err != nil {
@@ -794,6 +828,7 @@ func (s *Service) chat(
 		History:     contextMessages,
 		Query:       text,
 		AgentPrompt: sess.AgentPrompt,
+		ClientClock: opt.clock,
 	}, out, emit)
 }
 

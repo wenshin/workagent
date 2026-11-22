@@ -7,8 +7,12 @@
 #   seccompProfile: Unconfined —— 默认 RuntimeDefault 会拦 unshare/clone(CLONE_NEW*)
 #   没有给 privileged —— 上述两项能力已足够，privileged 会把节点设备全暴露
 #
-# 存储：本地单节点用 hostPath（OrbStack VM 内的 ext4）；生产换成每租户一个
-# local PV，挂载点必须与控制面看到的绝对路径完全一致（路径是跨进程契约）。
+# 存储：过线的是「相对这个根的 key」（如 spaces/<id>/files），不是宿主绝对路径，
+# 所以这里挂在哪、控制面挂在哪，两边都可以不同——只要这个目录里装的是同一份数据。
+#   本地调试：hostPath 指向控制面的 STORAGE_ROOT（默认 ./data/storage），
+#            __WA_STORAGE__ 由 scripts/sandbox-exec.sh（make sandbox-up）渲染，
+#            不要直接 kubectl apply 这个文件。
+#   生产：换成每租户一个 local PV；沙箱内只会出现 /workspace 这类虚拟路径。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,8 +53,9 @@ spec:
             - name: http
               containerPort: 8323
           env:
+            # 允许执行的根目录 = 控制面的 STORAGE_ROOT（同一绝对路径），由脚本替换
             - name: SANDBOX_AGENT_ROOT
-              value: /var/lib/workagent
+              value: __WA_STORAGE__
             # 租户级缓存根目录：与下面的 volumeMount 必须一致。
             # apt 的索引与 deb、npm / pip / go 的下载、Deno 的 DENO_DIR 都落在这里。
             - name: WA_CACHE_DIR
@@ -60,6 +65,8 @@ spec:
                 secretKeyRef:
                   name: sandbox-runner-token
                   key: token
+            # 执行体本身只认 bwrap（cmd/sandbox-agent），没有「降级到 local」的开关，
+            # 所以这里不需要 SANDBOX_REQUIRE；控制面的 server 形态同样没有降级档。
           readinessProbe:
             httpGet:
               path: /healthz
@@ -85,7 +92,7 @@ spec:
               add: ["SYS_ADMIN", "NET_ADMIN"]
           volumeMounts:
             - name: storage
-              mountPath: /var/lib/workagent
+              mountPath: __WA_STORAGE__
             # 租户级缓存：apt 索引与 deb、npm / pip / go 下载、Deno 的 DENO_DIR。
             # 漏挂的表现是「装过的包重建后又要联网下载」，
             # 而且 apt 会报 "Unable to locate package"——像包不存在，其实是索引没了。
@@ -106,8 +113,9 @@ spec:
       volumes:
         - name: storage
           hostPath:
-            path: /var/lib/workagent
-            type: DirectoryOrCreate
+            # 与控制面 STORAGE_ROOT 相同的绝对路径（目录由部署脚本先建好）
+            path: __WA_STORAGE__
+            type: Directory
         - name: cache
           hostPath:
             path: /var/cache/workagent

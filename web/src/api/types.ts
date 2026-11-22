@@ -102,15 +102,22 @@ export type MessageRole = 'user' | 'assistant' | 'system';
 /** 工具调用结局：与后端 tool.InvokeStatus 一致 */
 export type ToolStatus = 'running' | 'ok' | 'denied' | 'approval' | 'error';
 
-/** 一次待确认的工具调用（approval.req） */
+/**
+ * 一次待确认的工具调用（approval.req）。
+ *
+ * 没有超时字段：审批是会话的暂停点，不点就一直停在那里，
+ * 所以卡片上也没有「还剩几分钟」这种会过期的承诺。
+ */
 export interface ApprovalInfo {
   id: string;
+  /** 发起这条待办的调用 id：卡片与工具调用一一对应，刷新后据此补回原位 */
+  callId: string;
+  tool: string;
   sessionId: string;
   kind: string;
   detail: string;
   reason: string;
   risk: number;
-  timeoutS: number;
 }
 
 /** 服务端还没处理的确认（GET /sessions/{id}/approvals） */
@@ -122,7 +129,6 @@ export interface PendingApproval {
   detail: string;
   reason: string;
   risk: number;
-  timeout_s: number;
 }
 
 /** 一次工具调用的完整状态 */
@@ -137,6 +143,35 @@ export interface ToolCallRecord {
   risk?: number;
   /** 命中审批规则时挂在卡片上，用户点按钮后由 tool.result 更新结局 */
   approval?: ApprovalInfo;
+  /**
+   * 本地已提交的审批结论，只覆盖「点完按钮 → 服务端回执」这一段空窗。
+   *
+   * 决策提交成功到 tool.result 之间要经过「唤醒执行体 → 命令真正跑完 → 帧回传」，
+   * 这期间审批卡若还挂着按钮，用户会以为没点上而重复提交。落库的历史消息里没有
+   * 这个字段，终态一律以 status 为准。
+   */
+  decided?: 'approve' | 'deny';
+}
+
+/** 任务清单里的一条：与后端 agent.PlanItem 一致 */
+export interface PlanItem {
+  title: string;
+  /** pending 未开始 / doing 进行中 / done 已完成 / blocked 卡住 */
+  status?: PlanStatus;
+  note?: string;
+}
+
+export type PlanStatus = 'pending' | 'doing' | 'done' | 'blocked';
+
+/**
+ * 一份任务清单的完整状态（plan.updated 与 message.parts 共用）。
+ *
+ * 永远是整份快照，不做增量合并：清单是「现在到哪一步了」的状态，
+ * 合并逻辑一旦分叉，直播与历史回看就会给出两份不一样的清单。
+ */
+export interface PlanState {
+  goal?: string;
+  items: PlanItem[];
 }
 
 /** 消息里的一次工具调用 */
@@ -159,12 +194,21 @@ export interface MessageTextPart {
 }
 
 /**
+ * 消息里的任务清单。
+ *
+ * 一条消息最多留一份（这一轮的最终状态），续跑拼接可能出现两份：渲染时取最后一份。
+ */
+export interface MessagePlanPart extends PlanState {
+  type: 'plan';
+}
+
+/**
  * 消息里的结构化执行轨迹，按发生顺序排列。
  *
  * 新消息是完整时间线（思考 / 正文 / 工具交错），历史回放据此还原真实顺序；
  * 老消息只有工具段（这次改动之前没有时间线），前端回落到分组渲染。
  */
-export type MessagePart = MessageToolPart | MessageTextPart;
+export type MessagePart = MessageToolPart | MessageTextPart | MessagePlanPart;
 
 /**
  * 流式过程中的一段内容：思考、正文片段或一次工具调用。
@@ -177,7 +221,9 @@ export type MessagePart = MessageToolPart | MessageTextPart;
 export type StreamItem =
   | { kind: 'reasoning'; text: string }
   | { kind: 'text'; text: string }
-  | { kind: 'tool'; tool: ToolCallRecord };
+  | { kind: 'tool'; tool: ToolCallRecord }
+  /** 任务清单：整份状态，后续更新替换同一条，不追加 */
+  | { kind: 'plan'; plan: PlanState };
 
 export interface ChatMessage {
   id: string;
@@ -277,6 +323,9 @@ export interface DirsResponse {
   dirs: SpaceDir[];
 }
 
+/** 右侧面板的渲染方式：text 取正文，image/video/audio/pdf 取原始字节，none 只能下载 */
+export type FilePreviewKind = 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'none';
+
 /** 空间目录下的文件，展示在左侧树与右侧面板 */
 export interface SpaceFile {
   space_id: string;
@@ -288,10 +337,15 @@ export interface SpaceFile {
   size: number;
   mod_time?: string;
   /**
-   * 能否在右侧面板渲染（md / json 等文本类型）；false 时只给下载入口。
-   * 可选：老版本后端没有这个字段，前端按扩展名兜底（见 `isPreviewable`）。
+   * 能否读取正文（md / json 等文本类型）。false 不影响上传与引用：
+   * 图片 / 音视频 / 压缩包能传、能作为附件引用，只是模型读不到正文（见 `isPreviewable`）。
+   * 可选：老版本后端没有这个字段，前端按扩展名兜底。
    */
   previewable?: boolean;
+  /**
+   * 面板渲染方式。可选：老版本后端没有这个字段，前端按扩展名兜底（见 `previewKindOf`）。
+   */
+  preview_kind?: FilePreviewKind;
 }
 
 export interface FilesResponse {

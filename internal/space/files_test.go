@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path"
+	"strings"
 	"testing"
 
 	"github.com/workagent/auto-agent/internal/storage"
@@ -73,14 +76,22 @@ func TestListAndDownloadNonPreviewableFile(t *testing.T) {
 
 	listed := svc.walkFiles(ctx, "sp1", "", 1)
 	previewableByPath := make(map[string]bool, len(listed))
+	kindByPath := make(map[string]PreviewKind, len(listed))
 	for _, f := range listed {
 		previewableByPath[f.Path] = f.Previewable
+		kindByPath[f.Path] = f.PreviewKind
 	}
 	if !previewableByPath["notes/a.md"] {
 		t.Fatalf("md 应可预览: %+v", listed)
 	}
+	if kindByPath["notes/a.md"] != PreviewKindText {
+		t.Fatalf("md 的渲染方式应为 text: %+v", listed)
+	}
 	if ok, exists := previewableByPath["assets/logo.png"]; !exists || ok {
-		t.Fatalf("png 应出现在清单里且不可预览: %+v", listed)
+		t.Fatalf("png 应出现在清单里且不可预览正文: %+v", listed)
+	}
+	if kindByPath["assets/logo.png"] != PreviewKindImage {
+		t.Fatalf("png 的渲染方式应为 image: %+v", listed)
 	}
 
 	file, rc, err := svc.DownloadFile(ctx, "u1", "sp1", "assets/logo.png")
@@ -107,6 +118,148 @@ func TestListAndDownloadNonPreviewableFile(t *testing.T) {
 	// 正文读取仍只认文本类型
 	if _, err := svc.ReadFile(ctx, "u1", "sp1", "assets/logo.png"); !errors.Is(err, ErrFileUnsupported) {
 		t.Fatalf("file_read 读二进制应返回 ErrFileUnsupported，实际: %v", err)
+	}
+}
+
+// 浏览器能原生渲染的类型走 raw 端点：白名单决定 MIME 与渲染方式，
+// 文本与可执行容器（HTML / JS）一律拒绝。
+func TestPreviewFileKinds(t *testing.T) {
+	ctx := context.Background()
+	fs, err := localfs.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+	svc := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "read"},
+		storage: fs,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	base := svc.filesKey("sp1")
+	put := func(rel, body string) {
+		t.Helper()
+		if _, err := fs.Put(ctx, path.Join(base, rel), bytes.NewReader([]byte(body)), int64(len(body))); err != nil {
+			t.Fatalf("预置 %s 失败: %v", rel, err)
+		}
+	}
+	put("assets/logo.png", "png")
+	put("assets/clip.mp4", "mp4")
+	put("docs/manual.pdf", "pdf")
+	put("notes/a.md", "# 标题")
+	put("notes/page.html", "<script>alert(1)</script>")
+
+	cases := []struct {
+		path string
+		kind PreviewKind
+		mime string
+	}{
+		{"assets/logo.png", PreviewKindImage, "image/png"},
+		{"assets/clip.mp4", PreviewKindVideo, "video/mp4"},
+		{"docs/manual.pdf", PreviewKindPDF, "application/pdf"},
+	}
+	for _, c := range cases {
+		file, contentType, rc, err := svc.PreviewFile(ctx, "u1", "sp1", c.path)
+		if err != nil {
+			t.Fatalf("%s 应可预览，实际: %v", c.path, err)
+		}
+		if contentType != c.mime || file.PreviewKind != c.kind {
+			t.Fatalf("%s 类型不符: mime=%q kind=%q", c.path, contentType, file.PreviewKind)
+		}
+		if file.Previewable {
+			t.Fatalf("%s 不应被当成可读正文的文本类型", c.path)
+		}
+		// 本地存储要能 Seek，raw 端点才能交给 http.ServeContent 出 Range
+		if _, ok := rc.(io.ReadSeeker); !ok {
+			t.Fatalf("%s 的读取器应支持 Seek（视频拖动进度条依赖 Range）", c.path)
+		}
+		_ = rc.Close()
+	}
+
+	// 文本走正文端点，可执行容器不允许内联返回
+	for _, banned := range []string{"notes/a.md", "notes/page.html", "assets"} {
+		if _, _, _, err := svc.PreviewFile(ctx, "u1", "sp1", banned); !errors.Is(err, ErrFileUnsupported) {
+			t.Fatalf("%s 不应允许 raw 预览，实际: %v", banned, err)
+		}
+	}
+	if _, _, _, err := svc.PreviewFile(ctx, "u1", "sp1", "../secret.png"); !errors.Is(err, ErrNameInvalid) {
+		t.Fatalf("越界路径应返回 ErrNameInvalid，实际: %v", err)
+	}
+}
+
+// 扩展名判定大小写无关，且文本 / 媒体 / 其它三档互斥。
+func TestPreviewKind(t *testing.T) {
+	cases := map[string]PreviewKind{
+		"README.md":    PreviewKindText,
+		".env":         PreviewKindText,
+		"photo.PNG":    PreviewKindImage,
+		"logo.svg":     PreviewKindImage,
+		"clip.webm":    PreviewKindVideo,
+		"voice.mp3":    PreviewKindAudio,
+		"manual.pdf":   PreviewKindPDF,
+		"archive.zip":  PreviewKindNone,
+		"page.html":    PreviewKindNone,
+		"script.js":    PreviewKindNone,
+		"no-extension": PreviewKindNone,
+	}
+	for name, want := range cases {
+		if got := previewKind(name); got != want {
+			t.Fatalf("%s 期望 %q，得到 %q", name, want, got)
+		}
+	}
+}
+
+// raw 端点：白名单 MIME + inline + Range；非媒体类型回 400，不能当文档内联返回。
+func TestPreviewFileHandlerServesRange(t *testing.T) {
+	ctx := context.Background()
+	fs, err := localfs.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "read"},
+		storage: fs,
+		log:     logger,
+	}
+	body := []byte("0123456789abcdef")
+	if _, err := fs.Put(ctx, path.Join(svc.filesKey("sp1"), "assets/logo.png"), bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("预置图片失败: %v", err)
+	}
+	if _, err := fs.Put(ctx, path.Join(svc.filesKey("sp1"), "notes/a.md"), bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatalf("预置文档失败: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	NewHandler(svc, func(*http.Request) (store.User, error) {
+		return store.User{ID: "u1"}, nil
+	}, logger).Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/spaces/sp1/file/raw?path=assets/logo.png", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("Range 请求应回 206，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "image/png" {
+		t.Fatalf("Content-Type 应为白名单里的 image/png，得到 %q", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); !strings.HasPrefix(got, "inline") {
+		t.Fatalf("内联预览应回 inline，得到 %q", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("应禁止类型嗅探，得到 %q", got)
+	}
+	if got := rec.Body.String(); got != "2345" {
+		t.Fatalf("Range 内容不符: %q", got)
+	}
+
+	// 文本走正文端点；raw 端点拒绝，避免把 HTML / JS 之类的东西当文档返回
+	req = httptest.NewRequest(http.MethodGet, "/spaces/sp1/file/raw?path=notes/a.md", nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "unsupported_file") {
+		t.Fatalf("文本类型请求 raw 应回 400 unsupported_file，得到 %d：%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -237,5 +390,104 @@ func TestDeleteFileGuardsAndDeletes(t *testing.T) {
 
 	if err := svc.DeleteFile(ctx, "u1", "sp1", "notes/missing.md"); !errors.Is(err, ErrFileNotFound) {
 		t.Fatalf("不存在的文件应返回 ErrFileNotFound，实际: %v", err)
+	}
+}
+
+// 上传不限类型：图片 / 音视频 / 压缩包都能落盘并带上对应的预览类别；
+// 平台保留名与只读权限仍在写入侧拦住。
+func TestSaveFileAcceptsAnyType(t *testing.T) {
+	ctx := context.Background()
+	fs, err := localfs.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "write"},
+		storage: fs,
+		log:     logger,
+	}
+
+	cases := []struct {
+		name string
+		body []byte
+		kind PreviewKind
+	}{
+		{"logo.png", []byte{0x89, 'P', 'N', 'G'}, PreviewKindImage},
+		{"演示.mp4", []byte("mp4"), PreviewKindVideo},
+		{"打包.zip", []byte("PK\x03\x04"), PreviewKindNone},
+		{"README", []byte("no ext"), PreviewKindNone},
+		{"说明.md", []byte("# 标题"), PreviewKindText},
+	}
+	for _, c := range cases {
+		f, err := svc.SaveFile(ctx, "u1", "sp1", "uploads", c.name, bytes.NewReader(c.body), int64(len(c.body)))
+		if err != nil {
+			t.Fatalf("%s 应可上传，实际: %v", c.name, err)
+		}
+		if f.Name != c.name || f.Size != int64(len(c.body)) || f.PreviewKind != c.kind {
+			t.Fatalf("%s 元信息不符: %+v", c.name, f)
+		}
+		// 只有文本能读正文：二进制即使能传、能预览，也不进引用 / file_read
+		if c.kind != PreviewKindText && f.Previewable {
+			t.Fatalf("%s 不应被当成可读文本", c.name)
+		}
+	}
+
+	// 平台保留的隐藏元数据不能由用户上传覆盖
+	if _, err := svc.SaveFile(ctx, "u1", "sp1", "", ".install.json", strings.NewReader("{}"), 2); !errors.Is(err, ErrNameInvalid) {
+		t.Fatalf("保留名应返回 ErrNameInvalid，实际: %v", err)
+	}
+
+	// 只读权限仍不能上传
+	readonly := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "read"},
+		storage: fs,
+		log:     logger,
+	}
+	if _, err := readonly.SaveFile(ctx, "u1", "sp1", "", "a.png", bytes.NewReader([]byte("x")), 1); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("只读空间上传应返回 ErrForbidden，实际: %v", err)
+	}
+}
+
+// 默认上限是 100MB；超限两条路都要挡住，且不能在空间里留下半截文件。
+// 测试把上限调到 1KB，避免真的写 100MB。
+func TestSaveFileRejectsOversize(t *testing.T) {
+	ctx := context.Background()
+	fs, err := localfs.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+	svc := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "write"},
+		storage: fs,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if DefaultUploadMaxBytes != 100<<20 {
+		t.Fatalf("默认上限应为 100MB，实际 %d", DefaultUploadMaxBytes)
+	}
+	svc.SetUploadMaxBytes(1 << 10)
+
+	// size 已知：解析阶段就能判断，不必写进存储
+	big := bytes.Repeat([]byte("x"), 2<<10)
+	if _, err := svc.SaveFile(ctx, "u1", "sp1", "", "known.bin", bytes.NewReader(big), int64(len(big))); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("size 已知时超限应返回 ErrFileTooLarge，实际: %v", err)
+	}
+	if _, err := fs.Stat(ctx, path.Join(svc.filesKey("sp1"), "known.bin")); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("超限文件不应落盘，实际 err=%v", err)
+	}
+
+	// size 未知：流式写入后靠计数兜底，刚落的文件要删掉
+	if _, err := svc.SaveFile(ctx, "u1", "sp1", "", "unknown.bin", bytes.NewReader(big), -1); !errors.Is(err, ErrFileTooLarge) {
+		t.Fatalf("size 未知时超限应返回 ErrFileTooLarge，实际: %v", err)
+	}
+	if _, err := fs.Stat(ctx, path.Join(svc.filesKey("sp1"), "unknown.bin")); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("超限文件不应留在空间里，实际 err=%v", err)
+	}
+
+	// 刚好等于上限可以写入
+	exact := bytes.Repeat([]byte("y"), 1<<10)
+	f, err := svc.SaveFile(ctx, "u1", "sp1", "", "exact.bin", bytes.NewReader(exact), int64(len(exact)))
+	if err != nil || f.Size != int64(len(exact)) {
+		t.Fatalf("恰好等于上限应可写入: file=%+v err=%v", f, err)
 	}
 }

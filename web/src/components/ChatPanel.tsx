@@ -11,18 +11,21 @@ import { Button, Empty, Input, Popover, Spin, TextArea, Toast, Tooltip, Typograp
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type {
+  ApprovalInfo,
   ChatMessage,
   ChatSession,
   MessagePart,
   MessageToolPart,
+  PlanState,
   SessionTask,
   SpaceFile,
   SpaceSkill,
   StreamItem,
   ToolCallRecord,
 } from '../api/types';
-import { UPLOAD_ACCEPT, UPLOAD_ACCEPT_LABEL, decideApproval, firstOversize } from '../api/client';
+import { UPLOAD_HINT, decideApproval, firstOversize } from '../api/client';
 import { useAgents } from '../api/hooks';
+import { markApprovalDecided } from '../api/liveRun';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
 import { SessionAgentIcon } from './AgentAvatar';
@@ -72,17 +75,36 @@ export function splitReferences(content: string): { text: string; refs: string[]
   return { text: content.slice(0, idx), refs };
 }
 
-/** 引用文件标签：输入框上方可删除，消息气泡里只读 */
-function ReferenceChips({ paths, onRemove }: { paths: string[]; onRemove?: (path: string) => void }) {
+/** 引用文件标签：输入框上方可删除，消息气泡里只读。非文本标「附件」——模型读不到正文 */
+function ReferenceChips({
+  paths,
+  files,
+  onRemove,
+}: {
+  paths: string[];
+  files?: SpaceFile[];
+  onRemove?: (path: string) => void;
+}) {
+  // 老版本后端没有 previewable 字段时按可读处理，避免历史消息里的文本文件被误标成附件
+  const readableByPath = useMemo(
+    () => new Map((files ?? []).map((f) => [f.path, f.previewable !== false])),
+    [files],
+  );
   if (paths.length === 0) return null;
   return (
     <div className="chat-refs">
       {paths.map((p) => {
         const name = p.split('/').pop() || p;
+        const readable = readableByPath.get(p) ?? true;
         return (
-          <span key={p} className="chat-ref" title={p}>
+          <span
+            key={p}
+            className="chat-ref"
+            title={readable ? p : `${p}（非文本附件，模型读不到正文）`}
+          >
             <IconFile size="small" className="chat-ref-icon" />
             <span className="chat-ref-name">{name}</span>
+            {readable ? null : <span className="chat-ref-kind">附件</span>}
             {onRemove ? (
               <button
                 type="button"
@@ -118,7 +140,7 @@ interface Props {
   onSelectSkill: (path: string) => void;
   /** 打开选择器前重新取一次：技能可能刚在另一个页面新建/启停过 */
   onRefreshSkills?: () => void;
-  /** 当前空间里可引用的文件 */
+  /** 当前空间的文件；引用不限类型（非文本按附件，标签与清单标明读不到正文） */
   spaceFiles: SpaceFile[];
   /** 上传文件到当前空间，返回服务端落盘后的文件（同名会被改名） */
   onUploadFiles: (files: File[]) => Promise<SpaceFile[]>;
@@ -133,15 +155,30 @@ interface Props {
   onResume?: () => void;
   /** 打开本轮写入的空间文件：清单由工具回执推导，点击跳到右侧预览 */
   onOpenFile?: (path: string) => void;
+  /**
+   * 服务端仍挂着的待确认动作。
+   *
+   * 审批即暂停：那一轮已经收尾，卡片不在流式气泡里了，但待办还在。
+   * 不点它，会话就一直是「已暂停」；点同意由服务端从断点续跑。
+   */
+  pendingApprovals?: ApprovalInfo[];
 }
 
 /** 用户消息：正文 + 引用文件标签 */
-function UserBody({ content, refs }: { content: string; refs?: string[] }) {
+function UserBody({
+  content,
+  refs,
+  files,
+}: {
+  content: string;
+  refs?: string[];
+  files?: SpaceFile[];
+}) {
   const parsed = splitReferences(content);
   return (
     <>
       <div className="chat-msg-content">{parsed.text}</div>
-      <ReferenceChips paths={refs ?? parsed.refs} />
+      <ReferenceChips paths={refs ?? parsed.refs} files={files} />
     </>
   );
 }
@@ -210,6 +247,14 @@ function statusLabel(status: ToolCallRecord['status']) {
   if (status === 'approval') return '待审批';
   if (status === 'denied') return '已拒绝';
   return '失败';
+}
+
+/** 实时视图里的正文：交接时用来判断「这一段是不是已经落库了」，避免同一段话说两遍 */
+function viewText(view: StreamView): string {
+  return view.items
+    .filter((item): item is { kind: 'text'; text: string } => item.kind === 'text')
+    .map((item) => item.text)
+    .join('');
 }
 
 /**
@@ -326,7 +371,9 @@ function isStandaloneTool(tool: ToolCallRecord): boolean {
   return (
     parseSecretRequest(tool) !== null ||
     parseMCPAppRequest(tool) !== null ||
-    tool.status === 'approval'
+    tool.status === 'approval' ||
+    // 已提交决策、等回执的那几秒：留在原位露出「正在执行」，不要一提交就折进工具组
+    Boolean(tool.decided)
   );
 }
 
@@ -363,6 +410,9 @@ function ToolCard({
     setBusy(key);
     try {
       const out = await decideApproval(approval.sessionId, approval.id, decision, scope);
+      // 决策已落库：立刻收掉按钮，别等 tool.result（执行体唤醒 + 命令跑完要几秒）。
+      // 等待期间的「已提交」由卡片自己渲染，终态仍以回执为准。
+      markApprovalDecided(approval.sessionId, tool.id, decision);
       if (out.resumed) {
         // 当时的执行体已经不在了：决策已落库，服务端正从断点接着跑
         Toast.info('这一轮已中断，正在从断点继续');
@@ -428,9 +478,14 @@ function ToolCard({
         </Button>
       </div>
       <div className="msg-approval-hint">
-        「本轮」只对这一次执行生效，下一轮需重新确认
-        {approval.timeoutS ? `；${Math.max(1, Math.round(approval.timeoutS / 60))} 分钟未处理自动拒绝` : ''}
+        「本轮」只对这一次执行生效，下一轮需重新确认；不点也没有超时，这一轮会一直停在这里
       </div>
+    </div>
+  ) : tool.decided ? (
+    // 已提交、还没回执：按钮先收掉，避免「点了没反应」被重复点击
+    <div className="msg-approval msg-approval-decided">
+      <Spin size="small" />
+      <span>{tool.decided === 'approve' ? '已同意，正在执行…' : '已拒绝，正在收尾…'}</span>
     </div>
   ) : null;
 
@@ -578,6 +633,8 @@ function toBlocks(items: StreamItem[]): TurnBlock[] {
       blocks.push({ kind: 'text', text: item.text });
       continue;
     }
+    // 清单不进时间线：它是整轮的状态，单独一张卡常驻在正文之上
+    if (item.kind === 'plan') continue;
     const last = blocks[blocks.length - 1];
     if (last && last.kind === 'tools') {
       last.tools.push(item.tool);
@@ -616,11 +673,25 @@ function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
  */
 function toItems(parts?: MessagePart[]): StreamItem[] | null {
   if (!parts || !parts.some((p) => p.type !== 'tool')) return null;
-  return parts.map((p) =>
-    p.type === 'tool'
-      ? { kind: 'tool' as const, tool: toToolRecord(p) }
-      : { kind: p.type, text: p.text },
-  );
+  return parts.map((p) => {
+    if (p.type === 'tool') return { kind: 'tool' as const, tool: toToolRecord(p) };
+    if (p.type === 'plan') return { kind: 'plan' as const, plan: { goal: p.goal, items: p.items } };
+    return { kind: p.type, text: p.text };
+  });
+}
+
+/**
+ * 时间线里的任务清单：取最后一份。
+ *
+ * 一条消息理论上只有一份（落库时只留最终状态），但续跑会把中断前那份拼进来，
+ * 两份并存时后一份才是现状——旧的那份已经过时，显示出来只会让人以为进度倒退。
+ */
+function lastPlan(items?: StreamItem[] | null): PlanState | null {
+  let found: PlanState | null = null;
+  for (const item of items ?? []) {
+    if (item.kind === 'plan') found = item.plan;
+  }
+  return found;
 }
 
 function parseToolArgs(args: string): Record<string, unknown> | null {
@@ -688,6 +759,53 @@ function WrittenFiles({ paths, onOpen }: { paths: string[]; onOpen?: (path: stri
   );
 }
 
+const PLAN_STATUS_LABEL: Record<string, string> = {
+  pending: '待做',
+  doing: '进行中',
+  done: '已完成',
+  blocked: '卡住',
+};
+
+/**
+ * 任务清单卡片：这一轮的执行计划与完成进度。
+ *
+ * 常驻在正文之上、不折叠——读这条回答时最需要知道的就是「还剩几步、卡在哪」。
+ * 状态用图标 + 文字双写，不只靠颜色：深色主题与色盲都要能读出来。
+ */
+function PlanCard({ plan }: { plan: PlanState }) {
+  if (plan.items.length === 0) return null;
+  const done = plan.items.filter((item) => item.status === 'done').length;
+  return (
+    <div className="msg-plan">
+      <div className="msg-plan-head">
+        <span className="msg-plan-title">任务清单</span>
+        <span className="msg-plan-progress">
+          {done}/{plan.items.length} 完成
+        </span>
+      </div>
+      {plan.goal ? <div className="msg-plan-goal">{plan.goal}</div> : null}
+      <ol className="msg-plan-list">
+        {plan.items.map((item, index) => {
+          const status = item.status ?? 'pending';
+          return (
+            <li key={`${index}-${item.title}`} className={`msg-plan-item is-${status}`}>
+              <span className={`msg-plan-dot is-${status}`} aria-hidden="true">
+                {status === 'done' ? <IconTick size="small" /> : null}
+                {status === 'blocked' ? '!' : null}
+              </span>
+              <span className="msg-plan-text">{item.title}</span>
+              {item.note ? <span className="msg-plan-note">{item.note}</span> : null}
+              <span className={`msg-plan-status is-${status}`}>
+                {PLAN_STATUS_LABEL[status] ?? status}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
 function AssistantBody({
   content,
   reasoning,
@@ -721,8 +839,11 @@ function AssistantBody({
     ? timeline.flatMap((item) => (item.kind === 'tool' ? [item.tool] : []))
     : tools;
   const writes = writtenFiles(allTools);
+  // 清单排在最前：先看计划再看过程，才读得懂中间的取舍
+  const plan = lastPlan(timeline);
   return (
     <>
+      {plan ? <PlanCard plan={plan} /> : null}
       {timeline ? null : reasoning ? <ReasoningBlock text={reasoning} live={live && !hasBody} /> : null}
       {blocks ? (
         // 流式：思考、正文与工具按实际到达顺序交错，
@@ -794,6 +915,7 @@ export default function ChatPanel({
   resumable,
   onResume,
   onOpenFile,
+  pendingApprovals = [],
 }: Props) {
   // 智能体清单只在同空间时查：子任务会话的 agent 来自发起方空间，被派发人无权读那份目录，
   // 跨空间只显示「发起方智能体」，不去请求一个必然 403 的接口。
@@ -878,9 +1000,18 @@ export default function ChatPanel({
       lastVisible?.role === 'assistant' &&
       !lastVisible.streaming,
   );
+  // 暂停轮已经落库时列表末尾就是它：正文一模一样，再顶一个气泡就是同一段话说两遍。
+  // 条数没变（续跑并回同一条消息）时上面的 growth 判据等不到，靠这一条交接。
+  const heldLanded = Boolean(
+    handover &&
+      !replyLanded &&
+      lastVisible?.role === 'assistant' &&
+      !lastVisible.streaming &&
+      lastVisible.content.trim() === viewText(handover.view).trim(),
+  );
   // 只有真的写出了正文才顶住：失败或只有思考的空轮次不该留一个假气泡
   const heldStream =
-    handover && !replyLanded && handover.view.items.some((item) => item.kind === 'text')
+    handover && !replyLanded && !heldLanded && handover.view.items.some((item) => item.kind === 'text')
       ? handover.view
       : null;
   /** 实际要画出来的实时内容：流式中是真流，交接空窗期是按住的那份 */
@@ -974,7 +1105,8 @@ export default function ChatPanel({
   const pickerVisible = refPickerOpen || mention !== null;
   const pickerQuery = mention ? mention.query : refQuery;
 
-  // 上传成功即引用：用户传文件的下一步几乎总是让 Agent 读它
+  // 上传成功即引用：用户传文件的下一步几乎总是让 Agent 用到它。
+  // 引用不限类型——非文本作为附件进清单，服务端会告诉模型读不到正文、不要 file_read。
   const handleUpload = async (list: FileList | null) => {
     const picked = Array.from(list ?? []);
     if (picked.length === 0) return;
@@ -989,6 +1121,10 @@ export default function ChatPanel({
     setUploading(true);
     try {
       const saved = await onUploadFiles(picked);
+      const attachments = saved.filter((f) => f.previewable === false).length;
+      if (attachments > 0) {
+        Toast.info(`${attachments} 个非文本文件已作为附件引用，模型读不到其正文`);
+      }
       setRefs((prev) => {
         const next = [...prev];
         saved.forEach((f) => {
@@ -1005,6 +1141,7 @@ export default function ChatPanel({
     }
   };
 
+  // 引用候选是空间里全部文件：文本由模型读正文，非文本作为附件（清单里会标明不可读）
   const fileOptions = useMemo(() => {
     const q = pickerQuery.trim().toLowerCase();
     const list = q ? spaceFiles.filter((f) => f.path.toLowerCase().includes(q)) : spaceFiles;
@@ -1240,7 +1377,7 @@ export default function ChatPanel({
                     <MarkdownView content={m.content} spaceId={session.space_id} />
                   </div>
                 ) : (
-                  <UserBody content={m.content} />
+                  <UserBody content={m.content} files={spaceFiles} />
                 )}
                 {turnTaskList ? <TaskPanel tasks={turnTaskList} onReload={reloadTasks} /> : null}
               </div>
@@ -1253,7 +1390,7 @@ export default function ChatPanel({
             <div className="chat-msg-meta">
               <span>我</span>
             </div>
-            <UserBody content={pendingUser} refs={pendingRefs} />
+            <UserBody content={pendingUser} refs={pendingRefs} files={spaceFiles} />
           </div>
         ) : null}
 
@@ -1300,6 +1437,34 @@ export default function ChatPanel({
             <TaskPanel tasks={looseTasks} onReload={reloadTasks} />
           </div>
         ) : null}
+
+        {/* 已暂停的轮次：审批即中断，卡片不在流式气泡里了，但待办还在。
+            不点它，会话就一直停在这里；点同意由服务端从断点续跑。
+            liveView 还在时不画：那一轮的气泡里已经有一张同样的卡了。 */}
+        {pendingApprovals.length > 0 && !liveView ? (
+          <div className="chat-msg chat-msg-assistant">
+            <div className="chat-msg-meta">
+              <span>Agent</span>
+              <span className="chat-msg-time">已暂停，等待确认</span>
+            </div>
+            {pendingApprovals.map((a) => (
+              <ToolCard
+                key={a.id}
+                tool={{
+                  id: a.callId,
+                  name: a.tool,
+                  args: '',
+                  status: 'approval',
+                  risk: a.risk || undefined,
+                  approval: a,
+                }}
+                spaceId={session.space_id}
+                onSend={continueRun}
+                onResume={onResume}
+              />
+            ))}
+          </div>
+        ) : null}
       </div>
 
       <div className="chat-input">
@@ -1325,7 +1490,7 @@ export default function ChatPanel({
           >
             <span className="chat-composer-resize-bar" />
           </div>
-          <ReferenceChips paths={refs} onRemove={removeRef} />
+          <ReferenceChips paths={refs} files={spaceFiles} onRemove={removeRef} />
           <div className="chat-composer-row">
             <TextArea
               className="chat-composer-input"
@@ -1363,11 +1528,10 @@ export default function ChatPanel({
                 type="file"
                 multiple
                 hidden
-                accept={UPLOAD_ACCEPT}
                 onChange={(e) => void handleUpload(e.target.files)}
               />
               <Tooltip
-                content={`上传文件到当前空间（${UPLOAD_ACCEPT_LABEL}，${
+                content={`上传文件到当前空间（${UPLOAD_HINT}，${
                   uploadMaxMb ? `单个 ≤ ${uploadMaxMb}MB` : '单个大小受服务端配置限制'
                 }）`}
                 position="topRight"
@@ -1423,7 +1587,10 @@ export default function ChatPanel({
                             <IconFile className="file-picker-icon" />
                             <span className="file-picker-body">
                               <span className="file-picker-name">{f.name}</span>
-                              <span className="file-picker-path">{f.dir || '空间根'}</span>
+                              <span className="file-picker-path">
+                                {f.dir || '空间根'}
+                                {f.previewable === false ? ' · 附件（模型读不到正文）' : ''}
+                              </span>
                             </span>
                             {refs.includes(f.path) ? <IconTick className="file-picker-check" /> : null}
                           </button>

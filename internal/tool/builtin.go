@@ -21,7 +21,6 @@ import (
 // 当前空间文件根下（SideEffectsWorkspace），策略层按空间权限放行，见 policy.RBACEngine。
 func builtinTools() []Tool {
 	return []Tool{
-		timeNow(),
 		spaceList(),
 		sessionList(),
 		taskCreate(),
@@ -79,21 +78,6 @@ func BuiltinManifests() []Manifest {
 
 // 系统空间的固定目录名；与 space 包保持一致，这里用字面量避免包间循环依赖。
 const systemSpaceType = "system"
-
-func timeNow() Tool {
-	return Tool{
-		Name:        "time_now",
-		Capability:  "time.now",
-		Description: "获取服务器当前的日期与时间（含时区与星期）。回答时间相关问题前先调用。",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-		Risk:        policy.RiskReadOnly,
-		Runtime:     "builtin",
-		Invoke: func(context.Context, json.RawMessage, Env) (string, error) {
-			now := time.Now()
-			return now.Format("2006-01-02 15:04:05 MST (Monday)"), nil
-		},
-	}
-}
 
 func spaceList() Tool {
 	return Tool{

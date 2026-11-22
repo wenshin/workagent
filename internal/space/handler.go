@@ -14,6 +14,11 @@ import (
 	"github.com/workagent/auto-agent/internal/store"
 )
 
+// maxUploadInMemory 是 multipart 解析时单个文件留在内存的上限，超出部分自动落到临时文件。
+// 它不决定「能传多大」（那是 UPLOAD_MAX_FILE_MB），只决定解析时占多少内存：
+// 100MB 的文件按整段读进内存，几个并发上传就能把进程撑爆。
+const maxUploadInMemory = 16 << 20
+
 // UserResolver 从请求中解析当前登录用户。
 type UserResolver func(r *http.Request) (store.User, error)
 
@@ -57,11 +62,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /spaces/{id}/skills", h.listSkills)
 
 	// 树里的文件节点：/spaces/files 一次取全，/spaces/{id}/file 读正文。
-	// 正文端点只读且只暴露 md/json 等文本类型；预览不了的类型走 download 取原始字节。
+	// 正文端点只读且只暴露 md/json 等文本类型；浏览器能原生渲染的媒体与 PDF 走
+	// file/raw 取原始字节（内联 MIME + Range）；其余类型走 download 落盘。
 	mux.HandleFunc("GET /spaces/files", h.listFiles)
 	mux.HandleFunc("GET /spaces/{id}/file", h.readFile)
+	mux.HandleFunc("GET /spaces/{id}/file/raw", h.previewFile)
 	mux.HandleFunc("GET /spaces/{id}/file/download", h.downloadFile)
-	// 上传只接受可预览的文本类型，落在空间 files/ 下（dir 可选，相对 files/）
+	// 上传不限类型，落在空间 files/ 下（dir 可选，相对 files/）；能否读正文由读取侧判定
 	mux.HandleFunc("POST /spaces/{id}/files", h.uploadFiles)
 	// 删除单个文件；目录走 /dirs，已安装插件与系统空间内置目录只读
 	mux.HandleFunc("DELETE /spaces/{id}/file", h.deleteFile)
@@ -453,8 +460,10 @@ type fileDTO struct {
 	Name    string `json:"name"`
 	Size    int64  `json:"size"`
 	ModTime string `json:"mod_time,omitempty"`
-	// Previewable=false 的文件前端只给下载入口：正文端点不认这些扩展名
+	// Previewable=false 的文件不能读正文（file_read 与引用候选都认这个开关）
 	Previewable bool `json:"previewable"`
+	// PreviewKind 是面板渲染方式：text / image / video / audio / pdf / none
+	PreviewKind PreviewKind `json:"preview_kind"`
 }
 
 // fileContentDTO 在文件元信息上追加正文，Truncated 表示超过读取上限被截断。
@@ -472,6 +481,7 @@ func toFileDTO(f File) fileDTO {
 		Name:        f.Name,
 		Size:        f.Size,
 		Previewable: f.Previewable,
+		PreviewKind: f.PreviewKind,
 	}
 	if !f.ModTime.IsZero() {
 		dto.ModTime = f.ModTime.Format("2006-01-02T15:04:05Z07:00")
@@ -516,6 +526,53 @@ func (h *Handler) readFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// previewFile 内联返回浏览器可渲染的文件原始字节（图片 / 音视频 / PDF）。
+//
+// 与 downloadFile 的差别：按固定白名单给出真实 Content-Type 并 inline，浏览器才能渲染；
+// 可寻址的存储直接交给 http.ServeContent，视频拖动进度条只取目标区间而不是整段重下。
+// 端点与平台同源，因此只放行不会执行脚本的容器；SVG 是唯一能带脚本的格式，
+// 靠 CSP sandbox 让它即便被直接打开也拿不到平台 Cookie 与 localStorage。
+func (h *Handler) previewFile(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	file, contentType, body, err := h.svc.PreviewFile(r.Context(), user.ID, r.PathValue("id"), rel)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	defer func() { _ = body.Close() }()
+
+	disposition := mime.FormatMediaType("inline", map[string]string{"filename": file.Name})
+	if disposition == "" {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", disposition)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if contentType == "image/svg+xml" {
+		w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+	}
+
+	// 本地 FS 的 Get 返回 *os.File，能直接走 Range / If-Modified-Since / HEAD；
+	// 换成不支持 Seek 的存储时退回整段返回，功能不受影响（只是不能拖进度条）。
+	if rs, ok := body.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, file.Name, file.ModTime, rs)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := io.Copy(w, body); err != nil {
+		h.log.Warn("文件预览中断", "space_id", file.SpaceID, "path", file.Path, "err", err)
+	}
+}
+
 // downloadFile 把文件原始字节回给浏览器（预览不了的类型只有这一条取回路径）。
 //
 // 与 readFile 的两点差别：不看扩展名，也不按 256KB 截断——用户拿到的是本机上的完整文件，
@@ -551,7 +608,7 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 
 // uploadFiles 接收 multipart/form-data：文件字段名 files，可选 dir 表示目标子目录。
 //
-// 一次最多 10 个文件，单个大小上限由配置注入（默认 4MB）；扩展名与同名策略由 Service.SaveFile 兜底。
+// 一次最多 10 个文件，单个大小上限由配置注入（默认 100MB）；不限类型，同名策略由 Service.SaveFile 兜底。
 func (h *Handler) uploadFiles(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.current(w, r)
 	if !ok {
@@ -562,7 +619,7 @@ func (h *Handler) uploadFiles(w http.ResponseWriter, r *http.Request) {
 	// 多留 1MB 给表单边界与字段（Go 的 * 与 << 同级，括号不能省）
 	limit := h.svc.UploadMaxBytes()
 	r.Body = http.MaxBytesReader(w, r.Body, limit*maxUploadFiles+(1<<20))
-	if err := r.ParseMultipartForm(limit); err != nil {
+	if err := r.ParseMultipartForm(maxUploadInMemory); err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body",
 			fmt.Sprintf("请用 multipart/form-data 上传文件，且单次不超过 %d 个、每个不超过 %dMB", maxUploadFiles, limit>>20))
 		return
@@ -582,12 +639,18 @@ func (h *Handler) uploadFiles(w http.ResponseWriter, r *http.Request) {
 	dir := strings.TrimSpace(r.FormValue("dir"))
 	saved := make([]fileDTO, 0, len(parts))
 	for _, header := range parts {
+		// 解析阶段已经拿到真实字节数：先挡一次，超限文件不必写进存储再回滚
+		if header.Size > limit {
+			platform.WriteError(w, r, http.StatusRequestEntityTooLarge, "file_too_large",
+				fmt.Sprintf("「%s」超过 %dMB 上限", header.Filename, limit>>20))
+			return
+		}
 		f, err := header.Open()
 		if err != nil {
 			h.writeErr(w, r, err)
 			return
 		}
-		item, err := h.svc.SaveFile(r.Context(), user.ID, r.PathValue("id"), dir, header.Filename, f)
+		item, err := h.svc.SaveFile(r.Context(), user.ID, r.PathValue("id"), dir, header.Filename, f, header.Size)
 		_ = f.Close()
 		if err != nil {
 			h.writeErr(w, r, err)

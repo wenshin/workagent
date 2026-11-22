@@ -123,7 +123,7 @@ func TestApprovalLevelsPerBuiltinTool(t *testing.T) {
 		{Slug: "tool_wiki_write", Config: json.RawMessage(`{"approval_policy":"always"}`)},
 		{Slug: "tool_file_write", Config: json.RawMessage(`{"approval_policy":"off"}`)},
 		{Slug: "tool_file_read", Config: json.RawMessage(`{}`)},                           // 没配过 → 不出现
-		{Slug: "tool_time_now", Config: json.RawMessage(`{"approval_policy":"none"}`)},    // 非法值 → 默认档
+		{Slug: "tool_space_list", Config: json.RawMessage(`{"approval_policy":"none"}`)},  // 非法值 → 默认档
 		{Slug: "builtin_coding", Config: json.RawMessage(`{"approval_policy":"always"}`)}, // 非工具，忽略
 	}
 	levels := approvalLevels(installs)
@@ -136,8 +136,8 @@ func TestApprovalLevelsPerBuiltinTool(t *testing.T) {
 	if _, ok := levels["file_read"]; ok {
 		t.Fatal("没配过的工具不该出现在档位表里（调用方按默认档处理）")
 	}
-	if levels["time_now"] != ApprovalDeclared {
-		t.Fatalf("非法档位应走默认档，实际 %q", levels["time_now"])
+	if levels["space_list"] != ApprovalDeclared {
+		t.Fatalf("非法档位应走默认档，实际 %q", levels["space_list"])
 	}
 	if _, ok := levels["builtin_coding"]; ok {
 		t.Fatal("非工具插件（技能）不该有工具档位")

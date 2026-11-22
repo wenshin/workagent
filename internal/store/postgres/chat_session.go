@@ -293,6 +293,40 @@ returning ` + messageColumns
 	return m, nil
 }
 
+// MessageOfRun 读一次执行写下的那条助手消息。
+//
+// 判据是 run_step 里 type='message' 的载荷：它在落库的同一个位置写下，比按时间
+// 猜「这一轮的最后一条」可靠。续跑靠它接着同一条消息写。
+func (d *DB) MessageOfRun(ctx context.Context, runID string) (store.Message, bool, error) {
+	if runID == "" {
+		return store.Message{}, false, nil
+	}
+	const q = `
+select m.id::text, m.session_id::text, m.role, m.content, m.reasoning,
+       coalesce(m.parts, '[]'::jsonb), m.in_tokens, m.out_tokens, m.duration_ms,
+       m.streaming, m.interrupted, m.source, m.created_at
+from run_step s
+join message m on m.id::text = s.payload->>'message_id'
+where s.run_id = $1::uuid
+  and s.type = 'message'
+  and coalesce(s.payload->>'message_id', '') <> ''
+order by s.seq desc
+limit 1`
+
+	var m store.Message
+	if err := d.pool.QueryRow(ctx, q, runID).Scan(
+		&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Parts,
+		&m.Stats.InTokens, &m.Stats.OutTokens, &m.Stats.DurationMS,
+		&m.Streaming, &m.Interrupted, &m.Source, &m.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.Message{}, false, nil
+		}
+		return store.Message{}, false, err
+	}
+	return m, true, nil
+}
+
 // ListMessages 按时间顺序返回会话消息。
 func (d *DB) ListMessages(ctx context.Context, sessionID string) ([]store.Message, error) {
 	const q = `

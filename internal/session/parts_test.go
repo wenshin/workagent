@@ -62,6 +62,45 @@ func TestMarshalPartsSkipsTimelineWithoutTools(t *testing.T) {
 	}
 }
 
+// 清单要落进 parts：不落的话刷新后界面上那张进度卡就没了，
+// 翻历史只剩一堆工具卡，看不出这一轮原本打算做几步。
+// 位置固定在最前：先看计划再看过程，才读得懂中间为什么这么走。
+func TestMarshalPartsLeadsWithPlan(t *testing.T) {
+	res := agent.Result{
+		Content: "做完了",
+		Plan: &agent.Plan{Goal: "整理合同", Items: []agent.PlanItem{
+			{Title: "读合同", Status: agent.PlanDone},
+			{Title: "写摘要", Status: agent.PlanDoing},
+		}},
+		Steps:    []agent.Step{{Type: "tool", ID: "c1", Name: "fs_read", Status: "ok"}},
+		Timeline: []agent.Segment{{Type: "tool", ToolID: "c1"}, {Type: "text", Text: "做完了"}},
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(marshalParts(discardLogger(), "s1", res), &got); err != nil {
+		t.Fatalf("解析 parts 失败: %v", err)
+	}
+	if len(got) < 2 || got[0]["type"] != "plan" {
+		t.Fatalf("清单应排在最前，实际 %+v", got)
+	}
+	if got[0]["goal"] != "整理合同" {
+		t.Errorf("目标丢了: %+v", got[0])
+	}
+	items, _ := got[0]["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("清单条数不对: %+v", got[0]["items"])
+	}
+
+	// 只有清单、没有工具时也要落：否则占位消息会被当成空占位藏掉
+	onlyPlan := agent.Result{Content: "我先列个计划", Plan: res.Plan}
+	var planOnly []map[string]any
+	if err := json.Unmarshal(marshalParts(discardLogger(), "s1", onlyPlan), &planOnly); err != nil {
+		t.Fatalf("解析 parts 失败: %v", err)
+	}
+	if len(planOnly) != 1 || planOnly[0]["type"] != "plan" {
+		t.Fatalf("只有清单时应落一条清单段，实际 %+v", planOnly)
+	}
+}
+
 // 时间线缺失（第三方实现）时工具轨迹不能丢，否则历史里只剩正文。
 func TestMarshalPartsKeepsUnplacedTools(t *testing.T) {
 	res := agent.Result{

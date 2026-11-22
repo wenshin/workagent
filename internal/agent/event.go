@@ -17,12 +17,14 @@ const (
 	EventToolCall     = "tool.call"
 	EventToolResult   = "tool.result"
 	EventApprovalReq  = "approval.req"
-	EventMessageDone  = "message.done"
-	EventRunFinished  = "run.finished"
+	// EventPlanUpdated 是任务清单的一次整体更新（整份覆盖，不是增量）。
+	//
+	// 单独一条事件而不是塞进 tool.result：清单是这一轮的执行计划，前端要按它画
+	// 进度卡片并随时刷新——让界面去解析 plan_write 的回执文本，格式一改就崩。
+	EventPlanUpdated = "plan.updated"
+	EventMessageDone = "message.done"
+	EventRunFinished = "run.finished"
 )
-
-// ApprovalTimeoutS 是审批请求的默认超时（§7.3 approval.req）。
-const ApprovalTimeoutS = 300
 
 // Event 是 Agent 运行过程中推送给前端的增量（§7.3）。
 type Event struct {
@@ -36,6 +38,8 @@ type Event struct {
 	Reasoning bool
 	Tool      *ToolState
 	Approval  *ApprovalState
+	// Plan 是 plan.updated 的载荷：整份清单（前端整块替换，不做合并）。
+	Plan *Plan
 }
 
 // ApprovalState 是一条审批请求（§5.7.5 / §7.3 approval.req）。
@@ -46,10 +50,9 @@ type ApprovalState struct {
 	// Kind 是动作类别（net.write / shell），前端据此显示图标与文案。
 	Kind string `json:"kind,omitempty"`
 	// Detail 是命令原文或入参摘要，审批卡片要让人看清「确认什么」。
-	Detail   string `json:"detail,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-	Risk     int    `json:"risk,omitempty"`
-	TimeoutS int    `json:"timeout_s"`
+	Detail string `json:"detail,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Risk   int    `json:"risk,omitempty"`
 }
 
 // ApprovalID 由工具调用 ID 派生稳定的审批 ID，跨事件与 checkpoint 保持一致。
@@ -237,6 +240,40 @@ func (p *Plan) Render() string {
 	return strings.TrimSpace(b.String())
 }
 
+// Summary 是一行进度摘要：当前那一步 + 完成数，可选带上卡住的条数。
+//
+// plan_write 的回执用它而不是 Render：完整清单已经存在断点里、由 plan_read 读回，
+// 回执再贴一遍就是同一份内容在上下文里占两遍（压缩后还会留下半截副本）。
+func (p *Plan) Summary() string {
+	if p.Empty() {
+		return "当前还没有任务清单。"
+	}
+	done, doing, blocked := 0, "", 0
+	for _, it := range p.Items {
+		switch it.Status {
+		case PlanDone:
+			done++
+		case PlanDoing:
+			if doing == "" {
+				doing = strings.TrimSpace(it.Title)
+			}
+		case PlanBlocked:
+			blocked++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d/%d 完成", done, len(p.Items))
+	if doing != "" {
+		b.WriteString("，当前：")
+		b.WriteString(doing)
+	}
+	if blocked > 0 {
+		fmt.Fprintf(&b, "，%d 条卡住", blocked)
+	}
+	b.WriteString("。")
+	return b.String()
+}
+
 // RunInput 是一次 Agent 运行的输入。
 type RunInput struct {
 	// Env 决定工具能看到的资源范围与权限
@@ -266,6 +303,9 @@ type RunInput struct {
 	// 直接注入系统提示词。做成工具的话模型会凭先验抢答「我们用钉钉吧」，
 	// 而这类事实必须恒真，不能放在概率路径上。
 	Platform PlatformFacts
+	// Clock 是本轮「现在」：优先用户端上报的本地时间与时区，缺失时回落服务器时间。
+	// 每轮重新给，不做成工具——模型对「今天是几号」有训练期先验，做成工具它会不查就答。
+	Clock ClockFacts
 	// Plan 是本轮开始前已有的任务清单（断点续跑时由快照带回来）。
 	// 顶层会话由内置实现注入 plan_write / plan_read 维护它；子 Agent 不建清单。
 	Plan *Plan
@@ -359,11 +399,41 @@ type PlatformFacts struct {
 	Exec ExecFacts
 }
 
+// ClockFacts 是本轮「现在」的时间语义。
+//
+// 时间进提示词而不是做成工具：模型对「今天是几号」有很强的训练期先验，做成工具它
+// 会先抢答（把今天说成昨天），而「今天」是每轮对话的前提，不能放在概率路径上。
+// 来源优先用户端——用户在哪个时区、他看到的今天是几号，只有用户端知道：服务端按
+// 自己的时区算，会把 UTC+8 的凌晨算成前一天。
+type ClockFacts struct {
+	// Now 是本轮的时间点，Location 已是用户时区（时区未知时为服务器时区）。
+	// 零值表示调用方没有给出时间，提示词里整段省略。
+	Now time.Time
+	// Zone 是用户时区名（IANA，如 Asia/Shanghai），空表示未知。
+	Zone string
+	// Source 说明 Now 从哪来，决定提示词怎么说（是否要提醒「这是服务器时间」）。
+	Source ClockSource
+}
+
+// ClockSource 是「现在」的来源。
+type ClockSource string
+
+const (
+	// ClockClient 表示时间来自用户端上报：用户看到的墙上时间。
+	ClockClient ClockSource = "client"
+	// ClockServer 表示用户端没有上报，回落服务器时间。
+	ClockServer ClockSource = "server"
+)
+
 // ExecFacts 是执行容器对自身运行环境的自述。
 //
 // 与 Tenant / IM 的区别：那两条来自部署配置，这一条来自执行体运行时上报。
 // 分开建模是因为判断「模型能不能用某个命令」必须看真实镜像，写死一份说明
 // 迟早会与镜像漂移，而漂移的表现是「模型反复执行不存在的命令」。
+//
+// 只留「提示词要说、工具描述说不出」的两项：镜像标识与命令清单。
+// 可写目录、出网形态、容器是否持久属于平台策略，由 shell_exec 的描述表达——
+// 它们随命令变化（同一次运行里三档并存），写成全局事实必然对一半错一半。
 type ExecFacts struct {
 	// Image 是镜像标识，仅用于排障对账
 	Image string
@@ -371,14 +441,6 @@ type ExecFacts struct {
 	OS string
 	// Tools 是镜像里确认可用的命令，未列出的按不可用处理
 	Tools []ExecTool
-	// Writable 是除空间目录外还可写的位置（如 deps 目录）
-	Writable []string
-	// Network 描述出网形态
-	Network string
-	// Sources 是安装源，键为生态，值为镜像 ID 或 URL
-	Sources map[string]string
-	// Persistent 表示容器重建后系统目录的改动是否保留
-	Persistent bool
 }
 
 // ExecTool 是一个可用命令及其版本。
@@ -411,6 +473,12 @@ type Result struct {
 	//
 	// 可以不填：没有工具调用时位置是固定的（思考在前、正文在后），会话层不会落它。
 	Timeline []Segment
+	// Parked 是停在审批上、还没执行的那几条调用。
+	//
+	// 它不进 Steps：没有回执就不能当成已完成的步骤。但这一轮的消息必须能把它们
+	// 画出来——否则「第一个动作就要确认」的那一轮会一条产出都没有，占位消息被
+	// 前端当成空占位藏掉，用户点完同意只看到结论，暂停前想干什么全没了。
+	Parked []PendingCall
 	// NeedApproval 表示本次执行中至少有一次工具调用被策略要求审批
 	NeedApproval bool
 	Provider     string
@@ -422,4 +490,9 @@ type Result struct {
 	// Mode 是本次执行实际走到的档位（answer / exec / orchestrate），由实现按
 	// 实际调用推断。只用于观测，不改变权限：降级靠提示词与工具面，不靠改名。
 	Mode string
+	// Plan 是这一轮结束时的任务清单（没有清单时为 nil）。
+	//
+	// 落库用：message.parts 里带一份最终清单，历史回看才看得到这一轮的计划与进度。
+	// 中途的每一次更新走 plan.updated 事件，不必逐份留档——清单是状态，不是步骤。
+	Plan *Plan
 }

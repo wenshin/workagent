@@ -34,12 +34,11 @@ func TestSetInstallMirrors(t *testing.T) {
 // 混了的表现：包被放进 /cache 后被另一个空间用同名版本覆盖，
 // 或者缓存落进空间目录，每个空间各存一份。
 func TestInstallEnvSplitsSpaceAndCache(t *testing.T) {
-	spaceRoot := "/data/space"
-	workDir := spaceRoot + "/files"
-	pkg := spaceRoot + "/.pkg"
-	cache := CacheRoot()
+	// 沙箱内的固定路径：宿主目录不进环境变量
+	pkg := sandbox.PkgDir
+	cache := sandbox.CacheDir
 
-	env := InstallEnv(spaceRoot, workDir)
+	env := InstallEnv()
 	if len(env) == 0 {
 		t.Fatal("installEnv 不应为空")
 	}
@@ -77,6 +76,15 @@ func TestInstallEnvSplitsSpaceAndCache(t *testing.T) {
 	}
 	if !strings.HasPrefix(path, filepath.Join(pkg, "venv", "bin")) {
 		t.Errorf("venv 必须排在 PATH 最前，实际 %q", path)
+	}
+}
+
+// venv 里的 pip 失效时（跨镜像复用、Python 版本变了），pip 会静默回落到
+// /usr/bin/pip3，再被 PEP 668 拒绝——用户看到的是「装了两次都失败」。
+// 平台必须自己把这个坑填掉，而不是让模型记住 --break-system-packages。
+func TestInstallEnvBreaksPEP668(t *testing.T) {
+	if v, ok := lookupEnv(InstallEnv(), "PIP_BREAK_SYSTEM_PACKAGES"); !ok || v != "1" {
+		t.Fatalf("PIP_BREAK_SYSTEM_PACKAGES 必须是 1，实际 %q（存在=%v）", v, ok)
 	}
 }
 

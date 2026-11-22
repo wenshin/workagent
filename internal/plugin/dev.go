@@ -62,12 +62,18 @@ func (m *Manager) DevExec(ctx context.Context, spaceID, slug, userID, command st
 	}
 	// 开发会话总是给网：装依赖、deno cache、拉示例代码都要。
 	// 超时/输出超限本身是结果的一部分，把 res 一起返回让调用方展示。
+	// 草稿目录挂到 /workspace：开发会话里的 pwd、报错与装包日志都不该出现
+	// 控制面的存储路径（spaces/<id>/drafts/<slug>）。
 	return m.o.Runner.Run(ctx, sandbox.Spec{
-		Cmd:     []string{"sh", "-c", command},
-		Dir:     dir,
-		Mode:    mode,
+		Cmd:  []string{"sh", "-c", command},
+		Dir:  sandbox.WorkspaceDir,
+		Mode: mode,
+		Mounts: []sandbox.Mount{
+			{Source: dir, Key: DraftKey(m.o.Storage, spaceID, slug), Target: sandbox.WorkspaceDir, Write: true},
+			{Source: tool.CacheRoot(), Root: sandbox.RootCache, Target: sandbox.CacheDir, Write: true},
+		},
 		Timeout: timeout,
 		Network: true,
-		Env:     tool.InstallEnv(dir, dir),
+		Env:     tool.InstallEnv(),
 	})
 }

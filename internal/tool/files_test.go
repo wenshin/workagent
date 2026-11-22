@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/workagent/auto-agent/internal/storage/localfs"
 )
@@ -211,6 +212,25 @@ func TestToolDescriptionsCarryUsageRules(t *testing.T) {
 			if !strings.Contains(c.desc, want) {
 				t.Errorf("%s 的描述缺少 %q：%s", c.tool, want, c.desc)
 			}
+		}
+	}
+}
+
+// 内置工具要当成插件发布（seedBuiltin → Manifest.Validate），所以描述必须和
+// 插件清单同一套上限：name ≤ 64、description ≤ 500 个字符。超了不是「市场里难看」，
+// 而是启动时发布失败、工具直接从列表里消失，只留一条 WARN——必须在这里挡住。
+func TestBuiltinManifestsFitPluginLimits(t *testing.T) {
+	seen := map[string]bool{}
+	for _, m := range BuiltinManifests() {
+		if seen[m.Capability] {
+			t.Errorf("内置工具能力重复: %s", m.Capability)
+		}
+		seen[m.Capability] = true
+		if n := utf8.RuneCountInString(strings.TrimSpace(m.Name)); n == 0 || n > 64 {
+			t.Errorf("%s 的 name 长度 %d 超出 1-64", m.Name, n)
+		}
+		if n := utf8.RuneCountInString(strings.TrimSpace(m.Description)); n == 0 || n > 500 {
+			t.Errorf("%s 的 description %d 字，超出插件清单上限 500", m.Name, n)
 		}
 	}
 }

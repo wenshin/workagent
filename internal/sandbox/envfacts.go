@@ -119,7 +119,7 @@ func LoadEnvFacts(path string) (EnvFacts, error) {
 
 // EnvProvider 是执行体的可选能力：报告自己跑在什么环境里。
 //
-// 做成可选接口而不是扩 Runner：本地后端（bwrap / sandbox-exec / local）
+// 做成可选接口而不是扩 Runner：本地后端（bwrap / local）
 // 没有「容器镜像」这个概念，硬塞进接口只能返回空值，还得让三个实现都写一遍。
 type EnvProvider interface {
 	Env() EnvFacts

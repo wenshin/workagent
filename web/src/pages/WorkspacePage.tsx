@@ -4,14 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
-import {
-  UPLOAD_ACCEPT,
-  api,
-  firstOversize,
-  getActiveRun,
-  getResumable,
-  isPreviewable,
-} from '../api/client';
+import { api, firstOversize, getActiveRun, getResumable, listPendingApprovals } from '../api/client';
 import {
   invalidateAfterWrite,
   queryKeys,
@@ -38,6 +31,7 @@ import {
   startLiveRun,
   stopLiveRun,
   subscribeLiveRun,
+  toApprovalInfo,
 } from '../api/liveRun';
 import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
 import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
@@ -258,6 +252,7 @@ export default function WorkspacePage() {
       onSettled: (info) => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+        void queryClient.invalidateQueries({ queryKey: ['approvals', sessionId] });
         void queryClient.invalidateQueries({ queryKey: ['resumable', sessionId] });
         if (info.wroteFiles) invalidateAfterWrite(queryClient);
       },
@@ -266,6 +261,21 @@ export default function WorkspacePage() {
 
   // 带上会话 id：服务端按会话定位这一轮，前端不必等 run.started 拿到 run_id
   const stopGenerating = () => stopLiveRun(selectedSession?.id);
+
+  // 服务端仍挂着的待确认动作。审批即暂停，那一轮没有流可挂，卡片只能从这里来：
+  // 不查的话，切页回来会只剩一句「已中断」，用户根本不知道在等什么。
+  const approvalsKey = ['approvals', selectedSession?.id ?? ''] as const;
+  const { data: pendingList = [] } = useQuery({
+    queryKey: approvalsKey,
+    queryFn: () => listPendingApprovals(selectedSession!.id),
+    enabled: Boolean(selectedSession) && !stream,
+    staleTime: 0,
+    retry: false,
+  });
+  const approvals = useMemo(
+    () => pendingList.map((a) => toApprovalInfo(a, selectedSession?.id ?? '')),
+    [pendingList, selectedSession?.id],
+  );
 
   // 断点续跑入口：只在没有轮次在跑时才探测，一轮结束后重新问一次
   // （断点可能刚被这一轮覆盖或被用户停掉清掉，缓存留着就是错的）
@@ -298,6 +308,7 @@ export default function WorkspacePage() {
       onSettled: (info) => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.messages(sessionId) });
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+        void queryClient.invalidateQueries({ queryKey: ['approvals', sessionId] });
         void queryClient.invalidateQueries({ queryKey: ['resumable', sessionId] });
         if (info.wroteFiles) invalidateAfterWrite(queryClient);
       },
@@ -338,6 +349,7 @@ export default function WorkspacePage() {
           onSettled: (info) => {
             void queryClient.invalidateQueries({ queryKey: queryKeys.messages(session.id) });
             void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+            void queryClient.invalidateQueries({ queryKey: ['approvals', session.id] });
             if (info.wroteFiles) invalidateAfterWrite(queryClient);
           },
         });
@@ -453,13 +465,13 @@ export default function WorkspacePage() {
               onClick={() => setDialog({ kind: 'create-root' })}
             />
           </div>
-          {/* 树里的「上传文件」共用这一个选择框：目标空间/目录由点击时记下的 ref 提供 */}
+          {/* 树里的「上传文件」共用这一个选择框：目标空间/目录由点击时记下的 ref 提供。
+              不限类型：图片 / 音视频 / 压缩包都能传，右侧面板按 preview_kind 预览或给下载 */}
           <input
             ref={treeFileInput}
             type="file"
             multiple
             hidden
-            accept={UPLOAD_ACCEPT}
             onChange={(e) => void handleTreeUpload(e.currentTarget)}
           />
           {spacesLoading ? (
@@ -535,48 +547,54 @@ export default function WorkspacePage() {
             <PluginCatalogPanel defaultSpaceId={selectedSpaceId} category={pluginCategory} />
           </div>
         ) : selectedFile ? (
-          <FilePanel space={selectedSpace} file={selectedFile} />
+          // key 跟着文件走：切文件时媒体加载失败 / 加载中状态必须重置
+          <FilePanel
+            key={`${selectedFile.space_id}/${selectedFile.path}`}
+            space={selectedSpace}
+            file={selectedFile}
+          />
         ) : selectedSession ? (
           <div className="chat-shell">
             <ChatPanel
-            session={selectedSession}
-            spaceName={selectedSpace?.name}
-            messages={messages}
-            loading={messagesLoading}
-            sending={Boolean(stream)}
-            stream={stream}
-            pendingUser={pendingUser}
-            pendingRefs={stream ? liveRun?.pendingRefs : undefined}
-            agentReady={agentInfo?.ready ?? false}
-            model={agentInfo?.model}
-            uploadMaxMb={agentInfo?.upload_max_file_mb}
-            skills={skills}
-            onRefreshSkills={() => {
-              void refetchSkills();
-            }}
-            onSelectSkill={(path) => {
-              setSessionSkill.mutate(
-                { id: selectedSession.id, path },
-                { onError: (e) => Toast.error(e instanceof Error ? e.message : '技能切换失败') },
-              );
-            }}
-            // 引用文件只列当前空间、且只能预览的文本类型：
-            // 跨空间路径会被后端跳过，图片/压缩包这类模型 file_read 也读不到
-            spaceFiles={files.filter(
-              (f) => f.space_id === selectedSession.space_id && isPreviewable(f),
-            )}
-            onUploadFiles={(list) =>
-              uploadFiles.mutateAsync({
-                spaceId: selectedSession.space_id,
-                files: list,
-                // 会话挂在某个目录下时，材料默认放进这个目录
-                dir: selectedSession.dir,
-              })
-            }
+              session={selectedSession}
+              spaceName={selectedSpace?.name}
+              messages={messages}
+              loading={messagesLoading}
+              sending={Boolean(stream)}
+              stream={stream}
+              pendingUser={pendingUser}
+              pendingRefs={stream ? liveRun?.pendingRefs : undefined}
+              agentReady={agentInfo?.ready ?? false}
+              model={agentInfo?.model}
+              uploadMaxMb={agentInfo?.upload_max_file_mb}
+              skills={skills}
+              onRefreshSkills={() => {
+                void refetchSkills();
+              }}
+              onSelectSkill={(path) => {
+                setSessionSkill.mutate(
+                  { id: selectedSession.id, path },
+                  { onError: (e) => Toast.error(e instanceof Error ? e.message : '技能切换失败') },
+                );
+              }}
+              // 只按空间收窄：引用不限类型（非文本按附件进清单），跨空间路径会被后端跳过，
+              // 所以这里不把其他空间的文件混进来
+              spaceFiles={files.filter((f) => f.space_id === selectedSession.space_id)}
+              onUploadFiles={(list) =>
+                uploadFiles.mutateAsync({
+                  spaceId: selectedSession.space_id,
+                  files: list,
+                  // 会话挂在某个目录下时，材料默认放进这个目录
+                  dir: selectedSession.dir,
+                })
+              }
               onSend={send}
               onStop={stopGenerating}
-              resumable={Boolean(resumeInfo?.resumable) && !stream}
+              // 有待办时只留审批卡：「继续」和它抢的是同一份断点，点了也只会再停一次
+              resumable={Boolean(resumeInfo?.resumable) && !stream && approvals.length === 0}
               onResume={() => void resume()}
+              // 审批即暂停：这一轮已经收尾，卡片要从服务端待办补，刷新后也在
+              pendingApprovals={stream ? [] : approvals}
               // 写入文件清单里的条目：切到右侧文件预览，路径落在会话所属空间
               onOpenFile={(path) =>
                 setSearchParams({ space: selectedSession.space_id, file: path })

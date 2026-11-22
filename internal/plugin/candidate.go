@@ -38,6 +38,10 @@ func (m *Manager) EnableLocal(ctx context.Context, spaceID, slug, userID, author
 	if err := m.reloadSpace(ctx, spaceID); err != nil {
 		m.o.Logger.Warn("重载空间失败", "space", spaceID, "err", err)
 	}
+	// 启用即启动：常驻工具在这一刻就要有进程。未发布不等于一次性——作者在草稿里
+	// 声明了 runtime.resident，就说明他要的是「跨调用保留连接与进程内状态」，
+	// 发布与否只影响别人能不能装，不影响这个空间怎么跑它。
+	m.startResident(ctx, spaceID, slug)
 	m.notify(ctx, spaceID)
 	m.recordAudit(ctx, userID, "plugin.local.enable", slug, "enabled", map[string]any{"space": spaceID})
 	return c, nil

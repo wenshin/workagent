@@ -153,7 +153,10 @@ func (a *Agent) runSubAgent(
 		AgentPrompt:    parent.AgentPrompt,
 		// 部署事实是环境，不是父会话的上下文：子 Agent 同样需要知道租户与 IM
 		Platform: parent.Platform,
-		History:  nil,
+		// 「现在」也一起继承：子任务与父任务几乎是同一时刻发起的，
+		// 各自再取一次服务器时间会与父级给出的日期打架
+		Clock:   parent.Clock,
+		History: nil,
 	}, nil)
 	if runErr != nil && res.Content == "" {
 		return "", fmt.Errorf("子 Agent 未产出结果：%w", runErr)

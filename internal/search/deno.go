@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -45,14 +46,18 @@ type Deno struct {
 	keyFunc  func(context.Context) (string, error)
 	client   doer
 	shell    sandbox.Runner
-	// fs 是脚本进程的文件白名单：零值表示只有系统基线 + 脚本目录。
+	// mounts 是脚本进程要挂进沙箱的目录：零值表示只有系统基线 + 脚本目录。
 	// 脚本源是纯变换，不需要读空间文件，默认就是最小权限。
-	fs sandbox.FS
+	mounts []sandbox.Mount
+	// scriptInSandbox 非空时用它（沙箱内路径）代替宿主路径执行脚本：
+	// 脚本来自插件目录时，宿主路径既不该进 argv，也不该出现在编译错误里。
+	scriptInSandbox string
 }
 
-// WithFS 设置脚本进程的文件白名单（由插件层按空间解析）。
-func (d *Deno) WithFS(fs sandbox.FS) *Deno {
-	d.fs = fs
+// WithMounts 设置脚本进程的挂载表与沙箱内脚本路径（由插件层按空间解析）。
+func (d *Deno) WithMounts(mounts []sandbox.Mount, script string) *Deno {
+	d.mounts = mounts
+	d.scriptInSandbox = script
 	return d
 }
 
@@ -204,16 +209,20 @@ func (d *Deno) run(ctx context.Context, in map[string]any, secret string) ([]byt
 	if err != nil {
 		return nil, fmt.Errorf("序列化脚本入参失败: %w", err)
 	}
+	script, dir := d.script, filepath.Dir(d.script)
+	if d.scriptInSandbox != "" {
+		script, dir = d.scriptInSandbox, path.Dir(d.scriptInSandbox)
+	}
 	res, err := d.shell.Run(ctx, sandbox.Spec{
 		Cmd: []string{
 			d.deno, "run",
 			"--quiet", "--no-prompt",
 			// 沙箱里没有可写的工作目录，锁文件与配置会变成噪音甚至失败
 			"--no-lock", "--no-config",
-			d.script,
+			script,
 		},
-		Dir:       filepath.Dir(d.script),
-		FS:        d.fs,
+		Dir:       dir,
+		Mounts:    d.mounts,
 		Stdin:     payload,
 		Mode:      sandbox.ModeReadOnly,
 		Network:   false,

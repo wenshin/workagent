@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func (f *fakeRunner) Start(context.Context, sandbox.Spec) (*sandbox.Proc, error)
 
 func newTestClient(t *testing.T, runner sandbox.Runner, token, root string) (*Client, *httptest.Server) {
 	t.Helper()
-	srv := httptest.NewServer(Handler(runner, token, root, sandbox.EnvFacts{}, nil, nil))
+	srv := httptest.NewServer(Handler(runner, token, root, filepath.Join(root, "cache"), sandbox.EnvFacts{}, nil, nil))
 	t.Cleanup(srv.Close)
 	c, err := New(srv.URL, token)
 	if err != nil {
@@ -65,14 +66,22 @@ func (p *passthroughRunner) Start(ctx context.Context, spec sandbox.Spec) (*sand
 // 远端执行和本地执行就不是同一个语义了。
 func TestRunRoundTrip(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap, res: sandbox.Result{ExitCode: 0, Stdout: "ok"}}
-	c, _ := newTestClient(t, runner, "tk", "/var/lib/workagent")
+	root := t.TempDir()
+	c, _ := newTestClient(t, runner, "tk", root)
 
 	start := time.Now()
 	res, err := c.Run(context.Background(), sandbox.Spec{
-		Cmd:     []string{"sh", "-c", "echo ok"},
-		Dir:     "/var/lib/workagent/storage/spaces/s1/files",
-		FS:      sandbox.FS{Read: []string{"/var/lib/workagent/storage/spaces/s1/files"}},
-		Mode:    sandbox.ModeWorkspaceWrite,
+		Cmd:  []string{"sh", "-c", "echo ok"},
+		Dir:  sandbox.WorkspaceDir,
+		Mode: sandbox.ModeWorkspaceWrite,
+		// 控制面给的是本机真实路径 + 相对 key；过线时真实路径被清掉，
+		// 执行体用自己的根解析 key。
+		Mounts: []sandbox.Mount{{
+			Source: "/Users/someone/data/storage/spaces/s1/files",
+			Key:    "spaces/s1/files",
+			Target: sandbox.WorkspaceDir,
+			Write:  true,
+		}},
 		Timeout: 5 * time.Second,
 		Stdin:   []byte("input"),
 	})
@@ -82,11 +91,19 @@ func TestRunRoundTrip(t *testing.T) {
 	if res.Stdout != "ok" || res.Sandbox != sandbox.NameBwrap {
 		t.Fatalf("结果不符: %+v", res)
 	}
-	if got := runner.got; got.Mode != sandbox.ModeWorkspaceWrite ||
-		got.Timeout != 5*time.Second ||
-		string(got.Stdin) != "input" ||
-		len(got.FS.Read) != 1 {
+	got := runner.got
+	if got.Mode != sandbox.ModeWorkspaceWrite || got.Timeout != 5*time.Second || string(got.Stdin) != "input" {
 		t.Fatalf("Spec 在传输中被改写: %+v", got)
+	}
+	if len(got.Mounts) != 1 {
+		t.Fatalf("挂载表丢了: %+v", got.Mounts)
+	}
+	if got.Mounts[0].Key != "spaces/s1/files" {
+		t.Fatalf("key 没穿过去: %+v", got.Mounts[0])
+	}
+	want := filepath.Join(root, "spaces/s1/files")
+	if got.Mounts[0].Source != want {
+		t.Fatalf("Source 应由执行体解析成 %q，实际 %q", want, got.Mounts[0].Source)
 	}
 	if time.Since(start) > 5*time.Second {
 		t.Fatal("往返耗时异常")
@@ -128,7 +145,7 @@ func (w *wrapped) Unwrap() error { return w.base }
 
 func TestAuthRequired(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap}
-	srv := httptest.NewServer(Handler(runner, "right", "", sandbox.EnvFacts{}, nil, nil))
+	srv := httptest.NewServer(Handler(runner, "right", "", "", sandbox.EnvFacts{}, nil, nil))
 	t.Cleanup(srv.Close)
 
 	// 令牌不对：握手就失败
@@ -142,19 +159,39 @@ func TestAuthRequired(t *testing.T) {
 }
 
 // 执行体是特权容器：请求里的路径必须落在允许的根目录之内。
-func TestPathEscapesRootRejected(t *testing.T) {
+// 越界的 key 必须在执行体上被拒绝：过线的是相对路径，
+// 一旦允许 ".." 就等于让控制面任意挂载执行体容器里的目录。
+func TestMountKeyEscapeRejected(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap}
 	c, _ := newTestClient(t, runner, "tk", "/var/lib/workagent")
 
 	_, err := c.Run(context.Background(), sandbox.Spec{
-		Cmd: []string{"sh", "-c", "id"},
-		Dir: "/etc",
+		Cmd:    []string{"sh", "-c", "id"},
+		Dir:    sandbox.WorkspaceDir,
+		Mounts: []sandbox.Mount{{Key: "../../etc", Target: sandbox.WorkspaceDir}},
 	})
 	if err == nil {
-		t.Fatal("越界路径应该被拒绝")
+		t.Fatal("越界 key 应该被拒绝")
 	}
-	if !strings.Contains(err.Error(), "允许的根目录") {
+	if !strings.Contains(err.Error(), "越界") {
 		t.Fatalf("错误信息应说明越界原因: %v", err)
+	}
+}
+
+// 系统挂载（Key 为空）是容器内本来就一致的路径，原样过线。
+func TestSystemMountPassesThrough(t *testing.T) {
+	runner := &fakeRunner{name: sandbox.NameBwrap}
+	c, _ := newTestClient(t, runner, "tk", "/var/lib/workagent")
+
+	if _, err := c.Run(context.Background(), sandbox.Spec{
+		Cmd:    []string{"sh", "-c", "id"},
+		Dir:    sandbox.WorkspaceDir,
+		Mounts: []sandbox.Mount{{Source: "/opt/scripts", Target: "/opt/scripts"}},
+	}); err != nil {
+		t.Fatalf("系统挂载不该被拒绝: %v", err)
+	}
+	if got := runner.got.Mounts; len(got) != 1 || got[0].Source != "/opt/scripts" {
+		t.Fatalf("系统挂载路径应原样保留: %+v", got)
 	}
 }
 
@@ -210,17 +247,23 @@ func TestStartPropagatesError(t *testing.T) {
 
 // 出网代理路径是执行体要 bind 的位置：不在白名单目录里必须拒绝，
 // 否则等于允许控制面在任意路径建文件。
-func TestEgressPathRejected(t *testing.T) {
+// 代理 socket 由执行体自己建：控制面的路径过线时就被清掉，
+// 否则执行体会去 bind 一个属于另一个容器的路径（以前必须同路径，现在不需要）。
+func TestEgressProxyRebuiltOnRunner(t *testing.T) {
 	runner := &fakeRunner{name: sandbox.NameBwrap}
 	c, _ := newTestClient(t, runner, "tk", "")
 	_, err := c.Run(context.Background(), sandbox.Spec{
 		Cmd:    []string{"sh", "-c", "true"},
-		Dir:    "/tmp",
+		Dir:    sandbox.WorkspaceDir,
 		Proxy:  "/etc/evil.sock",
 		Egress: &sandbox.EgressSpec{Hosts: []string{"example.com"}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "允许的位置") {
-		t.Fatalf("非法代理路径应被拒绝: %v", err)
+	// 测试里没有装配出网注册表：执行体应明确拒绝，而不是悄悄用控制面的路径。
+	if err == nil || !strings.Contains(err.Error(), "未启用出网代理") {
+		t.Fatalf("执行体应拒绝无法满足的出网声明: %v", err)
+	}
+	if runner.got.Proxy == "/etc/evil.sock" {
+		t.Fatalf("控制面的代理路径不该过线: %q", runner.got.Proxy)
 	}
 }
 
@@ -231,8 +274,8 @@ func TestLocalBackendVisible(t *testing.T) {
 	if c.Name() != sandbox.NameLocal || c.Isolated() {
 		t.Fatalf("local 后端没有如实上报: name=%s isolated=%v", c.Name(), c.Isolated())
 	}
-	if err := sandbox.Ensure(c, true); err == nil {
-		t.Fatal("要求隔离时 local 必须被拒绝")
+	if err := sandbox.Ensure(c); err == nil {
+		t.Fatal("local 后端必须被拒绝")
 	}
 }
 
@@ -244,7 +287,7 @@ func TestEnvFactsTravelWithHandshake(t *testing.T) {
 		Tools:   []sandbox.ToolFact{{Name: "git", Version: "2.39.5"}},
 		Network: "默认断网",
 	}
-	srv := httptest.NewServer(Handler(&fakeRunner{name: sandbox.NameBwrap}, "t", "", facts, nil, nil))
+	srv := httptest.NewServer(Handler(&fakeRunner{name: sandbox.NameBwrap}, "t", "", "", facts, nil, nil))
 	t.Cleanup(srv.Close)
 
 	c, err := New(srv.URL, "t")

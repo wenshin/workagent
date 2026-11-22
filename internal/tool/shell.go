@@ -5,9 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
-	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -43,25 +42,25 @@ func shellExec() Tool {
 	return Tool{
 		Name:       "shell_exec",
 		Capability: "shell.exec",
+		// 描述长度受插件清单约束（plugin.maxDescRunes=500），内置工具也要过发布校验：
+		// 超了会在启动时发布失败，工具直接消失，所以这里只留模型判断「何时用」必需的信息。
 		Description: "在当前空间的工作目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
-			"系统其它位置只读，有超时与输出上限。网络按命令形态决定，调用前先看清楚：" +
-			"curl/wget/nc/ssh 这类网络工具会先请用户确认，用户拒绝就不执行。" +
-			"sh/bash/python/node/deno/go 这类脚本默认不联网，访问外网会失败；确实需要联网时传 `network: true`，" +
-			"会先请用户确认，批准后才联网执行。" +
-			"其余命令（ls/git/make/npm i/pip install/apt install）默认有网且不弹确认。" +
+			"系统其它位置只读，有超时与输出上限。网络由命令内容自动决定，没有开关参数：" +
+			"只装依赖（pip install / npm i / apt install）直接联网；" +
+			"只跑脚本（sh/python/node/deno/go）默认不联网，因断网失败时会把「联网重跑」交给用户确认；" +
+			"装依赖和脚本同时出现先请用户确认，拒绝仍按无网执行；" +
+			"curl/wget/nc/ssh 这类网络工具一律先确认，拒绝就不执行。" +
 			"下载与解析可以连着写，例如 `curl -o data.json <url> && python parse.py`。" +
-			"容器闲置会被回收，系统目录回到基础镜像：缺什么直接装，包在本地缓存里，重跑很快。" +
-			"Python 已预置 .pkg/venv 并在 PATH 里，直接 `pip install` 即可；" +
-			"npm 全局安装已指向 .pkg/npm，直接 `npm i -g` 即可，两者重建后都还在。" +
-			"系统级工具（apt install）装进可写层，重建后会消失，需要时再装一次。" +
-			"适合做文件统计、批量改名、跑本地脚本；要查外网信息请用 web_search。" +
-			"命令返回非零退出码或超时时，先看 stderr 再调整，不要重复执行同一条失败命令。",
+			"容器闲置会被回收，系统目录回到基础镜像：缺什么直接装，包在缓存里。" +
+			"Python venv、npm 全局目录在 PATH 里（首次自动建），直接 `pip install` / `npm i -g`，重建后还在；" +
+			"apt install 装进可写层，重建后会消失。" +
+			"适合跑本地脚本与文件统计；查外网请用 web_search。" +
+			"命令返回非零退出码或超时时先看 stderr 再调整，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "要执行的命令，由 sh -c 执行"},
-    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"},
-    "network": {"type": "boolean", "description": "脚本需要联网时置 true，会先请用户确认、批准后才联网执行。只对 sh/python/node/deno/go 这类脚本有意义；curl/wget 等网络工具本来就会先确认，其他命令默认有网"}
+    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"}
   },
   "required": ["command"],
   "additionalProperties": false
@@ -75,13 +74,14 @@ func shellExec() Tool {
 		Runtime:       "builtin",
 		// 命令输出（尤其是测试日志）比文件内容更长，单独放宽回填额度
 		MaxResultBytes: shellMaxResultBytes,
+		// 网络判据挂在工具上：Invoker 据此决定问答、拒绝后的处置与升级重跑。
+		NetPlan: func(args json.RawMessage) ShellNetPolicy {
+			return ShellNetPlan(shellCommandOf(args))
+		},
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
 			var in struct {
 				Command        string `json:"command"`
 				TimeoutSeconds int    `json:"timeout_seconds"`
-				// Network 是调用方替脚本档声明的「这次需要联网」。
-				// 它不是权限开关：声明之后仍要用户批准，批准之前不联网。
-				Network bool `json:"network"`
 			}
 			if err := json.Unmarshal(args, &in); err != nil {
 				return "", fmt.Errorf("参数解析失败: %w", err)
@@ -101,7 +101,8 @@ func shellExec() Tool {
 			if !ok {
 				return "", fmt.Errorf("当前存储不支持命令执行（需要可直接访问的文件系统）")
 			}
-			spaceRoot, err := local.LocalPath(env.Storage.SpaceKey(env.SpaceID))
+			spaceKey := env.Storage.SpaceKey(env.SpaceID)
+			spaceRoot, err := local.LocalPath(spaceKey)
 			if err != nil {
 				return "", fmt.Errorf("解析空间目录失败: %w", err)
 			}
@@ -118,15 +119,15 @@ func shellExec() Tool {
 				timeout = maxShellTimeout
 			}
 
-			// 网络按命令形态分三档，判据只在 shellnet.go：
-			//   网络工具  有网 + 先审批
-			//   脚本     默认无网，声明 network=true 才有网 + 审批
-			//   其他     有网，不审批
+			// 网络按命令内容分四类，判据只在 shellnet.go：
+			//   只有装依赖           有网，不确认
+			//   只有脚本            无网；失败且像网络问题时由 Invoker 申请联网重跑
+			//   装依赖 + 脚本        先确认；拒绝按无网执行
+			//   出现网络工具         先确认；拒绝不执行
 			//
-			// 审批已经在 Invoker 里做完（ApprovalFor 读的是同一个 ShellNetPlan），
-			// 这里只把结论落到沙箱上。两处各判一次必然漂移，而且「没批就联网」
-			// 是静默的——用户不会收到任何提示。
-			plan := ShellNetPlan(command, in.Network)
+			// 审批已经在 Invoker 里做完（ApprovalFor 与这里的 plan 读同一份判据），
+			// env.NetGrant 就是它的结论：拿到许可才落 Spec.Network=true。
+			plan := ShellNetPlan(command)
 			mode := sandbox.ModeWorkspaceWrite
 			if shellNeedsSystemWrite(command) {
 				mode = sandbox.ModeSystemWrite
@@ -134,14 +135,25 @@ func shellExec() Tool {
 			if err := CheckSpaceQuota(spaceRoot); err != nil {
 				return "", err
 			}
-			ensureVenv(ctx, spaceRoot)
+			pkgDir := filepath.Join(spaceRoot, ".pkg")
+			if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+				return "", fmt.Errorf("创建空间安装目录失败: %w", err)
+			}
+			// 宿主路径只出现在 Source 里：它留在控制面，过线的是 Key。
+			// 沙箱里统一是 /workspace 与 /pkg，命令输出、报错、环境变量都不会
+			// 暴露 data/storage/spaces/<id> 这套结构。
 			res, runErr := env.Shell.Run(ctx, sandbox.Spec{
-				Cmd:     []string{"sh", "-c", command},
-				Dir:     workDir,
+				Cmd: []string{"sh", "-c", venvBootstrap + command},
+				Dir: sandbox.WorkspaceDir,
+				Mounts: []sandbox.Mount{
+					{Source: workDir, Key: spaceKey + "/" + workspaceFilesDir, Target: sandbox.WorkspaceDir, Write: true},
+					{Source: pkgDir, Key: spaceKey + "/.pkg", Target: sandbox.PkgDir, Write: true},
+					{Source: CacheRoot(), Root: sandbox.RootCache, Target: sandbox.CacheDir, Write: true},
+				},
 				Mode:    mode,
 				Timeout: timeout,
-				Network: plan.NeedsNetwork(),
-				Env:     InstallEnv(spaceRoot, workDir),
+				Network: plan.Mode == ShellNetOn || (plan.NeedsApproval() && env.NetGrant),
+				Env:     InstallEnv(),
 			})
 
 			// 超时与输出超限是「命令没跑完」，属于结果的一部分，回给模型让它调整；
@@ -152,11 +164,12 @@ func shellExec() Tool {
 				return "", runErr
 			}
 			out := formatShellResult(res, runErr, timeout)
-			// 脚本默认无网：失败原因是网络时给一句可执行的下一步。
-			// 不给的话模型只能从 EAI_AGAIN 这类错误里猜「是不是沙箱的问题」。
-			if plan.Mode == ShellNetOff && looksLikeNetworkFailure(res.Stdout, res.Stderr) {
-				out += "\n[提示] 这次执行没有联网（脚本默认不联网）。" +
-					"如果失败与网络有关，确认后带 `network: true` 重新调用，会先请用户确认。\n"
+			// 纯脚本无网执行、退出码非零且错误像网络不可达：交给 Invoker 去申请联网重跑。
+			// 这里只判断「要不要问」，问完批不批不归工具管——执行阶段套着 30s 墙钟，
+			// 在工具里等人点按钮会先超时。
+			if plan.Escalate && !env.NetGrant && res.ExitCode != 0 &&
+				looksLikeNetworkFailure(res.Stdout, res.Stderr) {
+				return out, errNetNeeded{}
 			}
 			return out, nil
 		},
@@ -255,42 +268,47 @@ func CacheRoot() string {
 //
 // PATH 必须在这里拼好：--clearenv 之后沙箱只继承 baseEnvKeys 里的变量，
 // 在 shell 里 export 影响不到下一条命令。
-func InstallEnv(spaceRoot, workDir string) []string {
-	if spaceRoot == "" {
-		spaceRoot = filepath.Dir(workDir)
-	}
-	pkg := filepath.Join(spaceRoot, ".pkg")
-	venv := filepath.Join(pkg, "venv")
-	npm := filepath.Join(pkg, "npm")
-	cache := CacheRoot()
-	mise := filepath.Join(cache, "mise")
+// InstallEnv 返回沙箱内的安装环境变量。
+//
+// 一律用沙箱内路径（/pkg、/cache）：宿主目录只出现在挂载表里，
+// 环境变量、命令输出与报错里都看不到 STORAGE_ROOT。
+func InstallEnv() []string {
+	pkg := sandbox.PkgDir
+	venv := path.Join(pkg, "venv")
+	npm := path.Join(pkg, "npm")
+	cache := sandbox.CacheDir
+	mise := path.Join(cache, "mise")
 	m := installMirror
 	// mise 装的运行时通过 shims 暴露成普通命令：`mise use -g node@22` 会写 shims，
 	// PATH 里有它就能直接用 node，不需要 source 任何脚本（shell_exec 是独立的
 	// 非交互 sh -c，靠 shell 集成改 PATH 的做法在这里不成立）。
-	path := strings.Join([]string{
-		filepath.Join(venv, "bin"),
-		filepath.Join(npm, "bin"),
-		filepath.Join(mise, "shims"),
+	searchPath := strings.Join([]string{
+		path.Join(venv, "bin"),
+		path.Join(npm, "bin"),
+		path.Join(mise, "shims"),
 	}, ":") + ":" + sandbox.FallbackPath()
 	return []string{
-		"WA_SPACE_DIR=" + spaceRoot,
+		"WA_SPACE_DIR=" + sandbox.WorkspaceDir,
 		// npm 全局包装进空间目录，Pod 重建后还在。
 		"NPM_CONFIG_PREFIX=" + npm,
-		"NPM_CONFIG_CACHE=" + filepath.Join(cache, "npm"),
+		"NPM_CONFIG_CACHE=" + path.Join(cache, "npm"),
 		"NPM_CONFIG_REGISTRY=" + m.NPM,
 		// venv 激活后 pip 装进 venv，同时天然绕开 PEP 668（不动系统 python）。
 		"VIRTUAL_ENV=" + venv,
-		"PIP_CACHE_DIR=" + filepath.Join(cache, "pip"),
+		"PIP_CACHE_DIR=" + path.Join(cache, "pip"),
 		"PIP_INDEX_URL=" + m.PyPI,
 		"PIP_DISABLE_PIP_VERSION_CHECK=1",
+		// 兜底：venvBootstrap 建 venv 失败时，pip 仍要能装进可写层。
+		// 不设的话系统 python 是 externally-managed，pip 一律被 PEP 668 拒绝，
+		// 而报错里只有一个 hint 链接，看起来像权限问题。
+		"PIP_BREAK_SYSTEM_PACKAGES=1",
 		"GOPROXY=" + m.Go,
-		"GOMODCACHE=" + filepath.Join(cache, "go", "mod"),
-		// mise 的数据 / 配置必须在这里给：它们依赖 CacheRoot，父进程不知道。
+		"GOMODCACHE=" + path.Join(cache, "go", "mod"),
+		// mise 的数据 / 配置必须在这里给：它们依赖缓存根，父进程不知道。
 		// HOME 是每次调用的私有 tmp，放默认位置等于每次重装、全局版本配置丢失。
 		"MISE_DATA_DIR=" + mise,
-		"MISE_CACHE_DIR=" + filepath.Join(mise, "cache"),
-		"MISE_CONFIG_DIR=" + filepath.Join(mise, "config"),
+		"MISE_CACHE_DIR=" + path.Join(mise, "cache"),
+		"MISE_CONFIG_DIR=" + path.Join(mise, "config"),
 		"MISE_NODE_MIRROR=" + m.Node,
 		// python 走预编译包，不编译源码（否则一次 mise use python@3.12 要几分钟）。
 		"MISE_PYTHON_COMPILE=false",
@@ -298,31 +316,29 @@ func InstallEnv(spaceRoot, workDir string) []string {
 		// 沙箱里 agent 可能写 mise.toml；信任提示只会让它卡住，且容器本身就是一次性的。
 		"MISE_TRUSTED_CONFIG_PATHS=/",
 		// HOME 是每次调用的私有 tmp，缓存放那里等于每次重下。
-		"XDG_CACHE_HOME=" + filepath.Join(cache, "xdg"),
-		"PATH=" + path,
+		"XDG_CACHE_HOME=" + path.Join(cache, "xdg"),
+		"PATH=" + searchPath,
 	}
 }
 
-// ensureVenv 保证 .pkg/venv 存在，建一次就够。
+// venvBootstrap 在沙箱内保证 /pkg/venv 属于当前执行体，拼在用户命令之前。
 //
-// 失败不阻断命令：没有 venv 时 pip 会落到系统 python 上，
-// 报错信息是 PEP 668，用户照样能看懂。真正要避免的是
-// "每条命令都试一次 python3 -m venv" 的开销。
-func ensureVenv(ctx context.Context, spaceRoot string) {
-	venv := filepath.Join(spaceRoot, ".pkg", "venv")
-	if _, err := os.Stat(filepath.Join(venv, "bin", "python")); err == nil {
-		return
-	}
-	if err := os.MkdirAll(filepath.Join(spaceRoot, ".pkg"), 0o755); err != nil {
-		return
-	}
-	c, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(c, "python3", "-m", "venv", venv).CombinedOutput()
-	if err != nil {
-		slog.Warn("创建空间 venv 失败", "dir", venv, "err", err, "out", strings.TrimSpace(string(out)))
-	}
-}
+// 为什么必须在沙箱里建：venv 的 bin/pip 是带 shebang 的脚本，指向创建它的那个
+// python。控制面建出来的 venv（macOS 的 homebrew python、或另一个镜像的 python）
+// 进容器后 shebang 悬空，PATH 里的 /pkg/venv/bin/pip3 执行失败，sh 会静默回落到
+// /usr/bin/pip3，再被 PEP 668 拒绝——回执只剩一句「No matching distribution found」，
+// 用户看到的是「装了两次都失败」。
+//
+// 判据用 pyvenv.cfg 的 home：那是创建时的解释器目录，容器里不存在就说明这个 venv
+// 不属于当前镜像，删掉重建（一次性，约 2s）。正常运行只有 sed + test 两个进程。
+//
+// 失败不阻断：PIP_BREAK_SYSTEM_PACKAGES=1 兜底，pip 至少能装进可写层。
+// 不在沙箱里（本地调试、单测）时 WA_SPACE_DIR 不存在，整段跳过，绝不在宿主上动 /pkg。
+const venvBootstrap = `if [ -d "$WA_SPACE_DIR" ] && [ -d /pkg ]; then ` +
+	`vh=$(sed -n 's/^home *= *//p' /pkg/venv/pyvenv.cfg 2>/dev/null); ` +
+	`if [ -z "$vh" ] || [ ! -d "$vh" ]; then ` +
+	`rm -rf /pkg/venv; python3 -m venv /pkg/venv >/dev/null 2>&1 || true; fi; ` +
+	`fi; `
 
 // shellSysWriteRe 命中的命令要往系统目录装东西，必须放开 /usr、/var/lib/dpkg。
 //

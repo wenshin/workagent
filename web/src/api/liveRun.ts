@@ -28,6 +28,8 @@ export interface LiveRunView {
   pendingRefs: string[];
   /** 思考、正文与工具调用按到达顺序排列：这是真实时间线，渲染时照序输出即可 */
   items: StreamItem[];
+  /** 卡在等人确认：气泡不该继续显示「生成中」，那会让人以为模型还在想 */
+  waitingApproval?: boolean;
   /** 本轮是否写过空间文件，结束后据此刷新文件树与预览 */
   wroteFiles: boolean;
 }
@@ -82,6 +84,34 @@ export function isLiveRunning(sessionId?: string): boolean {
 /** 这个会话是不是刚被停过、服务端还没确认收尾：续流要绕开它。 */
 export function isStopping(sessionId: string): boolean {
   return stoppingSessions.has(sessionId);
+}
+
+/** 本轮是否还有没处理的审批卡。 */
+function hasPendingApproval(items: StreamItem[]): boolean {
+  return items.some((item) => item.kind === 'tool' && item.tool.status === 'approval');
+}
+
+/**
+ * 决策提交成功后立刻在本地收掉审批按钮。
+ *
+ * 点完按钮到 tool.result 之间隔着「唤醒执行体 → 命令真正跑完 → 帧回传」，
+ * 几百毫秒到几秒。这期间按钮若还挂着，用户会以为没点上而重复提交（后端会拒绝
+ * 第二次，观感却是「点了没反应」；更糟的是两个标签页各点一次）。所以先本地置为
+ * 执行中并记下结论，终态仍由 onToolResult 覆盖——两边写的是同一份视图。
+ */
+export function markApprovalDecided(
+  sessionId: string,
+  callId: string,
+  decision: 'approve' | 'deny',
+): void {
+  if (!current || current.sessionId !== sessionId) return;
+  const items = current.items.map((item): StreamItem =>
+    item.kind === 'tool' && item.tool.id === callId && item.tool.status === 'approval'
+      ? { kind: 'tool', tool: { ...item.tool, status: 'running', approval: undefined, decided: decision } }
+      : item,
+  );
+  current = { ...current, items, waitingApproval: hasPendingApproval(items) };
+  emit();
 }
 
 /**
@@ -164,18 +194,28 @@ function buildHandlers(
         return { ...v, items: [...v.items, { kind: 'text', text: delta }] };
       }),
     onToolStart: (tool) => patch((v) => ({ ...v, items: [...v.items, { kind: 'tool', tool }] })),
+    // 清单是状态不是步骤：已经有卡片就整块替换，别把每次更新都追加成一张新卡
+    onPlan: (plan) =>
+      patch((v) => {
+        const idx = v.items.findIndex((item) => item.kind === 'plan');
+        if (idx < 0) return { ...v, items: [...v.items, { kind: 'plan', plan }] };
+        return {
+          ...v,
+          items: v.items.map((item, i): StreamItem => (i === idx ? { kind: 'plan', plan } : item)),
+        };
+      }),
     onToolResult: (tool) => {
       // Agent 改过空间文件（含新建插件目录）：结束后让树与当前预览重新拉取
       if (tool.status === 'ok' && (tool.name === 'file_write' || tool.name === 'wiki_write')) {
         markWrote();
       }
-      patch((v) => ({
-        ...v,
-        waitingApproval: false,
-        items: v.items.map((item): StreamItem =>
+      patch((v) => {
+        const items = v.items.map((item): StreamItem =>
           item.kind === 'tool' && item.tool.id === tool.id ? { kind: 'tool', tool } : item,
-        ),
-      }));
+        );
+        // 同一条回执不代表整轮没人等：这一轮可能还有别的待办审批
+        return { ...v, waitingApproval: hasPendingApproval(items), items };
+      });
     },
     // 命中审批规则：把请求挂到对应工具卡片上，用户点按钮后由 tool.result 更新结局。
     // 卡片还没到（理论上不会，tool.call 先发）时补一条，避免审批提示丢失。
@@ -183,12 +223,13 @@ function buildHandlers(
       patch((v) => {
         const approval = {
           id: req.approvalId,
+          callId: req.callId,
+          tool: req.tool,
           sessionId,
           kind: req.kind,
           detail: req.detail,
           reason: req.reason,
           risk: req.risk,
-          timeoutS: req.timeoutS,
         };
         const idx = v.items.findIndex((item) => item.kind === 'tool' && item.tool.id === req.callId);
         if (idx < 0) {
@@ -344,15 +385,17 @@ async function syncApprovals(
   });
 }
 
-function toApprovalInfo(a: PendingApproval, sessionId: string) {
+/** 服务端待办 → 卡片用的审批信息（会话按待办列表整体刷回，刷新后也能补出卡片） */
+export function toApprovalInfo(a: PendingApproval, sessionId: string) {
   return {
     id: a.approval_id,
+    callId: a.call_id,
+    tool: a.tool,
     sessionId,
     kind: a.kind,
     detail: a.detail,
     reason: a.reason,
     risk: a.risk,
-    timeoutS: a.timeout_s,
   };
 }
 
@@ -440,9 +483,30 @@ export function startLiveRun(opts: LiveRunOptions): Promise<void> {
  * 与 startLiveRun 共用一套视图与收尾：不发新的用户消息，服务端带着已有的工具回执
  * 接着走，所以已经执行过的工具不会再执行一遍。
  */
-export function resumeLiveRun(
+/**
+ * 续跑一断掉的轮次。
+ *
+ * 先看有没有已经在跑的 run：点了审批之后，服务端自己就从断点续起来了，
+ * 断点被它消费掉。这时再 POST /resume 只会拿到「没有可继续的执行」，
+ * 用户看到的却是一句错误提示。有人在跑就挂上去，没人跑才去发起续跑。
+ */
+export async function resumeLiveRun(
   opts: Omit<LiveRunOptions, 'content' | 'references' | 'resume'>,
 ): Promise<void> {
+  try {
+    const res = await getActiveRun(opts.sessionId);
+    if (res.active && res.run) {
+      return attachLiveRun({
+        sessionId: opts.sessionId,
+        runId: res.run.id,
+        startedAt: res.run.started_at,
+        onError: opts.onError,
+        onSettled: opts.onSettled,
+      });
+    }
+  } catch {
+    // 探测失败（网络抖动、服务端刚重启）就按原路走，让 /resume 给出准确结论
+  }
   return startLiveRun({ ...opts, content: '', resume: true });
 }
 

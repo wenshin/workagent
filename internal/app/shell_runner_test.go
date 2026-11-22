@@ -41,6 +41,17 @@ func TestServerRunnerNeedsRunnerAddr(t *testing.T) {
 	}
 }
 
+// dev 已删除：服务端与开发机不再有「本机执行面」这一档，配置层与装配层都要拒绝。
+func TestShellRunnerRejectsDevRole(t *testing.T) {
+	_, err := newShellRunner(&config.Config{
+		Role:           "dev",
+		SandboxBackend: "remote",
+	}, discardLogger())
+	if err == nil || !strings.Contains(err.Error(), "未知运行形态") {
+		t.Fatalf("dev 形态应拒绝，实际 %v", err)
+	}
+}
+
 // 客户端不接受远端执行体：用户目录不能交给另一个进程。
 func TestClientRunnerRejectsRemoteBackend(t *testing.T) {
 	_, err := newShellRunner(&config.Config{
@@ -52,7 +63,7 @@ func TestClientRunnerRejectsRemoteBackend(t *testing.T) {
 	}
 }
 
-// 客户端只有 bwrap 一个选项：探测不到就启动失败，不退回 sandbox-exec / 裸跑。
+// 客户端只有 bwrap 一个选项：探测不到就启动失败，不退回裸跑。
 func TestClientRunnerOnlyAcceptsBwrap(t *testing.T) {
 	runner, err := newShellRunner(&config.Config{
 		Role:           config.RoleClient,

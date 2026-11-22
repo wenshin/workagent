@@ -55,11 +55,16 @@
 
 | WA_ROLE | 允许的执行面 | 硬约束 |
 |---|---|---|
-| `server`（默认） | 只能连远端执行体 | `SANDBOX_BACKEND` 必须是 `remote`；执行体上报的后端不是真隔离就**启动失败**，没有「容器是唯一边界」的降级档 |
+| `server`（默认，含本机调试与 CI） | 只能连远端执行体 | `SANDBOX_BACKEND` 必须是 `remote`；执行体上报的后端不是真隔离就**启动失败**，没有「容器是唯一边界」的降级档 |
 | `client`（本地 runtime） | 只能在本进程起 bwrap | 探测不到 bwrap 直接失败，不退回 sandbox-exec / 裸跑，也不允许连远端执行体 |
-| `dev`（`make run` 固定带） | 自动探测 bwrap → sandbox-exec → local，或显式 `remote` | 唯一允许无隔离降级的形态，只用于本机调试与 CI |
 
-两边的理由对称：服务端节点的内核、镜像、安全上下文都不由我们决定，不能假设 bwrap 可用；客户端的用户目录不能交给另一个进程执行。`SANDBOX_REQUIRE` 只对 `dev` 生效——server / client 各自强制要求隔离，不受它影响。
+两边的理由对称：服务端节点的内核、镜像、安全上下文都不由我们决定，不能假设 bwrap 可用；客户端的用户目录不能交给另一个进程执行。
+
+**判定口径是「谁在执行 agent」，不是「这是不是开发环境」**：只要执行体在服务端进程里（开发、CI、生产一视同仁），就必须走远端沙箱；只有装到用户机器上的本地 runtime（`client`）才在本进程起 bwrap。原先的 `dev` 档（自动探测 bwrap → sandbox-exec → local）与 `SANDBOX_REQUIRE` 已删除——它让「本机调试」成了唯一可以绕开远端执行体的入口，实际表现是真实会话跑在开发机的 Seatbelt 上。本机调试现在同样需要 `make sandbox-up` 起执行体，再 `kubectl port-forward svc/sandbox-runner 8323:8323` 并把地址与令牌传给服务进程。
+
+**过线的是 key，不是宿主路径**：`Spec.Mounts` 只带三样东西——相对某个根的 `Key`（如 `spaces/<id>/files`）、沙箱内的挂载点 `Target`、以及是否可写。执行体用自己的 `SANDBOX_AGENT_ROOT`（或 `WA_CACHE_DIR`）把 `Key` 解析成真实路径，控制面的 `Source` 在发出去之前就被清掉。所以两边不需要看到同一个绝对路径，PVC / hostPath 挂在哪里都可以；报错里也不会出现对方机器的目录结构。
+
+**沙箱内只有虚拟路径**：工作区挂到 `/workspace`，安装目录 `/pkg`，租户缓存 `/cache`，私有 HOME/TMPDIR 是 `/tmp/wa-home`，出网 socket 是 `/tmp/wa-egress.sock`；插件还有 `/plugin`、`/space`、`/runtime`、`/deno`。`pwd`、`ls`、编译错误、环境变量都只会出现这些固定路径，不会泄露 `data/storage/spaces/<uuid>` 这类布局。这也意味着 `sandbox-exec` 无法支持——Seatbelt 没有挂载命名空间，因此该后端已删除。
 
 ### 两套集群
 
@@ -231,9 +236,11 @@ mise ls --installed
 
 | 字段 | 改由谁表达 | 为什么不能进 `env.json` |
 |---|---|---|
-| `network` | `shell_exec` 的 description | 同一容器里三档并存（网络工具审批、脚本默认无网、其余有网），不是全局事实 |
+| `network` | `shell_exec` 的 description | 同一容器里四类并存（装依赖有网、纯脚本无网、装依赖 + 脚本审批、网络工具审批），不是全局事实 |
 | `writable` | `shell_exec` 的 description | 可写范围由 `Mode` 决定（系统安装档才放开 `/usr`），与命令的网络无关 |
-| `persistent` | 提示词的「平台」段 | 全局且只由部署决定 |
+| `persistent` | `shell_exec` 的 description | 「apt 装的会在重建后消失」只对跑命令的沙箱有意义，写在工具描述里会随工具一起消失 |
+
+三个字段都**不再渲染进系统提示词**：提示词每轮都发，重复一遍既占上下文，又会在改策略时只改一处。系统提示词里的「执行环境」段现在只剩镜像事实（系统与可用命令）。
 
 `network` 必须进工具描述而不是全局提示词，因为它**随命令变**：`ls` 有网、`curl` 要先审批、`python` 默认无网，写成一句全局事实必然对一半错一半。
 
@@ -485,29 +492,43 @@ Debian 12 的系统 `python3` 带 `EXTERNALLY-MANAGED` 标记（PEP 668），`pi
 error: externally-managed-environment
 ```
 
-这不是配置错误，是发行版有意为之。三条出路：
+这不是配置错误，是发行版有意为之。平台的处理方式是两层，模型都不需要记参数：
 
-| 做法 | 命令 | 适用 |
+| 层次 | 做法 | 作用 |
 |---|---|---|
-| 允许装进系统 | `pip install --break-system-packages requests` | 容器一次性的，可以接受 |
-| 装进空间目录 | `python3 -m venv .pkg/venv`，见下节 | 更好，重建后不用重装 |
-| 建虚拟环境 | `python3 -m venv .pkg/venv` | 全局环境就该用这个，见下节 |
+| 正常路径 | `python3 -m venv /pkg/venv`，`PATH` 前置 `/pkg/venv/bin` | 装进空间目录，绕开 PEP 668，重建后还在 |
+| 兜底 | 注入 `PIP_BREAK_SYSTEM_PACKAGES=1` | venv 建不出来时 pip 也能装进可写层，不至于只报一句 hint |
 
-`--break-system-packages` 名字很吓人，但在"一空间一容器、坏了就重建"的前提下，破坏系统 python 的代价只是重来一次。让它直接可用，比让 agent 反复试 venv 要省事。
+`--break-system-packages` 名字很吓人，但在"一空间一容器、坏了就重建"的前提下，破坏系统 python 的代价只是重来一次。让 venv 与兜底都在平台侧就绪，比让 agent 遇到 `externally-managed-environment` 再自己找参数要省好几轮——这个报错看起来像权限问题，实际是策略问题，`sudo` 和 `chmod` 都解决不了。
 
-提示词里应该直接给出这个写法。否则 agent 会在这个报错上绕很久——它看起来像权限问题，实际是策略问题，`sudo` 和 `chmod` 都解决不了。
+**venv 必须由执行体创建，不能由控制面创建。** venv 的 `bin/pip` 是带 shebang 的脚本，指向创建它的那个 python：
+
+```
+#!/Users/autohome/.../.pkg/venv/bin/python3.14     ← 控制面（macOS homebrew）建的
+#!/usr/bin/python3                                  ← 执行体（Debian 容器）建的
+```
+
+控制面建出来的那份进容器后 shebang 悬空，`PATH` 里排第一的 `/pkg/venv/bin/pip3` 执行失败，`sh` 会**静默回落**到 `/usr/bin/pip3`，再被 PEP 668 拒绝。回执里只有一句 `No matching distribution found`，看起来像包名写错，实际是「这个 venv 不属于这个容器」。真实现场是用户连续审批了两条几乎一样的 `pip install`——第一条装不上，模型加 `--break-system-packages` 重试，第二次审批。
+
+所以 `shell_exec` 在每次执行前跑一段固定前缀（沙箱内、少于两个进程）：
+
+```sh
+[vh 取自 /pkg/venv/pyvenv.cfg 的 home]
+home 不存在  →  rm -rf /pkg/venv; python3 -m venv /pkg/venv
+```
+
+`pyvenv.cfg` 的 `home` 是创建时的解释器目录，容器里不存在就说明这份 venv 是别的镜像/宿主留下的，删掉重建（约 2s，一次性）。跨镜像升级、本地调试接入真实执行体都能自愈；不在沙箱里（`$WA_SPACE_DIR` 与 `/pkg` 都不存在）时整段跳过，绝不在宿主动 `/pkg`。
 
 ### 装进空间目录
 
 `npm` 和 `pip` 的全局安装可以直接落到空间目录，位置本身持久，就不存在"重建后恢复"这件事：
 
 ```bash
-# 空间容器的 entrypoint
-export NPM_CONFIG_PREFIX="$WA_SPACE_DIR/.pkg/npm"
-export PATH="$WA_SPACE_DIR/.pkg/venv/bin:$WA_SPACE_DIR/.pkg/npm/bin:$PATH"
+# 环境变量由 shell_exec 注入（全是沙箱内路径，宿主位置由挂载决定）
+export NPM_CONFIG_PREFIX="/pkg/npm"
+export PATH="/pkg/venv/bin:/pkg/npm/bin:$PATH"
 
-# 首次创建（幂等）
-python3 -m venv "$WA_SPACE_DIR/.pkg/venv"
+# venv 由执行前的固定前缀创建 / 自愈，不靠 agent 记得先建
 ```
 
 **pip 用 venv，不用 `PIP_TARGET`：**
@@ -684,36 +705,45 @@ BuildKit 的 `RUN --mount=type=cache` 解决的是同一个问题，它的三个
 2. agent 在空间容器内可以全局安装任意依赖，**直接装到系统目录**（`apt install` / `pip install` / `npm i -g`），不要求改用 `dpkg -x` 这类手段。装进可写层的东西 Pod 重建就丢，缺的时候再装一次——这是"允许正常安装"的代价，也是它成立的前提。系统工具**只有一个版本**，同一空间内多个插件需要不同版本的 `ffmpeg` 时无法共存，这是「一个空间一个容器」的固有代价，需要用 `mise` 之类做版本隔离。
 3. shell 命令仍然走 bwrap，不是直接在容器里跑。
 
-### 网络策略：按命令形态分三档
+### 网络策略：按命令内容分四类
 
-`shell_exec` 不再「默认断网」，网络由命令形态决定，三档互不兼任：
+`shell_exec` 的网络由命令里**出现了什么**自动决定，模型不再声明 `network` 参数（声明式开关与实际行为漂移时，模型会以为自己申请过网）：
 
-| 类别 | 判据（每段命令的首个真实命令名） | 网络 | 审批 |
-|---|---|---|---|
-| 网络工具 | `curl` / `wget` / `nc` / `ncat` / `socat` / `ssh` / `scp` / `sftp` / `rsync` / `telnet` / `ftp` / `/dev/tcp` | 有网 | **必须先审批；拒绝即不执行** |
-| 脚本执行 | `sh` / `bash` / `zsh` / `python` / `node` / `deno` / `bun` / `ruby` / `perl` / `php` / `go` | 默认**无网**；调用方声明 `network=true` 后才审批、通过才开网 | 仅在声明联网时 |
-| 其他命令 | `ls` / `grep` / `git` / `make` / `npm i` / `pip install` / `apt install` … | 有网 | 否（仍受「需确认命令」名单约束） |
+| 命令里有 | 判据（每段命令真正执行的命令名） | 网络 | 审批 | 用户拒绝后 |
+|---|---|---|---|---|
+| 只有装依赖 | `pip install` / `npm i` / `yarn add` / `apt install` / `go get` / `uv add` … | 有网 | 否 | — |
+| 只有脚本 | `sh` / `bash` / `python x.py` / `node app.js` / `go run` / `-m pytest` / `-c …` | **无网**执行 | 否 | 失败且像网络问题时升级为审批（见下） |
+| 装依赖 + 脚本 | 同一条命令里两类都出现 | 有网 | **先确认** | 按无网执行 |
+| 出现网络工具 | `curl` / `wget` / `nc` / `ncat` / `socat` / `ssh` / `scp` / `sftp` / `rsync` / `telnet` / `ftp` / `/dev/tcp` | 有网 | **先确认** | **不执行** |
+| 都没有 | `ls` / `grep` / `git` / `make` / `npm run build` … | 有网 | 否（仍受「需确认命令」名单约束） | — |
 
-三条理由：
+四条理由：
 
-- **网络工具是单一用途的外发通道，它只该在人看过之后执行。** 一条被注入的 `curl` 就能把会话内容拼进 URL 带出去，而命令原文是用户唯一能判断「里面有没有不该发的东西」的依据。所以它不是「批了才有网」，而是拒绝即停止。
-- **脚本是「跑一段未知代码」，默认先别给网。** 绝大多数脚本任务是本地处理（统计、改名、跑测试），默认断网就能做完；真要联网时由调用方声明 `network=true`，用户看到命令原文再决定。声明之前脚本访问网络会失败，回执里带一句提示，模型据此决定要不要申请联网——这比「猜这段脚本里有没有 `requests`」可靠得多。
-- **其他命令默认有网。** `git clone`、`make`、`npm i`、`apt install`、`pip install` 都不再需要模型猜「这次会不会因为断网失败」。边界从「不给网」移到「网络层封私网 + 命令级审批」，装依赖仍然不弹确认。
+- **装依赖是「下载」，终点由安装源决定。** `pip` / `npm` / `apt` 的参数就是包名，没有把对话内容拼进请求的通路；镜子源由 `installEnv` 注入，直接给网，不打扰用户。
+- **脚本是「跑一段未知代码」，先别给网。** 绝大多数脚本任务是本地处理（统计、改名、跑测试），无网就能做完；真需要联网时不必让模型猜、也不必让它先声明——失败后自动升级，用户看命令原文再决定。
+- **两类都出现时要人看一眼。** `pip install x && python build.py` 既下载又执行未知代码，无网会让装依赖白跑，直接有网又等于放行那段脚本；一次确认把两个问题一起解决。
+- **网络工具是单一用途的外发通道。** 一条被注入的 `curl` 就能把会话内容拼进 URL 带出去，而命令原文是用户唯一能判断「里面有没有不该发的东西」的依据。所以它是拒绝即停止，连无网执行都不做。
 
-给不给网不影响文件可见面：三档都挂整个工作区，`curl -o out.json` 写下的文件就在当前目录，`curl … && python parse.py` 也能连着写。曾经有过一版「网络工具执行时把工作区换成空 tmpfs、只挂 `.deps`」的遮蔽方案，已经删掉——它换来的那点纵深，代价是下载的文件凭空消失、复合命令必须拆开，而真正拦住外发的是审批与 NetworkPolicy。
+**无网脚本的「升级重跑」（第 5 条规则）**：脚本段先无网跑；非零退出且失败看起来是网络不可达（`name resolution` / `getaddrinfo` / `ECONNREFUSED` / `ETIMEDOUT` / `no matching distribution found` 等）时，发起一次审批「允许联网重跑」。批准 → 原地再跑一次 `Network=true`，回执里注明这次是联网结果；拒绝或超时 → 把无网结果原样回给模型，并注明「按无网执行结束」，不让它反复试同一条命令。
+
+审批之所以由 `Invoker` 发起、而不是在 `shell_exec` 内部等：执行阶段套着 30s 墙钟（`Invoker.timeout`），在里面等人点按钮会先超时。审批等待必须落在墙钟之外，与网络工具那条路径共用同一套 pending / 心跳 / 超时（`runApprover.Decide`）。工具侧只回一个控制信号 `errNetNeeded`（退出码非零 + 命中网络失败特征），判据仍是 `ShellNetPlan` 与 `looksLikeNetworkFailure`。
+
+给不给网不影响文件可见面：四类都挂整个工作区，`curl -o out.json` 写下的文件就在当前目录，`curl … && python parse.py` 也能连着写。曾经有过一版「网络工具执行时把工作区换成空 tmpfs、只挂 `.deps`」的遮蔽方案，已经删掉——它换来的那点纵深，代价是下载的文件凭空消失、复合命令必须拆开，而真正拦住外发的是审批与 NetworkPolicy。
 
 判据各管一段，互不兼任：
 
 | 判据 | 决定 | 作用点 |
 |---|---|---|
-| `ShellNetPlan` | 给不给网 + 弹不弹确认 | `Spec.Network` + 审批动作 |
+| `ShellNetPlan` | 给不给网 + 弹不弹确认 + 拒绝后怎么办 | `Spec.Network` + 审批动作 + 升级重跑 |
 | `shellNeedsSystemWrite` | 放开不放开系统目录 | `Spec.Mode` |
 
-复合命令按「任一段命中就整体升级」处理：`curl ... | sh` 里只要有一段是网络工具，整条命令就审批；反过来 `git clone ... && python build.py` 只有脚本段，按脚本档执行（默认无网，`network=true` 才审批联网）。
+复合命令按「任一段命中就整体升级」处理：出现网络工具最严（确认，拒绝即不执行）；其次是装依赖 + 脚本（确认，拒绝按无网跑）；两者都没有时按装依赖 / 脚本 / 其他三类各自的规则走。
 
-安装方把审批档位设成 `off` 时，命令名单与网络准入的确认都不再弹——这是显式例外，等于由安装方自己承担外发风险，卡片上会写明。
+`python -m` 按模块分开判：`-m pip install` 算装依赖，`-m venv` / `-m virtualenv` 算其他命令（只建目录），`-m pytest` / `-m http.server` / `-c …` 仍在跑用户代码，按脚本。同理，同一个入口换个子命令就换类别：`npm i` 是装依赖，`npm run build` / `go run` / `deno run` 是跑代码（`npm run` 与 `make` 一样按其他命令处理）。
 
-私网目标（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、IPv6 私网）与云元数据地址由容器内 iptables 与集群 NetworkPolicy 拒绝，不在应用层判——这一层与上面三档无关，任何一档都给不到私网。
+安装方把审批档位设成 `off` 时，命令名单与网络准入的确认都不再弹——这是显式例外，等于由安装方自己承担外发风险，卡片上会写明。装依赖 + 脚本与网络工具在 `off` 档下直接联网；只有脚本的升级重跑在 `off` 档下不会发生（没有人可问），仍按无网执行。
+
+私网目标（`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、IPv6 私网）与云元数据地址由容器内 iptables 与集群 NetworkPolicy 拒绝，不在应用层判——这一层与上面四类无关，任何一类都给不到私网。
 
 ### 运行时安装需要一个新的可写档位
 
@@ -954,7 +984,7 @@ Deno 装包不做构建：不跑 `postinstall`、不调 `node-gyp`。所以不�
 | 层 | 内容 | 由谁提供 |
 |---|---|---|
 | 文件 | `bootstrap.ts` / `host_sdk.ts` | `installSDK()` 写入 `RuntimeDir` |
-| 环境 | `WA_SPACE_DIR` / `WA_EGRESS_PROXY` | `Spec.Env` |
+| 环境 | `WA_SPACE_DIR=/space` / `WA_EGRESS_PROXY=/tmp/wa-egress.sock`（固定虚拟路径） | `Spec.Env` |
 | 信道 | stdin/stdout 的 NDJSON 帧 | 执行体的 RPC 循环 |
 | 校验 | method 白名单 | 宿主侧按 `capabilities` 查 |
 
@@ -1079,7 +1109,7 @@ if spec.Proxy != "" && spec.HostRPC != nil {
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `apt: cannot access /etc/apt` | 沙箱内 `/etc` 是白名单挂载，`/etc/apt` 已经不在了 | 把它加回 `bwrapBaselineRead`（当前已加） |
-| `Temporary failure in name resolution`（脚本） | 脚本档默认无网 | 确认确实需要联网后带 `network=true` 重试，用户批准即可联网 |
+| `Temporary failure in name resolution`（脚本） | 纯脚本默认无网 | 不该停在这一步：`Invoker` 会按 `looksLikeNetworkFailure` 发起「允许联网重跑」审批，批准后原地重跑一次。若回执里说没有获批，说明用户拒绝了或审批通道不可用 |
 | `NotCapable` | Deno 权限未开 | 检查 `plugin.json` 的 `fs` 声明，或跑 dry-run 复现 |
 | `connection refused` | 代理未建或域名不在白名单 | 检查 `net.hosts` |
 | `Read-only file system`（dpkg） | 命令没命中 `apt` / `dpkg` 判据，还在 `workspace-write` 里 | 用 `apt install` 而不是直接调底层工具 |

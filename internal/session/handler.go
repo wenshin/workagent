@@ -395,6 +395,11 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		// References 是用户在图里勾选的引用文件（相对空间 files/ 的路径）。
 		// 只传路径，不传正文：是否读、读多少由 Agent 按任务决定。
 		References []string `json:"references"`
+		// ClientTime 是用户端此刻的本地时间（RFC3339，带偏移），Timezone 是 IANA
+		// 时区名。「今天」由用户在哪个时区决定：服务端按自己的时区算，会把 UTC+8
+		// 的凌晨算成前一天。两个都缺时回落服务器时间，并在提示词里标明来源。
+		ClientTime string `json:"client_time"`
+		Timezone   string `json:"timezone"`
 	}
 	if err := platform.DecodeJSON(r, &req); err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, "invalid_body", "请求体不是合法 JSON")
@@ -435,7 +440,8 @@ func (h *Handler) chat(w http.ResponseWriter, r *http.Request) {
 		return sendRunEvent(stream, ev, offset)
 	}
 
-	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, content, emit)
+	out, err := h.svc.Chat(r.Context(), user.ID, sessionID, content,
+		ClientClock{Time: req.ClientTime, Zone: req.Timezone}, emit)
 	h.streamOutcome(r, stream, sessionID, out, err)
 }
 
@@ -565,6 +571,17 @@ func sendRunEvent(stream *platform.Stream, ev agent.Event, offset int) error {
 		payload := ev.Tool.Payload()
 		payload["offset"] = offset
 		return stream.Send(ev.Type, payload)
+	case agent.EventPlanUpdated:
+		// 整份清单下发：前端整块替换卡片，不做合并——合并逻辑一旦分叉，
+		// 断点续跑后的清单与直播时就对不上。
+		if ev.Plan.Empty() {
+			return nil
+		}
+		return stream.Send(ev.Type, map[string]any{
+			"goal":   ev.Plan.Goal,
+			"items":  ev.Plan.Items,
+			"offset": offset,
+		})
 	case agent.EventApprovalReq:
 		return stream.Send(ev.Type, ev.Approval)
 	default:

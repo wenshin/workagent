@@ -194,6 +194,9 @@ select id::text, session_id::text, status, budget, usage, provider, model, error
 from run
 where session_id = $1::uuid
   and status in ('running', 'waiting_approval')
+  -- 停在审批上的那一轮带着 waiting_approval 落终态（ended_at 非空）：
+  -- 它是「已暂停」，不是「还在跑」，不能当成活跃执行让前端挂上去
+  and ended_at is null
   and ($2 <= 0 or heartbeat_at > now() - ($2 * interval '1 second'))
 order by started_at desc
 limit 1`

@@ -30,7 +30,7 @@ WorkAgent 不是"会聊天的助手"，它把 Agent 放进一个真实的文件�
 - **对话即生产**：在会话里创建技能、工具、数据库、MCP 连接、UI 组件；产出的组件可直接在消息内渲染，也能嵌入业务页面。
 - **企业级治理**：Agent 以用户身份执行；四级权限（view / read / write / manage）；高危操作二次确认；审计永久保留。
 - **能力可编程**：`skill` / `tool` / `mcp` / `component` 统一为插件，走同一条「开发 → 发布 → 安装 → 运行 → 卸载」链路；风险由能力清单推导，不由作者声明。
-- **安全执行**：命令与脚本跑在沙箱内（Linux `bwrap` / macOS `sandbox-exec`），默认无网络；密钥以句柄形式下发，插件进程拿不到明文。
+- **安全执行**：命令与脚本跑在 `bwrap` 沙箱内，默认无网络；沙箱里只有 `/workspace`、`/pkg`、`/cache` 这类虚拟路径，模型与环境变量看不到宿主目录；密钥以句柄形式下发，插件进程拿不到明文。
 - **私有化就绪**：K8s 私有化 + SaaS 多租户同一套代码，可替换模型供应商与国产化依赖。
 
 ## 架构速览
@@ -59,17 +59,26 @@ cp .env.example .env        # 至少填写 LLM_API_KEY
 # 2. 启动数据库
 make pg-up
 
-# 3. 拉齐依赖并启动 API（127.0.0.1:8321）
+# 3. 启动沙箱执行体（服务端执行 agent 一律走远端沙箱，本机调试也不例外）
+#    它把 .env 里的 STORAGE_ROOT（默认 ./data/storage）挂成自己的存储根；
+#    过线的是相对 key，两边路径不需要一致。
+make sandbox-up
+kubectl -n workagent port-forward svc/sandbox-runner 8323:8323 &
+
+# 4. 拉齐依赖并启动 API（127.0.0.1:8321）
 make tidy
+export SANDBOX_RUNNER_ADDR=http://127.0.0.1:8323
+export SANDBOX_RUNNER_TOKEN=$(kubectl -n workagent get secret sandbox-runner-token -o jsonpath='{.data.token}' | base64 -d)
+export SECRET_KEK=C7tPoV6eFsnNrZykBMLlBhjkJcYgWe+w7YSeOHflvkE=
 make run
 
-# 4. 另开一个终端启动前端
+# 5. 另开一个终端启动前端
 cd web && npm install && npm run dev
 ```
 
 首次启动会自动建表、初始化系统空间与内置技能。
 
-**执行面由运行形态决定**：`make run` 固定 `WA_ROLE=dev`（本机自动探测 bwrap / sandbox-exec）。部署到服务端时 `WA_ROLE=server`（默认）**只接受远端执行体**——必须配 `SANDBOX_BACKEND=remote`、`SANDBOX_RUNNER_ADDR`、`SANDBOX_RUNNER_TOKEN`，否则启动失败；没有「服务端本机裸跑」这条降级。客户端形态（`WA_ROLE=client`）只接受本进程的 `bwrap`。细节见 [K8s 容器沙箱方案](docs/K8s容器沙箱方案.md)「运行形态与执行面」。
+**执行面由运行形态决定，开发与生产一视同仁**：`WA_ROLE=server`（默认）**只接受远端执行体**——必须配 `SANDBOX_BACKEND=remote`、`SANDBOX_RUNNER_ADDR`、`SANDBOX_RUNNER_TOKEN`，否则启动失败；没有「本机调试就裸跑」这条降级。客户端形态（`WA_ROLE=client`）只接受本进程的 `bwrap`；`WA_ROLE=dev` 已删除，启动即报错。细节见 [K8s 容器沙箱方案](docs/K8s容器沙箱方案.md)「运行形态与执行面」。
 
 ```bash
 make test     # 单元测试
@@ -84,7 +93,7 @@ cmd/server        服务入口
 internal/
   agent/          Harness 与编排循环
   tool/           工具、能力注册、Invoker
-  sandbox/        命令执行沙箱（bwrap / sandbox-exec / local）
+  sandbox/        命令执行沙箱（bwrap / local，路径虚拟化）
   search/         搜索 provider 与脚本搜索源
   mcp/            MCP 客户端与管理器
   policy/         策略引擎与风险模型

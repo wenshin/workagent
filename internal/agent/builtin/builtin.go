@@ -144,6 +144,22 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	if in.Depth == 0 {
 		tools = append(tools, a.planTools(plan)...)
 	}
+	// 清单随结果一起交出去：会话层把它写进 message.parts，历史回看才有这一轮的计划。
+	defer func() { res.Plan = plan.snapshot() }()
+	// emitPlan 把清单的最新状态推给前端：只有真的变过才推，避免每轮重复刷同一份。
+	// 推的是整份清单而不是 diff——前端与断点都以「最后一次覆盖」为准。
+	planRev := -1
+	emitPlan := func() error {
+		if plan.revision() == planRev {
+			return nil
+		}
+		p := plan.snapshot()
+		if p == nil {
+			return nil
+		}
+		planRev = plan.revision()
+		return emit(agent.Event{Type: agent.EventPlanUpdated, Plan: p})
+	}
 	defs := tool.Definitions(tools)
 
 	// 续跑：直接沿用断点里的消息序列与预算计数。
@@ -204,6 +220,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 	// 已完成的调用会命中 Invoker 的回放缓存（同工具同参数），不会再产生一次副作用；
 	// 没完成的这次才真正执行——包括重新走审批，但已批准的结论会按参数复用。
 	if in.Resume != nil && len(in.Resume.Pending) > 0 {
+		unfinished := in.Resume.Pending
 		for _, p := range in.Resume.Pending {
 			call := llm.ToolCall{
 				ID:       p.ID,
@@ -222,6 +239,14 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			default:
 				r = a.invoker.Invoke(ctx, t, call, in.Env)
 				toolCalls++
+			}
+			if r.Parked {
+				// 续上来的这条又在等人确认（换了参数，或上一轮的结论已失效）：
+				// 依旧停在原地，剩下的 pending 原样留着
+				res.Parked = unfinished
+				checkpoint(roundStart-1, unfinished)
+				res.StopReason = "awaiting_approval"
+				return res, agent.ErrPaused
 			}
 			state := &agent.ToolState{
 				ID:         p.ID,
@@ -251,9 +276,20 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				ToolCallID: p.ID,
 				Content:    agent.TruncateText(r.Content, resultBudget(tools, p.Name)),
 			})
+			unfinished = dropPending(unfinished, p.ID)
+			// 补齐的调用里可能有 plan_write：清单变了就立刻推，别等下一轮
+			if err := emitPlan(); err != nil {
+				return res, err
+			}
 		}
 		// 补齐后这一轮才算真正完成
 		checkpoint(roundStart-1, nil)
+	}
+
+	// 续跑带回来的清单先亮一次：用户在断点续跑后要看到「接着走哪几步」，
+	// 而不是等模型下次更新才出现一张空白的进度卡。
+	if err := emitPlan(); err != nil {
+		return res, err
 	}
 
 	for round := roundStart; round < maxRounds; round++ {
@@ -423,10 +459,20 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		}
 		wg.Wait()
 
+		// 这一批里写过清单就推一次：plan_write 的执行体拿不到 emit，
+		// 只能在批次结束后统一比对版本号（并列调用会被合成一条）。
+		if err := emitPlan(); err != nil {
+			return res, err
+		}
+
 		records := make([]callRecord, 0, len(out.ToolCalls))
 		lastToolMsg := -1
 		for i, call := range out.ToolCalls {
 			r := results[i]
+			if r.Parked {
+				// 这条没执行：不产回执、不进消息序列，留在 pending 里等续跑
+				continue
+			}
 			state := &agent.ToolState{
 				ID:         call.ID,
 				Name:       call.Function.Name,
@@ -440,7 +486,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				return res, err
 			}
 			// 审批事件由 Invoker 在调用中途经 Approver 推（含命令原文与动作类别），
-			// 这里不再重复推送：命中审批时 Invoker 会先阻塞，拿到决策后才产出这条结果。
+			// 这里不再重复推送：命中审批时 Invoker 不产回执，本轮直接停在下面那个分支。
 
 			res.Steps = append(res.Steps, agent.Step{
 				Type:       "tool",
@@ -470,6 +516,23 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Status: r.Status,
 				Output: r.Content,
 			})
+		}
+
+		// 这一批里有调用停在审批上：本轮到此为止。
+		//
+		// 不能继续往下走——没执行的那条既没有回执也不该被当成已完成，模型若看到
+		// 「一半回执」只会重新规划、把已经做完的副作用再做一遍。暂停也是状态：
+		// 断点里留着 pending，用户点同意后从这里接着发。
+		for _, r := range results {
+			if !r.Parked {
+				continue
+			}
+			// 没执行的那几条要能画进这一轮的消息：暂停不是「什么都没发生」，
+			// 界面上那张待确认的卡就是它们。
+			res.Parked = unfinished
+			checkpoint(round, unfinished)
+			res.StopReason = "awaiting_approval"
+			return res, agent.ErrPaused
 		}
 
 		// 按这一轮实际调用的工具抬升档位：写操作算任务档，清单与派发算编排档。

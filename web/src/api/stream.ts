@@ -1,5 +1,5 @@
-import { ApiError, redirectToLogin } from './client';
-import type { ChatMessage, ChatSession, ToolCallRecord } from './types';
+import { ApiError, clientClock, redirectToLogin } from './client';
+import type { ChatMessage, ChatSession, PlanItem, PlanState, ToolCallRecord } from './types';
 
 export interface StreamHandlers {
   onRunStarted?: (runId: string) => void;
@@ -7,6 +7,7 @@ export interface StreamHandlers {
   onText?: (delta: string) => void;
   onToolStart?: (tool: ToolCallRecord) => void;
   onToolResult?: (tool: ToolCallRecord) => void;
+  onPlan?: (plan: PlanState) => void;
   onApproval?: (request: {
     approvalId: string;
     callId: string;
@@ -15,7 +16,6 @@ export interface StreamHandlers {
     detail: string;
     reason: string;
     risk: number;
-    timeoutS: number;
   }) => void;
   onDone?: (payload: { message: ChatMessage; session: ChatSession }) => void;
   onError?: (message: string) => void;
@@ -41,6 +41,9 @@ interface StreamPayload {
   duration_ms?: number;
   approval_id?: string;
   timeout_s?: number;
+  /** plan.updated：整份任务清单 */
+  goal?: string;
+  items?: PlanItem[];
   /** approval.req：动作类别与要确认的原文（命令 / 入参）；reason 与 run.finished 共用同一字段 */
   kind?: string;
   detail?: string;
@@ -85,6 +88,10 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
     case 'tool.result':
       handlers.onToolResult?.(toToolRecord(payload));
       break;
+    case 'plan.updated':
+      // 整份清单：前端整块替换，不做增量合并
+      handlers.onPlan?.({ goal: payload.goal, items: payload.items ?? [] });
+      break;
     case 'approval.req':
       handlers.onApproval?.({
         approvalId: payload.approval_id ?? '',
@@ -94,7 +101,6 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
         detail: payload.detail ?? '',
         reason: payload.reason ?? '',
         risk: payload.risk ?? 0,
-        timeoutS: payload.timeout_s ?? 0,
       });
       break;
     case 'message.done':
@@ -104,6 +110,10 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
       return true;
     case 'run.finished':
       // 失败与中断都以 run.finished 收尾（成功时由 message.done 更新界面）
+      if (payload.status === 'waiting_approval') {
+        // 停在审批上不是错误：卡片还在，用户点了就从断点接着跑
+        return true;
+      }
       if (payload.status && payload.status !== 'succeeded') {
         const fallback =
           payload.status === 'cancelled' ? '回答已中断，已保留已生成的内容' : '生成失败，请重试';
@@ -216,8 +226,9 @@ export async function streamChat(
     res = await fetch(`/sessions/${sessionId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // references 是相对空间 files/ 的路径；正文由服务端拼上引用清单落库
-      body: JSON.stringify({ content, references }),
+      // references 是相对空间 files/ 的路径；正文由服务端拼上引用清单落库。
+      // 时间是用户端此刻的本地时间与时区：服务端只做兜底，不能拿它代替用户看到的今天
+      body: JSON.stringify({ content, references, ...clientClock() }),
       signal,
     });
   } catch (err) {

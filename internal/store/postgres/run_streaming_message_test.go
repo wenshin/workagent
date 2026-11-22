@@ -146,6 +146,73 @@ func TestInterruptStreamingMessageKeepsToolTrace(t *testing.T) {
 	}
 }
 
+// 执行中断时的清单只能从断点补回来：清单不再写 run_step（它连工具轨迹都没有），
+// 断点里的 Plan 是唯一一份。补出来的卡要排在最前、状态与断点里一致，
+// 否则用户刷新后看到的进度比实际更早，会以为「同意审批之后进度倒退了」。
+func TestInterruptStreamingMessageRestoresPlan(t *testing.T) {
+	db, sessionID := newStreamingFixture(t, "plan")
+	ctx := context.Background()
+
+	var runID string
+	if err := db.pool.QueryRow(ctx,
+		`insert into run (session_id, status, ended_at) values ($1::uuid, 'failed', now())
+		 returning id::text`, sessionID).Scan(&runID); err != nil {
+		t.Fatalf("建 run 失败: %v", err)
+	}
+	if _, err := db.CreateStreamingMessage(ctx, sessionID); err != nil {
+		t.Fatalf("写占位失败: %v", err)
+	}
+	appendStep(t, db, runID, 1, "tool.call", stepPayload("c1", "file_read", `{"path":"a.md"}`, "", "running", 0))
+	appendStep(t, db, runID, 2, "tool.result", stepPayload("c1", "file_read", `{"path":"a.md"}`, "已读取", "ok", 5))
+
+	// 断点：完成一步、正在做第二步
+	snapshot := []byte(`{"messages":[{"role":"user","content":"整理合同"}],"round":1,"tool_calls":1,` +
+		`"total_tokens":10,"query":"整理合同",` +
+		`"plan":{"goal":"整理合同","items":[` +
+		`{"title":"读合同","status":"done"},` +
+		`{"title":"写摘要","status":"doing","note":"还差后半段"}]}}`)
+	if err := db.SaveRunResume(ctx, runID, snapshot); err != nil {
+		t.Fatalf("写断点失败: %v", err)
+	}
+
+	if err := db.InterruptStreamingMessage(ctx, runID, sessionID, store.RunContent{}); err != nil {
+		t.Fatalf("结算占位失败: %v", err)
+	}
+	msgs, err := db.ListMessages(ctx, sessionID)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("读消息失败: %v 条数=%d", err, len(msgs))
+	}
+
+	var parts []struct {
+		Type  string `json:"type"`
+		Goal  string `json:"goal"`
+		Items []struct {
+			Title  string `json:"title"`
+			Status string `json:"status"`
+			Note   string `json:"note"`
+		} `json:"items"`
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(msgs[0].Parts, &parts); err != nil {
+		t.Fatalf("解析 parts 失败: %v", err)
+	}
+	if len(parts) != 2 || parts[0].Type != "plan" {
+		t.Fatalf("清单应补在最前，实际 %+v", parts)
+	}
+	if parts[0].Goal != "整理合同" || len(parts[0].Items) != 2 {
+		t.Fatalf("清单还原不对: %+v", parts[0])
+	}
+	if parts[0].Items[0].Status != "done" || parts[0].Items[1].Status != "doing" {
+		t.Fatalf("步骤状态应与断点一致: %+v", parts[0].Items)
+	}
+	if parts[0].Items[1].Note != "还差后半段" {
+		t.Errorf("note 丢了: %+v", parts[0].Items[1])
+	}
+	if parts[1].ID != "c1" {
+		t.Fatalf("工具轨迹应保留在清单之后，实际 %+v", parts[1])
+	}
+}
+
 // TestInterruptStreamingMessageWritesRecoveredContent 锁定「重启不丢正文」：
 // 正文只存在过缓存里，收尾时必须把它写回同一条占位消息，
 // 否则用户回来只剩一条问题（没有工具轨迹时连卡片都没有）。

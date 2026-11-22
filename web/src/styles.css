@@ -1107,6 +1107,17 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   color: var(--semi-color-text-2);
 }
 
+/* 决策已提交、等回执的短暂态：按钮先收掉，只留一行进行中 */
+.msg-approval-decided {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top-color: transparent;
+  background: var(--semi-color-fill-0);
+  font-size: 13px;
+  color: var(--semi-color-text-1);
+}
+
 .msg-risk {
   font-size: 11px;
   padding: 0 6px;
@@ -1288,6 +1299,16 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   white-space: nowrap;
 }
 
+/* 非文本附件：模型读不到正文，标签上标出来，避免误以为它能读 */
+.chat-ref-kind {
+  flex: none;
+  padding: 0 var(--wa-space-4);
+  border-radius: var(--wa-radius-4);
+  background: var(--semi-color-fill-1);
+  color: var(--semi-color-text-2);
+  font-size: var(--wa-text-xs);
+}
+
 .chat-ref-remove {
   display: inline-flex;
   align-items: center;
@@ -1383,6 +1404,132 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   font-size: var(--wa-text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 任务清单：这一轮的执行计划与进度，常驻在正文之上、不折叠 */
+.msg-plan {
+  padding: var(--wa-space-8) var(--wa-space-12);
+  border: 1px solid var(--semi-color-border);
+  border-radius: var(--wa-radius-8);
+  background: var(--semi-color-fill-0);
+}
+
+.msg-plan-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wa-space-8);
+  color: var(--semi-color-text-2);
+  font-size: var(--wa-text-xs);
+}
+
+.msg-plan-title {
+  color: var(--semi-color-text-1);
+  font-weight: 600;
+}
+
+/* 进度靠右：一行里最想先看到的是「还剩多少」 */
+.msg-plan-progress {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.msg-plan-goal {
+  margin-top: var(--wa-space-6);
+  color: var(--semi-color-text-1);
+  font-size: var(--wa-text-sm);
+  line-height: var(--wa-leading-normal);
+  overflow-wrap: anywhere;
+}
+
+.msg-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wa-space-4);
+  /* 步骤多时框内滚动：一张清单不该把整条回答挤出屏幕 */
+  max-height: 240px;
+  margin: var(--wa-space-8) 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.msg-plan-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wa-space-8);
+  font-size: var(--wa-text-sm);
+  line-height: var(--wa-leading-normal);
+}
+
+/* 状态点：图标 + 文字双写，不只靠颜色（深色主题与色盲都要能读） */
+.msg-plan-dot {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: var(--wa-radius-pill);
+  color: var(--semi-color-white);
+  font-size: var(--wa-text-xs);
+  font-weight: 600;
+  line-height: 1;
+}
+
+.msg-plan-dot.is-doing {
+  border-color: var(--semi-color-primary);
+  background: var(--semi-color-primary);
+  opacity: 0.55;
+}
+
+.msg-plan-dot.is-done {
+  border-color: var(--semi-color-success);
+  background: var(--semi-color-success);
+}
+
+.msg-plan-dot.is-blocked {
+  border-color: var(--semi-color-warning);
+  color: var(--semi-color-warning);
+}
+
+.msg-plan-text {
+  flex: 1;
+  color: var(--semi-color-text-0);
+  overflow-wrap: anywhere;
+}
+
+/* 已完成的只降亮度、不划掉：长标题划线后反而不好读 */
+.msg-plan-item.is-done .msg-plan-text {
+  color: var(--semi-color-text-2);
+}
+
+.msg-plan-item.is-blocked .msg-plan-text {
+  color: var(--semi-color-warning);
+}
+
+.msg-plan-note {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  color: var(--semi-color-text-3);
+  font-size: var(--wa-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-plan-status {
+  flex: none;
+  color: var(--semi-color-text-3);
+  font-size: var(--wa-text-xs);
+}
+
+.msg-plan-status.is-doing {
+  color: var(--wa-color-primary-text);
+}
+
+.msg-plan-status.is-blocked {
+  color: var(--semi-color-warning);
 }
 
 /* 输入框内的次要操作：上传、引用，与发送按钮同尺寸 */
@@ -1723,6 +1870,51 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   white-space: pre-wrap;
   word-break: break-word;
   color: var(--semi-color-text-1);
+}
+
+/*
+ * 图片 / 音视频 / PDF 预览：媒体永远不撑破面板。
+ * 媒体区用弱填充底衬出透明图（png / gif / svg），并保持与文本区一致的圆角与内边距。
+ */
+.file-panel-media {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--wa-space-16);
+  background: var(--semi-color-fill-0);
+}
+
+.file-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--wa-radius-8);
+}
+
+.file-video {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--wa-radius-8);
+  background: var(--semi-color-bg-2);
+}
+
+.file-audio {
+  width: min(480px, 100%);
+}
+
+/* PDF 铺满内容区：iframe 自带边框与白色底，去掉后交给浏览器阅读器 */
+.file-panel-frame {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.file-pdf {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--semi-color-bg-2);
 }
 
 /* ---- 轻量 Markdown 渲染 ---- */

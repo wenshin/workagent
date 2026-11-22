@@ -163,6 +163,7 @@ var builtinSkills = []BuiltinSkill{
 			"## 规则",
 			"- 目录最多 5 层，名称不能含 `/`、`\\` 与 `..`；平台的隐藏元数据（`.meta.json` / `.install.json` / `.history`）不暴露、不可读写，其余隐藏文件（`.env` / `.gitignore` 等）与普通文件一样可读写。",
 			"- 可读写类型：md / json / txt / yaml；隐藏配置按文本处理；读上限 24KB，单文件写上限 256KB。",
+			"- 用户上传的文件可以是任意类型（图片 / 音视频 / PDF / 压缩包），但只有文本类型能用 `file_read` 读；其余类型读不到正文，只能由用户在界面上预览或下载，也不要尝试用 `file_read` 打开。",
 			"- 单次 `file_write` 的 content 别超 12KB：模型单次输出有上限，写更长的会被截断（报「参数被截断」）。更大的文件分块写：第一块 `mode=overwrite`（或 `create`），其余 `mode=append` 追加到同一路径。",
 			"- 修改已有文件前先 `file_read`，避免覆盖用户内容。",
 			"- 技能是插件目录 `plugins/<slug>/`：元数据只在 `plugin.json`，正文在 `SKILL.md`（不写 frontmatter）。",

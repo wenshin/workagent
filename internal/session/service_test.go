@@ -12,7 +12,7 @@ import (
 )
 
 // 引用文件清单必须带稳定标记：前端靠它切分正文与文件标签，
-// 模型靠它识别「用户要求先读这些文件」。
+// 模型靠它识别「用户要求参考这些文件」——文本要求先读，非文本只作附件。
 func TestComposeContentWithReferences(t *testing.T) {
 	content := ComposeContent("帮我总结", []string{"docs/规范.md", "docs/模板.md"})
 
@@ -30,6 +30,34 @@ func TestComposeContentWithReferences(t *testing.T) {
 
 	if got := ComposeContent("没有引用", nil); got != "没有引用" {
 		t.Fatalf("没有引用时不应改变正文: %q", got)
+	}
+}
+
+// 引用不限类型：非文本（图片等）作为附件写进清单，但不能要求模型 file_read——
+// 二进制读不到正文，照着指令读只会换来一次失败的回执。
+func TestComposeContentWithAttachmentReferences(t *testing.T) {
+	content := ComposeContent("看看这张图", []string{"docs/规范.md", "shots/login.png"})
+
+	// 清单行必须是纯路径：前端按 "- " 行切出标签，路径里夹说明会让标签与跳转都错
+	for _, want := range []string{"\n- docs/规范.md\n", "\n- shots/login.png\n"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("引用块缺少纯路径行 %q: %q", want, content)
+		}
+	}
+	if !strings.Contains(content, "非文本附件") || !strings.Contains(content, "不要对它们调用 file_read") {
+		t.Fatalf("非文本引用应标注为附件且不可读: %q", content)
+	}
+	if !strings.Contains(content, "file_read 读取上面的文本文件") {
+		t.Fatalf("文本引用仍应要求读取正文: %q", content)
+	}
+
+	// 全部都是附件时不能再发「逐个 file_read」的指令
+	only := ComposeContent("看看这张图", []string{"shots/login.png"})
+	if strings.Contains(only, "先逐个 file_read") {
+		t.Fatalf("只有附件时不应要求 file_read: %q", only)
+	}
+	if !strings.Contains(only, "不要对它们调用 file_read") {
+		t.Fatalf("只有附件时仍要说明不可读: %q", only)
 	}
 }
 

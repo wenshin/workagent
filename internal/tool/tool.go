@@ -100,6 +100,11 @@ type Env struct {
 	// 为 nil 时按「拒绝」处理——宁可挡住，也不要在没有出口的情况下静默执行。
 	Approvals Approver
 
+	// NetGrant 表示这次调用已获准联网，由 Invoker 按审批结论置位。
+	// 工具不自己判断「能不能联网」：判据在 ShellNetPlan，编排在 Invoker，
+	// 工具内部等审批会被执行阶段的 30s 墙钟掐断。
+	NetGrant bool
+
 	// Replay 是续跑时的结果缓存：key 是 ArgsHash，值是被中断那一轮已经产生的回执。
 	//
 	// 命中就直接回放，不再执行——副作用不能重来。为空表示这是全新的一轮，
@@ -180,6 +185,12 @@ type Tool struct {
 	// ShellApproval 是「命中就需要确认」的命令名单，只对 shell 类工具有意义。
 	// 为空表示不是 shell 工具；内置 shell_exec 用 DefaultApprovalCommands。
 	ShellApproval []string
+	// NetPlan 是 shell 类工具的网络判据入口：把实参换算成这次的网络策略。
+	// 为 nil 表示这个工具不涉及网络准入（MCP / 文件工具）。
+	//
+	// 放在 Tool 上是因为「要不要网」必须由工具解释参数（命令原文），
+	// 而「谁批准、批准后怎么重跑」必须由 Invoker 编排（它持有审批通道与墙钟外的 ctx）。
+	NetPlan func(args json.RawMessage) ShellNetPolicy
 	// ApprovalLevel 是安装方给这个插件定的审批档位（declared / always / off）。
 	// 空值与非法值都按 declared 处理，见 NormalizeApprovalLevel。
 	ApprovalLevel string

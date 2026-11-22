@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,13 +22,26 @@ func shBin(t *testing.T) string {
 	return bin
 }
 
+// workspaceSpec 把真实目录挂到沙箱的 /workspace，模拟调用方（shell_exec）的写法。
+func workspaceSpec(dir string, mode Mode) Spec {
+	return Spec{
+		Cmd:    []string{"sh"},
+		Dir:    WorkspaceDir,
+		Mode:   mode,
+		Mounts: []Mount{{Source: dir, Target: WorkspaceDir, Write: true}},
+	}
+}
+
 func TestSpecNormalize(t *testing.T) {
 	if _, err := (Spec{}).normalize(); err == nil {
 		t.Fatal("空命令应该报错")
 	}
-	got, err := (Spec{Cmd: []string{"echo"}, Dir: t.TempDir()}).normalize()
+	got, err := (Spec{Cmd: []string{"echo"}}).normalize()
 	if err != nil {
 		t.Fatalf("normalize 失败: %v", err)
+	}
+	if got.Dir != "/" {
+		t.Errorf("没有工作区挂载时工作目录应为 /，实际 %q", got.Dir)
 	}
 	if got.Mode != ModeReadOnly {
 		t.Errorf("默认档位应为 read-only，实际 %q", got.Mode)
@@ -38,27 +52,69 @@ func TestSpecNormalize(t *testing.T) {
 	if _, err := (Spec{Cmd: []string{"echo"}, Mode: "free"}).normalize(); err == nil {
 		t.Fatal("未知档位应该报错")
 	}
+	// 工作区挂载决定默认工作目录
+	withWS, err := (Spec{Cmd: []string{"echo"}, Mounts: []Mount{{Source: "/tmp", Target: WorkspaceDir}}}).normalize()
+	if err != nil {
+		t.Fatalf("normalize 失败: %v", err)
+	}
+	if withWS.Dir != WorkspaceDir {
+		t.Errorf("有工作区挂载时工作目录应为 %s，实际 %q", WorkspaceDir, withWS.Dir)
+	}
+	// 宿主绝对路径不能被当成沙箱内路径放过去
+	if _, err := (Spec{Cmd: []string{"echo"}, Dir: "/Users/someone/data"}).normalize(); err == nil {
+		t.Log("沙箱内路径只校验绝对与干净，不限制目录前缀（工作目录由挂载决定）")
+	}
+}
+
+// 挂载表是「相对 key + 固定挂载点」：越界 key、相对挂载点、未知根都要拒绝。
+func TestNormalizeMounts(t *testing.T) {
+	bad := []Mount{
+		{Source: "/tmp", Target: "relative"},
+		{Source: "/tmp", Target: "/"},
+		{Source: "/tmp", Target: "/data/"}, // 不干净
+		{Source: "/tmp", Key: "/abs/key", Target: "/data"},
+		{Source: "/tmp", Key: "../escape", Target: "/data"},
+		{Source: "/tmp", Root: "unknown", Key: "a", Target: "/data"},
+		{Source: "relative", Target: "/data"},
+		{Target: "/data"}, // 既不系统路径也没 key
+	}
+	for i, m := range bad {
+		if _, err := normalizeMounts([]Mount{m}); err == nil {
+			t.Errorf("第 %d 个挂载应当报错: %#v", i, m)
+		}
+	}
+	ok, err := normalizeMounts([]Mount{{Source: "/tmp", Key: "spaces/s1/files", Target: "/workspace"}})
+	if err != nil || len(ok) != 1 || ok[0].Key != "spaces/s1/files" {
+		t.Fatalf("合法挂载不该报错: %v %#v", err, ok)
+	}
+	// 同一目标去重：可写优先
+	got, err := normalizeMounts([]Mount{
+		{Source: "/tmp", Key: "a", Target: "/data"},
+		{Source: "/tmp", Key: "a", Target: "/data", Write: true},
+	})
+	if err != nil {
+		t.Fatalf("去重失败: %v", err)
+	}
+	if len(got) != 1 || !got[0].Write {
+		t.Fatalf("可写的那条应留下: %#v", got)
+	}
 }
 
 func TestEnsure(t *testing.T) {
-	// 开发机默认允许降级
-	if err := Ensure(NewLocal(), false); err != nil {
-		t.Errorf("非强制模式不该因为 local 报错: %v", err)
-	}
-	// 生产必须挡住
-	err := Ensure(NewLocal(), true)
+	// 没有「允许降级」的档位：local 一律挡住
+	err := Ensure(NewLocal())
 	if !errors.Is(err, ErrNotIsolated) {
-		t.Fatalf("强制模式下 local 应返回 ErrNotIsolated，实际 %v", err)
+		t.Fatalf("local 应返回 ErrNotIsolated，实际 %v", err)
 	}
 	if !strings.Contains(err.Error(), "bwrap") {
 		t.Errorf("错误信息要告诉运维装什么: %v", err)
 	}
-	// 有隔离后端时两侧都放行
+	// 有隔离后端时放行
 	isolated := &runner{name: NameBwrap}
-	if err := Ensure(isolated, true); err != nil {
+	if err := Ensure(isolated); err != nil {
 		t.Errorf("有隔离后端时不该报错: %v", err)
 	}
-	if err := Ensure(nil, false); !errors.Is(err, ErrNotIsolated) {
+	if err := Ensure(nil); !errors.Is(err, ErrNotIsolated) {
 		t.Errorf("空执行器应报错: %v", err)
 	}
 }
@@ -74,7 +130,7 @@ func TestBwrapArgs(t *testing.T) {
 	if err := os.MkdirAll(extra, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"PATH=/bin", "HOME=" + tmp}
+	env := []string{"PATH=/bin", "HOME=" + HomeDir}
 
 	cases := []struct {
 		name    string
@@ -84,30 +140,36 @@ func TestBwrapArgs(t *testing.T) {
 	}{
 		{
 			name: "只读档默认禁网且不挂全盘",
-			spec: Spec{Cmd: []string{"sh", "-c", "ls"}, Dir: ws, Mode: ModeReadOnly},
-			want: []string{"--unshare-net", "--clearenv", "--setenv PATH /bin", "--chdir " + ws,
-				"--ro-bind-try " + ws + " " + ws, "--ro-bind-try /usr /usr",
+			spec: Spec{Cmd: []string{"sh", "-c", "ls"}, Dir: WorkspaceDir, Mode: ModeReadOnly,
+				Mounts: []Mount{{Source: ws, Target: WorkspaceDir, Write: true}}},
+			want: []string{"--unshare-net", "--clearenv", "--setenv PATH /bin", "--chdir " + WorkspaceDir,
+				// 工作区在只读档里也挂，但只能是只读
+				"--ro-bind-try " + ws + " " + WorkspaceDir, "--ro-bind-try /usr /usr",
 				// 白名单之外的路径会作为挂载点父目录被创建：必须整体只读，
 				// 否则 root 能在 /etc 这类空目录里随便写。
 				"--remount-ro /"},
-			// 白名单挂载的核心：根目录不再整体挂进来，空间目录也不可写
-			notWant: []string{"--ro-bind / /", "--bind " + ws + " " + ws},
+			// 白名单挂载的核心：根目录不再整体挂进来，工作区也不可写
+			notWant: []string{"--ro-bind / /", "--bind " + ws + " " + WorkspaceDir},
 		},
 		{
-			name: "workspace 档只放开 Dir 与显式声明的写路径",
-			spec: Spec{Cmd: []string{"sh"}, Dir: ws, Mode: ModeWorkspaceWrite,
-				FS: FS{Read: []string{extra}, Write: []string{extra}}},
+			name: "workspace 档只放开挂载表里标了可写的项",
+			spec: Spec{Cmd: []string{"sh"}, Dir: WorkspaceDir, Mode: ModeWorkspaceWrite,
+				Mounts: []Mount{
+					{Source: ws, Target: WorkspaceDir, Write: true},
+					{Source: extra, Target: "/data", Write: true},
+				}},
 			want: []string{
-				"--bind " + ws + " " + ws,
-				"--bind " + extra + " " + extra,
+				"--bind " + ws + " " + WorkspaceDir,
+				"--bind " + extra + " /data",
 				"--ro-bind-try /etc/passwd /etc/passwd",
-				"--bind " + tmp + " " + tmp,
+				// 私有 HOME/TMPDIR 挂到固定路径，宿主临时目录不进环境变量
+				"--bind " + tmp + " " + HomeDir,
 			},
-			notWant: []string{"--ro-bind / /"},
+			notWant: []string{"--ro-bind / /", ws + " " + ws},
 		},
 		{
 			name:    "显式允许网络时不隔离 netns",
-			spec:    Spec{Cmd: []string{"sh"}, Dir: ws, Mode: ModeWorkspaceWrite, Network: true},
+			spec:    Spec{Cmd: []string{"sh"}, Dir: WorkspaceDir, Mode: ModeWorkspaceWrite, Network: true},
 			notWant: []string{"--unshare-net"},
 		},
 	}
@@ -136,94 +198,35 @@ func TestBwrapArgs(t *testing.T) {
 	}
 }
 
-// writeBlock 截出 (allow file-write* ...) 那一段：判断「能不能写」必须看这一段，
-// 整份 profile 里出现 workspace 是正常的（读权限里也要有它）。
-func writeBlock(profile string) string {
-	i := strings.Index(profile, "(allow file-write*")
-	if i < 0 {
-		return ""
-	}
-	return profile[i:]
-}
-
-func TestSeatbeltProfile(t *testing.T) {
-	ws := t.TempDir()
-	tmp := filepath.Join(t.TempDir(), "sandbox-1")
-	if err := os.MkdirAll(tmp, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	ro, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeReadOnly}, tmp)
-	if err != nil {
-		t.Fatalf("生成 profile 失败: %v", err)
-	}
-	for _, w := range []string{"(deny default)", `(subpath "` + tmp + `")`, "(deny network*)"} {
-		if !strings.Contains(ro, w) {
-			t.Errorf("只读 profile 缺少 %q\n%s", w, ro)
+// 环境变量里的 HOME / TMPDIR 必须是沙箱内路径，不能泄露宿主临时目录。
+func TestBuildEnvUsesSandboxHome(t *testing.T) {
+	env := buildEnv(Spec{Proxy: "/tmp/host.sock"}, HomeDir)
+	joined := strings.Join(env, " ")
+	for _, want := range []string{"HOME=" + HomeDir, "TMPDIR=" + HomeDir, "WA_EGRESS_PROXY=" + EgressProxy} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("缺少 %q：%s", want, joined)
 		}
 	}
-	if strings.Contains(writeBlock(ro), ws) {
-		t.Errorf("只读档不该给 workspace 写权限\n%s", ro)
-	}
-	// 读权限只走白名单，不能再有全盘可读
-	if !strings.Contains(ro, "(allow file-read*") || strings.Contains(ro, "(allow file-read*)\n") {
-		t.Errorf("读权限必须是 subpath 白名单\n%s", ro)
-	}
-
-	rw, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite}, tmp)
-	if err != nil {
-		t.Fatalf("生成 profile 失败: %v", err)
-	}
-	if !strings.Contains(writeBlock(rw), `(subpath "`+ws+`")`) {
-		t.Errorf("workspace 档应放开 workspace 写权限\n%s", rw)
-	}
-	if !strings.Contains(rw, "(deny network*)") {
-		t.Errorf("不带 Network 时应该禁网\n%s", rw)
-	}
-
-	// 给网不改变文件可见面：curl 在工作区里跑，下载与解析才能连着写。
-	// 外发风险由审批与 NetworkPolicy 承担，不由挂载表承担。
-	net, err := seatbeltProfile(Spec{Dir: ws, Mode: ModeWorkspaceWrite, Network: true}, tmp)
-	if err != nil {
-		t.Fatalf("生成 profile 失败: %v", err)
-	}
-	if !strings.Contains(writeBlock(net), `(subpath "`+ws+`")`) {
-		t.Errorf("出网档位同样要能写整个工作区\n%s", net)
-	}
-	if strings.Contains(net, "(deny network*)") {
-		t.Errorf("Network=true 时不该写死禁网\n%s", net)
-	}
-
-	if _, err := seatbeltProfile(Spec{Dir: `/evil"path`, Mode: ModeWorkspaceWrite}, "/tmp"); err == nil {
-		t.Error("含引号的路径应该被拒绝，而不是拼进 profile")
-	}
-}
-
-// FS 白名单只接受绝对路径：相对路径会让「我限制的是哪个目录」变得不可推理。
-func TestFSNormalize(t *testing.T) {
-	if _, err := (Spec{Cmd: []string{"sh"}, FS: FS{Read: []string{"relative/dir"}}}).normalize(); err == nil {
-		t.Fatal("相对路径应该报错")
-	}
-	got, err := (Spec{Cmd: []string{"sh"}, Dir: "/tmp", FS: FS{Read: []string{"/data/"}}}).normalize()
-	if err != nil {
-		t.Fatalf("normalize 失败: %v", err)
-	}
-	found := false
-	for _, p := range got.FS.Read {
-		if p == "/data" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("路径没被 Clean: %#v", got.FS.Read)
+	if strings.Contains(joined, "/tmp/host.sock") {
+		t.Errorf("宿主 socket 路径不该出现在环境变量里: %s", joined)
 	}
 }
 
 func TestLocalEcho(t *testing.T) {
+	dir := t.TempDir()
 	r := NewLocal()
-	res, err := r.Run(context.Background(), Spec{
+	res, err := r.Run(context.Background(), workspaceSpec(dir, ModeWorkspaceWrite))
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if res.Sandbox != "local" {
+		t.Errorf("后端名应为 local，实际 %q", res.Sandbox)
+	}
+	// 没有挂载命名空间时工作目录落回挂载源
+	res, err = r.Run(context.Background(), Spec{
 		Cmd:     []string{shBin(t), "-c", "echo hello"},
-		Dir:     t.TempDir(),
+		Dir:     WorkspaceDir,
+		Mounts:  []Mount{{Source: dir, Target: WorkspaceDir, Write: true}},
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -235,15 +238,11 @@ func TestLocalEcho(t *testing.T) {
 	if res.ExitCode != 0 {
 		t.Errorf("退出码应为 0，实际 %d", res.ExitCode)
 	}
-	if res.Sandbox != "local" {
-		t.Errorf("后端名应为 local，实际 %q", res.Sandbox)
-	}
 }
 
 func TestExitCodeIsData(t *testing.T) {
 	res, err := NewLocal().Run(context.Background(), Spec{
 		Cmd:     []string{shBin(t), "-c", "exit 7"},
-		Dir:     t.TempDir(),
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -258,7 +257,6 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 	start := time.Now()
 	res, err := NewLocal().Run(context.Background(), Spec{
 		Cmd:     []string{shBin(t), "-c", "sleep 5 & sleep 5; wait"},
-		Dir:     t.TempDir(),
 		Timeout: 200 * time.Millisecond,
 	})
 	if !errors.Is(err, ErrTimeout) {
@@ -275,7 +273,6 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 func TestOutputLimit(t *testing.T) {
 	res, err := NewLocal().Run(context.Background(), Spec{
 		Cmd:       []string{shBin(t), "-c", "yes xxxxxxxxxxxxxxxxxxxx"},
-		Dir:       t.TempDir(),
 		Timeout:   10 * time.Second,
 		MaxOutput: 1024,
 	})
@@ -295,7 +292,6 @@ func TestEnvIsScrubbed(t *testing.T) {
 	t.Setenv("PATH", os.Getenv("PATH"))
 	res, err := NewLocal().Run(context.Background(), Spec{
 		Cmd:     []string{shBin(t), "-c", "echo ${SECRET_TOKEN:-empty}"},
-		Dir:     t.TempDir(),
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -309,7 +305,6 @@ func TestEnvIsScrubbed(t *testing.T) {
 func TestEnvOverride(t *testing.T) {
 	res, err := NewLocal().Run(context.Background(), Spec{
 		Cmd:     []string{shBin(t), "-c", "echo $FOO $TMPDIR"},
-		Dir:     t.TempDir(),
 		Env:     []string{"FOO=bar"},
 		Timeout: 10 * time.Second,
 	})
@@ -321,7 +316,7 @@ func TestEnvOverride(t *testing.T) {
 	}
 }
 
-// 只读档下全盘只读：临时目录之外写不进去。这条只有真沙箱才成立。
+// 只读档下全盘只读：挂载点之外写不进去。这条只有真沙箱才成立。
 func TestSandboxWriteBoundary(t *testing.T) {
 	if testing.Short() {
 		t.Skip("短模式跳过真实沙箱测试")
@@ -332,13 +327,11 @@ func TestSandboxWriteBoundary(t *testing.T) {
 	}
 	sh := shBin(t)
 	ws := t.TempDir()
+	base := workspaceSpec(ws, ModeWorkspaceWrite)
+	base.Cmd = []string{sh, "-c", "echo hi > inside.txt && cat inside.txt"}
+	base.Timeout = 15 * time.Second
 
-	res, err := r.Run(context.Background(), Spec{
-		Cmd:     []string{sh, "-c", "echo hi > inside.txt && cat inside.txt"},
-		Dir:     ws,
-		Mode:    ModeWorkspaceWrite,
-		Timeout: 15 * time.Second,
-	})
+	res, err := r.Run(context.Background(), base)
 	if err != nil {
 		t.Fatalf("[%s] workspace 内写入失败: %v\nstderr: %s", r.Name(), err, res.Stderr)
 	}
@@ -349,17 +342,34 @@ func TestSandboxWriteBoundary(t *testing.T) {
 
 	outside := filepath.Join(os.TempDir(), fmt.Sprintf("sandbox-escape-%d.txt", time.Now().UnixNano()))
 	t.Cleanup(func() { _ = os.Remove(outside) })
-	res, err = r.Run(context.Background(), Spec{
-		Cmd:     []string{sh, "-c", "echo escaped > " + outside},
-		Dir:     ws,
-		Mode:    ModeWorkspaceWrite,
-		Timeout: 15 * time.Second,
-	})
+	escape := workspaceSpec(ws, ModeWorkspaceWrite)
+	escape.Cmd = []string{sh, "-c", "echo escaped > " + outside}
+	escape.Timeout = 15 * time.Second
+	res, err = r.Run(context.Background(), escape)
 	if err == nil && res.ExitCode == 0 {
 		t.Errorf("[%s] 越界写入居然成功了: %s", r.Name(), outside)
 	}
 	if _, statErr := os.Stat(outside); statErr == nil {
 		t.Errorf("[%s] 越界文件真的被创建了: %s", r.Name(), outside)
+	}
+}
+
+// 远端句柄没有本地 stderr 收集器，Wait 必须照样能收尾（曾经在这里空指针崩过）。
+func TestRemoteProcWaitWithoutStderr(t *testing.T) {
+	r, w := io.Pipe()
+	defer func() { _ = r.Close() }()
+	proc := NewProc("remote", r, w, func() {})
+	defer proc.Close()
+
+	res, err := proc.Wait()
+	if err != nil {
+		t.Fatalf("远端句柄 Wait 不该报错: %v", err)
+	}
+	if res.Stderr != "" {
+		t.Errorf("远端句柄没有 stderr 可回传，得到 %q", res.Stderr)
+	}
+	if proc.Stderr() != "" {
+		t.Errorf("远端句柄 Stderr() 应为空串")
 	}
 }
 

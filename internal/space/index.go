@@ -350,7 +350,7 @@ func normalizeSourcePath(raw string) (string, error) {
 			return "", ErrNameInvalid
 		}
 	}
-	if !previewable(rel) {
+	if !Readable(rel) {
 		return "", ErrFileUnsupported
 	}
 	return rel, nil

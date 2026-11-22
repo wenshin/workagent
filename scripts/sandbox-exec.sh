@@ -34,11 +34,32 @@ build() {
     -t "$IMAGE" deploy/runner
 }
 
+# 控制面的存储根（STORAGE_ROOT），执行体必须按相同的绝对路径挂载进来。
+# 路径是跨进程契约：控制面把 /…/data/storage/spaces/<id>/files 原样发给执行体，
+# 执行体只接受自己根目录（SANDBOX_AGENT_ROOT）之下的路径；两边路径不一致时
+# 第一次 shell_exec 就会报「路径 … 不在执行体允许的根目录 … 之下」。
+storage_dir() {
+  local p="${WA_STORAGE:-}"
+  if [[ -z "$p" && -f .env ]]; then
+    p="$(sed -n 's/^STORAGE_ROOT=//p' .env | head -1)"
+  fi
+  p="${p:-./data/storage}"
+  case "$p" in
+    /*) ;;
+    *) p="$ROOT_DIR/${p#./}" ;;
+  esac
+  mkdir -p "$p"
+  ( cd "$p" && pwd -P )
+}
+
 up() {
   build
-  echo "==> 部署执行面"
+  local storage
+  storage="$(storage_dir)"
+  echo "==> 部署执行面（存储根 ${storage}）"
   kubectl apply -f deploy/local/00-namespace.yaml
-  kubectl apply -f deploy/local/10-runner.yaml
+  # 执行体的存储根必须与控制面一致：渲染成同一个绝对路径再 apply
+  sed "s|__WA_STORAGE__|${storage}|g" deploy/local/10-runner.yaml | kubectl apply -f -
   # 私网封禁：OrbStack 自带 k8s 没有 CNI，这条会被接受但不生效，
   # 验证它要用 kind + Calico。集群禁用 NetworkPolicy 时也不阻断部署。
   kubectl apply -f deploy/local/15-runner-netpol.yaml >/dev/null 2>&1 \

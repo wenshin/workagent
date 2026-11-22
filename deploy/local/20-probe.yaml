@@ -1,6 +1,6 @@
 # 部署后验：用与线上一致的 Spec 形状打一遍执行体。
 # 这不是「能不能起来」的检查，而是「能不能上线」的检查：
-# 能跑、能写自己空间、写不了系统目录、断网、看不到同级空间、超时生效。
+# 能跑、能写自己空间、写不了系统目录、断网、宿主路径不可见、超时生效。
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -19,19 +19,13 @@ spec:
           command:
             - /usr/local/bin/sandbox-probe
             - -addr=http://sandbox-runner:8323
-            - -space=/var/lib/workagent/storage/tenants/default/spaces/probe/files
+            # 相对执行体存储根的 key；目录由执行体自己创建，探针不需要挂载
+            - -space=spaces/probe/files
           env:
             - name: SANDBOX_RUNNER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: sandbox-runner-token
                   key: token
-          volumeMounts:
-            # 探针要自己建目录：它和 runner 看的是同一个 hostPath
-            - name: storage
-              mountPath: /var/lib/workagent
-      volumes:
-        - name: storage
-          hostPath:
-            path: /var/lib/workagent
-            type: DirectoryOrCreate
+          # 探针只调执行体的 HTTP 接口，自己不需要任何卷：
+          # 工作区由执行体按 key 解析并创建。

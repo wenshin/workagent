@@ -46,12 +46,19 @@ type runSeed struct {
 	AgentPrompt string
 	Resume      *agent.ResumeState
 
+	// ClientClock 是用户端上报的时间与时区。零值表示这一轮没有用户端
+	// （任务回执、续跑），注入时回落服务器时间。
+	ClientClock ClientClock
+
 	// PrevRunID 是被这一轮接替的执行（续跑时非空）：审批结论、工具结果
 	// 都挂在旧 run 上，恢复要沿这条链去找。
 	PrevRunID string
 	// Replay 是旧 run 已经产生过的工具结果（key 为工具 + 参数指纹）。
 	// 命中就不执行，直接回放：副作用不能因为续跑再发生一次。
 	Replay map[string]tool.InvokeResult
+	// Carry 是暂停那一轮已经写下的消息（续跑时非空）：
+	// 这一次接着它写，正文、轨迹与用量都并回同一条，界面上看到的是一轮。
+	Carry *store.Message
 }
 
 // runWatchdog 是「这一轮卡住了」的唯一判据。
@@ -171,9 +178,14 @@ func (s *Service) execute(
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
 	live := s.runs.add(run.ID, userID, cancelRun, s.stream, s.log)
+	// approver 在下面才建好；这里只声明，收尾时用它回查「批了却没动」的待办
+	var approver *runApprover
 	defer func() {
 		live.finish()
 		s.runs.remove(run.ID, live)
+		// 决策可能在我收尾之前就到了：那会儿 ResolveApproval 看到执行体还活着，
+		// 只落库不续跑。摘掉登记之后再补一次，免得停在「批了却没动」。
+		s.resumeParkedDecisions(context.WithoutCancel(ctx), userID, sessionID, approver)
 	}()
 
 	// 看门狗：连续没有事件才算卡住；总上限只是最后一道保险
@@ -200,6 +212,11 @@ func (s *Service) execute(
 		progressMu.Lock()
 		defer progressMu.Unlock()
 		if placeholderID != "" {
+			return
+		}
+		// 续跑接上暂停那一轮的消息：这一轮还没写完，不是新的一条。
+		if seed.Carry != nil {
+			placeholderID = seed.Carry.ID
 			return
 		}
 		placeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -244,6 +261,14 @@ func (s *Service) execute(
 			// 断点前强制推一次：工具可能跑几分钟，这段时间里切页要能看到已经说了什么
 			live.flush(true)
 			appendStep(ev.Type, ev.Tool.Payload())
+		case agent.EventPlanUpdated:
+			// 清单也是内容：只有轨迹、还没有正文的时刻，列表里也该看到这一轮在干什么。
+			//
+			// 只补占位与缓存，不落 run_step：清单是状态不是步骤，最终那份随结果进
+			// message.parts，执行中的那份在 run_resume 里（plan_read 读的就是它）。
+			// run_step 只留「发生过什么」，重复存一份既没人读，还会随覆盖次数一直涨。
+			ensurePlaceholder()
+			live.flush(true)
 		case agent.EventApprovalReq:
 			// 等人可能等满审批时限：进等待前先把已产出的正文推到缓存
 			live.flush(true)
@@ -325,8 +350,16 @@ func (s *Service) execute(
 	// 整轮耗时：从进入实现到回答落库，含所有工具轮次与思考时间。
 	// 用应用侧时钟而不是 run.started_at，避免与应用、数据库的时钟差导致耗时失真。
 	startedAt := time.Now()
-	// 审批授权只在「这一轮」有效：run 结束时把待办置 expired，下一轮重新确认。
-	defer s.expireRunApprovals(run.ID)
+
+	// 审批待办**不**在 run 结束时就地作废：本轮停下来等人，待办必须活过这一轮。
+	// 只有显式停止（CancelSessionRun）与续跑接替才清理它们。
+	approver = &runApprover{
+		hub:         s.approvals,
+		runID:       run.ID,
+		sessionID:   sessionID,
+		emit:        emitEvent,
+		parentRunID: seed.PrevRunID,
+	}
 
 	res, runErr := s.agent.Run(runCtx, agent.RunInput{
 		Env: tool.Env{
@@ -357,25 +390,16 @@ func (s *Service) execute(
 			ExtraPluginRefs: extraRefs,
 			// 搜索：provider 与密钥都在装配层，工具只拿到注册表
 			Search: s.search,
-			// 命令执行：沙箱后端在装配层选定（bwrap / sandbox-exec / local），
+			// 命令执行：沙箱后端在装配层选定（bwrap / local），
 			// 工具只拿到 Runner，无法自行降级到无隔离执行。
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
 			PluginTry: s.pluginTry,
 			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
 			Tasks: s,
-			// 审批：命中出网写 / 需确认命令时挂起，等前端按钮（本轮内有效）
-			Approvals: &runApprover{
-				hub:         s.approvals,
-				runID:       run.ID,
-				sessionID:   sessionID,
-				emit:        emitEvent,
-				parentRunID: seed.PrevRunID,
-				beat: func() {
-					watch.touch()
-					beat()
-				},
-			},
+			// 审批：命中出网写 / 需确认命令时登记待办并把本轮停下，
+			// 用户点完按钮由决策驱动的续跑接着走
+			Approvals: approver,
 			// 续跑时把上一轮已经做完的结果带上：工具执行前先查它
 			Replay: seed.Replay,
 			// 凭证：只给「配过没有 + 指纹」，工具拿不到明文
@@ -393,7 +417,10 @@ func (s *Service) execute(
 		AgentSkills:   agentSkills,
 		// 平台事实进系统提示词，不做成工具：租户、IM 这类信息必须恒真
 		Platform: s.platformFacts(user, sp),
-		Resume:   seed.Resume,
+		// 本轮「现在」：优先用户端上报的本地时间与时区，取不到才用服务器时间。
+		// 每次 run 都重新解析，注入的是这一轮的时刻，不是会话创建时的时刻。
+		Clock:  resolveClock(seed.ClientClock, time.Now),
+		Resume: seed.Resume,
 		// 每轮工具执行完把「走到哪了」落库：中断后从这里接着走，
 		// 而不是让模型凭半截正文重新规划、把工具再执行一遍
 		Checkpoint: func(state agent.ResumeState) error {
@@ -422,6 +449,9 @@ func (s *Service) execute(
 	switch {
 	case reason != "":
 		// 已经在 live 上记过，不再覆盖
+	case errors.Is(runErr, agent.ErrPaused):
+		// 停在审批上：这一轮的终态就是「等人」，断点留着那条没执行的调用
+		reason = ReasonAwaitingApproval
 	case errors.Is(runErr, agent.ErrStalled):
 		// 循环守卫判定停滞：已经强制收尾并给出结论，重试同样不会更好
 		reason = ReasonStalled
@@ -434,6 +464,10 @@ func (s *Service) execute(
 
 	status := store.RunSucceeded
 	switch {
+	case reason == ReasonAwaitingApproval:
+		// 复用 waiting_approval 这个状态，但它是终态（ended_at 由 FinishRun 写）：
+		// active-run 与清扫都按 ended_at 判活，暂停中的 run 不会被当成还在跑
+		status = store.RunWaitingApproval
 	case reason != "":
 		status = store.RunCancelled
 	case runErr != nil:
@@ -467,6 +501,11 @@ func (s *Service) execute(
 			s.log.Warn("更新 run 状态失败", "run_id", run.ID, "err", err)
 		}
 		s.settleResume(saveCtx, run.ID, status, reason)
+		// 用户主动停止就是放弃这一轮：待办一起收掉。留着的话卡片还在界面上，
+		// 点它会把会话重新跑起来——而停止的意思正是「不要了」。
+		if reason == ReasonUserCancelled {
+			s.expireRunApprovals(run.ID)
+		}
 	}
 
 	// 流式刷新点上的正文：被中断时 Result 里可能还没收尾，
@@ -480,7 +519,7 @@ func (s *Service) execute(
 		reasoning = streamedReasoning
 	}
 
-	if content == "" && len(res.Steps) == 0 {
+	if content == "" && len(res.Steps) == 0 && reason != ReasonAwaitingApproval {
 		// 没有内容可存：取消不改判为失败，原因如实写进 run.error
 		if reason == "" {
 			status = store.RunFailed
@@ -508,15 +547,29 @@ func (s *Service) execute(
 		OutTokens:  res.Usage.OutputTokens,
 		DurationMS: int(time.Since(startedAt).Milliseconds()),
 	}
+	// 续跑接上暂停那一轮的消息：一轮只有一条回答，暂停只是把它切成两段。
+	// 另起一条会把前半段留在「已中断」里，用户点完同意就只剩后半段。
+	content, reasoning, parts, stats = mergeCarried(seed.Carry, content, reasoning, parts, stats)
+
 	var msg store.Message
 	var err error
 	progressMu.Lock()
 	placeID := placeholderID
 	progressMu.Unlock()
+	if placeID == "" && seed.Carry != nil {
+		placeID = seed.Carry.ID
+	}
 	if placeID != "" {
 		// 占位消息已经存在：整段覆盖，并把 streaming 置回 false
 		msg, err = s.store.FinishMessage(saveCtx, placeID,
 			content, reasoning, parts, stats, reason != "")
+		if err != nil && seed.Carry != nil && seed.Carry.ID == placeID {
+			// 接续的那条被别人收掉了（例如清扫把空占位删了）：不能因此判这一轮失败，
+			// 退回新建，正文与轨迹都在 parts/content 里，不会丢。
+			s.log.Warn("接续消息已不存在，改为新建",
+				"session_id", sessionID, "message_id", placeID, "err", err)
+			msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, content, reasoning, parts, stats)
+		}
 	} else {
 		msg, err = s.store.CreateAssistantMessage(saveCtx, sessionID, content, reasoning, parts, stats)
 	}
@@ -574,6 +627,10 @@ func (s *Service) execute(
 	out.Session = sess
 	out.Usage = res.Usage
 	out.Status = status
+	if reason == ReasonAwaitingApproval {
+		// 暂停不是错误：调用方不该按失败收尾，也不该弹错误提示
+		return out, nil
+	}
 	return out, runErr
 }
 
@@ -581,6 +638,100 @@ func (s *Service) execute(
 type timelinePart struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+}
+
+// planPart 是 message.parts 里的任务清单，与前端 MessagePart 对齐。
+//
+// 只留这一轮结束时的最终清单：清单是状态不是步骤，中途每一次覆盖都存进来
+// 会把一条消息撑成十几份同名卡片，翻历史时反而看不出到底做完了什么。
+type planPart struct {
+	Type  string           `json:"type"`
+	Goal  string           `json:"goal,omitempty"`
+	Items []agent.PlanItem `json:"items"`
+}
+
+// pausedToolStatus 是「停在审批上、还没执行」的工具卡状态，与前端 ToolCard 的
+// 标签表对齐（待审批）。它只是这一轮的证据，可点的卡片由待办列表单独渲染。
+const pausedToolStatus = "approval"
+
+// mergeCarried 把续跑这一轮的产出并回暂停前的那条消息。
+//
+// 一轮只有一条回答：暂停把同一轮切成两段，续跑要接着写，而不是另起一条。合并
+// 只做「接着写」——正文与思考按段落接在后面，用量相加；工具轨迹按顺序追加，
+// 暂停时留下的待审批卡被同一次调用的真实回执顶掉，免得界面上出现两张。
+func mergeCarried(carry *store.Message, content, reasoning string, parts []byte, stats store.MessageStats) (string, string, []byte, store.MessageStats) {
+	if carry == nil {
+		return content, reasoning, parts, stats
+	}
+	content = joinParagraph(carry.Content, content)
+	reasoning = joinParagraph(carry.Reasoning, reasoning)
+	stats.InTokens += carry.Stats.InTokens
+	stats.OutTokens += carry.Stats.OutTokens
+	stats.DurationMS += carry.Stats.DurationMS
+	return content, reasoning, mergeParts(carry.Parts, parts), stats
+}
+
+// joinParagraph 接两段正文：空的那边直接让位，都不空才补一个空行分段。
+func joinParagraph(head, tail string) string {
+	head, tail = strings.TrimSpace(head), strings.TrimSpace(tail)
+	switch {
+	case head == "":
+		return tail
+	case tail == "":
+		return head
+	default:
+		return head + "\n\n" + tail
+	}
+}
+
+// mergeParts 按顺序拼接两次执行的 parts。
+//
+// 暂停时留下的待审批卡（status=approval）在同名同参数的调用拿到真实回执后就让位，
+// 否则同一步会既显示「待审批」又显示「成功」。
+func mergeParts(head, tail []byte) []byte {
+	var prev, next []map[string]any
+	if len(head) > 0 {
+		_ = json.Unmarshal(head, &prev)
+	}
+	if len(tail) > 0 {
+		_ = json.Unmarshal(tail, &next)
+	}
+	if len(prev) == 0 {
+		return tail
+	}
+	if len(next) == 0 {
+		return head
+	}
+	carried := make(map[string]bool, len(next))
+	for _, p := range next {
+		if key := partKey(p); key != "" {
+			carried[key] = true
+		}
+	}
+	out := make([]map[string]any, 0, len(prev)+len(next))
+	for _, p := range prev {
+		if p["status"] == pausedToolStatus && carried[partKey(p)] {
+			continue
+		}
+		out = append(out, p)
+	}
+	out = append(out, next...)
+	data, err := json.Marshal(out)
+	if err != nil {
+		return tail
+	}
+	return data
+}
+
+// partKey 是「同一个工具调用」的判据：续跑时模型会重新生成 call id，
+// 只有工具名加参数能证明这是刚才那一步。
+func partKey(p map[string]any) string {
+	name, _ := p["name"].(string)
+	if name == "" {
+		return ""
+	}
+	args, _ := p["args"].(string)
+	return name + "\x00" + args
 }
 
 // marshalParts 把这一轮的时间线落成 message.parts。
@@ -592,14 +743,19 @@ type timelinePart struct {
 // 没有工具调用时正文位置是固定的（思考在前、正文在后），分组渲染已经够用，
 // 不再把整段正文复制一份进 parts。
 func marshalParts(log *slog.Logger, sessionID string, res agent.Result) []byte {
-	if len(res.Steps) == 0 {
+	if len(res.Steps) == 0 && len(res.Parked) == 0 && res.Plan.Empty() {
 		return []byte("[]")
 	}
 	steps := make(map[string]agent.Step, len(res.Steps))
 	for _, st := range res.Steps {
 		steps[st.ID] = st
 	}
-	parts := make([]any, 0, len(res.Timeline)+len(res.Steps))
+	parts := make([]any, 0, len(res.Timeline)+len(res.Steps)+len(res.Parked)+1)
+	// 清单排在最前：它是这一轮的执行计划，先看计划再看过程才读得懂后面的取舍。
+	// 中途的每次覆盖不进 parts，只留最终状态（plan.updated 事件负责直播时的逐次刷新）。
+	if !res.Plan.Empty() {
+		parts = append(parts, planPart{Type: "plan", Goal: res.Plan.Goal, Items: res.Plan.Items})
+	}
 	placed := make(map[string]bool, len(res.Steps))
 	for _, seg := range res.Timeline {
 		if seg.Type == "tool" {
@@ -622,6 +778,18 @@ func marshalParts(log *slog.Logger, sessionID string, res agent.Result) []byte {
 			parts = append(parts, st)
 		}
 	}
+	// 停在审批上的调用也要留在这一轮里：它们没有回执，状态如实标成待审批。
+	// 不落的话「第一个动作就要确认」的那一轮就是一条空产出，界面看不见。
+	for _, p := range res.Parked {
+		if placed[p.ID] {
+			continue
+		}
+		placed[p.ID] = true
+		parts = append(parts, agent.Step{
+			Type: "tool", ID: p.ID, Name: p.Name, Args: p.Args,
+			Status: pausedToolStatus,
+		})
+	}
 	data, err := json.Marshal(parts)
 	if err != nil {
 		log.Warn("序列化消息轨迹失败", "session_id", sessionID, "err", err)
@@ -639,7 +807,8 @@ func keepResume(status, reason string) bool {
 	if status == store.RunFailed {
 		return true
 	}
-	return reason == ReasonIdleTimeout || reason == ReasonWallClockExceeded
+	// 停在审批上的断点是「恢复的唯一凭据」：待办还在，断点没了就只剩一张点不动的卡。
+	return reason == ReasonIdleTimeout || reason == ReasonWallClockExceeded || reason == ReasonAwaitingApproval
 }
 
 // settleResume 按 keepResume 的结论落库。
@@ -750,6 +919,14 @@ func (s *Service) Resume(
 	if err := s.store.InterruptStreamingMessage(settleCtx, prev.ID, sessionID, s.recoverContent(prev.ID)); err != nil {
 		s.log.Warn("结算中断轮占位消息失败", "run_id", prev.ID, "err", err)
 	}
+	// 暂停那一轮已经写下的消息：续跑接着它写，一轮只有一条回答。
+	// 结算之后再读，拿到的是补齐了正文与工具轨迹的最终形态。
+	var carry *store.Message
+	if prevMsg, ok, err := s.store.MessageOfRun(settleCtx, prev.ID); err != nil {
+		s.log.Warn("读取续跑接续消息失败", "run_id", prev.ID, "err", err)
+	} else if ok {
+		carry = &prevMsg
+	}
 	cancelSettle()
 
 	user, err := s.store.GetUser(ctx, userID)
@@ -774,6 +951,7 @@ func (s *Service) Resume(
 		Resume:    &state,
 		PrevRunID: prev.ID,
 		Replay:    replay,
+		Carry:     carry,
 	}, out, emit)
 }
 

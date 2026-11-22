@@ -331,23 +331,21 @@ func TestFSValidation(t *testing.T) {
 	}
 }
 
+// resolveUnder 返回的是「相对空间工作区的干净路径」：它是挂载 key 的尾段，
+// 不再是宿主绝对路径——绝对路径只在挂载那一侧拼出来。
 func TestResolveUnder(t *testing.T) {
 	root := t.TempDir()
 	got, err := resolveUnder(root, "data/sub")
 	if err != nil {
 		t.Fatalf("正常路径不该报错: %v", err)
 	}
-	if got != filepath.Join(root, "data", "sub") {
+	if got != "data/sub" {
 		t.Fatalf("解析结果不对: %s", got)
 	}
-	for _, bad := range []string{"../x", "/etc/passwd", "a/../../b", ""} {
+	for _, bad := range []string{"../x", "/etc/passwd", "a/../../b", "", " ", "//", "."} {
 		if _, err := resolveUnder(root, bad); err == nil {
 			t.Errorf("%q 应被拒绝", bad)
 		}
-	}
-	// . 表示空间根（macOS 上 /var 会展开成 /private/var，所以比 realPath）
-	if got, err := resolveUnder(root, "."); err != nil || got != realPath(root) {
-		t.Errorf("`.` 应解析为空间根，得到 %q err=%v", got, err)
 	}
 }
 

@@ -53,8 +53,8 @@ type Client struct {
 
 // New 连接执行体并完成握手：拿不到真实的沙箱后端名就报错。
 //
-// 这里必须握手而不是假设「远端一定隔离」——执行容器里 bwrap 起不来时
-// Detect 会降级到 local，控制面如果不知情，就会把「裸跑」记成 bwrap。
+// 这里必须握手而不是假设「远端一定隔离」——执行体可能自报非隔离后端，
+// 控制面如果不知情，就会把「裸跑」记成 bwrap。
 func New(addr, token string) (*Client, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("远端沙箱缺少鉴权令牌（SANDBOX_RUNNER_TOKEN）")
@@ -89,7 +89,7 @@ func New(addr, token string) (*Client, error) {
 	return c, nil
 }
 
-// Name 返回执行体真实生效的后端名（bwrap / sandbox-exec / local）。
+// Name 返回执行体真实生效的后端名（bwrap / local）。
 // 调用方据此判断「到底有没有隔离」，不要用字面量比较。
 func (c *Client) Name() string { return c.backend }
 
@@ -109,9 +109,30 @@ func (c *Client) Transport() string { return "remote" }
 // Isolated 表示执行体报告自己不是 local。
 func (c *Client) Isolated() bool { return c.isolated }
 
+// wire 清掉只在本机有意义的字段：宿主路径不出这条线。
+//
+// Mount.Source 是控制面看到的真实目录，执行体有它自己的根与 Key 解析；
+// Proxy 是建 socket 那一侧的临时路径，断网时由执行体自己重建。
+// 这样过线的只有「相对根 + 沙箱内挂载点」，两边不再需要同路径，
+// 报错里也不会出现对方机器的目录结构。
+func wire(spec sandbox.Spec) sandbox.Spec {
+	mounts := make([]sandbox.Mount, len(spec.Mounts))
+	copy(mounts, spec.Mounts)
+	for i := range mounts {
+		// 只有「空间数据」这一路需要由执行体重新解析：
+		// 系统挂载（Key 为空）在两边本来就是同一个容器内路径。
+		if mounts[i].Key != "" || mounts[i].Root == sandbox.RootCache {
+			mounts[i].Source = ""
+		}
+	}
+	spec.Mounts = mounts
+	spec.Proxy = ""
+	return spec
+}
+
 // Run 在远端执行一次命令。
 func (c *Client) Run(ctx context.Context, spec sandbox.Spec) (sandbox.Result, error) {
-	body, err := json.Marshal(runRequest{Spec: spec})
+	body, err := json.Marshal(runRequest{Spec: wire(spec)})
 	if err != nil {
 		return sandbox.Result{Sandbox: c.backend}, fmt.Errorf("序列化执行请求失败: %w", err)
 	}
@@ -134,7 +155,7 @@ func (c *Client) Run(ctx context.Context, spec sandbox.Spec) (sandbox.Result, er
 // 连接断开即进程终止（服务端读到上行 EOF 会杀掉进程），所以 Close /
 // Kill 都退化成关连接。
 func (c *Client) Start(ctx context.Context, spec sandbox.Spec) (*sandbox.Proc, error) {
-	payload, err := json.Marshal(startRequest{Spec: spec})
+	payload, err := json.Marshal(startRequest{Spec: wire(spec)})
 	if err != nil {
 		return nil, fmt.Errorf("序列化常驻进程请求失败: %w", err)
 	}

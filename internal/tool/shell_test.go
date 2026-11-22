@@ -60,6 +60,19 @@ func TestShellExecWritesInWorkspace(t *testing.T) {
 	}
 }
 
+// 命令前拼的是平台固定的 venv 自愈脚本，不能改变用户命令的语义：
+// heredoc、管道、退出码都要照旧（模型写的多行脚本全靠这个）。
+func TestVenvBootstrapKeepsCommandSemantics(t *testing.T) {
+	env := newShellEnv(t, sandbox.NewLocal())
+	out, err := runShell(t, env, `{"command":"cat <<'EOF'\nhello\nEOF\necho done"}`)
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if !strings.Contains(out, "退出码 0") || !strings.Contains(out, "hello") || !strings.Contains(out, "done") {
+		t.Fatalf("前缀不该影响 heredoc 与后续命令: %s", out)
+	}
+}
+
 func TestShellExecNonZeroIsResult(t *testing.T) {
 	out, err := runShell(t, newShellEnv(t, sandbox.NewLocal()), `{"command":"echo boom >&2; exit 3"}`)
 	if err != nil {

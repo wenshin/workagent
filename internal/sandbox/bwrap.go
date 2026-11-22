@@ -13,7 +13,7 @@ import (
 
 // bwrapBaselineRead 是「进程能跑起来」所需的最小只读系统路径。
 //
-// 这张表是白名单而不是黑名单：不在表里、也没被 Spec.FS.Read 列出的路径，
+// 这张表是白名单而不是黑名单：不在表里、也没被 Spec.Mounts 列出的路径，
 // 在沙箱里是空目录且不可写（根最后会 --remount-ro）。所以漏项的表现是
 // 「空目录」或 ENOENT（跑不起来，立刻暴露），而不是「悄悄读到了不该读的东西」。
 var bwrapBaselineRead = []string{
@@ -50,7 +50,7 @@ var bwrapBaselineRead = []string{
 // NewBwrap 检测 bubblewrap 是否真的可用——不只看有没有装。
 //
 // 很多发行版（尤其加固过的内核）会禁用 user namespace，此时 bwrap 二进制在、
-// 但一跑就失败。探针能提前发现，让 Detect 老老实实降级并让调用方告警。
+// 但一跑就失败。探针能提前发现，让调用方在启动阶段就失败而不是等第一条命令。
 func NewBwrap() (Runner, error) {
 	bin, err := exec.LookPath("bwrap")
 	if err != nil {
@@ -73,13 +73,13 @@ func NewBwrap() (Runner, error) {
 
 func bwrapBuild(bin string) buildFunc {
 	return func(spec Spec, tmp string, env []string) ([]string, error) {
-		read, write := spec.fsPaths(bwrapBaselineRead)
+		read, write := spec.plan(bwrapBaselineRead)
 
 		args := []string{bin}
 		// 白名单挂载：只挂运行所需，不再 --ro-bind / /。
 		// -try 用来兼容不同发行版的路径差异（缺一个不能让沙箱整个起不来）。
-		for _, p := range read {
-			args = append(args, "--ro-bind-try", p, p)
+		for _, m := range read {
+			args = append(args, "--ro-bind-try", m.source, m.target)
 		}
 		args = append(args,
 			"--dev", "/dev",
@@ -96,14 +96,15 @@ func bwrapBuild(bin string) buildFunc {
 			"--clearenv",
 		)
 		// 可写路径后挂，覆盖前面同路径的只读挂载。
-		for _, p := range write {
-			if err := os.MkdirAll(p, 0o755); err != nil {
-				return nil, fmt.Errorf("准备可写目录 %s 失败: %w", p, err)
+		for _, m := range write {
+			if err := os.MkdirAll(m.source, 0o755); err != nil {
+				return nil, fmt.Errorf("准备可写目录失败: %w", err)
 			}
-			args = append(args, "--bind", p, p)
+			args = append(args, "--bind", m.source, m.target)
 		}
-		// 本次调用的私有目录：同时充当 TMPDIR 与 HOME。
-		args = append(args, "--bind", tmp, tmp)
+		// 本次调用的私有目录：挂到固定的 HomeDir，同时充当 TMPDIR 与 HOME。
+		// 不能用宿主的临时路径当挂载点，否则 pwd/env 里会出现 /var/folders/...。
+		args = append(args, "--bind", tmp, HomeDir)
 
 		// 出网必须 share-net：bwrap 给不了 veth，--unshare-net 之后是一个空 netns，
 		// 连 loopback 都不通。所以 Network 一旦为 true，网络边界就只能靠
@@ -115,7 +116,7 @@ func bwrapBuild(bin string) buildFunc {
 		// 只暴露这一条路径，父目录里的其它东西照旧不可见。
 		// 必须可写（rw）：连 unix socket 需要 socket 文件的写权限。
 		if spec.Proxy != "" {
-			args = append(args, "--bind", spec.Proxy, spec.Proxy)
+			args = append(args, "--bind", spec.Proxy, EgressProxy)
 		}
 		// 所有挂载做完之后再把根重新挂成只读。
 		//
@@ -132,7 +133,13 @@ func bwrapBuild(bin string) buildFunc {
 			}
 			args = append(args, "--setenv", k, v)
 		}
-		args = append(args, "--chdir", spec.Dir, "--")
+		orDefault := func(s, def string) string {
+			if s == "" {
+				return def
+			}
+			return s
+		}
+		args = append(args, "--chdir", orDefault(spec.Dir, "/"), "--")
 		return append(args, spec.Cmd...), nil
 	}
 }

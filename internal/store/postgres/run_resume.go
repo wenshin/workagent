@@ -129,13 +129,14 @@ func (d *DB) SweepStaleRuns(ctx context.Context, staleAfter time.Duration, reaso
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// waiting_approval 一起收：进程没了就没有执行体在等，这一轮必须落终态，
-	// 否则 active-run 会一直说「还在跑」。审批记录不动——它有自己的有效期，
-	// 用户在窗口内点批准，会从断点把这一轮续起来（approval → resume）。
+	// 只收 ended_at 为空的那批：waiting_approval 且已收尾的是「停在审批上」的
+	// 暂停轮，它本来就该一直挂着——待办与断点都在，用户点同意就续起来。
+	// 审批记录不动：它有自己的有效期（与断点同寿命）。
 	const q = `
 update run
 set status = 'failed', error = $2, ended_at = now()
 where status in ('running', 'waiting_approval')
+  and ended_at is null
   and heartbeat_at < now() - ($1 * interval '1 second')
 returning id::text, session_id::text`
 
@@ -201,6 +202,7 @@ where m.streaming
 	select 1 from run a
 	where a.session_id = m.session_id
 	  and a.status in ('running', 'waiting_approval')
+	  and a.ended_at is null
   )`
 	rows, err := tx.Query(ctx, q)
 	if err != nil {
@@ -227,8 +229,8 @@ where m.streaming
 			continue
 		}
 		done[o.sessionID] = true
-		// 孤儿占位不取缓存：它对应的 run 已终态，正文在当初结算时就该写回去了
-		if err := settleRunStreamingMessage(ctx, tx, o.runID, o.sessionID, store.RunContent{}); err != nil {
+		// 孤儿占位不取缓存也不补清单：它对应的 run 已终态，正文在当初结算时就该写回去了
+		if err := settleRunStreamingMessageWithPlan(ctx, tx, o.runID, o.sessionID, store.RunContent{}, false); err != nil {
 			return err
 		}
 	}
@@ -259,6 +261,7 @@ update run
 set status = 'failed', error = $3, ended_at = now()
 where id = $1::uuid and session_id = $2::uuid
   and status in ('running', 'waiting_approval')
+  and ended_at is null
   and ($4 <= 0 or heartbeat_at < now() - ($4 * interval '1 second'))`
 	tag, err := tx.Exec(ctx, q, runID, sessionID, reason, staleAfter.Seconds())
 	if err != nil {
@@ -305,6 +308,42 @@ type messagePart struct {
 	Status     string `json:"status"`
 	Risk       int    `json:"risk,omitempty"`
 	DurationMS int64  `json:"duration_ms,omitempty"`
+	// 清单段（type=plan）专用：标题与步骤
+	Goal  string       `json:"goal,omitempty"`
+	Items []planItemIn `json:"items,omitempty"`
+}
+
+// planItemIn 是清单段里的一条，字段名与前端 MessagePlanPart 对齐。
+type planItemIn struct {
+	Title  string `json:"title"`
+	Status string `json:"status,omitempty"`
+	Note   string `json:"note,omitempty"`
+}
+
+// planPartFromResume 从断点快照里取出任务清单，包成一条 parts 元素。
+//
+// 读的是断点而不是 run_step：清单是整轮的状态，最后一次覆盖在 run_resume 里
+// （断点本身就带 Plan），而 run_step 只留「发生过什么」，不再存清单副本。
+func planPartFromResume(ctx context.Context, tx pgx.Tx, runID string) *messagePart {
+	if runID == "" {
+		return nil
+	}
+	const q = `select payload from run_resume where run_id = $1::uuid`
+	var raw []byte
+	if err := tx.QueryRow(ctx, q, runID).Scan(&raw); err != nil {
+		// 没有断点（正常跑完会被清掉）就不补，不是错误
+		return nil
+	}
+	var state struct {
+		Plan *struct {
+			Goal  string       `json:"goal"`
+			Items []planItemIn `json:"items"`
+		} `json:"plan"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil || state.Plan == nil || len(state.Plan.Items) == 0 {
+		return nil
+	}
+	return &messagePart{Type: "plan", Goal: state.Plan.Goal, Items: state.Plan.Items}
 }
 
 // settleRunStreamingMessage 结算一次执行残留的流式占位消息。
@@ -315,6 +354,16 @@ type messagePart struct {
 // 工具调用还原成 parts 写回去：有轨迹就留一条 interrupted 消息（正文可以为空，
 // 工具卡还在），连轨迹都没有的空占位才删掉，那种留在列表里只是一条空白回答。
 func settleRunStreamingMessage(ctx context.Context, tx pgx.Tx, runID, sessionID string, recovered store.RunContent) error {
+	return settleRunStreamingMessageWithPlan(ctx, tx, runID, sessionID, recovered, true)
+}
+
+// settleRunStreamingMessageWithPlan 是 settleRunStreamingMessage 的本体。
+//
+// withPlan 为 false 时不查断点补清单：孤儿占位（清扫路径）连断点都没留下，
+// 查一次也只会拿到空，反而给启动路径多一次往返。
+func settleRunStreamingMessageWithPlan(
+	ctx context.Context, tx pgx.Tx, runID, sessionID string, recovered store.RunContent, withPlan bool,
+) error {
 	// 先把缓存里取回的正文写回去：正文只存在过内存/Redis 里，run_step 里没有。
 	// 这一步在轨迹还原之前做，后面「有正文就保留」的判断才有依据。
 	if recovered.Content != "" || recovered.Reasoning != "" {
@@ -331,6 +380,13 @@ where session_id = $1::uuid and streaming`
 	parts, err := toolPartsFromSteps(ctx, tx, runID)
 	if err != nil {
 		return err
+	}
+	// 清单不在 run_step 里（它是状态不是步骤），执行中断时只能从断点快照补一张卡。
+	// 补在最前面，与正常落库时 message.parts[0] 就是清单的位置一致。
+	if withPlan {
+		if part := planPartFromResume(ctx, tx, runID); part != nil {
+			parts = append([]messagePart{*part}, parts...)
+		}
 	}
 
 	if len(parts) > 0 {

@@ -90,6 +90,12 @@ var ErrBudgetExceeded = errors.New("运行预算已用尽")
 // 预算用尽意味着「还有事没做完」，stalled 意味着「再做也一样」，重试没有意义。
 var ErrStalled = errors.New("运行已停滞，未产生新进展")
 
+// ErrPaused 表示这一轮停在「等人确认」上：工具调用已经发出去了，但没执行。
+//
+// 与 ErrStalled / ErrBudgetExceeded 都不同：它不是这一轮的结局，是暂停。
+// 断点里留着那条没拿到回执的调用，用户点同意后由续跑把它重新发出来。
+var ErrPaused = errors.New("执行已暂停，等待人工确认")
+
 var (
 	registryMu sync.RWMutex
 	factories  = map[string]Factory{}

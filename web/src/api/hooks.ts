@@ -186,7 +186,7 @@ export function useSpaceDirs() {
   });
 }
 
-/** 用户可见空间下的全部文件（平台保留的隐藏项除外），供左侧树展示；previewable 决定能否预览 */
+/** 用户可见空间下的全部文件（平台保留的隐藏项除外），供左侧树展示；previewable 决定能否读正文 */
 export function useSpaceFiles() {
   return useQuery({
     queryKey: queryKeys.files,
@@ -197,12 +197,12 @@ export function useSpaceFiles() {
 
 /**
  * 单个文件正文：选中文件后才请求，避免拉起大文件。
- * previewable=false 的类型（图片、压缩包等）不请求：正文端点只认文本，请求只会回 400。
+ * 非文本类型（图片、音视频、压缩包等）不请求：正文端点只认文本，请求只会回 400。
  */
 export function useFileContent(
   spaceId: string | undefined,
   path: string | undefined,
-  previewable = true,
+  readable = true,
 ) {
   return useQuery({
     queryKey: queryKeys.file(spaceId ?? '', path ?? ''),
@@ -210,7 +210,7 @@ export function useFileContent(
       api<FileContentResponse>(
         `/spaces/${spaceId}/file?path=${encodeURIComponent(path ?? '')}`,
       ).then((r) => r.file),
-    enabled: previewable && Boolean(spaceId && path),
+    enabled: readable && Boolean(spaceId && path),
     staleTime: 10_000,
   });
 }

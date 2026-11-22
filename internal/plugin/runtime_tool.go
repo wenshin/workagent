@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -68,16 +69,15 @@ type invokeInput struct {
 	// Version 用于隔离 DENO_DIR：同一插件不同版本的缓存不能混，
 	// 否则回滚到旧版本会拿到新版本编译出来的产物。
 	Version string
-	// FS 是文件访问白名单（插件目录 + 清单 fs 声明的空间子目录）。
-	// 它同时喂给沙箱挂载和 deno 的 --allow-read/--allow-write：
+	// Mounts 是文件访问白名单（插件目录 + 清单 fs 声明的空间子目录），
+	// 同时喂给沙箱挂载和 deno 的 --allow-read/--allow-write：
 	// 挂载决定「路径存不存在」，权限决定「deno 允不允许读」，缺一层都算没管。
-	FS sandbox.FS
+	Mounts []sandbox.Mount
 	// NetHosts 是清单声明的出网域名，用来建该插件的代理白名单。
 	NetHosts []string
-	// SpaceRoot 是空间工作区的绝对路径，以 WA_SPACE_DIR 注入：
-	// 文件改直连后，脚本得知道自己的相对路径挂在哪。
-	// 只有清单 fs 声明了空间路径时才非空——空间工作区默认不挂。
-	SpaceRoot string
+	// SpaceMounted 表示清单确实挂了空间路径，只在这种情况下注入 WA_SPACE_DIR：
+	// 文件改直连后，脚本得知道自己的相对路径挂在哪（沙箱内固定是 /space）。
+	SpaceMounted bool
 	// OneShot 为 true 时不起常驻进程：试运行必须跑完就退，
 	// 否则草稿会一直挂在池里，而常驻进程不按空闲回收——改一次就永远占着一个名额，
 	// 还得等草稿变更的 killPrefix 才清掉。
@@ -104,12 +104,23 @@ func residentKey(spaceID, slug, dir string) string {
 // 插件目录对运行时是可写的（作者可能往里写缓存），但那是「每个安装副本一份」，
 // 而 DENO_DIR 要按 slug@version 跨空间复用，两者的生命周期不同。
 func (r *toolRuntime) denoDir(slug, version string) string {
-	name := slug
-	if version != "" {
-		name = slug + "@" + version
-	}
-	return filepath.Join(tool.CacheRoot(), "deno", name)
+	return filepath.Join(tool.CacheRoot(), "deno", denoDirName(slug, version))
 }
+
+// denoDirName 是 DENO_DIR 在租户缓存里的目录名，也是过线时用的 key 尾段。
+func denoDirName(slug, version string) string {
+	if version == "" {
+		return slug
+	}
+	return slug + "@" + version
+}
+
+// RuntimeDirKey 是注入的 SDK 目录相对存储根的 key。
+//
+// 与 app.go 里 RuntimeDir = STORAGE_ROOT/plugin-runtime 是同一个目录：
+// 控制面用它算真实路径，执行体用它解析自己的那一份——两边的挂载点都是
+// /runtime，所以插件里看不到宿主目录。
+const RuntimeDirKey = "plugin-runtime"
 
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
@@ -226,6 +237,10 @@ func (r *toolRuntime) Warm(ctx context.Context, in invokeInput) error {
 }
 
 // procSpec 是启动插件进程的静态参数，一次性与常驻共用。
+//
+// 命令、cwd 与环境变量里的路径全部是沙箱内的固定路径（/plugin、/space、
+// /runtime、/deno）：宿主目录只出现在 Mount.Source 里，过线的是 Key，
+// 插件进程与报错都看不到控制面的存储结构。
 func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, error) {
 	lp, ok := r.fs.(localPathStore)
 	if !ok {
@@ -235,9 +250,11 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	if err != nil {
 		return sandbox.Spec{}, fmt.Errorf("解析插件目录失败: %w", err)
 	}
-	entry := filepath.Join(abs, filepath.FromSlash(in.Entry))
-	entryURL := (&url.URL{Scheme: "file", Path: entry}).String()
-	bootstrap := filepath.Join(r.runtimeDir, "bootstrap.ts")
+	entryURL := (&url.URL{
+		Scheme: "file",
+		Path:   path.Join(sandbox.PluginDir, filepath.ToSlash(in.Entry)),
+	}).String()
+	bootstrap := path.Join(sandbox.RuntimeDir, "bootstrap.ts")
 
 	// 出网：声明了 http.request 或 ws.connect 才有通道。两张名单都空就没有代理，
 	// 沙箱又保持 --unshare-net，等于完全断网。
@@ -250,16 +267,20 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 		proxy = p
 	}
 
-	// 运行时要可读：bootstrap.ts 与 host_sdk.ts 都在 runtimeDir 里，
-	// 不在挂载白名单里的话连启动都做不到（exec 直接 ENOENT）。
-	fs := in.FS
-	fs.Read = dedupePaths(append(append([]string{}, fs.Read...), r.runtimeDir))
-
-	// DENO_DIR 既要读（remote / npm）又要写（gen 编译产物），
-	// 两条白名单都得加，少一条表现为「缓存读到了但编译不了」。
-	denoDirPath := r.denoDir(in.Slug, in.Version)
-	fs.Read = dedupePaths(append(fs.Read, denoDirPath))
-	fs.Write = dedupePaths(append(append([]string{}, fs.Write...), denoDirPath))
+	mounts := append([]sandbox.Mount{}, in.Mounts...)
+	mounts = append(mounts,
+		// 运行时要可读：bootstrap.ts 与 host_sdk.ts 都在 runtimeDir 里，
+		// 不挂的话连启动都做不到（exec 直接 ENOENT）。
+		sandbox.Mount{Source: r.runtimeDir, Key: RuntimeDirKey, Target: sandbox.RuntimeDir},
+		// DENO_DIR 既要读（remote / npm）又要写（gen 编译产物）。
+		sandbox.Mount{
+			Source: r.denoDir(in.Slug, in.Version),
+			Root:   sandbox.RootCache,
+			Key:    path.Join("deno", denoDirName(in.Slug, in.Version)),
+			Target: sandbox.DenoDir,
+			Write:  true,
+		},
+	)
 
 	args := []string{
 		r.deno, "run",
@@ -272,19 +293,20 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	}
 	// lock 是依赖完整性的唯一凭据。有它就必须校验；
 	// --frozen 让「代码与声明不一致」变成硬错误，而不是静默装别的版本。
+	// 存在性在宿主上看，参数用沙箱内路径。
 	if lock := filepath.Join(abs, "deno.lock"); fileExists(lock) {
-		args = append(args, "--lock="+lock, "--frozen")
+		args = append(args, "--lock="+path.Join(sandbox.PluginDir, "deno.lock"), "--frozen")
 	} else {
 		args = append(args, "--no-lock")
 	}
-	args = append(args, denoPermissionFlags(fs, proxy, len(in.WSHosts) > 0)...)
+	args = append(args, denoPermissionFlags(mounts, proxy != "", len(in.WSHosts) > 0)...)
 	args = append(args, bootstrap, entryURL)
 
 	spec := sandbox.Spec{
 		Cmd:       args,
-		Dir:       abs,
+		Dir:       sandbox.PluginDir,
 		Mode:      sandbox.ModeWorkspaceWrite,
-		FS:        fs,
+		Mounts:    mounts,
 		Network:   false,
 		Proxy:     proxy,
 		Timeout:   time.Duration(in.Limits.TimeoutMS) * time.Millisecond,
@@ -305,35 +327,42 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	// 进程环境被 --clearenv 清空过，只有这里列出来的变量能进沙箱。
 	// DENO_DIR 默认落 $HOME/.cache，而 HOME 是每次调用新建的临时目录：
 	// 不显式指定，每次冷启动都要重新解析、重新编译，断网时远程依赖必然失败。
-	spec.Env = append(spec.Env, "DENO_DIR="+denoDirPath)
-	if in.SpaceRoot != "" {
-		spec.Env = append(spec.Env, "WA_SPACE_DIR="+in.SpaceRoot)
+	spec.Env = append(spec.Env, "DENO_DIR="+sandbox.DenoDir)
+	if in.SpaceMounted {
+		spec.Env = append(spec.Env, "WA_SPACE_DIR="+sandbox.SpaceDir)
 	}
-	if proxy != "" {
-		spec.Env = append(spec.Env, "WA_EGRESS_PROXY="+proxy)
-	}
-	// wss:// 只能靠 Deno 自己的代理支持：它读 HTTPS_PROXY，
-	// 且认 unix:/path 这种写法（实测 2.9.4）。
+	// WA_EGRESS_PROXY 由 sandbox 统一注入（指向沙箱内的固定 socket 路径），
+	// 这里只补 Deno 自己认的 HTTPS_PROXY：
+	// wss:// 只能靠 Deno 的代理支持，它读 HTTPS_PROXY，且认 unix:/path 这种写法。
 	// 不声明 ws.connect 就不注入，插件连 new WebSocket 都会直连失败。
 	if proxy != "" && len(in.WSHosts) > 0 {
-		spec.Env = append(spec.Env, "HTTPS_PROXY=unix:"+proxy)
+		spec.Env = append(spec.Env, "HTTPS_PROXY=unix:"+sandbox.EgressProxy)
 	}
 	return spec, nil
 }
 
-// denoPermissionFlags 把同一份 fs 白名单翻译成 deno 的权限参数。
+// denoPermissionFlags 把同一份挂载表翻译成 deno 的权限参数。
 //
 // 沙箱挂载决定「路径存不存在」，这里决定「deno 允不允许读」。只做挂载的话，
 // 一个 --allow-read 全开就能读到挂载进来的所有东西；只做权限的话，
 // 挂载层漏掉的路径又会被 deno 放出去。两层都要，才是同一份声明的两个执行点。
-func denoPermissionFlags(fs sandbox.FS, proxy string, allowWS bool) []string {
-	read := append([]string{}, fs.Read...)
-	write := append([]string{}, fs.Write...)
-	if proxy != "" {
+func denoPermissionFlags(mounts []sandbox.Mount, hasProxy, allowWS bool) []string {
+	var read, write []string
+	for _, m := range mounts {
+		// 可写路径同样要读权限：deno 的两个档位是独立的，
+		// 只给 --allow-write 时连自己目录里的入口文件都读不了。
+		read = append(read, m.Target)
+		if m.Write {
+			write = append(write, m.Target)
+		}
+	}
+	read = dedupePaths(read)
+	write = dedupePaths(write)
+	if hasProxy {
 		// Deno 对 unix socket 的检查是「读 + 写 + net」三件套，
 		// 少一个就是 NotCapable，而不是「连不上」这种能猜到的错。
-		read = append(read, proxy)
-		write = append(write, proxy)
+		read = append(read, sandbox.EgressProxy)
+		write = append(write, sandbox.EgressProxy)
 	}
 	flags := make([]string, 0, 4)
 	if len(read) > 0 {
@@ -343,7 +372,7 @@ func denoPermissionFlags(fs sandbox.FS, proxy string, allowWS bool) []string {
 		flags = append(flags, "--allow-write="+strings.Join(write, ","))
 	}
 	envs := []string{"WA_SPACE_DIR"}
-	if proxy != "" {
+	if hasProxy {
 		envs = append(envs, "WA_EGRESS_PROXY")
 		if allowWS {
 			envs = append(envs, "HTTPS_PROXY")

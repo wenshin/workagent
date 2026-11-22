@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -78,7 +79,13 @@ func (m *Manager) newSourceProvider(ctx context.Context, spaceID, slug, dir stri
 		if err != nil {
 			return nil, err
 		}
-		return d.WithFS(sandbox.FS{Read: []string{root}}), nil
+		// 脚本目录挂到沙箱内的固定路径：argv 与编译错误里出现的都是 /plugin/…，
+		// 不是控制面的存储路径。
+		d = d.WithMounts(
+			[]sandbox.Mount{{Source: root, Key: dir, Target: sandbox.PluginDir}},
+			path.Join(sandbox.PluginDir, filepath.ToSlash(s.Entry)),
+		)
+		return d, nil
 	default:
 		return nil, fmt.Errorf("未知的 source.protocol %q", s.Protocol)
 	}

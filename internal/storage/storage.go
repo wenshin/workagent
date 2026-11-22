@@ -26,6 +26,7 @@ type Entry struct {
 // Storage 抽象文件存储。MVP 用本地 FS，部署期可换 HDFS / S3，业务代码不感知。
 // key 一律使用正斜杠、相对路径，例如 spaces/{space_id}/files/a.txt。
 type Storage interface {
+	// Put 流式写入整个 r；size 是已知字节数，-1 表示未知（实现可以按需忽略）。
 	Put(ctx context.Context, key string, r io.Reader, size int64) (string, error)
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
