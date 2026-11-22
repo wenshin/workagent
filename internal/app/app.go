@@ -440,8 +440,79 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 //
 // 两种形态共用同一套「必须真有隔离」的校验：远端执行体在握手时上报自己实际
 // 探测到的后端（bwrap / sandbox-exec / local），控制面不需要也不可能替它判断。
+// newShellRunner 按运行形态构造执行面。
+//
+// 形态是硬约束，不是「探测到什么用什么」：
+//
+//	server —— 只能远端执行体。服务端节点的内核、镜像与安全上下文都不由我们决定，
+//	          不能假设 bwrap 可用；执行体自己报告没有隔离后端时直接启动失败，
+//	          不存在「容器是唯一边界，先跑起来」的降级档。
+//	client —— 只能本进程起 bwrap。装在用户机器上的 runtime 必须自带真隔离，
+//	          连远端执行体等于把用户目录交给另一个进程。
+//	dev    —— 本机调试与 CI，允许自动探测与无隔离降级（由 SANDBOX_REQUIRE 兜底）。
 func newShellRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
-	if strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "remote") {
+	switch cfg.Role {
+	case config.RoleClient:
+		return newClientRunner(cfg, log)
+	case config.RoleDev:
+		return newDevRunner(cfg, log)
+	default:
+		return newServerRunner(cfg, log)
+	}
+}
+
+// newServerRunner 只接受远端执行体。
+func newServerRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
+	if !strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "remote") {
+		return nil, fmt.Errorf(
+			"服务端（WA_ROLE=server）只能用远端执行体：SANDBOX_BACKEND 必须为 remote（当前 %q）；"+
+				"本机调试请用 WA_ROLE=dev", cfg.SandboxBackend)
+	}
+	client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
+	if err != nil {
+		return nil, fmt.Errorf("远端执行体不可用: %w", err)
+	}
+	// require 恒为 true：执行体报告只有容器、没有 bwrap 时不能启动。
+	// 服务端没有「降级可接受」的档位——那等于把空间隔离寄托在镜像恰好装了 bwrap 上。
+	if err := sandbox.Ensure(client, true); err != nil {
+		return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
+	}
+	log.Info("执行面已就绪", "role", config.RoleServer, "transport", client.Transport(), "backend", client.Name())
+	return client, nil
+}
+
+// newClientRunner 只接受本进程的 bwrap。
+func newClientRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
+	if !strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "local") {
+		return nil, fmt.Errorf(
+			"客户端（WA_ROLE=client）只能用本机沙箱：SANDBOX_BACKEND 必须为 local（当前 %q）",
+			cfg.SandboxBackend)
+	}
+	runner, err := sandbox.NewBwrap()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"客户端要求 bwrap：%w（客户端形态只在 Linux 且内核允许 user namespace 的机器上成立）", err)
+	}
+	log.Info("本地沙箱已就绪", "role", config.RoleClient, "backend", runner.Name())
+	return runner, nil
+}
+
+// newDevRunner 是唯一允许「自动探测 + 无隔离降级」的形态。
+func newDevRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.SandboxBackend)) {
+	case "", "local":
+		runner := sandbox.Detect()
+		if err := sandbox.Ensure(runner, cfg.SandboxRequire); err != nil {
+			return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
+		}
+		if runner.Name() == sandbox.NameLocal {
+			log.Warn("开发模式没有可用的沙箱后端，shell_exec 将不受隔离", "require", cfg.SandboxRequire)
+		} else {
+			log.Info("命令执行沙箱已就绪", "role", config.RoleDev, "backend", runner.Name())
+		}
+		return runner, nil
+	case "remote":
+		// 开发机上想连执行体也允许：调试远端链路时不必改 WA_ROLE。
 		client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
 		if err != nil {
 			return nil, fmt.Errorf("远端执行体不可用: %w", err)
@@ -449,24 +520,11 @@ func newShellRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error
 		if err := sandbox.Ensure(client, cfg.SandboxRequire); err != nil {
 			return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
 		}
-		if !client.Isolated() {
-			log.Warn("远端执行体降级到 local：容器是唯一边界，空间级隔离失效", "require", cfg.SandboxRequire)
-		} else {
-			log.Info("执行面已就绪", "transport", client.Transport(), "backend", client.Name())
-		}
+		log.Info("执行面已就绪", "role", config.RoleDev, "transport", client.Transport(), "backend", client.Name())
 		return client, nil
+	default:
+		return nil, fmt.Errorf("dev 形态下 SANDBOX_BACKEND 只能是 local / remote，当前 %q", cfg.SandboxBackend)
 	}
-
-	runner := sandbox.Detect()
-	if err := sandbox.Ensure(runner, cfg.SandboxRequire); err != nil {
-		return nil, fmt.Errorf("命令执行沙箱不可用: %w", err)
-	}
-	if runner.Name() == sandbox.NameLocal {
-		log.Warn("没有可用的沙箱后端，shell_exec 将不受隔离（仅适合开发机）", "require", cfg.SandboxRequire)
-	} else {
-		log.Info("命令执行沙箱已就绪", "backend", runner.Name())
-	}
-	return runner, nil
 }
 
 // toExecFacts 把执行体的自述转成契约层的结构。

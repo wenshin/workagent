@@ -67,7 +67,9 @@ make run
 cd web && npm install && npm run dev
 ```
 
-首次启动会自动建表、初始化系统空间与内置技能。生产部署请设置 `SANDBOX_REQUIRE=true`，让沙箱降级直接启动失败。
+首次启动会自动建表、初始化系统空间与内置技能。
+
+**执行面由运行形态决定**：`make run` 固定 `WA_ROLE=dev`（本机自动探测 bwrap / sandbox-exec）。部署到服务端时 `WA_ROLE=server`（默认）**只接受远端执行体**——必须配 `SANDBOX_BACKEND=remote`、`SANDBOX_RUNNER_ADDR`、`SANDBOX_RUNNER_TOKEN`，否则启动失败；没有「服务端本机裸跑」这条降级。客户端形态（`WA_ROLE=client`）只接受本进程的 `bwrap`。细节见 [K8s 容器沙箱方案](docs/K8s容器沙箱方案.md)「运行形态与执行面」。
 
 ```bash
 make test     # 单元测试

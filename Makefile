@@ -28,8 +28,9 @@ redis-up:
 pg-down:
 	docker compose down
 
+# 本机调试固定 dev 形态：server 形态强制远端执行体，没有执行体时起不来。
 run:
-	$(GO) run ./cmd/server
+	WA_ROLE=dev $(GO) run ./cmd/server
 
 build:
 	mkdir -p bin && $(GO) build -o bin/server ./cmd/server

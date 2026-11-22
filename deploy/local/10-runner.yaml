@@ -49,8 +49,6 @@ spec:
             - name: http
               containerPort: 8323
           env:
-            - name: SANDBOX_REQUIRE
-              value: "true"
             - name: SANDBOX_AGENT_ROOT
               value: /var/lib/workagent
             # 租户级缓存根目录：与下面的 volumeMount 必须一致。

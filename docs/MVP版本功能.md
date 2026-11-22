@@ -80,7 +80,7 @@ MVP 交付一个**以“空间”为组织单位的 Web Agent 工作台**：用�
 
 | 项 | 现状 | 风险 | 补验方式 |
 | --- | --- | --- | --- |
-| `bwrap` 沙箱后端（Linux） | 参数生成有单测；`--ro-bind / /` 后再 `--bind` workspace 的顺序、`--unshare-*` 组合**未在真机跑过**；`Detect()` 的探针逻辑只在 macOS 上验证过 | 生产是 Linux，`shell_exec` 与脚本插件都跑在这个后端上。若探测误判成可用、实际起不来，表现为「命令一律失败」；若误降级，表现为「没隔离」——后者更危险 | 在一台 Linux（或 `docker run --privileged`）上跑 `go test ./internal/sandbox/ -run TestBwrap`，并手工确认：① 根目录不可写 ② workspace 可写 ③ 无网 ④ `Detect()` 返回 `bwrap`。**在此之前生产必须 `SANDBOX_REQUIRE=true`**，让降级直接启动失败而不是裸跑 |
+| `bwrap` 沙箱后端（Linux） | 参数生成有单测；`--ro-bind / /` 后再 `--bind` workspace 的顺序、`--unshare-*` 组合**未在真机跑过**；`Detect()` 的探针逻辑只在 macOS 上验证过 | 生产是 Linux，`shell_exec` 与脚本插件都跑在这个后端上。若探测误判成可用、实际起不来，表现为「命令一律失败」；若误降级，表现为「没隔离」——后者更危险 | 在一台 Linux（或 `docker run --privileged`）上跑 `go test ./internal/sandbox/ -run TestBwrap`，并手工确认：① 根目录不可写 ② workspace 可写 ③ 无网 ④ `Detect()` 返回 `bwrap`。**在此之前生产只能走 `WA_ROLE=server` + 远端执行体**（服务端不接受本机后端，也不存在裸跑降级）；本机验证用 `WA_ROLE=dev` 打开 `SANDBOX_REQUIRE=true`，让降级直接启动失败 |
 | 沙箱后端 `docker` | 未实现（`Runner` 接口已预留） | 多租户/无 user namespace 的机器没有隔离手段 | 后续加 `docker run --network none --read-only -v ws:ws` 实现，用同一套 `Runner` 接口 |
 | `deno` 运行时 | 脚本搜索源 `search.script` 依赖它；本机验证通过（2.9.4） | 生产镜像里没有 deno 时该特性静默回退到 spec/内置 provider（有告警日志），容易被误认为「配置没生效」 | 决定是否把 deno 打进镜像；若打，锁版本并在启动日志打印 `deno --version` |
 

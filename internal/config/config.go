@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+// 运行形态。三档互斥，由部署显式声明，不按「探测到什么」推断——
+// 推断会让生产环境的沙箱形态取决于镜像里有没有装 bwrap。
+const (
+	// RoleServer 是服务端：沙箱只能走远端执行体。
+	RoleServer = "server"
+	// RoleClient 是客户端本地 runtime：沙箱只能是本进程的 bwrap。
+	RoleClient = "client"
+	// RoleDev 是开发机：自动探测，允许无隔离降级。
+	RoleDev = "dev"
+)
+
 // Config 保存服务运行所需的全部配置，全部来源于环境变量（支持 .env 文件）。
 type Config struct {
 	HTTPAddr   string
@@ -78,14 +89,22 @@ type Config struct {
 	// 空表示不预装。改动只影响之后新建的空间。
 	PluginsDefaultInstall []string
 
+	// Role 是运行形态，决定沙箱能且只能用哪一种（docs/本地空间与双端架构.md §5.7）：
+	//   server —— 服务端：只能连远端执行体（SANDBOX_BACKEND=remote）。
+	//   client —— 客户端本地 runtime：只能在本进程起 bwrap。
+	//   dev    —— 开发机：自动探测 bwrap → sandbox-exec → local，仅本机调试与 CI。
+	// 三档互斥且必须显式声明：沙箱形态不能取决于「这台机器上恰好装了什么」，
+	// 否则同一份配置换台机器就从隔离变成裸跑。
+	Role string
+
 	// SandboxRequire 要求命令执行必须有真实隔离后端（bwrap / sandbox-exec）。
-	// 生产环境打开：探测不到就启动失败，而不是悄悄退化成裸跑。
-	// 开发机保持默认（false），降级到 local 时日志里会有告警。
+	// 只对 dev 生效：server 与 client 各自强制要求隔离，不受这个开关影响。
 	SandboxRequire bool
 
-	// SandboxBackend 选择执行面形态：
-	//   local  —— 在本进程里探测 bwrap / sandbox-exec（单机默认）
-	//   remote —— 连 SANDBOX_RUNNER_ADDR 上的执行体（容器化部署）
+	// SandboxBackend 选择执行面形态，取值由 Role 决定：
+	//   server —— 只能是 remote（默认）
+	//   client —— 只能是 local（默认），且必须是 bwrap
+	//   dev    —— local（自动探测）或 remote
 	SandboxBackend string
 	// SandboxRunnerAddr 是远端执行体地址（host:port 或完整 URL）。
 	SandboxRunnerAddr string
@@ -161,6 +180,20 @@ type Config struct {
 // Load 读取 .env（存在时）并解析环境变量。
 func Load() (*Config, error) {
 	_ = loadDotEnv(".env")
+
+	// 形态先定，后面的默认值都跟着它走：同一份 .env 换台机器就从隔离变成裸跑，
+	// 是比「没配」更难查的故障。
+	role := strings.ToLower(strings.TrimSpace(getenv("WA_ROLE", RoleServer)))
+	switch role {
+	case RoleServer, RoleClient, RoleDev:
+	default:
+		return nil, fmt.Errorf("WA_ROLE 只能是 server / client / dev，当前 %q", role)
+	}
+	// 服务端没有本机执行面，默认连执行体；客户端与开发机默认本机起进程。
+	backendDefault := "remote"
+	if role != RoleServer {
+		backendDefault = "local"
+	}
 
 	ttl, err := time.ParseDuration(getenv("SESSION_TTL", "168h"))
 	if err != nil {
@@ -345,9 +378,11 @@ func Load() (*Config, error) {
 
 		PluginsDefaultInstall: splitList(getenv("PLUGIN_DEFAULT_INSTALL", "")),
 
+		Role: role,
+
 		SandboxRequire: getenv("SANDBOX_REQUIRE", "false") == "true",
 
-		SandboxBackend:     getenv("SANDBOX_BACKEND", "local"),
+		SandboxBackend:     getenv("SANDBOX_BACKEND", backendDefault),
 		SandboxRunnerAddr:  getenv("SANDBOX_RUNNER_ADDR", ""),
 		SandboxRunnerToken: getenv("SANDBOX_RUNNER_TOKEN", ""),
 

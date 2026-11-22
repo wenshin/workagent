@@ -32,19 +32,17 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
 
-	require := env("SANDBOX_REQUIRE", "true") == "true"
 	sandbox.SetExtraRead(splitList(env("SANDBOX_READ_EXTRA", "")))
 
-	runner := sandbox.Detect()
-	if err := sandbox.Ensure(runner, require); err != nil {
-		log.Error("执行体没有可用的隔离后端", "err", err, "require", require)
+	// 执行体是服务端唯一的执行面，只接受 bwrap：
+	// 容器里不是 Linux 猜错平台，就是镜像没装 bubblewrap——两种情况都该启动失败，
+	// 而不是退回「容器即边界」。服务端不存在无隔离的合法档位（WA_ROLE=server 同理）。
+	runner, err := sandbox.NewBwrap()
+	if err != nil {
+		log.Error("执行体必须用 bwrap：容器内的空间级隔离没有替代品", "err", err)
 		os.Exit(1)
 	}
-	if runner.Name() == sandbox.NameLocal {
-		log.Warn("执行体降级到 local：容器成为唯一边界，空间级隔离失效", "require", require)
-	} else {
-		log.Info("执行体已就绪", "backend", runner.Name(), "root", *root)
-	}
+	log.Info("执行体已就绪", "backend", runner.Name(), "root", *root)
 
 	token := env("SANDBOX_RUNNER_TOKEN", "")
 	if token == "" {

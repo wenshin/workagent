@@ -87,7 +87,6 @@ ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
     MISE_PYTHON_COMPILE=false \
     MISE_YES=1 \
     MISE_TRUSTED_CONFIG_PATHS=/ \
-    SANDBOX_REQUIRE=true \
     SANDBOX_AGENT_ADDR=:8323 \
     SANDBOX_AGENT_ROOT=/var/lib/workagent
 

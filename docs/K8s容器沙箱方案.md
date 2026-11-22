@@ -49,6 +49,18 @@
 
 代码里现在只有 `Tenant string`（企业名称，来自 `CorpName`，仅用于提示词），没有租户实体。上多租户前需要补 `tenant_id` 并让空间挂在租户下。
 
+### 运行形态与执行面
+
+执行面由 `WA_ROLE` 决定，**不按「这台机器探测到什么」推断**（`internal/app/app.go` 的 `newShellRunner` 是唯一装配点）：
+
+| WA_ROLE | 允许的执行面 | 硬约束 |
+|---|---|---|
+| `server`（默认） | 只能连远端执行体 | `SANDBOX_BACKEND` 必须是 `remote`；执行体上报的后端不是真隔离就**启动失败**，没有「容器是唯一边界」的降级档 |
+| `client`（本地 runtime） | 只能在本进程起 bwrap | 探测不到 bwrap 直接失败，不退回 sandbox-exec / 裸跑，也不允许连远端执行体 |
+| `dev`（`make run` 固定带） | 自动探测 bwrap → sandbox-exec → local，或显式 `remote` | 唯一允许无隔离降级的形态，只用于本机调试与 CI |
+
+两边的理由对称：服务端节点的内核、镜像、安全上下文都不由我们决定，不能假设 bwrap 可用；客户端的用户目录不能交给另一个进程执行。`SANDBOX_REQUIRE` 只对 `dev` 生效——server / client 各自强制要求隔离，不受它影响。
+
 ### 两套集群
 
 - 沙箱集群：跑执行体，节点可以被容器逃逸类攻击影响
