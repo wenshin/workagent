@@ -246,6 +246,7 @@ function statusLabel(status: ToolCallRecord['status']) {
   if (status === 'ok') return '成功';
   if (status === 'approval') return '待审批';
   if (status === 'denied') return '已拒绝';
+  if (status === 'expired') return '未执行';
   return '失败';
 }
 
@@ -271,12 +272,22 @@ function riskLabel(risk: number) {
   return '只读';
 }
 
-/** 徽标太短，悬停时把完整含义补上。 */
-function riskHint(risk: number) {
-  if (risk >= 4) return '高危：涉及凭证或向外部发送数据';
-  if (risk === 3) return '写入：会改动数据';
-  if (risk === 2) return '查询：只读，但会访问外部系统或消耗额度';
-  return '只读：不改变任何数据';
+/**
+ * 徽标太短，悬停时把完整含义补上。
+ *
+ * label 是工具给的具体说法（脚本执行 / 网络请求…）。等级仍然要写出来：
+ * 「脚本执行」说明在做什么，「会改动数据」说明为什么要留意它——两件事。
+ */
+function riskHint(risk: number, label?: string) {
+  const detail =
+    risk >= 4
+      ? '涉及凭证或向外部发送数据'
+      : risk === 3
+        ? '会改动数据'
+        : risk === 2
+          ? '只读，但会访问外部系统或消耗额度'
+          : '不改变任何数据';
+  return `${label || riskLabel(risk)}：${detail}`;
 }
 
 /**
@@ -414,8 +425,11 @@ function ToolCard({
       // 等待期间的「已提交」由卡片自己渲染，终态仍以回执为准。
       markApprovalDecided(approval.sessionId, tool.id, decision);
       if (out.resumed) {
-        // 当时的执行体已经不在了：决策已落库，服务端正从断点接着跑
-        Toast.info('这一轮已中断，正在从断点继续');
+        // 当时的执行体已经不在了：决策已落库，服务端正从断点接着跑。
+        //
+        // 不弹 toast：审批就是暂停点，暂停过的轮次必然「中断过一次」再续跑，
+        // 这是正常流程而不是异常。弹出来等于每次点同意都告诉用户「刚才出事了」，
+        // 而接下来气泡里就会继续出字，自相矛盾。resumed 只用来触发挥手。
         onResume?.();
       }
     } catch (err) {
@@ -428,12 +442,14 @@ function ToolCard({
   // 风险等级常驻：不只出现在审批卡上。翻历史时「这一步是写入」比
   // 「成功」有用得多，而且不审批的调用（fs 写、只读查询）同样需要这个标注。
   const risk = approval?.risk || tool.risk || 0;
+  // 具体说法优先：同样是「写入」，脚本执行 / 网络请求 / 写文件该分得开
+  const badge = tool.riskLabel || approval?.riskLabel || '';
   const head = (
     <>
       <span className="msg-tool-name">{tool.name}</span>
       {risk > 0 ? (
-        <span className={`msg-risk msg-risk-${risk}`} title={riskHint(risk)}>
-          {riskLabel(risk)}
+        <span className={`msg-risk msg-risk-${risk}`} title={riskHint(risk, badge)}>
+          {badge || riskLabel(risk)}
         </span>
       ) : null}
       <span className="msg-tool-status">{statusLabel(tool.status)}</span>
@@ -456,7 +472,13 @@ function ToolCard({
   const approvalBar = approval ? (
     <div className="msg-approval">
       <div className="msg-approval-head">{approval.reason || '该操作需要人工确认'}</div>
-      {approval.detail ? <pre className="msg-approval-detail">{approval.detail}</pre> : null}
+      {approval.detail ? (
+        <>
+          {/* 裸 JSON 对用户是天书：先说明这块是什么，再给内容 */}
+          <div className="msg-tool-label">这次要执行的内容</div>
+          <pre className="msg-approval-detail">{prettyJSON(approval.detail)}</pre>
+        </>
+      ) : null}
       <div className="msg-approval-actions">
         <Button
           size="small"
@@ -645,8 +667,16 @@ function toBlocks(items: StreamItem[]): TurnBlock[] {
   return blocks;
 }
 
-function toToolRecord(p: MessageToolPart): ToolCallRecord {
-  return {
+/**
+ * 落库的工具段 → 卡片记录。
+ *
+ * 待审批卡（status=approval）只是那一轮暂停时的证据：真正能点的是服务端的待办。
+ * 所以这里按 callId 把待办挂回去——挂上了才是「可以点的一张卡」；挂不上说明这条
+ * 待办已经处理或作废（批过、拒过、被下一轮对话顶掉），卡片必须改成「未执行」，
+ * 否则刷新历史会看到一张永远停在「待审批」、还没有按钮的死卡。
+ */
+function toToolRecord(p: MessageToolPart, byCall?: Map<string, ApprovalInfo>, busy?: boolean): ToolCallRecord {
+  const record: ToolCallRecord = {
     id: p.id,
     name: p.name,
     args: p.args,
@@ -654,13 +684,20 @@ function toToolRecord(p: MessageToolPart): ToolCallRecord {
     status: p.status,
     duration_ms: p.duration_ms,
     risk: p.risk,
+    riskLabel: p.risk_label,
   };
+  if (record.status !== 'approval') return record;
+  const live = byCall?.get(record.id);
+  if (live) return { ...record, approval: live };
+  // 还有一轮在跑：这条调用正在被续跑补上，卡片留着「执行中」，按钮不在这里重复出现
+  if (busy) return { ...record, status: 'running' };
+  return { ...record, status: 'expired' };
 }
 
-function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
+function toRecords(parts?: MessagePart[], byCall?: Map<string, ApprovalInfo>, busy?: boolean): ToolCallRecord[] {
   const out: ToolCallRecord[] = [];
   for (const p of parts ?? []) {
-    if (p.type === 'tool') out.push(toToolRecord(p));
+    if (p.type === 'tool') out.push(toToolRecord(p, byCall, busy));
   }
   return out;
 }
@@ -671,10 +708,10 @@ function toRecords(parts?: MessagePart[]): ToolCallRecord[] {
  * 新消息的 parts 里带思考段与正文段，顺序就是当时的真实顺序；老消息只有工具段，
  * 返回 null，交给「思考置顶 + 工具分组 + 正文」那套分组渲染。
  */
-function toItems(parts?: MessagePart[]): StreamItem[] | null {
+function toItems(parts?: MessagePart[], byCall?: Map<string, ApprovalInfo>, busy?: boolean): StreamItem[] | null {
   if (!parts || !parts.some((p) => p.type !== 'tool')) return null;
   return parts.map((p) => {
-    if (p.type === 'tool') return { kind: 'tool' as const, tool: toToolRecord(p) };
+    if (p.type === 'tool') return { kind: 'tool' as const, tool: toToolRecord(p, byCall, busy) };
     if (p.type === 'plan') return { kind: 'plan' as const, plan: { goal: p.goal, items: p.items } };
     return { kind: p.type, text: p.text };
   });
@@ -816,6 +853,8 @@ function AssistantBody({
   onSend,
   onResume,
   onOpenFile,
+  approvals,
+  busy,
 }: {
   content?: string;
   reasoning?: string;
@@ -828,10 +867,18 @@ function AssistantBody({
   onSend?: (content: string) => void;
   onResume?: () => void;
   onOpenFile?: (path: string) => void;
+  /** 服务端仍挂着的待办：挂到历史里的待审批卡上，按钮就长在原位 */
+  approvals?: ApprovalInfo[];
+  /** 这个会话还有一轮在跑：待审批卡正在被续跑补上，别标成「未执行」 */
+  busy?: boolean;
 }) {
-  const tools = toRecords(parts);
+  const byCall = useMemo(
+    () => new Map((approvals ?? []).map((a) => [a.callId, a])),
+    [approvals],
+  );
+  const tools = toRecords(parts, byCall, busy);
   // 流式与历史共用同一套渲染：历史消息里新消息带时间线，老消息只有工具段
-  const timeline = items ?? toItems(parts);
+  const timeline = items ?? toItems(parts, byCall, busy);
   const blocks = timeline ? toBlocks(timeline) : null;
   const hasBody = blocks ? blocks.length > 0 : Boolean(content) || tools.length > 0;
   // 写入清单在两种渲染路径下都从工具回执推导：老消息没有时间线时 tools 就是全量
@@ -983,6 +1030,19 @@ export default function ChatPanel({
     (m) => !m.streaming || Boolean(m.content || m.reasoning || m.parts?.length),
   );
   const lastVisible = visibleMessages[visibleMessages.length - 1];
+
+  // 已经画在历史卡片上的待办不再单独出一张：同一个调用出现两张卡（一张能点、
+  // 一张点不动），用户不知道点哪个，也说不清到底批没批过。
+  const parkedCalls = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of visibleMessages) {
+      for (const p of m.parts ?? []) {
+        if (p.type === 'tool' && p.status === 'approval') set.add(p.id);
+      }
+    }
+    return set;
+  }, [visibleMessages]);
+  const looseApprovals = pendingApprovals.filter((a) => !parkedCalls.has(a.callId));
 
   // 流结束的瞬间 stream 变 null，而这一轮回复还没落库：此时若立刻卸载实时气泡，列表高度
   // 会先塌回去、等消息拉回来再长出来，滚动条看上去就是「先跳到顶、再回到底」。
@@ -1370,6 +1430,8 @@ export default function ChatPanel({
                     onSend={continueRun}
                     onResume={onResume}
                     onOpenFile={onOpenFile}
+                    approvals={pendingApprovals}
+                    busy={Boolean(liveView)}
                   />
                 ) : m.source === 'task_brief' ? (
                   // 任务委托里有代码与编号清单，按 Markdown 渲染；普通输入仍走纯文本，避免误把用户打的符号当语法
@@ -1440,14 +1502,15 @@ export default function ChatPanel({
 
         {/* 已暂停的轮次：审批即中断，卡片不在流式气泡里了，但待办还在。
             不点它，会话就一直停在这里；点同意由服务端从断点续跑。
-            liveView 还在时不画：那一轮的气泡里已经有一张同样的卡了。 */}
-        {pendingApprovals.length > 0 && !liveView ? (
+            liveView 还在时不画：那一轮的气泡里已经有一张同样的卡了。
+            历史卡片上已经挂上的待办也不重复画（见 looseApprovals）。 */}
+        {looseApprovals.length > 0 && !liveView ? (
           <div className="chat-msg chat-msg-assistant">
             <div className="chat-msg-meta">
               <span>Agent</span>
               <span className="chat-msg-time">已暂停，等待确认</span>
             </div>
-            {pendingApprovals.map((a) => (
+            {looseApprovals.map((a) => (
               <ToolCard
                 key={a.id}
                 tool={{
@@ -1456,6 +1519,7 @@ export default function ChatPanel({
                   args: '',
                   status: 'approval',
                   risk: a.risk || undefined,
+                  riskLabel: a.riskLabel || undefined,
                   approval: a,
                 }}
                 spaceId={session.space_id}

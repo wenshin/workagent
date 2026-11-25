@@ -1063,6 +1063,11 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
   color: var(--semi-color-warning);
 }
 
+/* 历史回放里没等到回执、待办也已消失的调用：既没执行也没在等人，弱化处理 */
+.msg-tool-expired .msg-tool-status {
+  color: var(--semi-color-text-3);
+}
+
 .msg-tool-time {
   margin-left: auto;
   font-size: 12px;
@@ -1077,8 +1082,11 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
 
 .msg-approval-head {
   font-size: 13px;
+  line-height: 1.6;
   color: var(--semi-color-text-0);
   margin-bottom: 8px;
+  /* 域名列表可能很长：一行放不下要能换，不能撑破卡片 */
+  word-break: break-word;
 }
 
 .msg-approval-detail {
@@ -2484,6 +2492,82 @@ body[theme-mode='dark'] .semi-button-primary.semi-button-borderless {
 
 .publish-required {
   color: var(--semi-color-danger);
+}
+
+/* 审批级别：三档并排对照，点哪张就是选哪档 */
+.approval-levels {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.approval-level {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--semi-color-border);
+  border-radius: 6px;
+  background: var(--semi-color-fill-0);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.approval-level:hover {
+  border-color: var(--semi-color-primary-light-active);
+}
+
+.approval-level.is-active {
+  border-color: var(--semi-color-primary);
+  background: var(--semi-color-primary-light-default);
+}
+
+.approval-level-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--semi-color-text-1);
+}
+
+.approval-level-now {
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--semi-color-primary);
+  background: var(--semi-color-primary-light-hover);
+}
+
+.approval-level-help {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--semi-color-text-2);
+}
+
+/* 字段的事实补充（如「这个插件能访问的网站」）。
+   刻意不用灰底圆角块：那样和下面可点的档位卡片长得一样，用户会去点它。
+   左侧竖线表达「这是说明，不是选项」，域名可能很长所以要能折行。 */
+.publish-note {
+  padding: 2px 0 2px 8px;
+  border-left: 2px solid var(--semi-color-primary-light-active);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--semi-color-text-1);
+  word-break: break-all;
+}
+
+/* 「不需要用户审批」是唯一会让你失去人工关卡的选项，选中时用危险色 */
+.approval-level.is-danger.is-active {
+  border-color: var(--semi-color-danger);
+  background: var(--semi-color-danger-light-default, var(--semi-color-fill-1));
+}
+
+.approval-level.is-danger.is-active .approval-level-now {
+  color: var(--semi-color-danger);
+  background: var(--semi-color-danger-light-hover, var(--semi-color-fill-2));
 }
 
 /* ---- 插件面板 ---- */

@@ -230,6 +230,7 @@ function buildHandlers(
           detail: req.detail,
           reason: req.reason,
           risk: req.risk,
+          riskLabel: req.riskLabel,
         };
         const idx = v.items.findIndex((item) => item.kind === 'tool' && item.tool.id === req.callId);
         if (idx < 0) {
@@ -396,6 +397,7 @@ export function toApprovalInfo(a: PendingApproval, sessionId: string) {
     detail: a.detail,
     reason: a.reason,
     risk: a.risk,
+    riskLabel: a.risk_label,
   };
 }
 

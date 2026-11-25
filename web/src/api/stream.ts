@@ -16,6 +16,7 @@ export interface StreamHandlers {
     detail: string;
     reason: string;
     risk: number;
+    riskLabel?: string;
   }) => void;
   onDone?: (payload: { message: ChatMessage; session: ChatSession }) => void;
   onError?: (message: string) => void;
@@ -38,6 +39,8 @@ interface StreamPayload {
   summary?: string;
   status?: string;
   risk?: number;
+  /** tool.call / tool.result / approval.req：具体动作标签 */
+  risk_label?: string;
   duration_ms?: number;
   approval_id?: string;
   timeout_s?: number;
@@ -68,6 +71,8 @@ function toToolRecord(payload: StreamPayload): ToolCallRecord {
     // 风险等级随 tool.call / tool.result 一起下发：等着看审批结果的人，
     // 看到「L4 外发」比看到「执行中」更有用
     risk: payload.risk || undefined,
+    // 等级之外的具体说法（脚本执行 / 网络请求…），徽标文案优先用它
+    riskLabel: payload.risk_label || undefined,
   };
 }
 
@@ -101,6 +106,7 @@ function handleEvent(event: string, payload: StreamPayload, handlers: StreamHand
         detail: payload.detail ?? '',
         reason: payload.reason ?? '',
         risk: payload.risk ?? 0,
+        riskLabel: payload.risk_label || undefined,
       });
       break;
     case 'message.done':

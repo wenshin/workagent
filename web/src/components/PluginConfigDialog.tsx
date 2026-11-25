@@ -15,6 +15,25 @@ import { usePluginConfig, useUpdatePluginConfig } from '../api/hooks';
 
 const { Text } = Typography;
 
+/** 审批档位是平台内建字段，键名与后端 tool.ApprovalPolicyKey 一致。 */
+const APPROVAL_POLICY_KEY = 'approval_policy';
+/** 最松的一档：选中它等于不再有人工关卡，视觉上要和另一档区分开。 */
+const APPROVAL_OFF = 'off';
+/** 界面第一档：按清单声明拦有风险的调用，「需要用户审批」就是它。 */
+const APPROVAL_DECLARED = 'declared';
+/** 已从界面移除的旧档位：每次都问。旧配置仍按它执行，只会更严。 */
+const APPROVAL_ALWAYS = 'always';
+
+/**
+ * 把存储值映射到界面上的档位。
+ *
+ * 只影响高亮，不改提交值：always 若被改写成 declared，用户只改了个 AppKey
+ * 点保存，插件就从「每次都问」静默放宽成「只拦有风险的调用」。
+ */
+function approvalOptionOf(value: string) {
+  return value === APPROVAL_ALWAYS ? APPROVAL_DECLARED : value;
+}
+
 interface Props {
   visible: boolean;
   spaceId?: string;
@@ -24,7 +43,7 @@ interface Props {
 }
 
 /**
- * 已安装插件的空间级配置。
+ * 插件在当前空间的配置：已安装件写安装记录，未发布的草稿写草稿记录。
  *
  * 字段定义来自后端：平台内建的那几项（MCP 地址、审批档位、shell 名单）
  * 加清单 config 段声明的通用项，前端只按 type 渲染，不写死字段名。
@@ -80,10 +99,12 @@ export default function PluginConfigDialog({ visible, spaceId, slug, name, onClo
         />
       ) : (
         <div className="publish-form">
-          <Text type="tertiary" size="small">
+          {/* 这句话管整个弹窗（作用范围与生效时机），字段的说明管单个开关：
+              用更淡的层级，避免两句小字看起来是同一类信息 */}
+          <Text type="quaternary" size="small">
             {data.scope === 'global'
-              ? '平台内置件：这份配置对全部空间生效（内置件只装在系统空间一份）。'
-              : '只影响当前空间，不修改发布快照；保存后立即重建运行时。'}
+              ? '平台内置件：这份配置对全部空间生效。'
+              : '只对当前空间生效，保存后立即生效。'}
           </Text>
           {data.fields.map((field) => {
             // 选中项的说明随选择变化：档位的三个选项后果差别很大，
@@ -95,6 +116,14 @@ export default function PluginConfigDialog({ visible, spaceId, slug, name, onClo
                   {field.label}
                   {field.required ? <span className="publish-required"> *</span> : null}
                 </label>
+                {/* 说明与事实都放在选项前面：先知道「这个开关管什么、它能碰什么」，
+                    再看选哪一档。放在控件下面会被读成脚注，没人往下看。 */}
+                {field.help ? (
+                  <Text type="tertiary" size="small">
+                    {field.help}
+                  </Text>
+                ) : null}
+                {field.note ? <div className="publish-note">{field.note}</div> : null}
                 {field.type === 'boolean' ? (
                   <Switch
                     checked={values[field.key] === 'true'}
@@ -102,6 +131,32 @@ export default function PluginConfigDialog({ visible, spaceId, slug, name, onClo
                       setValues((prev) => ({ ...prev, [field.key]: v ? 'true' : 'false' }))
                     }
                   />
+                ) : field.type === 'select' && field.key === APPROVAL_POLICY_KEY ? (
+                  // 只留卡片：上面再放一个下拉框就是同一件事两个控件，用户会不确定
+                  // 「到底点哪个才算保存」，而且下拉框只能看到当前选中那一句说明。
+                  <div className="approval-levels" role="radiogroup" aria-label={field.label}>
+                    {(field.options ?? []).map((op) => {
+                      const active = approvalOptionOf(values[field.key] ?? '') === op.value;
+                      return (
+                        <button
+                          key={op.value}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          className={`approval-level${active ? ' is-active' : ''}${
+                            op.value === APPROVAL_OFF ? ' is-danger' : ''
+                          }`}
+                          onClick={() => setValues((prev) => ({ ...prev, [field.key]: op.value }))}
+                        >
+                          <span className="approval-level-head">
+                            {op.label}
+                            {active ? <span className="approval-level-now">当前</span> : null}
+                          </span>
+                          {op.help ? <span className="approval-level-help">{op.help}</span> : null}
+                        </button>
+                      );
+                    })}
+                  </div>
                 ) : field.type === 'select' ? (
                   <Select
                     value={values[field.key] || field.options?.[0]?.value}
@@ -135,14 +190,9 @@ export default function PluginConfigDialog({ visible, spaceId, slug, name, onClo
                     onChange={(v) => setValues((prev) => ({ ...prev, [field.key]: v }))}
                   />
                 )}
-                {selected?.help ? (
+                {field.key !== APPROVAL_POLICY_KEY && selected?.help ? (
                   <Text type="tertiary" size="small">
                     {selected.help}
-                  </Text>
-                ) : null}
-                {field.help ? (
-                  <Text type="tertiary" size="small">
-                    {field.help}
                   </Text>
                 ) : null}
               </div>

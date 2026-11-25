@@ -58,13 +58,23 @@ function ApprovalTag({
     // 技能 / 组件 / 智能体不进审批链路，没有档位可显示
     return null;
   }
+  // 三个标签用同一句式回答「会不会拦我」：每次都问 / 有风险才问 / 不问。
+  // 「按声明」「调用」都是内部口径，用户看不出到底什么时候弹框，所以不上面。
   const view = {
-    always: { color: 'amber' as const, text: '审批：每次确认', hint: '每次调用都先弹确认框' },
-    off: { color: 'red' as const, text: '审批：不确认', hint: '直接执行，不再弹确认框' },
+    always: {
+      color: 'amber' as const,
+      text: '确认：每次都问',
+      hint: '不管做什么都先弹框问你，只读查询也一样',
+    },
     declared: {
       color: 'grey' as const,
-      text: '审批：按声明',
-      hint: '声明了改数据、或命令命中名单时才确认',
+      text: '确认：有风险才问',
+      hint: '只有会改动数据的操作（发消息、删除、改记录）才弹框；只读查询直接执行',
+    },
+    off: {
+      color: 'red' as const,
+      text: '确认：不问',
+      hint: '直接执行，不再弹框；插件仍只能访问允许的网站、只能改本空间的文件',
     },
   }[level];
   if (!view) return null;
@@ -358,7 +368,14 @@ export default function PluginPanel({ space }: Props) {
                     </Button>
                   ) : null}
 
-                  {!local && item.configurable && (item.origin !== 'system' || isSystemSpace) ? (
+                  {/*
+                    草稿也要能配置：启用的草稿就是这个空间真正在用的插件，
+                    但配置只存在安装记录上时，需要参数的插件（AppKey、服务地址）
+                    在草稿态永远是「未就绪」——作者得先发布安装才能填参数。
+                    保存需要空间 manage，所以只有管理员看得到这个入口。 */}
+                  {item.configurable &&
+                  (!local || (canManage && item.enabled)) &&
+                  (item.origin !== 'system' || isSystemSpace) ? (
                     <Button
                       size="small"
                       theme="borderless"

@@ -99,8 +99,14 @@ export interface ChatSession {
 
 export type MessageRole = 'user' | 'assistant' | 'system';
 
-/** 工具调用结局：与后端 tool.InvokeStatus 一致 */
-export type ToolStatus = 'running' | 'ok' | 'denied' | 'approval' | 'error';
+/**
+ * 工具调用结局：与后端 tool.InvokeStatus 一致。
+ *
+ * expired 只出现在历史回放里：落库的 parts 里还挂着「待审批」，但服务端已经没有
+ * 对应的待办了（批过、拒过、或被新一轮对话作废）。这种卡既没有按钮也没有回执，
+ * 再显示「待审批」就会让人觉得它还在等人。
+ */
+export type ToolStatus = 'running' | 'ok' | 'denied' | 'approval' | 'error' | 'expired';
 
 /**
  * 一次待确认的工具调用（approval.req）。
@@ -118,6 +124,8 @@ export interface ApprovalInfo {
   detail: string;
   reason: string;
   risk: number;
+  /** 具体动作标签（网络请求 / 写文件 / 脚本执行…）；为空时退回等级文案 */
+  riskLabel?: string;
 }
 
 /** 服务端还没处理的确认（GET /sessions/{id}/approvals） */
@@ -129,6 +137,7 @@ export interface PendingApproval {
   detail: string;
   reason: string;
   risk: number;
+  risk_label?: string;
 }
 
 /** 一次工具调用的完整状态 */
@@ -141,6 +150,12 @@ export interface ToolCallRecord {
   duration_ms?: number;
   /** 风险等级（L1~L4），由工具声明给出；只用于展示，不决定是否审批 */
   risk?: number;
+  /**
+   * 比等级更具体的动作标签（网络请求 / 写文件 / 脚本执行…）。
+   * 等级只有四档，`curl` / `python x.py` / `echo a > b` 都落在「写入」上；
+   * 徽标文案优先用它，为空时退回等级文案，颜色始终按 risk。
+   */
+  riskLabel?: string;
   /** 命中审批规则时挂在卡片上，用户点按钮后由 tool.result 更新结局 */
   approval?: ApprovalInfo;
   /**
@@ -185,6 +200,8 @@ export interface MessageToolPart {
   duration_ms?: number;
   /** 风险等级：历史消息回看时也要能看出这一步改了什么 */
   risk?: number;
+  /** 具体动作标签，与实时流同一口径 */
+  risk_label?: string;
 }
 
 /** 消息时间线上的思考 / 正文段：与工具段按发生顺序交错 */
@@ -535,6 +552,8 @@ export interface PluginConfigField {
   required: boolean;
   placeholder?: string;
   help?: string;
+  /** 字段下方的事实补充，不随选项变化（如「这个插件能访问的网站」） */
+  note?: string;
   /** select 型字段的选项；help 说明选它之后会发生什么 */
   options?: Array<{ value: string; label: string; help?: string }>;
   /** 安装方没填过时的生效值：留空就是它 */
