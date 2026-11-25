@@ -82,7 +82,10 @@ type liveRun struct {
 
 	runID  string
 	userID string
-	cancel context.CancelFunc
+	// sessionID 让「这个会话有没有在跑」能按会话查。空值表示调用方没提供
+	// （老的内部续跑路径），那种情况只是不进会话索引，不影响 run 本身。
+	sessionID string
+	cancel    context.CancelFunc
 	// reason 记录是「谁」掐断了这一轮：显式取消与墙钟到点要能区分
 	reason string
 	// sink 为空表示不落缓存（未配置 Redis 且走内存实现时也可能为空）
@@ -382,14 +385,24 @@ func (l *liveRun) finish() {
 type liveRuns struct {
 	mu sync.Mutex
 	m  map[string]*liveRun
+	// bySession 是同一批 run 按会话索引：判断「这个会话有没有在跑」必须按会话查，
+	// 只按 run_id 查等于没查。外部渠道投递进来时靠它拒绝并发执行
+	// （两个渠道进程同时投同一个人的会话）。
+	bySession map[string]*liveRun
 }
 
-func newLiveRuns() *liveRuns { return &liveRuns{m: map[string]*liveRun{}} }
+func newLiveRuns() *liveRuns {
+	return &liveRuns{m: map[string]*liveRun{}, bySession: map[string]*liveRun{}}
+}
 
-func (r *liveRuns) add(runID, userID string, cancel context.CancelFunc, sink StreamSink, log *slog.Logger) *liveRun {
+func (r *liveRuns) add(runID, userID, sessionID string, cancel context.CancelFunc, sink StreamSink, log *slog.Logger) *liveRun {
 	l := newLiveRun(runID, userID, cancel, sink, log)
+	l.sessionID = sessionID
 	r.mu.Lock()
 	r.m[runID] = l
+	if sessionID != "" {
+		r.bySession[sessionID] = l
+	}
 	r.mu.Unlock()
 	return l
 }
@@ -400,12 +413,22 @@ func (r *liveRuns) get(runID string) *liveRun {
 	return r.m[runID]
 }
 
+// active 返回该会话正在执行的 run；没有返回 nil。
+func (r *liveRuns) active(sessionID string) *liveRun {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bySession[sessionID]
+}
+
 // remove 摘掉一个已结束的 run；只有当前登记的还是同一个实例时才删，
 // 避免把同名新 run 误删。
 func (r *liveRuns) remove(runID string, l *liveRun) {
 	r.mu.Lock()
 	if cur, ok := r.m[runID]; ok && cur == l {
 		delete(r.m, runID)
+	}
+	if l != nil && l.sessionID != "" && r.bySession[l.sessionID] == l {
+		delete(r.bySession, l.sessionID)
 	}
 	r.mu.Unlock()
 }

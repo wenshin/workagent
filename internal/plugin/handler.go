@@ -66,6 +66,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/reset", h.resetBaseline)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/baseline/dismiss", h.dismissUpdate)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/data", h.data)
+	// IM 渠道桥：插件上报待投递消息，宿主投进各人固定的渠道会话并回传答复。
+	// 只能由声明了 im.reply 的插件调用，且目标空间/会话由宿主决定。
+	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/inbox", h.imInbox)
+	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/inbox/reply", h.imInboxReply)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/ui", h.ui)
 	// 智能体头像：读走空间 read（会话列表要渲染），写走空间 write（只能改草稿）
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/icon", h.agentIcon)

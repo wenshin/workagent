@@ -24,6 +24,7 @@ import (
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/securityscan"
 	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/spacelog"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -67,6 +68,19 @@ type Options struct {
 	// Evals 用于跑插件自带的 agent 类黄金用例；为 nil 时这类用例跳过并记入报告，
 	// 不阻塞发布——发布门禁不能依赖外部模型可用。
 	Evals EvalRunner
+	// SpaceLog 是空间运行日志（files/.logs）：每次插件调用记一条，含成败、
+	// 耗时与错误摘要。为 nil 时不写——测试与不关心留证的装配不必接它。
+	SpaceLog *spacelog.Logger
+	// HostBase 是平台自己的可达地址（APP_BASE_URL）。注入给插件当 host_base：
+	//
+	// 插件在沙箱里，不知道宿主在哪；而「宿主在哪」是部署事实，不是使用者的配置项。
+	// 让填的人手抄一遍，抄错的表现是投递 401，排查方向还全错。
+	// 容器化部署时把它配成集群内可达地址即可，插件侧无需感知。
+	HostBase string
+	// TokenSecret 是签发插件身份令牌的密钥。渠道插件没有登录态，回调
+	// /inbox 时靠平台签发的一次性可复算令牌认身份；为空时不签发，接口一律
+	// 401（宁可渠道不通，也不开一个匿名写入口）。
+	TokenSecret string
 }
 
 // Manager 管理四类插件的完整生命周期。
@@ -83,6 +97,15 @@ type Manager struct {
 	// 与 inst 分开存：借用只加载指定插件，不能污染来源空间的完整快照。
 	borrow map[string][]*instance
 	boot   map[string]bool
+	// loadLocks 按空间串行化加载：启动预热与首个业务请求可能同时到达，
+	// 没有它两边都会 buildInstance（读文件、建 MCP 连接），最终只留一份。
+	loadLocks sync.Map // spaceID → *sync.Mutex
+	// calls 是最近的调用记录（plugin_logs 的数据源）。只活在当前进程。
+	calls *callLog
+	// im 是 IM 消息投递能力（会话层实现）；为 nil 时渠道接口明确报未启用。
+	im IMSubmitter
+	// imDedup 挡住渠道侧重投：投递一次就是一轮模型调用，重复投递会答两遍。
+	imDedup *inboxDedup
 }
 
 type instance struct {
@@ -182,8 +205,14 @@ func New(o Options) (*Manager, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	deno, _ := exec.LookPath("deno")
-	if deno == "" {
+	// deno 要解析两次，因为它在两个文件系统里跑：
+	//   - hostDeno：本机进程（warmDeps 预热依赖缓存，跑在控制面）；
+	//   - sandboxDeno：插件进程（跑在执行体里，容器化后与控制面不是同一个根）。
+	// 混用就是 `bwrap: execvp /Users/.../deno: No such file or directory`：
+	// 进程起来就退，宿主只读到 EOF，现象像「插件自己崩了」。
+	hostDeno, _ := exec.LookPath("deno")
+	sandboxDeno := o.Runner.Executable("deno")
+	if sandboxDeno == "" {
 		o.Logger.Warn("找不到 deno，脚本插件（kind=tool）不可用")
 	}
 	if o.RuntimeDir != "" {
@@ -193,16 +222,18 @@ func New(o Options) (*Manager, error) {
 	}
 	m := &Manager{
 		o:       o,
-		deno:    deno,
+		deno:    sandboxDeno,
 		invoker: o.Invoker,
 		inst:    map[string]map[string]*instance{},
 		mcpCs:   map[string]*mcpRuntime{},
 		borrow:  map[string][]*instance{},
 		boot:    map[string]bool{},
+		calls:   newCallLog(callLogPerSpace),
+		imDedup: newInboxDedup(0, imResultTTL),
 	}
 	m.rt = &toolRuntime{
-		runner: o.Runner, deno: deno, runtimeDir: o.RuntimeDir,
-		secrets: o.Secrets, fs: o.Storage, logger: o.Logger,
+		runner: o.Runner, deno: hostDeno, denoBin: sandboxDeno, runtimeDir: o.RuntimeDir,
+		secrets: o.Secrets, fs: o.Storage, logger: o.Logger, spaceLog: o.SpaceLog,
 		egress: newEgressPool(o.Logger),
 	}
 	// 每个插件一个常驻进程：安装/停用/卸载/重载都会把对应进程关掉，
@@ -281,6 +312,11 @@ func (m *Manager) List(ctx context.Context, spaceID string) ([]Item, error) {
 		}
 		if d.DerivedFrom != nil {
 			item.BaselineVersion = d.DerivedFrom.Version
+		}
+		// 草稿也要显示审批档位：启用后的草稿和已安装件一样会拦人，
+		// 只在安装分支里算，作者在未发布时就看不到「这个插件会不会每次确认」。
+		if hasApprovalField(d) {
+			item.ApprovalLevel = ApprovalLevelOf(cand.Config)
 		}
 		// 草稿可能已经发布过：要有 latest_version 才能从面板里装回来，
 		// 同时用内容 hash 判断「有新版本待发布」。
@@ -473,6 +509,24 @@ func (m *Manager) readDraft(ctx context.Context, spaceID, slug string) (Manifest
 
 // DryRun 用样例输入跑一次，返回输出与风险，不产生副作用。
 func (m *Manager) DryRun(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (DryRunResult, error) {
+	start := time.Now()
+	res, err := m.dryRun(ctx, spaceID, slug, userID, input)
+	// 试跑也是一次真实执行（会起沙箱、会连远端），照样留证；但不进 plugin_logs：
+	// 那份是「正式调用」的记录，开发期反复试错混进去，排障时会看到一堆假调用。
+	if m.o.SpaceLog != nil {
+		status, msg := "ok", ""
+		if err != nil {
+			status, msg = "error", err.Error()
+		}
+		m.o.SpaceLog.Write(ctx, spacelog.Entry{
+			SpaceID: spaceID, Kind: "plugin", Tool: slug, Mode: "dry_run",
+			Status: status, Latency: time.Since(start), UserID: userID, Output: msg,
+		})
+	}
+	return res, err
+}
+
+func (m *Manager) dryRun(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (DryRunResult, error) {
 	b, err := LoadBundle(ctx, m.o.Storage, DraftKey(m.o.Storage, spaceID, slug), false)
 	if err != nil {
 		return DryRunResult{}, err
@@ -1656,6 +1710,8 @@ func (m *Manager) toolTools(inst *instance) []tool.Tool {
 	}
 	meta := inst.Manifest
 	name := ToolName(inst.Slug, inst.Slug)
+	// 域名与动词只给确认卡展示：脚本发请求时平台看不到 URL，白名单就是唯一事实。
+	hosts, verbs := meta.HTTPTargets()
 	return []tool.Tool{{
 		Name:           name,
 		Capability:     meta.Capability,
@@ -1665,10 +1721,12 @@ func (m *Manager) toolTools(inst *instance) []tool.Tool {
 		SideEffects:    inst.SideEffects,
 		Runtime:        "plugin",
 		NetworkWrite:   meta.WritesRemote(),
+		NetHosts:       hosts,
+		NetVerbs:       verbs,
 		ApprovalLevel:  inst.ApprovalLevel,
 		MaxResultBytes: meta.Limits.MaxResultBytes,
 		Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
-			return m.invokeTool(ctx, inst, args, env)
+			return m.invokeTool(ctx, inst, name, args, env)
 		},
 	}}
 }
@@ -1722,7 +1780,10 @@ func (m *Manager) mcpTools(inst *instance) []tool.Tool {
 			ServerID:      inst.PluginID,
 			ServerName:    inst.Slug,
 			Invoke: func(ctx context.Context, args json.RawMessage, env tool.Env) (string, error) {
-				return inst.MCP.call(ctx, remote, args, env)
+				start := time.Now()
+				out, err := inst.MCP.call(ctx, remote, args, env)
+				m.recordCall(ctx, env, inst.Slug, name, start, err)
+				return out, err
 			},
 		})
 	}
@@ -1745,7 +1806,10 @@ func (m *Manager) toolInvokeInput(inst *instance, userID string) (invokeInput, e
 		UserID: userID, Slug: inst.Slug, Version: inst.Version,
 		Mounts: mounts, SpaceMounted: spaceMounted,
 		NetHosts: inst.Manifest.NetHosts(), WSHosts: inst.Manifest.WSNetHosts(),
-		Allow: allow, Verbs: verbs, Secrets: secrets,
+		// 宿主地址由平台补进白名单：插件不需要在清单里声明，也声明不了
+		// （hosts 只收域名）。没有 im.reply 的插件拿不到这一项。
+		HostPorts: m.platformHostPorts(inst.Manifest),
+		Allow:     allow, Verbs: verbs, Secrets: secrets,
 		Config: inst.Config,
 		// 默认一次性：跑完即退，不占常驻池。声明 runtime.resident 才复用进程——
 		// 本地草稿同样适用：是否常驻只看清单，不看发布状态。
@@ -1753,7 +1817,18 @@ func (m *Manager) toolInvokeInput(inst *instance, userID string) (invokeInput, e
 	}, nil
 }
 
-func (m *Manager) invokeTool(ctx context.Context, inst *instance, args json.RawMessage, env tool.Env) (string, error) {
+// invokeTool 执行一次脚本插件调用，并记下结果供 plugin_logs 查询。
+//
+// 记账放在最外层，而不是运行时的更深处：用户看到的成功/失败以这里为准，
+// 参数装配失败、超时、进程崩溃都算一次失败，不该分成几种口径。
+func (m *Manager) invokeTool(ctx context.Context, inst *instance, toolName string, args json.RawMessage, env tool.Env) (string, error) {
+	start := time.Now()
+	out, err := m.callTool(ctx, inst, args, env)
+	m.recordCall(ctx, env, inst.Slug, toolName, start, err)
+	return out, err
+}
+
+func (m *Manager) callTool(ctx context.Context, inst *instance, args json.RawMessage, env tool.Env) (string, error) {
 	in, err := m.toolInvokeInput(inst, env.UserID)
 	if err != nil {
 		return "", err
@@ -1868,11 +1943,25 @@ func (m *Manager) registerTools(ctx context.Context, inst *instance) error {
 
 // ---------------------------------------------------------------- 加载缓存
 
-func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
+// loaded 判断空间是否已经加载过。
+func (m *Manager) loaded(spaceID string) bool {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	_, ok := m.inst[spaceID]
-	m.mu.RUnlock()
-	if ok {
+	return ok
+}
+
+func (m *Manager) ensureLoaded(ctx context.Context, spaceID string) error {
+	if m.loaded(spaceID) {
+		return nil
+	}
+	// 同一个空间只加载一次：启动预热与第一个请求常常同时到，并发
+	// buildInstance 会重复读文件、重复建 MCP 连接，最终只留一份。
+	mu, _ := m.loadLocks.LoadOrStore(spaceID, &sync.Mutex{})
+	lock := mu.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	if m.loaded(spaceID) {
 		return nil
 	}
 

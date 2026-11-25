@@ -23,6 +23,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -78,13 +79,20 @@ const (
 	CapUIRender    = "ui.render"
 	CapPluginInvok = "plugin.invoke"
 	CapAgentUse    = "agent.use"
+	// CapIMReply 声明「这是 IM 渠道插件」：收到的消息可以投进各人固定的渠道会话，
+	// 并由宿主把答复交回来。
+	//
+	// 单独一项而不是并进 http.request：能出网不等于能**驱动某个人的执行**
+	// （投递一条消息就是跑一轮，用那个人的工具与凭证）。授权口径明确写在
+	// 能力名上，审批页才能让人看懂自己批了什么。
+	CapIMReply = "im.reply"
 )
 
 var capabilities = map[string]bool{
 	CapSkillUse: true, CapSearchQuery: true, CapHTTPRequest: true,
 	CapFSRead: true, CapFSWrite: true, CapSQLQuery: true,
 	CapShellExec: true, CapUIRender: true, CapPluginInvok: true,
-	CapAgentUse: true,
+	CapAgentUse: true, CapIMReply: true,
 }
 
 // 宿主 RPC method（插件可申请的系统调用）。
@@ -130,6 +138,16 @@ type Capability struct {
 	// 一个凭证一条能力，没声明的名字 secret.get 一律拒绝——
 	// 否则「有 secret.use」就等于「能读整个 plugin scope」。
 	Name string `json:"name,omitempty"`
+}
+
+// IMSpec 是渠道插件的清单声明。
+type IMSpec struct {
+	// Channel 是渠道标识（dingtalk / wecom ...），与 im_channel.channel 对应，
+	// 也是会话绑定键的一部分。为空时用插件 slug。换它等于换一条会话时间线，
+	// 所以发布后不应修改。
+	Channel string `json:"channel,omitempty"`
+	// Label 是展示名，可空（回落到渠道注册表里的 label）。
+	Label string `json:"label,omitempty"`
 }
 
 // FSSpec 是插件声明的文件访问范围，路径相对「空间工作区」（files/）。
@@ -348,6 +366,10 @@ type Manifest struct {
 	Agent        *AgentSpec      `json:"agent,omitempty"`
 	Source       *SourceSpec     `json:"source,omitempty"`
 	DataSources  []DataSource    `json:"data_sources,omitempty"`
+	// IM 是渠道插件专属声明：一次接入只服务一个渠道。
+	// 与 capabilities 分开，是因为这一段描述的是「消息从哪来」，
+	// 而不是「能做什么」——它不参与风险推导，也不扩大任何权限。
+	IM *IMSpec `json:"im,omitempty"`
 	// FS 是文件访问范围（只能收紧平台默认边界）。
 	FS *FSSpec `json:"fs,omitempty"`
 	// Config 是「安装方可填」的配置项声明：发布方定义 schema，安装方在空间里填值，
@@ -668,10 +690,56 @@ func (m Manifest) HostAllow() (allow, verbs, secrets map[string]bool) {
 	return allow, verbs, secrets
 }
 
+// HTTPTargets 返回清单声明的出网域名与动词，去重、排序。
+//
+// 只给审批卡当文案素材：脚本的请求由它自己在沙箱里发，平台事前看不到具体 URL，
+// 能给出的事实就是这份白名单——「可能访问这几个域名，只允许这几种方法」。
+// 排序是为了文案稳定：map 遍历顺序随机会让同一份清单在不同次审批里显示成
+// 不同的顺序，用户会以为目标变了。
+func (m Manifest) HTTPTargets() (hosts, verbs []string) {
+	seen := make(map[string]bool, 4)
+	for _, c := range m.Capabilities {
+		if c.Method != MethodHTTP {
+			continue
+		}
+		for _, h := range c.Hosts {
+			h = strings.TrimSpace(h)
+			if h == "" || seen[h] {
+				continue
+			}
+			seen[h] = true
+			hosts = append(hosts, h)
+		}
+	}
+	_, verbSet, _ := m.HostAllow()
+	for v := range verbSet {
+		verbs = append(verbs, v)
+	}
+	sort.Strings(hosts)
+	sort.Strings(verbs)
+	return hosts, verbs
+}
+
 // HasHTTP 表示清单里有没有出网声明（有 hosts 才会建代理）。
 func (m Manifest) HasHTTP() bool {
 	for _, c := range m.Capabilities {
 		if c.Method == MethodHTTP && len(c.Hosts) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// HasCapability 表示清单里是否声明了某个能力方法名。
+//
+// 与 Capability 顶层字段（老式的单一能力写法）一并检查：两种写法都合法，
+// 判定口径必须一致，否则「按新写法声明的能过、按老写法声明的被拒」。
+func (m Manifest) HasCapability(method string) bool {
+	if m.Capability == method {
+		return true
+	}
+	for _, c := range m.Capabilities {
+		if c.Method == method {
 			return true
 		}
 	}
@@ -1326,8 +1394,9 @@ func validateCapability(c Capability) error {
 		if c.Name != "" {
 			return fmt.Errorf("ws.connect 不接受 name：凭证请用 secret.use")
 		}
-	case MethodShell, MethodSearch:
-		// 平台已实现的能力，不接受额外参数：范围由能力本身决定
+	case MethodShell, MethodSearch, CapIMReply:
+		// 平台已实现的能力，不接受额外参数：范围由能力本身决定。
+		// im.reply 的「能投给谁」由宿主按渠道 + 用户算，清单里写什么都没用。
 	case MethodSecret:
 		// 必须写清楚能取哪个凭证：没有名字就拒，不能退化成「整个 scope 可读」。
 		if c.Name == "" {
