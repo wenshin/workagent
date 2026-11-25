@@ -28,6 +28,9 @@ type InvokeResult struct {
 	Status    string
 	LatencyMS int64
 	Risk      int
+	// RiskLabel 是这次调用的动作标签（网络请求 / 写文件 / 脚本执行…），
+	// 为空表示工具没给更具体的说法，展示退回等级文案。
+	RiskLabel string
 	ToolName  string
 	// Cached 表示这条结果来自续跑回放，而不是这次真的执行了一遍。
 	// 前端与审计据此区分「做过」与「又做了一次」。
@@ -96,6 +99,7 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	// 展示等级按这次实参细化（如 shell_exec 按命令判只读/写入）。
 	// 下面策略判定仍用声明的 t.Risk：「这条命令看起来只读」不能绕过空间写权限。
 	result.Risk = t.EffectiveRisk(args)
+	result.RiskLabel = t.EffectiveRiskLabel(args)
 
 	// 审批动作在这里算：只有它需要看实参（命令、出网方法），策略层只做成员校验。
 	action := ApprovalFor(t, args)
@@ -147,7 +151,6 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 		netKey = shellNetApprovalKey(t.Name, args)
 	}
 	granted := plan.Mode == ShellNetOn
-	deniedNote := ""
 
 	if decision.NeedApproval {
 		approved, reason, parked := i.askApproval(ctx, t, call, env, decision)
@@ -157,20 +160,39 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 			result.Parked = true
 			return result
 		}
-		if approved {
+		if !approved {
+			// 声明了要网而用户不同意：这条命令不执行。
+			// 只跑半条（无网）会给出一个用户没要的结论，装依赖失败的回执还会被
+			// 模型当成任务本身失败，绕着同一件事反复试。
+			return i.finish(ctx, env, result, start, StatusDenied, reason+"（未执行）")
+		}
+		// 批准的是哪件事：联网准入本身，或「每次调用都确认」档位下那次确认
+		// （它本来就是这条命令唯一的一次人工放行）。命中命令名单（rm 之类）的
+		// 批准只解决那条名单，不改变网络档位——否则「批了删文件」会顺带放行联网。
+		// 名单与联网准入合成一张卡时 Covers 里带着网络键，同样算批准了联网。
+		if netKey != "" &&
+			(decision.Action.CoversKey(netKey) ||
+				NormalizeApprovalLevel(t.ApprovalLevel) == ApprovalAlways) {
 			granted = true
-		} else {
-			// 只有「用户拒的是联网」且策略允许降级时才继续：网络工具拒绝即不执行，
-			// 装依赖 + 脚本则按无网跑完（用户拒的是网，不是这个任务）。
-			netDenied := netKey != "" && decision.Action != nil && decision.Action.Key == netKey
-			if !netDenied || plan.OnDeny == DenyRefuse {
-				return i.finish(ctx, env, result, start, StatusDenied, reason+"（未执行）")
-			}
-			deniedNote = reason + "；本次按无网执行。\n"
 		}
 	} else if netKey != "" && NormalizeApprovalLevel(t.ApprovalLevel) == ApprovalOff {
 		// 安装方显式关掉确认：网络准入视为已批准，否则这条命令永远拿不到网
 		granted = true
+	}
+
+	// 续跑重放：这条命令的「联网重跑」已经批过了，第一次执行就直接带网。
+	//
+	// 不查这一步的话，续跑会先按无网再跑一遍（失败），再走一次升级重跑——白等一轮，
+	// 而这条命令往往有副作用（改文件、打补丁），无网那一遍的失败还可能把第二次拆坏。
+	//
+	// 判据是 plan.Escalate 而不是 netKey：联网重跑只发生在「模型没声明联网」的
+	// 命令上，那种命令本来就没有 netKey（没有准入审批），拿它当条件是永远查不到。
+	if plan.Escalate && !granted {
+		if lookup, ok := env.Approvals.(grantLookup); ok {
+			if d, found, err := lookup.Granted(ctx, i.netRetryRequest(t, call, env, args)); err == nil && found && d.Allow {
+				granted = true
+			}
+		}
 	}
 
 	out, runErr := i.execute(ctx, t, args, env, granted)
@@ -194,10 +216,6 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 			return i.finish(ctx, env, result, start, StatusError, "工具执行失败："+runErr.Error())
 		}
 	}
-	if deniedNote != "" {
-		out = deniedNote + out
-	}
-
 	out = Mask(out)
 	// 这里是回填前的硬上限；读类工具更大的额度由 Tool.MaxResultBytes 在
 	// 提示词侧另行控制（见 agent.resultBudget）。
@@ -231,8 +249,31 @@ func (i *Invoker) askApproval(
 		Detail:    decision.Action.Detail,
 		Reason:    decision.Reason,
 		// 确认卡上的徽标与工具卡一致：同样按这次实参细化
-		Risk: t.EffectiveRisk(json.RawMessage(call.Function.Arguments)),
+		Risk:      t.EffectiveRisk(json.RawMessage(call.Function.Arguments)),
+		RiskLabel: approvalLabel(t, json.RawMessage(call.Function.Arguments), decision.Action),
 	})
+}
+
+// approvalLabel 是确认卡上的动作标签（「网络请求」/「脚本执行」…）。
+//
+// 内置工具有实参级标签（按命令细化），脚本与 MCP 判不出来，只能按这次命中的
+// 审批类别给一个方向——总比让用户对着「高危」两个字自己猜「到底是要联网还是删文件」。
+func approvalLabel(t Tool, args json.RawMessage, action *policy.Action) string {
+	if label := t.EffectiveRiskLabel(args); label != "" {
+		return label
+	}
+	if action == nil {
+		return ""
+	}
+	switch action.Kind {
+	case policy.ActionNetwork:
+		return "网络请求"
+	case policy.ActionShell:
+		return "脚本执行"
+	case policy.ActionPlugin:
+		return "工具调用"
+	}
+	return ""
 }
 
 // decide 把一条审批请求交给通道，并统一处理暂停 / 中断 / 拒绝的措辞。
@@ -270,7 +311,7 @@ func (i *Invoker) execute(ctx context.Context, t Tool, args json.RawMessage, env
 	return t.Invoke(runCtx, args, env)
 }
 
-// escalateNetwork 实现「只有脚本时先无网跑，失败且像网络问题再申请联网重跑」。
+// escalateNetwork 实现「没声明联网时先无网跑，失败且像网络问题再申请联网重跑」。
 //
 // offline 是那次无网执行的回执：拿不到许可就把它原样回给模型（并注明仍是无网），
 // 批准后才真的重跑一次——所以拒绝的代价只是一次失败，不是一条被放行的命令。
@@ -287,21 +328,7 @@ func (i *Invoker) escalateNetwork(
 	if NormalizeApprovalLevel(t.ApprovalLevel) == ApprovalOff || env.Approvals == nil {
 		return offline + ShellNetRetryDeniedNote, false
 	}
-	approved, reason, parked := i.decide(ctx, t, env, ApprovalRequest{
-		// 与首次审批不同 ID：同一次调用的两种许可（先问装依赖、后问联网重跑）
-		// 不能互相覆盖，否则第二次点击会落在已终态的记录上。
-		ID:        ApprovalID(env.RunID, call.ID) + ":net",
-		RunID:     env.RunID,
-		SessionID: env.SessionID,
-		CallID:    call.ID,
-		Tool:      t.Name,
-		Kind:      policy.ActionShell,
-		Key:       shellNetRetryKey(t.Name, args),
-		ArgsHash:  ArgsHash(t.Name, args) + ":net",
-		Detail:    shellCommandOf(args),
-		Reason:    ShellNetRetryReason,
-		Risk:      t.EffectiveRisk(args),
-	})
+	approved, reason, parked := i.decide(ctx, t, env, i.netRetryRequest(t, call, env, args))
 	if parked {
 		return "", true
 	}
@@ -314,6 +341,37 @@ func (i *Invoker) escalateNetwork(
 		return offline + "\n[提示] 用户批准了联网重跑，但重跑失败：" + err.Error() + "\n", false
 	}
 	return retried + ShellNetRetryDoneNote, false
+}
+
+// netRetryRequest 是「联网重跑」这次许可的审批请求。
+//
+// 查询与登记用的是同一份措辞与键：续跑时先查（Granted）、失败后登记（decide），
+// 两处各拼一份就可能一个查得到、一个对不上。
+func (i *Invoker) netRetryRequest(t Tool, call llm.ToolCall, env Env, args json.RawMessage) ApprovalRequest {
+	return ApprovalRequest{
+		// 与首次审批不同 ID：同一次调用的两种许可（名单 / 联网准入、联网重跑）
+		// 不能互相覆盖，否则第二次点击会落在已终态的记录上。
+		ID:        ApprovalID(env.RunID, call.ID) + ":net",
+		RunID:     env.RunID,
+		SessionID: env.SessionID,
+		CallID:    call.ID,
+		Tool:      t.Name,
+		Kind:      policy.ActionShell,
+		Key:       shellNetRetryKey(t.Name, args),
+		ArgsHash:  ArgsHash(t.Name, args) + ":net",
+		Detail:    shellCommandOf(args),
+		Reason:    ShellNetRetryReason,
+		Risk:      t.EffectiveRisk(args),
+		RiskLabel: t.EffectiveRiskLabel(args),
+	}
+}
+
+// grantLookup 是审批通道的可选能力：只查已经做过的结论，不登记新待办、不阻塞。
+//
+// 单独定义而不并进 Approver：只有「续跑时要不要直接给网」需要它，
+// 让每个审批通道实现（含测试里的假通道）都背上一个方法没有必要。
+type grantLookup interface {
+	Granted(ctx context.Context, req ApprovalRequest) (ApprovalDecision, bool, error)
 }
 
 // ApprovalID 由 run 与 call 派生稳定 ID：前端点按钮时原样回传。

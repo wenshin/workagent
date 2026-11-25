@@ -137,6 +137,7 @@ func TestShellRiskByCommand(t *testing.T) {
 		{`grep -n "Q19\|Q30" 面试题.md | grep -v "^[0-9]*:### Q"; echo "exit=$?"`, policy.RiskReadOnly},
 
 		// 写入：重定向 / 白名单外 / 解释器 / 把读变成写的参数
+		{"cd /workspace && ls", policy.RiskReadOnly},
 		{"echo hello > a.txt", policy.RiskWrite},
 		{"echo hello >> a.txt", policy.RiskWrite},
 		{"rm -rf data", policy.RiskWrite},
@@ -179,5 +180,71 @@ func TestEffectiveRiskFallback(t *testing.T) {
 	bad := Tool{Name: "x", Risk: policy.RiskWrite, RiskFor: func(Tool, json.RawMessage) int { return 9 }}
 	if got := bad.EffectiveRisk(nil); got != policy.RiskWrite {
 		t.Fatalf("非法细化值应退回声明等级，实际 %d", got)
+	}
+}
+
+// 等级只有四档，脚本、出网、写文件、删文件不该都显示成「写入」。
+func TestShellRiskLabelByCommand(t *testing.T) {
+	sh := shellExec()
+	cases := []struct {
+		command string
+		want    string
+	}{
+		// 只读：整条命令都在白名单里
+		{"ls -la", RiskLabelReadOnly},
+		{"cat a.log | grep error", RiskLabelReadOnly},
+		{"find . -name '*.md'", RiskLabelReadOnly},
+
+		// 出网
+		{"curl -sS https://example.com/api", RiskLabelNetwork},
+		{"wget -q https://example.com/a.tgz", RiskLabelNetwork},
+
+		// 装依赖
+		{"pip install requests", RiskLabelInstall},
+		{"npm i lodash", RiskLabelInstall},
+
+		// 跑代码：解释器与脚本文件
+		{"python3 train.py", RiskLabelScript},
+		{"bash ./build.sh", RiskLabelScript},
+
+		// 落地文件
+		{"echo hi > out.txt", RiskLabelWriteFile},
+		{"mkdir -p build/cache", RiskLabelWriteFile},
+		{"sed -i 's/a/b/' conf.yaml", RiskLabelWriteFile},
+
+		// 删除比写入更该被看见
+		{"rm -rf build", RiskLabelDeleteFile},
+		{"find . -name '*.tmp' -delete", RiskLabelDeleteFile},
+
+		// 整篇写代码：heredoc 正文里的 python 是数据，不是在跑脚本
+		{"cat > app.py <<'EOF'\nimport os\nos.system('ls')\nEOF", RiskLabelWriteFile},
+
+		// cd 只是换目录，不该把整条命令带成写入
+		{"cd /workspace && ls -la", RiskLabelReadOnly},
+
+		// git 看子命令：出网 / 改工作区 / 只读
+		{"git push origin main", RiskLabelNetwork},
+		{"git clone https://example.com/a.git", RiskLabelNetwork},
+		{"git checkout -- src/", RiskLabelWriteFile},
+		{"git status", RiskLabelReadOnly},
+
+		// 判不准就不给标签，前端退回等级文案「写入」
+		{"docker ps", ""},
+	}
+	for _, tc := range cases {
+		args, err := json.Marshal(map[string]string{"command": tc.command})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if got := sh.EffectiveRiskLabel(args); got != tc.want {
+			t.Errorf("%q 的标签 = %q，期望 %q", tc.command, got, tc.want)
+		}
+	}
+}
+
+// 没有 RiskLabelFor 的工具必须返回空串，由前端退回等级文案。
+func TestEffectiveRiskLabelFallback(t *testing.T) {
+	if got := (Tool{Name: "x"}).EffectiveRiskLabel(json.RawMessage(`{}`)); got != "" {
+		t.Fatalf("未声明标签的工具应返回空串，得到 %q", got)
 	}
 }

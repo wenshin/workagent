@@ -15,6 +15,7 @@ import (
 
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
+	"github.com/workagent/auto-agent/internal/spacelog"
 )
 
 const (
@@ -44,22 +45,24 @@ func shellExec() Tool {
 		Capability: "shell.exec",
 		// 描述长度受插件清单约束（plugin.maxDescRunes=500），内置工具也要过发布校验：
 		// 超了会在启动时发布失败，工具直接消失，所以这里只留模型判断「何时用」必需的信息。
-		Description: "在当前空间的工作目录里执行 shell 命令并返回输出。命令运行在沙箱中：" +
-			"系统其它位置只读，有超时与输出上限。网络由命令内容自动决定，没有开关参数：" +
-			"只装依赖（pip install / npm i / apt install）直接联网；" +
-			"只跑脚本（sh/python/node/deno/go）默认不联网，因断网失败时会把「联网重跑」交给用户确认；" +
-			"装依赖和脚本同时出现先请用户确认，拒绝仍按无网执行；" +
-			"curl/wget/nc/ssh 这类网络工具一律先确认，拒绝就不执行。" +
-			"下载与解析可以连着写，例如 `curl -o data.json <url> && python parse.py`。" +
-			"容器闲置会被回收，系统目录回到基础镜像：缺什么直接装，包在缓存里。" +
-			"Python venv、npm 全局目录在 PATH 里（首次自动建），直接 `pip install` / `npm i -g`，重建后还在；" +
-			"apt install 装进可写层，重建后会消失。" +
-			"适合跑本地脚本与文件统计；查外网请用 web_search。" +
-			"命令返回非零退出码或超时时先看 stderr 再调整，不要重复执行同一条失败命令。",
+		//
+		// need_network 的说法要落在「命令自身要不要外网」上：写成「跑脚本就得声明
+		// true」时，模型对任何脚本都会二选一——要么一个都不写（默认无网，脚本自己
+		// 发请求就必然失败、再被问一次），要么处处都写（多出一堆没必要的确认）。
+		Description: "在当前空间的沙箱里执行命令并返回输出：只有 /workspace 可写，有超时与输出上限。" +
+			"工作区跨调用保留，/tmp 与 $HOME 每次调用都是全新的（放那里的文件下一次就没了），产物要写在当前目录。" +
+			"网络默认不通，用 need_network 表示「这条命令自身要访问外网」：" +
+			"pip install / npm i / apt install 是下载，不用声明，直接有网；" +
+			"声明 true 且命令里有脚本（python / node / deno / go run）或网络工具（curl / wget / nc / ssh）时先请用户确认，不同意就不执行；" +
+			"不声明按无网执行，脚本里的网络请求会因 DNS 失败，那时再问一次是否联网重跑（多一轮），所以脚本要联网就一开始声明 true；" +
+			"纯本地动作（列目录、读写文件、统计、本地编译）不要声明。复合命令连着写：curl -o a.json <url> && python parse.py。" +
+			"venv 与 npm 全局目录已在 PATH 里，直接装。查外网资料用 web_search。" +
+			"非零退出先看 stderr 再改，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "要执行的命令，由 sh -c 执行"},
+    "need_network": {"type": "boolean", "description": "这条命令自身是否要访问外网：抓页面、调 API、下载没装的东西、脚本里会发请求时为 true。纯本地处理（列目录、读写文件、统计、编译、不联网的测试）为 false（默认）。pip install / npm i / apt install 不看这个参数"},
     "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"}
   },
   "required": ["command"],
@@ -68,19 +71,23 @@ func shellExec() Tool {
 		Risk: policy.RiskWrite,
 		// 卡片徽标按命令判：`ls` 不应该和 `rm -rf` 显示成同一档。
 		RiskFor: shellRisk,
+		// 等级之外再给一个动作标签：脚本、出网、写文件、删文件不该都写成「写入」。
+		RiskLabelFor: shellRiskLabel,
 		// 默认只有命中名单的命令才要确认，其余命令直接跑（沙箱已限定范围）。
 		ShellApproval: DefaultApprovalCommands,
 		SideEffects:   policy.SideEffectsWorkspace,
 		Runtime:       "builtin",
 		// 命令输出（尤其是测试日志）比文件内容更长，单独放宽回填额度
 		MaxResultBytes: shellMaxResultBytes,
-		// 网络判据挂在工具上：Invoker 据此决定问答、拒绝后的处置与升级重跑。
+		// 网络判据挂在工具上：Invoker 据此决定问不问、以及要不要升级重跑。
+		// 模型声明的 need_network 与命令原文一起进判据，两处各读一份就会漂移。
 		NetPlan: func(args json.RawMessage) ShellNetPolicy {
-			return ShellNetPlan(shellCommandOf(args))
+			return ShellNetPlan(shellCommandOf(args), shellNeedNetwork(args))
 		},
 		Invoke: func(ctx context.Context, args json.RawMessage, env Env) (string, error) {
 			var in struct {
 				Command        string `json:"command"`
+				NeedNetwork    bool   `json:"need_network"`
 				TimeoutSeconds int    `json:"timeout_seconds"`
 			}
 			if err := json.Unmarshal(args, &in); err != nil {
@@ -119,15 +126,14 @@ func shellExec() Tool {
 				timeout = maxShellTimeout
 			}
 
-			// 网络按命令内容分四类，判据只在 shellnet.go：
-			//   只有装依赖           有网，不确认
-			//   只有脚本            无网；失败且像网络问题时由 Invoker 申请联网重跑
-			//   装依赖 + 脚本        先确认；拒绝按无网执行
-			//   出现网络工具         先确认；拒绝不执行
+			// 网络由「模型声明 + 命令内容」一起定，判据只在 shellnet.go：
+			//   只装依赖             有网，不确认（与声明无关）
+			//   声明 true + 脚本/网络工具  先确认；拒绝不执行
+			//   未声明                无网；脚本失败且像网络问题时由 Invoker 申请联网重跑
 			//
 			// 审批已经在 Invoker 里做完（ApprovalFor 与这里的 plan 读同一份判据），
 			// env.NetGrant 就是它的结论：拿到许可才落 Spec.Network=true。
-			plan := ShellNetPlan(command)
+			plan := ShellNetPlan(command, in.NeedNetwork)
 			mode := sandbox.ModeWorkspaceWrite
 			if shellNeedsSystemWrite(command) {
 				mode = sandbox.ModeSystemWrite
@@ -143,8 +149,10 @@ func shellExec() Tool {
 			// 沙箱里统一是 /workspace 与 /pkg，命令输出、报错、环境变量都不会
 			// 暴露 data/storage/spaces/<id> 这套结构。
 			res, runErr := env.Shell.Run(ctx, sandbox.Spec{
-				Cmd: []string{"sh", "-c", venvBootstrap + command},
-				Dir: sandbox.WorkspaceDir,
+				// 空间容器：每空间一个，空闲超时由执行面回收。
+				Scope: sandbox.Scope{Space: env.SpaceID, Kind: sandbox.KindShell},
+				Cmd:   []string{"sh", "-c", venvBootstrap + command},
+				Dir:   sandbox.WorkspaceDir,
 				Mounts: []sandbox.Mount{
 					{Source: workDir, Key: spaceKey + "/" + workspaceFilesDir, Target: sandbox.WorkspaceDir, Write: true},
 					{Source: pkgDir, Key: spaceKey + "/.pkg", Target: sandbox.PkgDir, Write: true},
@@ -152,7 +160,9 @@ func shellExec() Tool {
 				},
 				Mode:    mode,
 				Timeout: timeout,
-				Network: plan.Mode == ShellNetOn || (plan.NeedsApproval() && env.NetGrant),
+				// NetGrant 是 Invoker 的审批结论（含「联网重跑」的第二次执行），
+				// 声明了要网但被拒时这条命令根本不会走到这里。
+				Network: plan.Mode == ShellNetOn || env.NetGrant,
 				Env:     InstallEnv(),
 			})
 
@@ -164,7 +174,23 @@ func shellExec() Tool {
 				return "", runErr
 			}
 			out := formatShellResult(res, runErr, timeout)
-			// 纯脚本无网执行、退出码非零且错误像网络不可达：交给 Invoker 去申请联网重跑。
+			// 运行日志留证：命令、退出码、耗时与输出尾部。回执会被上下文预算截断，
+			// 事后想复核「那条命令到底输出了什么」只能靠这份。
+			// 顺序上先写日志再决定是否申请联网重跑：重跑是一次真实执行，也该各留一条。
+			env.SpaceLog.Write(ctx, spacelog.Entry{
+				SpaceID:   env.SpaceID,
+				Kind:      "shell",
+				Tool:      "shell_exec",
+				Status:    shellLogStatus(res, runErr),
+				Latency:   res.Duration,
+				SessionID: env.SessionID,
+				RunID:     env.RunID,
+				UserID:    env.UserID,
+				Command:   Mask(command),
+				ExitCode:  res.ExitCode,
+				Output:    Mask(res.Stdout + "\n" + res.Stderr),
+			})
+			// 没声明联网、无网执行失败且错误像网络不可达：交给 Invoker 去申请联网重跑。
 			// 这里只判断「要不要问」，问完批不批不归工具管——执行阶段套着 30s 墙钟，
 			// 在工具里等人点按钮会先超时。
 			if plan.Escalate && !env.NetGrant && res.ExitCode != 0 &&
@@ -374,6 +400,8 @@ var shellReadOnlyCommands = map[string]bool{
 	"grep": true, "egrep": true, "fgrep": true, "rg": true, "fd": true,
 	"find": true, "du": true, "df": true, "stat": true, "file": true,
 	"pwd": true, "echo": true, "printf": true, "date": true, "uname": true,
+	// cd 只是换目录：`cd x && ls` 不该因为 cd 被判成写入
+	"cd": true, "pushd": true, "popd": true,
 	"whoami": true, "id": true, "which": true, "type": true, "tree": true,
 	"diff": true, "cmp": true, "cut": true, "tr": true, "nl": true,
 	"basename": true, "dirname": true, "realpath": true, "readlink": true,
@@ -395,7 +423,38 @@ var (
 	// 这两个参数会把白名单里的读命令变成写：`find -delete/-exec`、`sort -o`。
 	shellFindWrites = regexp.MustCompile(`\s-(delete|exec|execdir|ok|okdir)\b`)
 	shellSortWrites = regexp.MustCompile(`\s(--output|-o)\b`)
+	// shellFindDelete 单独认删除：`find . -name '*.tmp' -delete` 是删除动作。
+	shellFindDelete = regexp.MustCompile(`\s-delete\b`)
 )
+
+// 卡片上的动作标签：比四档等级更具体地回答「这一步在做什么」。
+//
+// 等级只有 只读 / 查询 / 写入 / 高危 四档，`curl`、`pip install`、`python x.py`、
+// `echo a > b` 全挤在「写入」里，用户看不出区别。标签只补这层说明：徽标文案用它，
+// 颜色与审批判定仍按等级。
+const (
+	RiskLabelReadOnly   = "只读"
+	RiskLabelNetwork    = "网络请求"
+	RiskLabelInstall    = "安装依赖"
+	RiskLabelScript     = "脚本执行"
+	RiskLabelWriteFile  = "写文件"
+	RiskLabelDeleteFile = "删除文件"
+)
+
+// shellFileWriteCommands 是「确定会落地文件」的命令：命中就把标签定成写文件。
+//
+// 名单故意短：`tar` / `git` 这类既能读又能写的命令放进来，`tar -tf` 就会被说成
+// 写文件。判不准时退回等级文案「写入」，比编一个具体说法诚实。
+var shellFileWriteCommands = map[string]bool{
+	"mv": true, "cp": true, "ln": true, "touch": true, "mkdir": true,
+	"tee": true, "chmod": true, "chown": true, "truncate": true, "dd": true,
+	"patch": true, "unzip": true,
+}
+
+// shellDeleteCommands 是删除类命令：比「写文件」更该被看见。
+var shellDeleteCommands = map[string]bool{
+	"rm": true, "rmdir": true, "unlink": true, "shred": true,
+}
 
 // shellRisk 按命令给出这一次调用的展示等级。
 //
@@ -430,6 +489,109 @@ func shellRisk(t Tool, args json.RawMessage) int {
 		}
 	}
 	return policy.RiskReadOnly
+}
+
+// shellRiskLabel 给出卡片上的动作标签：比四档等级更具体。
+//
+// 与 shellRisk 同源（先剥掉 heredoc 正文与单引号字面量，再按管道切段），但两件事
+// 分开判：等级回答「有多危险」，标签回答「在做什么」。所以 `python x.py` 仍按
+// 写入计提（解释器里干什么静态看不出），标签却如实写「脚本执行」。
+//
+// 判不出来返回空串，由前端退回等级文案——没有把握时不该给一个具体说法。
+func shellRiskLabel(_ Tool, args json.RawMessage) string {
+	var in struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return ""
+	}
+	command := strings.TrimSpace(in.Command)
+	if command == "" {
+		return ""
+	}
+	// 只看会被 shell 解释的部分：heredoc 正文与单引号字面量是数据。整篇写代码的
+	// 命令里有 python，但那是要写进文件的内容，不是在跑脚本。
+	text := shellCommandText(command)
+	// 网络 / 装依赖 / 跑脚本三类复用出网判定的同一份分类，避免两套规则慢慢漂移。
+	kinds := classifyCommand(text)
+
+	segments := shellSegments(text)
+	if len(segments) == 0 {
+		return ""
+	}
+	readOnly := true
+	var write, remove bool
+	net, install, script := kinds.netTool, kinds.install, kinds.script
+	for _, seg := range segments {
+		fields := strings.Fields(seg)
+		head := segmentHead(fields)
+		if shellDeleteCommands[head] || shellFindDelete.MatchString(seg) {
+			remove = true
+		}
+		if shellFileWriteCommands[head] || shellSedInPlace(fields, head) {
+			write = true
+		}
+		// git 的动词决定它是出网、改工作区还是只读：`git push` 不是「写入文件」，
+		// `git checkout .` 也不只是查询。只读动词已由 shellGitReadOnly 兜住。
+		if head == "git" {
+			switch gitSubcommand(fields) {
+			case "clone", "fetch", "pull", "push", "ls-remote", "submodule":
+				net = true
+			case "checkout", "switch", "restore", "reset", "clean", "rm", "mv",
+				"merge", "rebase", "cherry-pick", "stash", "apply":
+				write = true
+			}
+		}
+		if !shellSegmentReadOnly(seg) {
+			readOnly = false
+		}
+	}
+	if shellWritesByRedirect(text) {
+		write = true
+	}
+
+	// 优先级按「后果有多不可逆」：删除 > 落地文件 > 出网 > 装依赖 > 跑代码。
+	// 一条命令同时做几件事时只显示最该被看见的那件，徽标容不下第二个词。
+	switch {
+	case remove:
+		return RiskLabelDeleteFile
+	case write:
+		return RiskLabelWriteFile
+	case net:
+		return RiskLabelNetwork
+	case install:
+		return RiskLabelInstall
+	case script:
+		return RiskLabelScript
+	case readOnly:
+		return RiskLabelReadOnly
+	}
+	return ""
+}
+
+// gitSubcommand 取 git 的子命令（`-C dir` 这类选项的参数会被跳过）。
+func gitSubcommand(fields []string) string {
+	for i, f := range fields {
+		if baseName(strings.Trim(f, `"'()`)) != "git" {
+			continue
+		}
+		return shellFirstArg(fields, i+1)
+	}
+	return ""
+}
+
+// shellSedInPlace 判断这一段是不是 sed 原地改文件（`sed -i`）：不带 -i 的 sed 只读。
+func shellSedInPlace(fields []string, head string) bool {
+	if head != "sed" {
+		return false
+	}
+	for _, f := range fields {
+		if f == "--in-place" || strings.HasPrefix(f, "--in-place=") ||
+			f == "-i" || (strings.HasPrefix(f, "-i") && !strings.HasPrefix(f, "--")) {
+			return true
+		}
+	}
+	return false
 }
 
 // shellWritesByRedirect 判断命令里是否有落地成文件的重定向（`>` / `>>`）。
@@ -493,6 +655,177 @@ func shellSegments(command string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// shellCommandText 返回命令里真正会被 shell 解释的部分：去掉 heredoc 正文与单引号字面量。
+//
+// 审批名单与命令分类判的是「会执行什么」，不是「要写进文件什么」。模型常用
+// `cat > a.ts <<'EOF' … EOF` 整篇写代码，正文里的反引号（TS 模板字符串）与 $( )
+// 在带引号的 heredoc 里是纯数据，按原文匹配会把每一次写文件都判成「命令替换」，
+// 于是每改一次代码就多一次确认、多一轮续跑。带引号的单引号同理。
+//
+// 双引号不能去掉：双引号里的反引号与 $( ) 确实会被展开。转义的写法也保留原样，
+// 由各条规则自己决定要不要命中。
+func shellCommandText(command string) string {
+	if !strings.ContainsRune(command, '\'') && !strings.Contains(command, "<<") {
+		return command
+	}
+	var b strings.Builder
+	var pending []heredocMark
+	for _, line := range strings.SplitAfter(command, "\n") {
+		body := strings.TrimSuffix(line, "\n")
+		newline := len(body) != len(line)
+		if len(pending) > 0 {
+			probe := body
+			if pending[0].stripTabs {
+				probe = strings.TrimLeft(probe, "\t")
+			}
+			// 命中定界符行：正文到此结束，这一行本身也不留
+			if strings.TrimSpace(probe) == pending[0].word {
+				pending = pending[1:]
+			}
+			if newline {
+				b.WriteByte('\n')
+			}
+			continue
+		}
+		pending = append(pending, scanHeredocMarks(body)...)
+		b.WriteString(stripSingleQuoted(body))
+		if newline {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// heredocMark 是一条 heredoc 的定界符。
+type heredocMark struct {
+	word      string
+	stripTabs bool // <<- 允许用行首 tab 缩进定界符
+}
+
+// scanHeredocMarks 找出一行里引入的 heredoc（引号内的 << 不算）。
+func scanHeredocMarks(line string) []heredocMark {
+	var out []heredocMark
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote != 0 {
+			switch {
+			case c == '\\' && quote == '"':
+				i++
+			case c == quote:
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '\\':
+			i++
+		case '<':
+			mark, next, ok := parseHeredocMark(line, i)
+			if !ok {
+				continue
+			}
+			out = append(out, mark)
+			i = next - 1
+		}
+	}
+	return out
+}
+
+// parseHeredocMark 从 i（指向 `<<`）读出定界符；不是 heredoc 时返回 false。
+//
+// here-string（`<<<`）与算术左移（`<<1`）都不是 heredoc：前者把输入接到命令的
+// stdin、后者是数字运算，都不产生「后面若干行是数据」的结构。
+func parseHeredocMark(line string, i int) (heredocMark, int, bool) {
+	if i+1 >= len(line) || line[i+1] != '<' {
+		return heredocMark{}, i, false
+	}
+	next := i + 2
+	if next < len(line) && line[next] == '<' {
+		return heredocMark{}, i, false
+	}
+	mark := heredocMark{}
+	if next < len(line) && line[next] == '-' {
+		mark.stripTabs = true
+		next++
+	}
+	for next < len(line) && (line[next] == ' ' || line[next] == '\t') {
+		next++
+	}
+	if next >= len(line) {
+		return heredocMark{}, i, false
+	}
+	if q := line[next]; q == '\'' || q == '"' {
+		end := strings.IndexByte(line[next+1:], q)
+		if end <= 0 {
+			return heredocMark{}, i, false
+		}
+		mark.word = line[next+1 : next+1+end]
+		return mark, next + end + 2, true
+	}
+	end := next
+	for end < len(line) && !strings.ContainsRune(" \t;|&<>()", rune(line[end])) {
+		end++
+	}
+	if end == next {
+		return heredocMark{}, i, false
+	}
+	mark.word = line[next:end]
+	return mark, end, true
+}
+
+// stripSingleQuoted 去掉单引号字面量（连同引号本身）。
+//
+// 单引号里的反引号、$、$( ) 都不会被展开，按原文匹配就是误判。引号替换成空格，
+// 让 `a'b c'd` 仍然保持两个字段，不会把前后文本粘成一个命令名。
+func stripSingleQuoted(line string) string {
+	if !strings.ContainsRune(line, '\'') {
+		return line
+	}
+	var b strings.Builder
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote == '\'' {
+			if c == '\'' {
+				quote = 0
+			}
+			continue
+		}
+		if quote == '"' {
+			b.WriteByte(c)
+			if c == '\\' && i+1 < len(line) {
+				b.WriteByte(line[i+1])
+				i++
+				continue
+			}
+			if c == '"' {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			quote = '\''
+			b.WriteByte(' ')
+		case '"':
+			quote = '"'
+			b.WriteByte(c)
+		case '\\':
+			b.WriteByte(c)
+			if i+1 < len(line) {
+				b.WriteByte(line[i+1])
+				i++
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // shellSegmentReadOnly 判断单段命令是不是纯读：命令名在只读名单里，
@@ -575,4 +908,23 @@ func formatShellResult(res sandbox.Result, runErr error, timeout time.Duration) 
 		b.WriteString("（无输出）\n")
 	}
 	return b.String()
+}
+
+// shellLogStatus 把一次执行归成运行日志里的状态。
+//
+// 超时与输出超限单独成档：它们不是「命令返回了失败」，运维看到这两个词
+// 就知道该调超时还是该换更省输出的做法，不必再点进日志正文里找。
+func shellLogStatus(res sandbox.Result, runErr error) string {
+	switch {
+	case errors.Is(runErr, sandbox.ErrTimeout):
+		return "timeout"
+	case errors.Is(runErr, sandbox.ErrOutputTooLarge):
+		return "output_limit"
+	case runErr != nil:
+		return "error"
+	case res.ExitCode != 0:
+		return "exit"
+	default:
+		return "ok"
+	}
 }

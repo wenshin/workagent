@@ -143,6 +143,9 @@ type ApprovalRequest struct {
 	// Reason 是给用户看的一句话：为什么要确认这个动作。
 	Reason string
 	Risk   int
+	// RiskLabel 是这次动作的具体标签（网络请求 / 写文件 / 脚本执行…）。
+	// 确认卡与工具卡上的徽标用同一份文案，为空时退回等级文案。
+	RiskLabel string
 }
 
 // ApprovalDecision 是用户的选择。
@@ -161,8 +164,12 @@ type ApprovalDecision struct {
 //     MCP 按清单里的 tools.writes 声明判定——远端工具对平台是黑盒，
 //     没有动词可看，只能由作者显式声明；
 //   - 参数里的命令命中 shell 审批名单（或无法静态判断的动态形态）；
-//   - shell 网络准入：出现网络工具，或装依赖与脚本混在一起时先确认（判据见 ShellNetPlan）。
-//     纯脚本不确认：它先无网执行，失败且像网络问题时由 Invoker 再申请一次联网重跑。
+//   - shell 网络准入：模型声明了 need_network，且命令里出现网络工具或脚本时先确认
+//     （判据见 ShellNetPlan）。没声明联网就不确认——命令会在无网沙箱里跑，
+//     失败且像网络问题时由 Invoker 再申请一次联网重跑。
+//
+// 后两类可能同时命中（一条 `rm -rf` 的脚本既要名单确认又要联网准入）：合成一张卡
+// 一次点击（见 mergeActions），不让人对同一件事点两次。
 func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	// 安装方的档位先于声明生效：always 与调用内容无关，off 直接放行。
 	switch NormalizeApprovalLevel(t.ApprovalLevel) {
@@ -173,23 +180,32 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 			// Key 带上参数指纹：档位是「每次都问」，本轮记忆不能把它并成「同类动作只问一次」；
 			// 但参数完全一样的重复调用（模型重试）复用结论，不再多弹一次。
 			Key:    policy.ActionPlugin + ":" + t.Name + ":" + ArgsHash(t.Name, args),
-			Reason: "这个插件的审批级别是「每次调用都确认」",
+			Reason: "这个插件被设为「每次都问」" + pluginAlwaysHint(t),
 		}
 	case ApprovalOff:
 		return nil
 	}
 	if t.NetworkWrite {
-		// MCP 工具与脚本工具的出网方式不同，文案要说清「谁在改」：
-		// 脚本是插件自己发请求，MCP 是远端 Server 替它改，用户判断依据不一样。
-		reason := "这次调用会以非只读方法访问外部系统"
+		// MCP 工具与脚本工具的出网方式不同，文案要说清「谁在改、改哪里」：
+		// 脚本是插件自己发请求，域名来自清单白名单；MCP 是远端 Server 替它改，
+		// 平台看不到目标地址——这两件事对用户来说是完全不同的判断依据。
 		if t.ServerID != "" {
-			reason = "这次调用会改动远端系统（MCP 工具）"
+			name := t.ServerName
+			if name == "" {
+				name = t.Name
+			}
+			return &policy.Action{
+				Kind:   policy.ActionNetwork,
+				Key:    policy.ActionNetwork,
+				Detail: argSummary(args),
+				Reason: "这次调用会改动远端系统（MCP 服务「" + name + "」），平台看不到它具体访问哪些地址",
+			}
 		}
 		return &policy.Action{
 			Kind:   policy.ActionNetwork,
 			Key:    policy.ActionNetwork,
 			Detail: argSummary(args),
-			Reason: reason,
+			Reason: netWriteReason(t.NetHosts, t.NetVerbs),
 		}
 	}
 	var in struct {
@@ -198,41 +214,107 @@ func ApprovalFor(t Tool, args json.RawMessage) *policy.Action {
 	if err := json.Unmarshal(args, &in); err != nil || strings.TrimSpace(in.Command) == "" {
 		return nil
 	}
+	var hits []policy.Action
 	if len(t.ShellApproval) > 0 {
 		if hit := MatchApprovalCommand(in.Command, t.ShellApproval); hit != "" {
-			return &policy.Action{
+			hits = append(hits, policy.Action{
 				Kind:   policy.ActionShell,
 				Key:    policy.ActionShell + ":" + hit,
 				Detail: in.Command,
 				Reason: "命令包含需要确认的操作：" + hit,
-			}
+			})
 		}
 	}
 	// 网络准入与执行必须是同一个判据（ShellNetPlan）：这里批了、执行时不给网，
 	// 或这里没问、执行时给了网，都是「用户以为没联网，实际联了」。
 	//
 	// Key 带参数指纹：同一条命令重试复用结论，改了命令则算另一次调用。
-	// Invoker 用同一个 Key 认出「用户拒的是联网」，从而按 plan.OnDeny 决定继续无网跑还是整条不执行。
-	if plan := ShellNetPlan(in.Command); plan.NeedsApproval() {
-		return &policy.Action{
+	// Invoker 用同一个 Key 认出「这次批的是联网」，批准才置 NetGrant。
+	if plan := ShellNetPlan(in.Command, shellNeedNetwork(args)); plan.NeedsApproval() {
+		hits = append(hits, policy.Action{
 			Kind:   policy.ActionShell,
 			Key:    shellNetApprovalKey(t.Name, args),
 			Detail: in.Command,
 			Reason: plan.Reason,
+		})
+	}
+	return mergeActions(hits)
+}
+
+// netWriteReason 把「要访问哪里、用什么方法」写进确认卡的第一句话。
+//
+// 「访问外部系统」说了等于没说：用户要点同意，就得知道是哪个域名、发什么请求。
+// 措辞用「可能访问」而不是「会访问」——域名是清单白名单，脚本运行时到底请求
+// 其中哪一个、请求哪个路径，平台事前并不知道；说成确定目标同样是在骗人。
+func netWriteReason(hosts, verbs []string) string {
+	if len(hosts) == 0 {
+		return "这次调用会以非只读方法访问外部网络，对方系统可能已经收到改动"
+	}
+	method := "非 GET 方法"
+	if len(verbs) > 0 {
+		method = strings.Join(verbs, "、")
+	}
+	return "这次调用可能访问 " + strings.Join(hosts, "、") +
+		"（允许 " + method + "），对方系统可能已经收到改动"
+}
+
+// pluginAlwaysHint 补一句「这次大概要做什么」。
+//
+// 「每次都问」是安装方定的，与内容无关；但卡片只说这一句，用户仍然不知道
+// 自己批的是读数据还是发请求。这里按工具声明补一个方向，不猜具体动作。
+func pluginAlwaysHint(t Tool) string {
+	switch {
+	case t.NetworkWrite && t.ServerID != "":
+		return "；这次调用会改动远端系统"
+	case t.NetworkWrite:
+		return "；这次调用可能访问外部网络"
+	case len(t.ShellApproval) > 0 || t.NetPlan != nil:
+		return "；这次调用会执行脚本"
+	}
+	return ""
+}
+
+// mergeActions 把同一次调用命中的多条审批动作并成一张卡。
+//
+// 一条命令可能既命中需确认名单（rm、反引号…）、又需要联网准入。分成两次问的话，
+// 用户要对同一件事点两次同意，中间还各要续跑一轮（每轮都是一次完整的重新推理）。
+// 合成一条之后一次点击覆盖两件事：Covers 记下每个键，执行侧据此判断「这次批的
+// 包含给网」；Key 取第一条，让本轮记忆（scope=turn）的粒度与单独命中时一致。
+func mergeActions(hits []policy.Action) *policy.Action {
+	switch len(hits) {
+	case 0:
+		return nil
+	case 1:
+		one := hits[0]
+		return &one
+	}
+	merged := hits[0]
+	merged.Covers = make([]string, 0, len(hits))
+	reasons := make([]string, 0, len(hits))
+	for _, h := range hits {
+		merged.Covers = append(merged.Covers, h.Key)
+		if h.Reason != "" {
+			reasons = append(reasons, strings.TrimSuffix(h.Reason, "。"))
 		}
 	}
-	return nil
+	merged.Reason = strings.Join(reasons, "；") + "。"
+	return &merged
 }
 
 // MatchApprovalCommand 返回命中的规则名，空表示不需要确认。
 //
 // 判不准就判危险：出现命令替换、xargs、嵌套 shell 时静态分析不成立，一律要求确认。
+//
+// 只看「会被 shell 解释的部分」（见 shellCommandText）：写进文件的正文是数据，
+// 里面的反引号、$( ) 在带引号的 heredoc 里不会被展开，按原文匹配等于每写一次
+// 代码就问一次，问了也没有可判断的信息。
 func MatchApprovalCommand(command string, list []string) string {
-	if strings.TrimSpace(command) == "" {
+	text := shellCommandText(command)
+	if strings.TrimSpace(text) == "" {
 		return ""
 	}
 	for _, c := range shellCombos {
-		if c.re.MatchString(command) {
+		if c.re.MatchString(text) {
 			return c.name
 		}
 	}
@@ -240,7 +322,7 @@ func MatchApprovalCommand(command string, list []string) string {
 	for _, c := range list {
 		allow[strings.TrimSpace(c)] = true
 	}
-	for _, word := range commandWords(command) {
+	for _, word := range commandWords(text) {
 		if allow[word] {
 			return word
 		}

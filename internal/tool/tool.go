@@ -21,6 +21,7 @@ import (
 	"github.com/workagent/auto-agent/internal/sandbox"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
+	"github.com/workagent/auto-agent/internal/spacelog"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 )
@@ -29,6 +30,32 @@ import (
 type PluginTry interface {
 	// DryRunJSON 返回可直接放进上下文的 JSON 回执；失败时也要尽量带回诊断。
 	DryRunJSON(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (string, error)
+}
+
+// PluginCall 是一次插件调用的记账，供 plugin_logs 展示。
+//
+// 它记录的是「平台看到的调用结果」，不是插件 print 的内容：脚本进程的 stdout
+// 是 RPC 帧，stderr 只在崩溃时被读一次，都不是可查询的日志。用户问「刚才那次
+// 为什么失败」时，需要的正是这一条：什么时候调的、成没成、耗时多久、错在哪。
+type PluginCall struct {
+	At time.Time
+	// Tool 是模型看到的工具名：脚本插件为 <slug>.<slug>，MCP 为 <slug>.<远端工具>。
+	Tool string
+	OK   bool
+	// Duration 是端到端耗时，含进程冷启动与网络往返。
+	Duration time.Duration
+	// Err 是失败时的错误摘要（已截断），成功时为空。
+	Err string
+}
+
+// PluginLogs 提供插件最近的调用记录，由 plugin.Manager 实现。
+//
+// 记录留在内存、按空间隔离：它回答的是「刚刚发生了什么」，重启即清空；
+// 合规审计另有 tool_call / audit_log，不走这里。
+type PluginLogs interface {
+	// RecentCalls 返回某个插件在该空间最近的调用，按时间倒序，最多 limit 条。
+	// slug 为空表示该空间全部插件。
+	RecentCalls(ctx context.Context, spaceID, slug string, limit int) []PluginCall
 }
 
 // PluginRef 指向另一个空间里的一个插件，用于「子会话借用发起方空间的智能体」。
@@ -84,6 +111,14 @@ type Env struct {
 	// PluginTry 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
 	// 「对话开发插件」如果没有试跑，就只能发布上线后才发现配置错。
 	PluginTry PluginTry
+
+	// PluginLogs 是插件调用记录（plugin.Manager 实现），为 nil 时 plugin_logs 不可用。
+	// 只读当前空间：借用插件也按执行落地的空间查，看得到「这次为什么没成」。
+	PluginLogs PluginLogs
+
+	// SpaceLog 是持久化的空间运行日志（files/.logs）：shell 与插件执行后各写一条，
+	// 按天分文件、历史压缩。为 nil 时不写——测试与不关心留证的调用方不必接它。
+	SpaceLog *spacelog.Logger
 
 	// Secrets 是凭证存储，只用于查询「这个凭证配过没有」（名字 + 指纹）。
 	// 值是平台内部资产：这里没有 Get 通道，工具也永远不该拿到明文。
@@ -172,6 +207,13 @@ type Tool struct {
 	// 工具声明，只按声明展示就只能永远写「写入」。它只影响卡片徽标与历史回看，
 	// 不参与审批判定，也不改变空间写权限的判据（那里仍按声明的 Risk）。
 	RiskFor func(t Tool, args json.RawMessage) int
+	// RiskLabelFor 可选：按实参给出比等级更具体的动作标签（「网络请求」「写文件」
+	// 「脚本执行」…），返回空串表示判不出来。
+	//
+	// 等级只有四档，`curl`、`python x.py`、`echo a > b` 全落在「写入」上，用户
+	// 看不出这一步到底动了什么。标签只补这层说明：徽标文案用它，颜色仍按等级，
+	// 审批与权限判定完全不读它。
+	RiskLabelFor func(t Tool, args json.RawMessage) string
 	// SideEffects 声明影响范围：read-only（默认）/ write-workspace（仅当前空间工作区）。
 	// 策略层据此区分「空间内写」与「外部写」。
 	SideEffects string
@@ -182,6 +224,13 @@ type Tool struct {
 	// NetworkWrite 表示这个工具会以非 GET/HEAD 的动词出网（插件清单声明）。
 	// 这类调用默认要人工确认：远端可能已经接收并落地了改动。
 	NetworkWrite bool
+	// NetHosts / NetVerbs 是清单声明允许访问的域名与 HTTP 方法（已排序、去重）。
+	//
+	// 只给确认卡当文案：审批判定仍然只看 NetworkWrite，调用也不会被这两个字段
+	// 再筛一次（白名单在出网代理里强制）。没有它们，卡片只能写「访问外部系统」，
+	// 用户看不出要往哪个域名发什么请求——而这正是他决定点不点同意所需的全部信息。
+	NetHosts []string
+	NetVerbs []string
 	// ShellApproval 是「命中就需要确认」的命令名单，只对 shell 类工具有意义。
 	// 为空表示不是 shell 工具；内置 shell_exec 用 DefaultApprovalCommands。
 	ShellApproval []string
@@ -232,6 +281,17 @@ func (t Tool) EffectiveRisk(args json.RawMessage) int {
 		}
 	}
 	return t.Risk
+}
+
+// EffectiveRiskLabel 返回这一次调用的动作标签，判不出来时为空串。
+//
+// 空串交给前端退回等级文案（只读 / 查询 / 写入 / 高危）：没有更具体的说法时，
+// 说「写入」比编一个「可能是脚本」要诚实。
+func (t Tool) EffectiveRiskLabel(args json.RawMessage) string {
+	if t.RiskLabelFor == nil {
+		return ""
+	}
+	return strings.TrimSpace(t.RiskLabelFor(t, args))
 }
 
 // MCPTool 是 MCP Server 暴露的工具（由 mcp.Manager 提供）。

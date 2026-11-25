@@ -53,6 +53,27 @@ type Action struct {
 	Key string
 	// Reason 是给用户看的一句话，说明为什么要确认。
 	Reason string
+	// Covers 是这次确认同时覆盖的其它动作键（含 Key 本身）。
+	//
+	// 一条命令可能既命中需确认命令名单、又需要联网准入：两件事合成一张卡、点一次
+	// 就够，但执行时必须知道「这次批的包含给网」，否则用户批了联网还要再被问一次。
+	Covers []string
+}
+
+// CoversKey 表示这次确认是否覆盖了动作键 k（Key 本身或 Covers 里的任一项）。
+func (a *Action) CoversKey(k string) bool {
+	if a == nil || k == "" {
+		return false
+	}
+	if a.Key == k {
+		return true
+	}
+	for _, c := range a.Covers {
+		if c == k {
+			return true
+		}
+	}
+	return false
 }
 
 // Request 是一次授权判定的输入。
