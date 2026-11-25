@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -49,10 +48,9 @@ type localPathStore interface {
 // 只有清单声明 runtime.resident 的插件才进常驻池，按键（空间 + slug + 目录）复用。
 type toolRuntime struct {
 	runner sandbox.Runner
-	// deno 是本机（控制面）的 deno，只给 warmDeps 用：依赖预热是宿主进程动作。
-	deno string
-	// denoBin 是**执行体里**的 deno 可执行文件，插件进程的命令行用它。
-	// 两者不能合并：容器化后控制面与执行体不是同一个文件系统。
+	// denoBin 是**执行体里**的 deno 可执行文件，插件进程与装依赖都用它。
+	// 过线的只能是命令名：控制面与执行体不是同一个文件系统（容器化之后
+	// 宿主路径在执行体里根本不存在，表现为进程起来就退）。
 	denoBin    string
 	runtimeDir string
 	secrets    Secrets
@@ -137,44 +135,168 @@ func fileExists(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// warmDeps 按 lock 预热 Deno 依赖缓存。
+// depInstallTimeout 是装依赖的墙钟上限。
 //
-// `deno cache` 只下载不执行，等价于 `apt-get --download-only`。
-// 装的时候有网，拉一次就够；运行期是断网沙箱，靠 `--cached-only`
-// 保证"缺依赖立刻失败"而不是等 DNS 超时。
+// 它不走工具超时：这是一次平台动作（安装/启用），用户没有可点的按钮，
+// 也没有上下文预算可烧；给足时间是唯一正确的选择（首装一个 SDK 动辄两三分钟）。
+const depInstallTimeout = 10 * time.Minute
+
+// installDeps 把插件声明的依赖装进**插件目录**（node_modules/ + vendor/ + deno.lock）。
 //
-// 在宿主进程里跑而不是起沙箱：安装是控制面动作，不该依赖用户空间的执行环境，
-// 也不能让插件代码在预热阶段被执行。
-func (r *toolRuntime) warmDeps(ctx context.Context, dir, entry, slug, version string) error {
-	if r.deno == "" {
-		return nil
+// 为什么不是预热门 DENO_DIR：全局缓存按 slug@version 复用，而插件目录是「每个安装
+// 副本一份」。依赖落在目录里，运行期用 `--node-modules-dir=manual --vendor`
+// 就能完全离线解析，也不再需要控制面有 deno。
+//
+// 为什么必须在沙箱里跑：写的是空间存储里的插件目录，而且要走执行体的网络
+// （镜像源、NetworkPolicy 都按执行环境配）；控制面自己下载再写回去，等于在
+// 两条链路上各维护一份安装源。
+//
+// `deno cache` 只下载不执行（npm 的 postinstall 不会跑），这一点和 `npm i` 不同，
+// 也是安装阶段敢直接给网的前提。
+func (r *toolRuntime) installDeps(ctx context.Context, in invokeInput) error {
+	if r.denoBin == "" {
+		return errors.New("当前环境没有 deno，无法安装插件依赖")
 	}
-	entryPath := filepath.Join(dir, filepath.FromSlash(entry))
-	if !fileExists(entryPath) {
-		return fmt.Errorf("插件入口不存在: %s", entryPath)
+	lp, ok := r.fs.(localPathStore)
+	if !ok {
+		return errors.New("当前存储不支持插件依赖安装（需要本地文件系统）")
 	}
-	denoDir := r.denoDir(slug, version)
-	if err := os.MkdirAll(denoDir, 0o755); err != nil {
-		return fmt.Errorf("创建 DENO_DIR 失败: %w", err)
+	abs, err := lp.LocalPath(in.Dir)
+	if err != nil {
+		return fmt.Errorf("解析插件目录失败: %w", err)
 	}
-	args := []string{"cache", "--quiet", "--no-config"}
-	if lock := filepath.Join(dir, "deno.lock"); fileExists(lock) {
-		// --frozen：代码与 lock 不一致时直接失败。
-		// 作者改了依赖却忘了更新 lock，装的时候就该报错。
-		args = append(args, "--lock="+lock, "--frozen")
+	entryURL := (&url.URL{
+		Scheme: "file",
+		Path:   path.Join(sandbox.PluginDir, filepath.ToSlash(in.Entry)),
+	}).String()
+
+	args := []string{
+		r.denoBin, "cache", "--quiet",
+		// 与运行期同一套门控：作者不能靠自带的 deno.json 换掉解析规则。
+		"--no-config",
+		// auto：把 npm: 包真正装进 ./node_modules（运行期换成 manual 只读它）。
+		// 没有依赖时这一步是空操作，不会因为「没有 package.json」报错。
+		"--node-modules-dir=auto", "--vendor",
+	}
+	if fileExists(filepath.Join(abs, "deno.lock")) {
+		// 有 lock 就是「按作者验过的版本装」：代码与 lock 不一致直接失败，
+		// 而不是悄悄装成别的版本。用 --frozen-lockfile 而不是 --frozen：
+		// 前者是 deno cache 文档里的写法，后者只是 run 那边的别名。
+		args = append(args, "--lock="+path.Join(sandbox.PluginDir, "deno.lock"), "--frozen-lockfile")
+	} else {
+		// lock 是可选件：没有就按代码里的说明符解析，装到哪算哪。
+		// 这里**不**创建 lock：安装动作不该改发布件的指纹（ContentHash 会把它
+		// 算进去，装上就变成「本地已改」），要不要锁由作者在开发期决定。
+		args = append(args, "--no-lock")
+	}
+	args = append(args, entryURL)
+
+	res, err := r.runner.Run(ctx, sandbox.Spec{
+		// 与插件运行同一个容器：依赖装完立刻能跑，不必等另一个容器热起来。
+		Scope:   sandbox.Scope{Space: in.SpaceID, Kind: sandbox.KindPlugin},
+		Cmd:     args,
+		Dir:     sandbox.PluginDir,
+		Mode:    sandbox.ModeWorkspaceWrite,
+		Mounts:  []sandbox.Mount{{Source: abs, Key: in.Dir, Target: sandbox.PluginDir, Write: true}},
+		Network: true,
+		Timeout: depInstallTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("安装插件依赖失败: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("安装插件依赖失败（exit %d）: %s",
+			res.ExitCode, strings.TrimSpace(res.Stdout+res.Stderr))
+	}
+	return nil
+}
+
+// depCheckTimeout 是离线依赖校验的墙钟。
+//
+// 只解析模块图、不下载不执行，正常是毫秒级；给一分钟是兜住超大依赖树在
+// 冷页缓存上的读取。它比安装短一个数量级——预检卡住说明依赖树本身有问题。
+const depCheckTimeout = time.Minute
+
+// verifyDeps 离线校验插件依赖是否装齐：只解析模块图，不执行代码、不联网。
+//
+// 为什么是 `deno cache`：
+//   - 它是唯一「只解析、不执行」的子命令。`deno run --cached-only` 会把插件
+//     启动起来（顶层代码就跑了），那不是预检；
+//   - `deno check` 不能用：2.9.4 没有 `--cached-only`，而不带它就会去下载；
+//     带 `--no-check` 的写法在 2.9.4 是 `unexpected argument`，版本可移植性差；
+//   - `--no-remote` 也不行：jsr 包的元数据每次都要远程取，实测依赖装齐了
+//     照样报 `A remote specifier was requested`。
+//
+// 离线的保证来自环境而不是参数：沙箱 `Network: false`（--unshare-net）+
+// 空的 DENO_DIR + `--node-modules-dir=manual`。实测三种情形（2.9.4 与 2.9.8
+// 都验过）：依赖装齐 → 0；缺 npm 包 → 1 且报「Could not find a matching
+// package for 'npm:ms@2' in the node_modules directory」；无依赖 → 0。
+func (r *toolRuntime) verifyDeps(ctx context.Context, spaceID, dir, entry string) error {
+	if r.denoBin == "" {
+		return errors.New("当前环境没有 deno，无法校验插件依赖")
+	}
+	lp, ok := r.fs.(localPathStore)
+	if !ok {
+		return errors.New("当前存储不支持插件依赖校验（需要本地文件系统）")
+	}
+	abs, err := lp.LocalPath(dir)
+	if err != nil {
+		return fmt.Errorf("解析插件目录失败: %w", err)
+	}
+	entryURL := (&url.URL{
+		Scheme: "file",
+		Path:   path.Join(sandbox.PluginDir, filepath.ToSlash(entry)),
+	}).String()
+
+	args := verifyDepsArgs(r.denoBin, entryURL, fileExists(filepath.Join(abs, "deno.lock")))
+
+	res, err := r.runner.Run(ctx, sandbox.Spec{
+		Scope: sandbox.Scope{Space: spaceID, Kind: sandbox.KindPlugin},
+		Cmd:   args,
+		Dir:   sandbox.PluginDir,
+		Mode:  sandbox.ModeWorkspaceWrite,
+		Mounts: []sandbox.Mount{
+			{Source: abs, Key: dir, Target: sandbox.PluginDir, Write: true},
+			// 插件可能 import type 平台 SDK：类型被擦除，但模块图仍要解析，
+			// 不挂就是一条与依赖无关的「找不到模块」。
+			{Source: r.runtimeDir, Key: RuntimeDirKey, Target: sandbox.RuntimeDir},
+		},
+		// 断网是这条命令的全部意义：--cached-only 下任何需要下载的解析都会
+		// 立刻失败并指名缺哪个包，而不是先等 DNS 超时再报「网络故障」。
+		Network: false,
+		Timeout: depCheckTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("校验插件依赖失败: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("依赖未装齐（exit %d）: %s",
+			res.ExitCode, strings.TrimSpace(res.Stdout+res.Stderr))
+	}
+	return nil
+}
+
+// verifyDepsArgs 是预检命令的参数。
+//
+// 单独抽出来是因为里面的每个标志都被 deno 的版本差异坑过：`cache` 不认
+// `--cached-only`（2.9.4 / 2.9.8 都是 `unexpected argument`），`check` 在
+// 2.9.4 又不认 `--no-check`。写错一个的直接后果是「预检永远失败」，
+// 而这种错在类型系统里看不出来，只能拿测试钉住。
+func verifyDepsArgs(denoBin, entryURL string, hasLock bool) []string {
+	args := []string{
+		denoBin, "cache", "--quiet",
+		// 与运行期完全一致的门控与解析规则：预检通过的才保证跑得起来。
+		"--no-check", "--no-config",
+		// manual：只用现成的 node_modules，缺了就报错（auto 会去下载，
+		// 那正好绕过「装没装齐」这个判断）。
+		"--node-modules-dir=manual", "--vendor",
+	}
+	if hasLock {
+		args = append(args, "--lock="+path.Join(sandbox.PluginDir, "deno.lock"), "--frozen-lockfile")
 	} else {
 		args = append(args, "--no-lock")
 	}
-	args = append(args, entryPath)
-
-	cmd := exec.CommandContext(ctx, r.deno, args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "DENO_DIR="+denoDir)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("deno cache 失败: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return append(args, entryURL)
 }
 
 type rpcFrame struct {
@@ -298,9 +420,16 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 		"--quiet", "--no-prompt",
 		// 不让插件自带 deno.json：作者能改自己的配置，等于绕过这里的门控。
 		"--no-config",
-		// 断网沙箱里绝不能尝试下载：缺依赖就立刻失败，
-		// 而不是等 DNS 超时（症状像网络故障，实际是依赖没预热）。
+		// 断网沙箱里绝不能尝试下载：缺依赖就立刻失败，报错里会指名缺哪个包，
+		// 而不是等 DNS 超时（那看起来像网络故障，实际是依赖没装）。
 		"--cached-only",
+		// 依赖只从插件目录解析，不碰全局缓存：
+		//   node_modules/ ← npm: 包
+		//   vendor/       ← jsr: / https: 包
+		// 两者都由「装依赖」那一步写进 /plugin（见 toolRuntime.installDeps）。
+		// manual 是「只用现成的、不自己装」：运行期断网，装不了也不该装。
+		// 没有依赖的插件带这两个标志也照跑（目录不存在就不解析）。
+		"--node-modules-dir=manual", "--vendor",
 	}
 	// lock 是依赖完整性的唯一凭据。有它就必须校验；
 	// --frozen 让「代码与声明不一致」变成硬错误，而不是静默装别的版本。

@@ -368,7 +368,7 @@ func TestHiddenFilesVisibleExceptPlatformReserved(t *testing.T) {
 	}
 }
 
-// fakeSpaceStore 只实现删除文件会用到的三个方法；其余走嵌入接口，测试里不会调到。
+// fakeSpaceStore 只实现文件相关用例会用到的方法；其余走嵌入接口，测试里不会调到。
 type fakeSpaceStore struct {
 	store.Store
 	space    store.Space
@@ -378,6 +378,11 @@ type fakeSpaceStore struct {
 
 func (f *fakeSpaceStore) GetSpace(context.Context, string) (store.Space, error) {
 	return f.space, nil
+}
+
+// ListSpaces 只返回这一个空间：TreeRev 的版本号按用户可见空间拼，用它可以验证结构指纹。
+func (f *fakeSpaceStore) ListSpaces(context.Context, string) ([]store.Space, error) {
+	return []store.Space{f.space}, nil
 }
 
 func (f *fakeSpaceStore) SpacePerm(context.Context, string, string) (string, error) {

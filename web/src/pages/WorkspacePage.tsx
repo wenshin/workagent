@@ -27,6 +27,7 @@ import {
   useSpaceDirs,
   useSpaceFiles,
   useSpaces,
+  useSpaceTreeAutoRefresh,
   useUploadFiles,
 } from '../api/hooks';
 import {
@@ -73,6 +74,9 @@ export default function WorkspacePage() {
   const { data: files = [], isFetched: filesFetched } = useSpaceFiles();
   // 树是四份数据拼出来的：齐了再定默认展开，否则后到的目录会被当成新增节点全部展开
   const treeReady = spacesFetched && sessionsFetched && dirsFetched && filesFetched;
+  // 定时刷新：树的内容是磁盘现状，别人（其他会话的 Agent、另一个标签页、shell）
+  // 写出来的文件没有事件可订阅，只能靠版本号轮询发现
+  useSpaceTreeAutoRefresh();
   const [searchParams, setSearchParams] = useSearchParams();
   const [dialog, setDialog] = useState<DialogState>({ kind: 'none' });
   const [pendingDelete, setPendingDelete] = useState<ChatSession | null>(null);

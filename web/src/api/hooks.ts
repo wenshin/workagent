@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
+import { useEffect, useRef } from 'react';
 
 import { api, deleteAgentIcon, uploadAgentIcon, uploadSpaceFiles } from './client';
 import type {
@@ -30,6 +31,7 @@ import type {
   Space,
   SpaceDir,
   SpacesResponse,
+  TreeRevResponse,
 } from './types';
 
 export const queryKeys = {
@@ -39,6 +41,7 @@ export const queryKeys = {
   sessions: ['sessions'] as const,
   dirs: ['dirs'] as const,
   files: ['files'] as const,
+  treeRev: ['tree', 'rev'] as const,
   skills: (spaceId: string) => ['skills', spaceId] as const,
   agent: ['agent'] as const,
   agents: (spaceId: string) => ['agents', spaceId] as const,
@@ -193,6 +196,53 @@ export function useSpaceFiles() {
     queryFn: () => api<FilesResponse>('/spaces/files').then((r) => r.files),
     staleTime: 15_000,
   });
+}
+
+/**
+ * 文件树版本号的轮询间隔。
+ *
+ * 它是「树最多滞后多久」的上限（服务端另有 1s 缓存，最坏再加一点）。
+ * 5s 够快：Agent 写完文件到用户看到，中间只有一次轮询。
+ */
+const TREE_REV_INTERVAL_MS = 5_000;
+
+/**
+ * 左侧文件树的定时刷新。
+ *
+ * 树的内容是磁盘现状：文件会被其他会话里的 Agent、另一个标签页、沙箱里的 shell
+ * 命令改出来，没有事件可订阅，「自己操作后失效」只能覆盖自己这一路。所以定时问
+ * 一次版本号——响应只有几十字节，服务端按空间缓存——值变了才重新取 dirs / files，
+ * 没变化时等于什么都没发生（清单一次可能有几百条，跟着版本号一起传是浪费）。
+ *
+ * 标签页在后台时不轮询（`refetchIntervalInBackground: false`），回到前台的下一次
+ * 间隔会把期间的变化一起补上，不需要额外的 focus 刷新。
+ */
+export function useSpaceTreeAutoRefresh() {
+  const qc = useQueryClient();
+  const { data: rev } = useQuery({
+    queryKey: queryKeys.treeRev,
+    queryFn: () => api<TreeRevResponse>('/spaces/tree/rev').then((r) => r.rev),
+    refetchInterval: TREE_REV_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+    // 默认 10s 的 staleTime 对「定时比较」没有意义，给 0 让间隔到了就真的去问
+    staleTime: 0,
+    // 轮询失败不值得重试：下一轮本来就会再问一次，重试只会把请求堆起来
+    retry: false,
+  });
+
+  // 首次拿到的版本号只建基线：此刻的清单就是按它取的，再失效一次等于白刷一遍
+  const baseline = useRef<string | null>(null);
+  useEffect(() => {
+    if (!rev || baseline.current === rev) return;
+    const first = baseline.current === null;
+    baseline.current = rev;
+    if (first) return;
+    void qc.invalidateQueries({ queryKey: queryKeys.spaces });
+    void qc.invalidateQueries({ queryKey: queryKeys.dirs });
+    void qc.invalidateQueries({ queryKey: queryKeys.files });
+    // 正在预览的文件也可能被改写（改写会改 mtime，版本号已经变了），正文一起刷新
+    void qc.invalidateQueries({ queryKey: ['file'] });
+  }, [rev, qc]);
 }
 
 /**

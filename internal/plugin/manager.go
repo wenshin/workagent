@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -205,12 +204,9 @@ func New(o Options) (*Manager, error) {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	// deno 要解析两次，因为它在两个文件系统里跑：
-	//   - hostDeno：本机进程（warmDeps 预热依赖缓存，跑在控制面）；
-	//   - sandboxDeno：插件进程（跑在执行体里，容器化后与控制面不是同一个根）。
-	// 混用就是 `bwrap: execvp /Users/.../deno: No such file or directory`：
-	// 进程起来就退，宿主只读到 EOF，现象像「插件自己崩了」。
-	hostDeno, _ := exec.LookPath("deno")
+	// deno 只在执行体里解析：插件进程与装依赖都跑在那边。
+	// 用控制面的 exec.LookPath 就是 `bwrap: execvp /Users/.../deno: No such file
+	// or directory`——进程起来就退，宿主只读到 EOF，现象像「插件自己崩了」。
 	sandboxDeno := o.Runner.Executable("deno")
 	if sandboxDeno == "" {
 		o.Logger.Warn("找不到 deno，脚本插件（kind=tool）不可用")
@@ -232,7 +228,7 @@ func New(o Options) (*Manager, error) {
 		imDedup: newInboxDedup(0, imResultTTL),
 	}
 	m.rt = &toolRuntime{
-		runner: o.Runner, deno: hostDeno, denoBin: sandboxDeno, runtimeDir: o.RuntimeDir,
+		runner: o.Runner, denoBin: sandboxDeno, runtimeDir: o.RuntimeDir,
 		secrets: o.Secrets, fs: o.Storage, logger: o.Logger, spaceLog: o.SpaceLog,
 		egress: newEgressPool(o.Logger),
 	}
@@ -819,6 +815,16 @@ func (m *Manager) Publish(ctx context.Context, spaceID, slug, userID, version, n
 		})
 	}
 
+	// 依赖没锁不阻断发布：deno.lock 是可选件，依赖也可能由镜像预装。但必须留痕——
+	// 这种版本到了别的空间，会在运行期才发现缺依赖，而那时已经不在作者手里了。
+	// 放在所有门禁之后：审计里不该出现「发布过」的痕迹，而这次其实没发成。
+	if b.DepsUnlocked() {
+		m.o.Logger.Warn("插件引用了远程依赖但没有 deno.lock，安装时按代码里的说明符解析",
+			"slug", slug, "version", version, "space", spaceID)
+		m.recordAudit(ctx, userID, "plugin.publish.deps_unlocked", slug, version,
+			map[string]any{"space": spaceID})
+	}
+
 	manifestRaw, err := json.Marshal(b.Meta)
 	if err != nil {
 		return store.PluginVersion{}, err
@@ -967,7 +973,7 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 	// 管理员在文件树里能直接看到全局装了哪些插件（内容仍只读）。
 	// 带内置技能的智能体必须落副本：技能页对外路径是 plugins/<slug>/...，
 	// 没有副本就读不到（内置工具本身能从发布件目录跑，但技能页不行）。
-	if meta.IsExtensible() || globalScope || meta.HasAgentSkills() {
+	if meta.IsExtensible() || globalScope || meta.HasAgentSkills() || needsDepsDir(meta) {
 		if err := m.ensureCopy(ctx, in.SpaceID, p.ID, in.Slug, v.Version, v.ArtifactPath, meta); err != nil {
 			rollback()
 			return store.PluginInstall{}, err
@@ -979,10 +985,11 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 		rollback()
 		return store.PluginInstall{}, err
 	}
-	// 依赖预热：装的时候有网，按 lock 一次性拉进 DENO_DIR，
-	// 运行期才能靠 --cached-only 在断网沙箱里跑起来。
-	// 失败不阻断安装——没有外部依赖的插件本来就不需要预热。
-	m.warmDeps(ctx, inst)
+	// 装依赖：装的时候有网，把 npm:/jsr: 包落进**插件目录**（node_modules/ + vendor/），
+	// 运行期用 --cached-only 与 --node-modules-dir=manual 完全离线解析。
+	// 失败只告警不阻断：依赖可能已经在本地缓存或目录里（重装、离线部署），
+	// 真缺的时候第一次调用会给出「Could not find a matching package」。
+	m.installDeps(ctx, inst)
 	if err := m.registerTools(ctx, inst); err != nil {
 		rollback()
 		return store.PluginInstall{}, err
@@ -1012,19 +1019,20 @@ func (m *Manager) install(ctx context.Context, in InstallInput, depth int) (stor
 	return install, nil
 }
 
-// warmDeps 预热插件的 Deno 依赖缓存。
+// installDeps 把插件依赖装进空间里的插件目录。
 //
-// 同步执行并设上限：安装动作要保证"装完就能跑"，
-// 异步预热会让紧接着的第一次调用撞上 --cached-only。
-// 失败只记日志，不阻断安装。
-func (m *Manager) warmDeps(ctx context.Context, inst *instance) {
+// 同步执行：安装动作要保证"装完就能跑"，异步装会让紧接着的第一次调用撞上
+// --cached-only。失败只记日志，不阻断安装（见 install 里的说明）。
+func (m *Manager) installDeps(ctx context.Context, inst *instance) {
 	if m.rt == nil || inst.Manifest.Kind != KindTool || inst.Manifest.Runtime.Entry == "" {
 		return
 	}
-	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, depInstallTimeout+time.Minute)
 	defer cancel()
-	if err := m.rt.warmDeps(cctx, inst.Dir, inst.Manifest.Runtime.Entry, inst.Slug, inst.Version); err != nil {
-		m.o.Logger.Warn("插件依赖预热失败，运行期可能缺依赖",
+	if err := m.rt.installDeps(cctx, invokeInput{
+		Dir: inst.Dir, Entry: inst.Manifest.Runtime.Entry, SpaceID: inst.SpaceID,
+	}); err != nil {
+		m.o.Logger.Warn("插件依赖安装失败，运行期可能缺依赖",
 			"slug", inst.Slug, "version", inst.Version, "err", err)
 	}
 }
@@ -1093,6 +1101,13 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 	if err != nil {
 		return err
 	}
+	// 启用常驻插件会立刻起进程：依赖没装齐的话，用户点完只能看到「插件不可用」。
+	// 在写状态之前先离线解析一次（不执行、不联网），缺什么直接回给他。
+	if enabled {
+		if err := m.verifyResidentDeps(ctx, spaceID, slug); err != nil {
+			return err
+		}
+	}
 	status := store.PluginInstallDisabled
 	if enabled {
 		status = store.PluginInstallEnabled
@@ -1149,6 +1164,11 @@ func (m *Manager) Restart(ctx context.Context, userID, spaceID, slug string) err
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("%w：插件 %s 未在本空间启用，没有可重启的进程", store.ErrNotFound, slug)
+	}
+	// 重启是「让磁盘上的最新代码生效」：依赖只可能更旧，先校验一次，
+	// 免得把能跑的进程换成起不来的那份。
+	if err := m.verifyResidentDeps(ctx, spaceID, slug); err != nil {
+		return err
 	}
 	// 进程与实例一起丢：入口文件、白名单、常驻声明都可能改过，只换进程会沿用
 	// 旧的 manifest 与沙箱参数，等于「重启了还是旧配置」。
@@ -1886,6 +1906,34 @@ func residentEligible(inst *instance) bool {
 		return false
 	}
 	return inst.Manifest.Runtime.Resident
+}
+
+// verifyResidentDeps 在「启用」之前离线校验常驻插件的依赖是否装齐。
+//
+// 常驻插件是「启用即启动」：依赖缺失的唯一表现是进程起来就崩、退避、最后熔断，
+// 启用页上看到的只有「插件不可用」，而真正的原因是依赖没装（报错里也不会提）。
+// 所以在写状态之前先解析一次模块图——不执行代码、不联网，缺什么由 deno 直接说。
+//
+// 只对常驻工具生效：一次性插件的进程就是调用本身，缺依赖在第一次调用时报错
+// 更直接（那里有完整的调用参数与上下文），在启用时拦反而挡住了「先启用再补依赖」。
+func (m *Manager) verifyResidentDeps(ctx context.Context, spaceID, slug string) error {
+	if m.rt == nil {
+		return nil
+	}
+	dir := DraftKey(m.o.Storage, spaceID, slug)
+	b, err := LoadBundle(ctx, m.o.Storage, dir, false)
+	if err != nil {
+		// 目录里没有清单（还没写代码、或已经被删）：交给后续加载去报错。
+		// 这里编一句「依赖没装」只会把排查引到错误的方向。
+		return nil
+	}
+	if b.Meta.Kind != KindTool || b.Meta.Builtin || !b.Meta.Runtime.Resident || b.Meta.Runtime.Entry == "" {
+		return nil
+	}
+	if err := m.rt.verifyDeps(ctx, spaceID, dir, b.Meta.Runtime.Entry); err != nil {
+		return fmt.Errorf("插件 %s 不能启用：%w", slug, err)
+	}
+	return nil
 }
 
 // startResident 在插件「变为可用」的那一刻拉起常驻进程。

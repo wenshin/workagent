@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -94,7 +95,6 @@ func TestProcSpecUsesExecutorDeno(t *testing.T) {
 	}
 	rt := &toolRuntime{
 		fs:         fs,
-		deno:       "/Users/someone/.nvm/versions/node/v18/bin/deno",
 		denoBin:    "deno",
 		runtimeDir: "/host/plugin-runtime",
 	}
@@ -111,6 +111,14 @@ func TestProcSpecUsesExecutorDeno(t *testing.T) {
 	}
 	if !spec.Resident {
 		t.Fatal("常驻插件应标记 Resident：否则会被墙钟超时杀掉")
+	}
+	// 依赖只从插件目录解析：node_modules（npm:）与 vendor（jsr:/https:）。
+	// 少了这两个标志，运行期就会去全局缓存找依赖，而缓存里什么都没有
+	// （--cached-only 直接报「缺依赖」）。
+	for _, flag := range []string{"--node-modules-dir=manual", "--vendor", "--cached-only"} {
+		if !slices.Contains(spec.Cmd, flag) {
+			t.Fatalf("运行参数缺少 %s: %v", flag, spec.Cmd)
+		}
 	}
 }
 

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
@@ -246,5 +248,81 @@ func TestShellRiskLabelByCommand(t *testing.T) {
 func TestEffectiveRiskLabelFallback(t *testing.T) {
 	if got := (Tool{Name: "x"}).EffectiveRiskLabel(json.RawMessage(`{}`)); got != "" {
 		t.Fatalf("未声明标签的工具应返回空串，得到 %q", got)
+	}
+}
+
+// 墙钟按命令类别给默认值：装依赖与 `ls` 的合理耗时差两个数量级，
+// 一个常量只能取最小值（长命令全被截断）或最大值（挂住的命令也要等半小时）。
+func TestShellTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		seconds int
+		want    time.Duration
+	}{
+		{"普通命令用默认两分钟", "ls -la", 0, defaultShellTimeout},
+		{"纯装依赖给五分钟", "pip install -q dingtalk-stream", 0, installShellTimeout},
+		{"deno 装依赖走脚本档（要审批）", "deno cache --vendor main.ts", 0, defaultShellTimeout},
+		{"模型显式声明优先", "sleep 1", 900, 900 * time.Second},
+		{"超过上限按上限", "sleep 1", 99999, maxShellTimeout},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shellTimeout(c.command, c.seconds); got != c.want {
+				t.Fatalf("shellTimeout(%q,%d)=%s，期望 %s", c.command, c.seconds, got, c.want)
+			}
+		})
+	}
+}
+
+// 插件作用域：只挂 plugins/<slug>，命令的 cwd 就是它。
+// 装依赖（npm postinstall 尤甚）是平台上最不该看见业务数据的一步。
+func TestShellExecPluginScope(t *testing.T) {
+	env := newShellEnv(t, sandbox.NewLocal())
+	local, ok := env.Storage.(localPathStore)
+	if !ok {
+		t.Fatal("测试用的存储应支持 LocalPath")
+	}
+	dir, err := local.LocalPath("spaces/sp1/files/plugins/demo")
+	if err != nil {
+		t.Fatalf("解析插件目录失败: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("创建插件目录失败: %v", err)
+	}
+
+	out, err := runShell(t, env, `{"command":"echo dep > dep.txt","plugin":"demo"}`)
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if !strings.Contains(out, "退出码 0") {
+		t.Fatalf("命令应成功: %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dep.txt")); err != nil {
+		t.Errorf("命令应落在插件目录里: %v", err)
+	}
+	workDir, err := local.LocalPath("spaces/sp1/files")
+	if err != nil {
+		t.Fatalf("解析工作区失败: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "dep.txt")); err == nil {
+		t.Error("插件作用域下不应写到工作区根目录")
+	}
+}
+
+// plugin 是模型写的，必须当成不可信输入：带 ../ 的 slug 能把挂载点指到空间里
+// 任何一个目录，等于绕开「只挂插件目录」这条边界。
+func TestShellPluginScopeRejectsUntrustedSlug(t *testing.T) {
+	env := newShellEnv(t, sandbox.NewLocal())
+	for _, slug := range []string{"../etc", "a/b", ".hidden", ""} {
+		if slug == "" {
+			continue // 空串是「不要插件作用域」，合法
+		}
+		if _, err := runShell(t, env, `{"command":"ls","plugin":"`+slug+`"}`); err == nil {
+			t.Errorf("非法 slug %q 应被拒绝", slug)
+		}
+	}
+	if _, err := runShell(t, env, `{"command":"ls","plugin":"missing"}`); err == nil {
+		t.Fatal("插件目录不存在时应报错，而不是退回工作区")
 	}
 }

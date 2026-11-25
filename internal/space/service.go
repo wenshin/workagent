@@ -95,6 +95,8 @@ type Service struct {
 	// uploadMaxBytes 是单文件上传大小上限（字节）。装配时由配置注入，
 	// 未注入按 DefaultUploadMaxBytes 处理。
 	uploadMaxBytes int64
+	// revCache 缓存每个空间的树版本号，见 TreeRev。
+	revCache treeRevCache
 }
 
 // SetUploadMaxBytes 设置单文件上传大小上限；非正值表示沿用默认值。

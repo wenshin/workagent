@@ -107,3 +107,32 @@ func TestArgsHashNormalizes(t *testing.T) {
 		t.Fatal("参数不同指纹应不同")
 	}
 }
+
+// 返回值取决于磁盘内容的工具不参与回放：plugin_try 的 key 只有 slug + input，
+// 但草稿改了。回放会把上一次的回执原样奉还（连耗时都一样），
+// 作者以为「改了没生效」，实际是根本没重跑。
+func TestInvokeSkipsReplayForNoReplayTools(t *testing.T) {
+	args := `{"slug":"demo","input":"{}"}`
+	tl, call, executed := replayFixture(t, args)
+	tl.Name = "plugin_try"
+	tl.NoReplay = true
+	call.Function.Name = "plugin_try"
+
+	env := replayEnv()
+	env.Replay = map[string]InvokeResult{
+		ArgsHash("plugin_try", json.RawMessage(args)): {
+			ToolName: "plugin_try",
+			Status:   StatusOK,
+			Content:  "上一次的结果",
+		},
+	}
+
+	got := NewInvoker(nil, noopRecorder{}, nil).Invoke(context.Background(), tl, call, env)
+
+	if !*executed {
+		t.Fatal("标记 NoReplay 的工具必须真的执行")
+	}
+	if got.Cached || got.Content != "written" {
+		t.Fatalf("不应命中回放，实际 %+v", got)
+	}
+}

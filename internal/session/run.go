@@ -95,6 +95,27 @@ func (w *runWatchdog) touch() {
 	w.idleT.Reset(w.idle)
 }
 
+// suspend 暂停 idle 判定：工具执行期间没有事件是正常的。
+//
+// 一次工具调用可能是几分钟的 `pip install`，而 idle 判据认的是「有没有事件」，
+// 两者天然冲突。工具自己有墙钟（Tool.TimeoutFor，最长 30 分钟），
+// 那段等待该由它负责回收，不该被当成「run 卡住」——后者会把整轮直接判失败，
+// 用户拿到的是一条和长命令毫无关系的错误。
+func (w *runWatchdog) suspend() {
+	if w == nil || w.idleT == nil || w.stopped.Load() {
+		return
+	}
+	w.idleT.Stop()
+}
+
+// resume 恢复 idle 判定：工具都回来了，重新等事件。
+func (w *runWatchdog) resume() {
+	if w == nil || w.idleT == nil || w.stopped.Load() {
+		return
+	}
+	w.idleT.Reset(w.idle)
+}
+
 // stop 关掉计时器（正常收尾时调用）。
 func (w *runWatchdog) stop() {
 	if w == nil {
@@ -249,13 +270,28 @@ func (s *Service) execute(
 		}
 	}
 
+	// 工具执行期间挂起 idle 判定：命令可能跑十几分钟（装依赖、跑测试），
+	// 这段时间本来就不该有任何事件。不挂起的话 RUN_IDLE_TIMEOUT（默认 10m）
+	// 会把它判成「run 卡住」——真正该负责回收的是工具自己的墙钟。
+	// 用计数而不是布尔：一轮里可能并发多条调用，结果是一条条回来的。
+	var toolsInFlight atomic.Int32
 	emitEvent := func(ev agent.Event) error {
 		watch.touch()
 		beat()
 		// 先广播：正文/帧进内存缓冲，工具事件也进这一轮的帧序列
 		offset := live.broadcast(ev)
 		switch ev.Type {
-		case agent.EventToolCall, agent.EventToolResult:
+		case agent.EventToolCall:
+			if toolsInFlight.Add(1) == 1 {
+				watch.suspend()
+			}
+			ensurePlaceholder()
+			live.flush(true)
+			appendStep(ev.Type, ev.Tool.Payload())
+		case agent.EventToolResult:
+			if toolsInFlight.Load() > 0 && toolsInFlight.Add(-1) == 0 {
+				watch.resume()
+			}
 			// 工具调用也是「内容」：只有轨迹、没有正文的中断轮同样要能在列表里看到
 			ensurePlaceholder()
 			// 断点前强制推一次：工具可能跑几分钟，这段时间里切页要能看到已经说了什么

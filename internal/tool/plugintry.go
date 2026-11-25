@@ -37,7 +37,11 @@ func pluginTry() Tool {
 		SideEffects:    policy.SideEffectsReadOnly,
 		Runtime:        "builtin",
 		MaxResultBytes: 16 << 10,
-		Invoke:         invokePluginTry,
+		// 试跑的输入只有 slug 与 args，但结果取决于磁盘上的草稿：改了入口再用
+		// 同样的参数重跑，回放会原样奉还上一次的回执（连耗时都一样），
+		// 作者会以为「改了半天没生效」。开发循环必须真的执行。
+		NoReplay: true,
+		Invoke:   invokePluginTry,
 	}
 }
 

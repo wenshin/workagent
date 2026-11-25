@@ -65,6 +65,18 @@ type Invoker struct {
 	maxArgBytes int
 }
 
+// maxToolTimeout 是单次工具调用的硬上限，工具自己声明的墙钟不能超过它。
+//
+// 三十分钟是「一轮回答总墙钟（默认两小时）的四分之一」：再长就该走平台任务，
+// 而不是让一次调用把整轮的预算吃光——用户还在等着看结论。
+const maxToolTimeout = 30 * time.Minute
+
+// defaultToolTimeout 是没声明 TimeoutFor 的工具的墙钟。
+//
+// 保持三十秒：MCP 远端、插件脚本、文件操作挂住时，等十分钟只会让用户更难受，
+// 真正需要长跑的是 shell（装依赖、跑测试），由它自己声明。
+const defaultToolTimeout = 30 * time.Second
+
 // NewInvoker 构造执行器；engine 为空时使用默认 RBAC 策略，rec 为空时只告警不落库。
 func NewInvoker(engine policy.Engine, rec Recorder, log *slog.Logger) *Invoker {
 	if engine == nil {
@@ -73,7 +85,7 @@ func NewInvoker(engine policy.Engine, rec Recorder, log *slog.Logger) *Invoker {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Invoker{engine: engine, rec: rec, log: log, timeout: 30 * time.Second}
+	return &Invoker{engine: engine, rec: rec, log: log, timeout: defaultToolTimeout}
 }
 
 // SetMaxArgBytes 设置单次调用参数上限（<=0 表示用 DefaultMaxArgBytes(0)）。
@@ -123,16 +135,22 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	}
 	// 续跑回放：这一次调用在中断前已经产生过结果，副作用不能再发生一遍。
 	// 放在策略之后：成员与写权限的校验不该因为「是回放」而被跳过。
-	if cached, ok := env.Replay[ArgsHash(t.Name, args)]; ok {
-		i.log.Info("回放中断前已完成的工具结果",
-			"tool", t.Name, "run_id", env.RunID, "status", cached.Status)
-		replayed := result
-		replayed.Cached = true
-		if cached.Risk > 0 {
-			// 徽标沿用当初记录的等级：历史回看与实际执行的展示一致
-			replayed.Risk = cached.Risk
+	//
+	// 标了 NoReplay 的工具不参与：它们的返回值取决于**磁盘上的内容**，而回放的
+	// key 只有「工具 + 参数」。plugin_try 就是这样——改了入口再跑同样的输入，
+	// 会拿到上一次的回执（连耗时都一字不差），开发循环里必然踩到。
+	if !t.NoReplay {
+		if cached, ok := env.Replay[ArgsHash(t.Name, args)]; ok {
+			i.log.Info("回放中断前已完成的工具结果",
+				"tool", t.Name, "run_id", env.RunID, "status", cached.Status)
+			replayed := result
+			replayed.Cached = true
+			if cached.Risk > 0 {
+				// 徽标沿用当初记录的等级：历史回看与实际执行的展示一致
+				replayed.Risk = cached.Risk
+			}
+			return i.finish(ctx, env, replayed, start, cached.Status, cached.Content)
 		}
-		return i.finish(ctx, env, replayed, start, cached.Status, cached.Content)
 	}
 
 	if t.Invoke == nil {
@@ -140,7 +158,7 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 	}
 
 	// shell 的网络准入：判据在 ShellNetPlan（工具挂在 NetPlan 上把参数换算成策略），
-	// 编排在这里——工具内部等人点按钮会被下面 30s 的墙钟掐断。
+	// 编排在这里——工具内部等人点按钮会被执行阶段的墙钟掐断。
 	// granted 表示这次落给沙箱的 Spec.Network。
 	plan := ShellNetPolicy{}
 	if t.NetPlan != nil {
@@ -208,7 +226,8 @@ func (i *Invoker) Invoke(ctx context.Context, t Tool, call llm.ToolCall, env Env
 			}
 			out = retried
 		} else if errors.Is(runErr, context.DeadlineExceeded) {
-			return i.finish(ctx, env, result, start, StatusError, fmt.Sprintf("工具执行超时（%s）", i.timeout))
+			return i.finish(ctx, env, result, start, StatusError,
+				fmt.Sprintf("工具执行超时（%s）", i.timeoutFor(t, args)))
 		} else if errors.Is(runErr, context.Canceled) {
 			return i.finish(ctx, env, result, start, StatusError, "调用已取消")
 		} else {
@@ -303,12 +322,30 @@ func (i *Invoker) decide(ctx context.Context, t Tool, env Env, req ApprovalReque
 
 // execute 跑一次工具，并告知它这次是否已获准联网。
 //
-// 每次尝试单独计时：升级重跑是第二次执行，不该和前一次共享 30s 预算。
+// 每次尝试单独计时：升级重跑是第二次执行，不该和前一次共享预算。
+//
+// 墙钟取「工具声明的」与「全局上限」的较小者：工具最了解自己这次要跑多久
+// （`ls` 与 `pip install` 差两个数量级），但上限必须由平台说了算——
+// 否则一个工具就能把一次调用的资源占用改到任意大。
 func (i *Invoker) execute(ctx context.Context, t Tool, args json.RawMessage, env Env, netGrant bool) (string, error) {
-	runCtx, cancel := context.WithTimeout(ctx, i.timeout)
+	runCtx, cancel := context.WithTimeout(ctx, i.timeoutFor(t, args))
 	defer cancel()
 	env.NetGrant = netGrant
 	return t.Invoke(runCtx, args, env)
+}
+
+// timeoutFor 是这次调用的墙钟：工具声明优先，全局上限收口。
+func (i *Invoker) timeoutFor(t Tool, args json.RawMessage) time.Duration {
+	d := i.timeout
+	if t.TimeoutFor != nil {
+		if v := t.TimeoutFor(t, args); v > 0 {
+			d = v
+		}
+	}
+	if d > maxToolTimeout {
+		d = maxToolTimeout
+	}
+	return d
 }
 
 // escalateNetwork 实现「没声明联网时先无网跑，失败且像网络问题再申请联网重跑」。

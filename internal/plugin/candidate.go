@@ -21,6 +21,11 @@ func (m *Manager) EnableLocal(ctx context.Context, spaceID, slug, userID, author
 	if err != nil {
 		return store.PluginCandidate{}, err
 	}
+	// 启用常驻插件会立刻起进程：依赖没装齐的话，作者点完只能看到「插件不可用」。
+	// 在写候选状态之前先离线解析一次（不执行、不联网），缺什么直接回给他。
+	if err := m.verifyResidentDeps(ctx, spaceID, slug); err != nil {
+		return store.PluginCandidate{}, err
+	}
 	risk, _ := Derive(b.Meta)
 	caps, _ := json.Marshal(b.Meta.Capabilities)
 	c, err := m.o.Store.UpsertPluginCandidate(ctx, store.PluginCandidate{

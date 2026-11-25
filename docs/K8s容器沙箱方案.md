@@ -76,7 +76,7 @@
 
 **出网 socket 说的是 HTTP 代理协议，不是 SOCKS5**：插件侧由 `wa.fetch` 发 absolute-form 明文请求，WebSocket 由 Deno 的 `HTTPS_PROXY` 走同一套语义，TLS 一律由代理这侧完成（Deno 在 unix socket 上做不了 TLS）。所以控制面的插件池与执行体都必须建 `egress.NewHTTPRegistry`，建成 SOCKS5 时插件一个字节都发不出去，现场特征是 `不支持的协议版本 71`（0x47 = `G`，`GET` 的首字节），看着像插件自己崩了。SOCKS5 只留给认 `socks5h://` 的原生客户端。
 
-**可执行文件同样过命令名，不过路径**：`Spec.Cmd[0]` 必须是执行体里能解析到的命令名（`deno`），不能是控制面 `exec.LookPath` 出来的绝对路径。控制面跑在 macOS 上时那串是 `/Users/<user>/.nvm/.../deno`，执行体里必然不存在，现象是 `bwrap: execvp <path>: No such file or directory`——进程起来就退，控制面只读到 EOF，日志上看像「插件自己崩了」。所以「命令在哪」由执行器回答（`sandbox.Runner.Executable`）：本地 / bwrap 后端返回本机绝对路径，远端执行体与 k8s 执行器返回裸命令名，由容器里的 PATH 解析。同理，依赖预热（`deno cache`）是宿主进程动作，仍用本机路径——两个路径各解析一次，不能合并成一个字段。
+**可执行文件同样过命令名，不过路径**：`Spec.Cmd[0]` 必须是执行体里能解析到的命令名（`deno`），不能是控制面 `exec.LookPath` 出来的绝对路径。控制面跑在 macOS 上时那串是 `/Users/<user>/.nvm/.../deno`，执行体里必然不存在，现象是 `bwrap: execvp <path>: No such file or directory`——进程起来就退，控制面只读到 EOF，日志上看像「插件自己崩了」。所以「命令在哪」由执行器回答（`sandbox.Runner.Executable`）：本地 / bwrap 后端返回本机绝对路径，远端执行体与 k8s 执行器返回裸命令名，由容器里的 PATH 解析。装依赖（`deno cache`）同样在执行体里跑（`toolRuntime.installDeps`）：写的是空间存储里的插件目录，用的也是执行环境配好的镜像源与 NetworkPolicy，控制面自己下载再写回去等于在两条链路上各维护一份安装源。所以它也只用 `denoBin` 这一个名字，没有第二处路径解析。
 
 ### 两套集群
 
@@ -791,7 +791,7 @@ BuildKit 的 `RUN --mount=type=cache` 解决的是同一个问题，它的三个
 
 **没声明联网时的「升级重跑」**：命令先无网跑；非零退出且失败看起来是网络不可达（`name resolution` / `getaddrinfo` / `ECONNREFUSED` / `ETIMEDOUT` / `no matching distribution found` 等）时，发起一次审批「允许联网重跑」。批准 → 原地再跑一次 `Network=true`，回执里注明这次是联网结果；拒绝 → 把无网结果原样回给模型，并注明「联网重跑没有获批」，不让它反复试同一条命令。模型判断错了的代价因此只是一次审批，不是一条永远失败的脚本。
 
-审批之所以由 `Invoker` 发起、而不是在 `shell_exec` 内部等：执行阶段套着 30s 墙钟（`Invoker.timeout`），在里面等人点按钮会先超时。审批等待必须落在墙钟之外，与网络工具那条路径共用同一套 pending / 心跳 / 超时（`runApprover.Decide`）。工具侧只回一个控制信号 `errNetNeeded`（退出码非零 + 命中网络失败特征），判据仍是 `ShellNetPlan` 与 `looksLikeNetworkFailure`。
+审批之所以由 `Invoker` 发起、而不是在 `shell_exec` 内部等：执行阶段套着墙钟（`Invoker.timeoutFor`：工具声明的值，或默认 30s，上限 30 分钟），在里面等人点按钮会先超时。审批等待必须落在墙钟之外，与网络工具那条路径共用同一套 pending / 心跳 / 超时（`runApprover.Decide`）。工具侧只回一个控制信号 `errNetNeeded`（退出码非零 + 命中网络失败特征），判据仍是 `ShellNetPlan` 与 `looksLikeNetworkFailure`。
 
 给不给网不影响文件可见面：每一档都挂整个工作区，`curl -o out.json` 写下的文件就在当前目录，`curl … && python parse.py` 也能连着写。曾经有过一版「网络工具执行时把工作区换成空 tmpfs、只挂 `.deps`」的遮蔽方案，已经删掉——它换来的那点纵深，代价是下载的文件凭空消失、复合命令必须拆开，而真正拦住外发的是审批与 NetworkPolicy。
 
@@ -908,13 +908,13 @@ shell 出网一律 `share-net` 直连，不建代理：`apt` / `pip` / `npm` 只
 
 | 路径 | 权限 | 说明 |
 |---|---|---|
-| 插件目录 | **可写** | 代码 + `deno.lock`；运行时缓存（临时文件、下载中转）也落这里 |
-| `DENO_DIR` | 可写 | `/cache/deno/<slug>@<version>`，只有 `gen/` 会写 |
+| 插件目录 | **可写** | 代码 + `deno.lock` + `node_modules/` + `vendor/`；运行时缓存（临时文件、下载中转）也落这里 |
+| `DENO_DIR` | 可写 | `/cache/deno/<slug>@<version>`，只有 `gen/` 会写（依赖不从这里解析） |
 | 空间工作区 | **不挂** | 默认零可见；清单 `fs.read` / `fs.write` 声明后才挂对应子目录 |
 
 空间工作区**默认不挂**：插件看不见这个空间的文件，读业务数据走 `file_*` 工具（经 `Invoker`，带策略、审批与审计）。安装一个插件不该顺带把整个空间的文件交出去——可见面必须来自作者的显式声明，而不是安装动作的副作用。清单里写了 `fs.read` / `fs.write` 才挂那些子目录，且仍然只能落在空间工作区内。
 
-插件目录**可写**：入口与随包资源在这里，运行时缓存也需要一个属于自己的可写位置（`DENO_DIR` 只装 Deno 自己的缓存，插件业务缓存放不进去）。已安装插件从 `published/` 起 runtime，那份目录跨空间共享，写进去会落在共享件上——插件来自系统管理员审核过的发布包，这个取舍是可接受的；`fs.read_only` 可以把它彻底关掉。
+插件目录**可写**：入口、随包资源与依赖都在这里。运行期用 `--cached-only --node-modules-dir=manual --vendor`，从 `node_modules/`（npm）与 `vendor/`（jsr / https）解析——不再从全局 `DENO_DIR` 解析，因为那份缓存按 `slug@version` 跨空间共享，而插件目录是每个安装副本一份。工具插件一律在空间里落副本（见 `needsDepsDir`），装依赖时写的就是这份副本；`fs.read_only` 仍然可以把写权限彻底关掉，此时依赖必须在安装阶段就已装好。
 
 ### 常驻进程
 

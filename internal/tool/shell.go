@@ -19,13 +19,28 @@ import (
 )
 
 const (
-	// Invoker 对单次工具调用的墙钟是 30s，这里必须明显短于它，
-	// 否则命令还没到自己的超时就被外层掐断，报错会指向错误的层。
-	defaultShellTimeout = 15 * time.Second
-	maxShellTimeout     = 25 * time.Second
+	// shell 的墙钟由这个工具自己声明（Tool.TimeoutFor），Invoker 只负责取用，
+	// 不再有一套「外层 30s」把长命令掐断——否则报告出来的超时会指向错误的层。
+	//
+	// 默认两分钟：真实命令里最慢的是装依赖，同镜像实测 `pip install` 一个 SDK
+	// 要 195s，原来的 15s 连 venv 都建不完。上限只是「最多等多久」，
+	// 秒级返回的命令不会因此变慢。
+	defaultShellTimeout = 120 * time.Second
+	// installShellTimeout 是纯装依赖（pip install / npm i / deno cache）的默认值：
+	// 下载 + 解包 + 链接，三百秒是常见 SDK 的量级。
+	installShellTimeout = 300 * time.Second
+	// maxShellTimeout 是模型能声明的上限。再长就该走平台任务：一轮回答的总墙钟
+	// 默认两小时，单条命令不该吃掉四分之一。
+	maxShellTimeout = 30 * time.Minute
 	// 命令输出比文件内容更碎，给 16KB；再多对模型也没有价值。
 	shellMaxResultBytes = 16 * 1024
 )
+
+// shellPluginDirName 是空间工作区下存放插件目录的子目录名。
+//
+// 与 plugin.DraftDir 必须是同一个值，但这里不能 import internal/plugin：
+// 依赖方向是 plugin → tool，反向引用会成环。
+const shellPluginDirName = "plugins"
 
 // localPathStore 是能把 key 解析成本机路径的存储实现（目前是 localfs）。
 // 用可选接口而不是扩大 storage.Storage：将来换成 S3 时，只有这条能力消失，
@@ -49,21 +64,23 @@ func shellExec() Tool {
 		// need_network 的说法要落在「命令自身要不要外网」上：写成「跑脚本就得声明
 		// true」时，模型对任何脚本都会二选一——要么一个都不写（默认无网，脚本自己
 		// 发请求就必然失败、再被问一次），要么处处都写（多出一堆没必要的确认）。
-		Description: "在当前空间的沙箱里执行命令并返回输出：只有 /workspace 可写，有超时与输出上限。" +
-			"工作区跨调用保留，/tmp 与 $HOME 每次调用都是全新的（放那里的文件下一次就没了），产物要写在当前目录。" +
-			"网络默认不通，用 need_network 表示「这条命令自身要访问外网」：" +
-			"pip install / npm i / apt install 是下载，不用声明，直接有网；" +
-			"声明 true 且命令里有脚本（python / node / deno / go run）或网络工具（curl / wget / nc / ssh）时先请用户确认，不同意就不执行；" +
-			"不声明按无网执行，脚本里的网络请求会因 DNS 失败，那时再问一次是否联网重跑（多一轮），所以脚本要联网就一开始声明 true；" +
-			"纯本地动作（列目录、读写文件、统计、本地编译）不要声明。复合命令连着写：curl -o a.json <url> && python parse.py。" +
-			"venv 与 npm 全局目录已在 PATH 里，直接装。查外网资料用 web_search。" +
+		Description: "在当前空间的沙箱里执行命令：只有 /workspace 可写，有超时与输出上限。" +
+			"工作区跨调用保留；/tmp 与 $HOME 每次都全新，产物写到当前目录。" +
+			"plugin=<slug> 只挂该插件目录到 /plugin 并以其为 cwd（装插件依赖用，如 deno cache）。" +
+			"网络默认不通，need_network 表示「这条命令自身要访问外网」：" +
+			"pip install / npm i / apt install 是下载，不用声明；" +
+			"声明 true 且含脚本（python / node / deno / go run）或网络工具（curl / wget / nc / ssh）时先确认，拒绝即不执行；" +
+			"不声明按无网执行；脚本联网失败会再问一次是否联网重跑，所以脚本要联网就一开始声明 true；" +
+			"纯本地动作（列目录、读写、统计、编译）不要声明。复合命令连着写：curl -o a.json <url> && python parse.py。" +
+			"venv 与 npm 全局目录已在 PATH 里。查外网资料用 web_search。" +
 			"非零退出先看 stderr 再改，不要重复执行同一条失败命令。",
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "要执行的命令，由 sh -c 执行"},
     "need_network": {"type": "boolean", "description": "这条命令自身是否要访问外网：抓页面、调 API、下载没装的东西、脚本里会发请求时为 true。纯本地处理（列目录、读写文件、统计、编译、不联网的测试）为 false（默认）。pip install / npm i / apt install 不看这个参数"},
-    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 15，最大 25"}
+    "timeout_seconds": {"type": "integer", "description": "超时秒数，默认 120（纯装依赖 300），最大 1800。装依赖、跑测试这类慢命令按预期耗时写，别让它被默认值截断"},
+    "plugin": {"type": "string", "description": "插件 slug：只挂 plugins/<slug> 到 /plugin 并以它为工作目录，工作区不可见。给插件装依赖时用（deno cache --no-config --lock=deno.lock --node-modules-dir=auto --vendor index.ts），同时要声明 need_network=true——deno cache 按脚本算，不在「安装类免声明」里"}
   },
   "required": ["command"],
   "additionalProperties": false
@@ -89,6 +106,7 @@ func shellExec() Tool {
 				Command        string `json:"command"`
 				NeedNetwork    bool   `json:"need_network"`
 				TimeoutSeconds int    `json:"timeout_seconds"`
+				Plugin         string `json:"plugin"`
 			}
 			if err := json.Unmarshal(args, &in); err != nil {
 				return "", fmt.Errorf("参数解析失败: %w", err)
@@ -118,13 +136,15 @@ func shellExec() Tool {
 				return "", fmt.Errorf("创建空间文件目录失败: %w", err)
 			}
 
-			timeout := defaultShellTimeout
-			if in.TimeoutSeconds > 0 {
-				timeout = time.Duration(in.TimeoutSeconds) * time.Second
+			// 插件作用域：只挂 plugins/<slug>，工作区整体不可见。
+			// 装依赖的脚本（npm 的 postinstall 尤其）是这个平台里最不该看见业务数据
+			// 的东西，而它恰好又是唯一需要联网的一步——把可见面压到最小。
+			pluginDir, pluginKey, err := shellPluginScope(spaceKey, workDir, in.Plugin)
+			if err != nil {
+				return "", err
 			}
-			if timeout > maxShellTimeout {
-				timeout = maxShellTimeout
-			}
+
+			timeout := shellTimeout(command, in.TimeoutSeconds)
 
 			// 网络由「模型声明 + 命令内容」一起定，判据只在 shellnet.go：
 			//   只装依赖             有网，不确认（与声明无关）
@@ -148,16 +168,31 @@ func shellExec() Tool {
 			// 宿主路径只出现在 Source 里：它留在控制面，过线的是 Key。
 			// 沙箱里统一是 /workspace 与 /pkg，命令输出、报错、环境变量都不会
 			// 暴露 data/storage/spaces/<id> 这套结构。
+			//
+			// /pkg 与 /cache 始终挂：InstallEnv 把 venv、npm 全局目录与下载缓存
+			// 都指到这两个沙箱路径上，不挂的话装依赖会写到一个不存在的目录。
+			mounts := []sandbox.Mount{
+				{Source: pkgDir, Key: spaceKey + "/.pkg", Target: sandbox.PkgDir, Write: true},
+				{Source: CacheRoot(), Root: sandbox.RootCache, Target: sandbox.CacheDir, Write: true},
+			}
+			dir, cmd := sandbox.WorkspaceDir, venvBootstrap+command
+			if pluginDir != "" {
+				// 插件作用域下不建 venv：依赖由 deno 管，venv 只会白等两秒。
+				mounts = append(mounts, sandbox.Mount{
+					Source: pluginDir, Key: pluginKey, Target: sandbox.PluginDir, Write: true,
+				})
+				dir, cmd = sandbox.PluginDir, command
+			} else {
+				mounts = append(mounts, sandbox.Mount{
+					Source: workDir, Key: spaceKey + "/" + workspaceFilesDir, Target: sandbox.WorkspaceDir, Write: true,
+				})
+			}
 			res, runErr := env.Shell.Run(ctx, sandbox.Spec{
 				// 空间容器：每空间一个，空闲超时由执行面回收。
-				Scope: sandbox.Scope{Space: env.SpaceID, Kind: sandbox.KindShell},
-				Cmd:   []string{"sh", "-c", venvBootstrap + command},
-				Dir:   sandbox.WorkspaceDir,
-				Mounts: []sandbox.Mount{
-					{Source: workDir, Key: spaceKey + "/" + workspaceFilesDir, Target: sandbox.WorkspaceDir, Write: true},
-					{Source: pkgDir, Key: spaceKey + "/.pkg", Target: sandbox.PkgDir, Write: true},
-					{Source: CacheRoot(), Root: sandbox.RootCache, Target: sandbox.CacheDir, Write: true},
-				},
+				Scope:   sandbox.Scope{Space: env.SpaceID, Kind: sandbox.KindShell},
+				Cmd:     []string{"sh", "-c", cmd},
+				Dir:     dir,
+				Mounts:  mounts,
 				Mode:    mode,
 				Timeout: timeout,
 				// NetGrant 是 Invoker 的审批结论（含「联网重跑」的第二次执行），
@@ -191,16 +226,73 @@ func shellExec() Tool {
 				Output:    Mask(res.Stdout + "\n" + res.Stderr),
 			})
 			// 没声明联网、无网执行失败且错误像网络不可达：交给 Invoker 去申请联网重跑。
-			// 这里只判断「要不要问」，问完批不批不归工具管——执行阶段套着 30s 墙钟，
-			// 在工具里等人点按钮会先超时。
+			// 这里只判断「要不要问」，问完批不批不归工具管——执行阶段套着工具自己的
+			// 墙钟（两分钟起），在工具里等人点按钮只会先被自己的超时掐断。
 			if plan.Escalate && !env.NetGrant && res.ExitCode != 0 &&
 				looksLikeNetworkFailure(res.Stdout, res.Stderr) {
 				return out, errNetNeeded{}
 			}
 			return out, nil
 		},
+		// 墙钟由 shell 自己给：装依赖与跑测试的合理耗时差两个数量级，
+		// 一个全局常量只能取最小值（于是长命令全被截断）或最大值（于是挂住的
+		// 文件工具也要等半小时）。Invoker 只负责取用与外层夹逼。
+		TimeoutFor: func(_ Tool, args json.RawMessage) time.Duration {
+			var in struct {
+				Command        string `json:"command"`
+				TimeoutSeconds int    `json:"timeout_seconds"`
+			}
+			_ = json.Unmarshal(args, &in)
+			return shellTimeout(strings.TrimSpace(in.Command), in.TimeoutSeconds)
+		},
 	}
 }
+
+// shellTimeout 是这条命令的墙钟：模型给了就用它的，没给按命令类别给默认值。
+//
+// 判据复用 shellnet.go 的分类（同一个入口、同一份命令原文），不另起一套：
+// 「装依赖」和「跑脚本」的合理耗时本来就差一个数量级。
+func shellTimeout(command string, seconds int) time.Duration {
+	if seconds > 0 {
+		d := time.Duration(seconds) * time.Second
+		if d > maxShellTimeout {
+			return maxShellTimeout
+		}
+		return d
+	}
+	if k := classifyCommand(command); k.install && !k.script && !k.netTool {
+		return installShellTimeout
+	}
+	return defaultShellTimeout
+}
+
+// shellPluginScope 解析 plugin 参数，返回插件目录的真实路径与存储 key。
+//
+// 空参数返回空路径（走整工作区那条老路）。给了 slug 就只允许它落在
+// plugins/<slug> 下：slug 是模型写的，必须当成不可信输入——带 ../ 的 slug
+// 能把挂载点指到空间里任何一个目录，等于绕开「只挂插件目录」这条边界。
+func shellPluginScope(spaceKey, workDir, slug string) (string, string, error) {
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return "", "", nil
+	}
+	if !shellPluginSlug.MatchString(slug) {
+		return "", "", fmt.Errorf("plugin 必须是插件 slug（字母、数字、- 与 _）: %q", slug)
+	}
+	abs := filepath.Join(workDir, shellPluginDirName, slug)
+	if !strings.HasPrefix(abs, workDir+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("插件目录越出工作区: %q", slug)
+	}
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return "", "", fmt.Errorf("插件目录不存在: %s/%s（先用 file_write 写 plugin.json 与入口文件）",
+			shellPluginDirName, slug)
+	}
+	return abs, path.Join(spaceKey, workspaceFilesDir, shellPluginDirName, slug), nil
+}
+
+// shellPluginSlug 是插件 slug 的字符集：与清单校验保持一致，只用来挡住路径分隔符。
+var shellPluginSlug = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
 // InstallMirrors 是安装源镜像地址。
 //

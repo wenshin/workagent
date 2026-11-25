@@ -149,7 +149,7 @@ type Env struct {
 
 	// NetGrant 表示这次调用已获准联网，由 Invoker 按审批结论置位。
 	// 工具不自己判断「能不能联网」：判据在 ShellNetPlan，编排在 Invoker，
-	// 工具内部等审批会被执行阶段的 30s 墙钟掐断。
+	// 工具内部等审批会被执行阶段的墙钟（TimeoutFor 或默认 30s）掐断。
 	NetGrant bool
 
 	// Replay 是续跑时的结果缓存：key 是 ArgsHash，值是被中断那一轮已经产生的回执。
@@ -259,6 +259,16 @@ type Tool struct {
 	// MaxResultBytes 是回填给模型的单次结果上限（默认 4KB）。
 	// 读类工具（file_read / plugin_read）可申请更高额度，避免长文档被无谓截断。
 	MaxResultBytes int
+	// NoReplay 表示「不参与续跑回放」：返回值取决于磁盘内容而不是参数的工具
+	// 必须打开它。回放的 key 只有「工具 + 参数」，plugin_try 用同一组参数重跑
+	// 会拿到上一次的回执——作者改完代码看到的却还是旧结果。
+	NoReplay bool
+	// TimeoutFor 可选：按实参给出这次调用的墙钟上限（返回 0 表示用 Invoker 默认）。
+	//
+	// 与 RiskFor 同理，判据留在工具自己的代码里：只有它知道这次命令是 `ls` 还是
+	// `pip install`，两者的合理耗时差两个数量级。Invoker 只负责取用，
+	// 再与全局上限取小——工具不能自己把平台的资源边界改宽。
+	TimeoutFor func(t Tool, args json.RawMessage) time.Duration
 	// Agent 是自带工具的归属智能体 slug（agent.tools 声明的那批）。空表示空间级
 	// 插件；非空时只有绑定了该智能体的会话才看得到——按 Env.AgentID 精确匹配过滤。
 	Agent string

@@ -108,39 +108,63 @@ Elasticsearch（嵌套 DSL，命中在 hits.hits）：
 
 命中任意一条再写脚本：请求要签名 / 时间戳 / 动态 token、响应不是 JSON、结果字段要计算、需要多步请求。
 
-脚本跑在 Deno 沙箱里，**只能用 TypeScript / JavaScript 写**（`main.ts`，平台没有 Python / Node 运行时），**没有网络权限**，分两段：
+脚本跑在 Deno 沙箱里，**只能用 TypeScript / JavaScript 写**（`main.ts`，平台没有 Python / Node 运行时），**没有网络权限**。
 
-- `plan(input)` 只输出 `{request:{method,url,headers,body}}`，不自己发请求；
-- `map(response)` 收 `{status, body}`，输出 `{results:[...]}`。
+ABI 是「一行 JSON 进、一行 JSON 出」：平台用 `deno run main.ts` 起进程，把入参
+从 **stdin** 写进去（不进 argv 与环境变量），脚本往 **stdout** 打一个 JSON 对象。
+**同一个文件会被执行两次**，靠入参里的 `phase` 区分：
 
-输入里有 `query` / `limit` / `secret`（密钥走 stdin，不进 argv 与环境变量）与 `endpoint`。
+- `phase="plan"`：入参 `{phase, query, limit, endpoint, secret?}`，输出
+  `{request:{method,url,headers,body}}`——只拼请求，不自己发；
+  `secret` 取不到时没有这个键，只有 `secret_error`（有些源不需要密钥，要不要报错由脚本决定）。
+- `phase="map"`：入参 `{phase, status, body}`，输出 `{results:[{title,url,snippet,published_at}]}`。
+
+不要写 `export function plan/map`：平台不会去调它们（进程跑完就退，没有谁 import 你的模块）。
+每次执行都是**新进程**，模块级变量不跨两段保留。
 
 ```ts
-export function plan(input: { query: string; limit: number; secret: string; endpoint: string }) {
+type Input = {
+  phase: "plan" | "map";
+  query?: string; limit?: number; endpoint?: string; secret?: string;
+  status?: number; body?: string;
+};
+
+const input: Input = JSON.parse(await new Response(Deno.stdin.readable).text());
+const emit = (v: unknown) => console.log(JSON.stringify(v));
+
+if (input.phase === "plan") {
   const body = JSON.stringify({ q: input.query, n: input.limit });
-  return {
+  const sign = await signBody(body, input.secret ?? "");
+  emit({
     request: {
       method: "POST",
-      url: input.endpoint,
-      headers: { "Content-Type": "application/json", "X-Sign": sign(body, input.secret) },
+      url: input.endpoint ?? "",
+      headers: { "Content-Type": "application/json", "X-Sign": sign },
       body,
     },
-  };
-}
-
-export function map(resp: { status: number; body: string }) {
-  const data = JSON.parse(resp.body);
-  return {
-    results: (data.results || []).map((r: any) => ({
-      title: r.title,
-      url: r.link,
-      snippet: r.summary,
-    })),
-  };
+  });
+} else {
+  const data = JSON.parse(input.body ?? "{}");
+  if ((data.code ?? 0) !== 0) {
+    // 业务错误码要显式报错，不要让它变成「0 条结果」
+    emit({ error: `接口返回 code=${data.code} ${data.msg ?? ""}`.trim() });
+  } else {
+    emit({
+      results: (data.items ?? []).map((r: any) => ({
+        title: r.t, url: r.u, snippet: r.s ?? "", published_at: r.d ?? "",
+      })),
+    });
+  }
 }
 ```
 
-脚本自己打日志用 `console.error`，stderr 会进试跑与调用日志。
+几条硬规则：
+
+- 输出必须是**单个 JSON 对象**：解析失败、没有输出、退出码非 0 都算这次搜索失败。
+- 业务错误用输出里的 `error` 字段（一句给用户看的中文），不要用非 0 退出码冒充。
+- 脚本拿不到 `freshness`：时间范围只有 spec 协议支持，script 协议下不会传给脚本。
+- 自己打日志用 `console.error`：stderr 会进试跑与调用日志；错误信息里回显的密钥会被打码。
+- 脚本可见的文件范围就是最小权限（只读、无网），不要试图读空间文件或起子进程。
 
 ## 三、试跑：必须做，不然等于盲写
 

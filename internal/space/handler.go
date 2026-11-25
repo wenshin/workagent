@@ -46,6 +46,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// 目录是文件系统里的真实目录，与 space 表无关（MVP 方案 §4.2）；
 	// 支持多级路径，因此读写都用 body/query 里的 path，而不是路径参数。
 	mux.HandleFunc("GET /spaces/dirs", h.listDirs)
+	// 文件树的结构版本号：前端定时拉它，变了才重新取 dirs / files。
+	// 响应只有几十字节，因此可以比清单勤得多。
+	mux.HandleFunc("GET /spaces/tree/rev", h.treeRev)
 	mux.HandleFunc("POST /spaces/{id}/dirs", h.createDir)
 	mux.HandleFunc("PATCH /spaces/{id}/dirs", h.renameDir)
 	mux.HandleFunc("DELETE /spaces/{id}/dirs", h.deleteDir)
@@ -278,6 +281,25 @@ func (h *Handler) listSkills(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	platform.WriteJSON(w, http.StatusOK, map[string]any{"skills": out})
+}
+
+// treeRev 返回整棵树的结构版本号。
+//
+// 左树要靠它轮询：树的内容是磁盘现状，没有事件可订阅（其他会话里的 Agent、
+// 另一个标签页都在改同一批文件）。版本号变了前端才重新取清单。
+func (h *Handler) treeRev(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.current(w, r)
+	if !ok {
+		return
+	}
+	rev, err := h.svc.TreeRev(r.Context(), user.ID)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	// 版本号只用于比较，不该被任何一层缓存下来，否则轮询永远读到旧值
+	w.Header().Set("Cache-Control", "no-store")
+	platform.WriteJSON(w, http.StatusOK, map[string]string{"rev": rev})
 }
 
 func (h *Handler) listDirs(w http.ResponseWriter, r *http.Request) {

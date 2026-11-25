@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -110,7 +111,54 @@ func (b *Bundle) ContentHash() string {
 	return HashDir(files)
 }
 
-// walk 递归遍历目录，按相对路径回调。跳过隐藏目录（如 .history）。
+// depsDirNames 是依赖目录，**不进 bundle**：不参与 hash、不写进发布件、不读进内存。
+//
+// 依赖的体积与源码不是一个量级（一个 node_modules 上千个文件、上百 MB），一旦进
+// bundle，草稿装完依赖后 plugin_try 会直接撞 maxBundleFiles / maxBundleBytes，
+// 表现为「装完依赖就试运行不了」。依赖属于"安装物"而不是"内容事实"：
+// 发布件只带 deno.lock，安装时按 lock 在插件目录里重建（见 Manager.installDeps）。
+var depsDirNames = map[string]bool{
+	"node_modules": true, // npm: 依赖
+	"vendor":       true, // jsr: / https: 依赖
+}
+
+// remoteImport 匹配代码里的远程依赖说明符（npm: / jsr: / http(s):）。
+//
+// 只用于发布时提示「这个版本没有 deno.lock」，不参与任何门禁：
+// 依赖可能确实由镜像预装，阻断发布只会逼作者造假锁文件。
+var remoteImport = regexp.MustCompile(`(?m)^\s*(?:import|export)[^\n;]*from\s*["'](?:npm:|jsr:|https?:)`)
+
+// DepsUnlocked 表示代码引用了远程依赖但没有 deno.lock。
+//
+// 这种版本发布出去以后，别的空间在 `--cached-only` 下会报「缺依赖」，
+// 而那时已经不在作者手里了——所以必须在发布时提醒，但只提醒。
+func (b *Bundle) DepsUnlocked() bool {
+	if _, ok := b.Files["deno.lock"]; ok {
+		return false
+	}
+	for name, body := range b.Files {
+		switch path.Ext(name) {
+		case ".ts", ".js", ".mts", ".mjs", ".tsx", ".jsx":
+		default:
+			continue
+		}
+		if remoteImport.Match(body) {
+			return true
+		}
+	}
+	return false
+}
+
+// needsDepsDir 表示这类插件需要一个**可写**的插件目录来放依赖。
+//
+// 工具插件的依赖装在 plugins/<slug>/ 里（node_modules/ + vendor/），而发布件是
+// 不可变快照：既不能往里写，也不能让一个空间的依赖泄漏给另一个空间。所以工具插件
+// 一律在空间里落副本，即便它声明了不可扩展。
+func needsDepsDir(m Manifest) bool {
+	return m.Kind == KindTool && m.Runtime.Entry != ""
+}
+
+// walk 递归遍历目录，按相对路径回调。跳过隐藏目录（如 .history）与依赖目录。
 func walk(ctx context.Context, fs storage.Storage, dir, rel string, fn func(rel string, size int64, read func() ([]byte, error)) error) error {
 	key := dir
 	if rel != "" {
@@ -133,6 +181,9 @@ func walk(ctx context.Context, fs storage.Storage, dir, rel string, fn func(rel 
 			child = rel + "/" + name
 		}
 		if e.IsDir {
+			if depsDirNames[name] {
+				continue
+			}
 			if err := walk(ctx, fs, dir, child, fn); err != nil {
 				return err
 			}

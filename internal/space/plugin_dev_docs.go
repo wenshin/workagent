@@ -7,6 +7,11 @@ import _ "embed"
 //go:embed plugin_docs/source.md
 var pluginDevSourceDoc string
 
+// 渠道子手册同理用嵌入文件：正文里有大量反引号与 JSON 围栏。
+//
+//go:embed plugin_docs/im.md
+var pluginDevIMDoc string
+
 // 插件开发技能的子手册。总纲在 system.go 的 pluginDevSkill()，
 // 这里按插件类型拆分，避免总纲膨胀成一份几百行的规范合集。
 //
@@ -123,6 +128,32 @@ const pluginDevToolDoc = `# 工具插件（kind=tool）
 写成 .py / .sh 时清单仍能解析，但进程起不来——deno 只认 .ts / .js，这一步会在试运行时报错。
 
 工具跑在沙箱里：**默认只看得见自己的插件目录**（可读写，运行时缓存可以放这里），空间工作区不挂；要直连空间文件必须在 fs 段声明，出网只能走平台代理（域名与动词由 capabilities 决定）。默认**一次性**：每次调用起一个进程、跑完即退，不占常驻池。
+
+## 依赖（npm / jsr 包）
+
+依赖必须装进**插件目录**：运行期是断网 + --cached-only，装不了、也不该在调用时装。
+
+1. 用 shell_exec 的 plugin 作用域装：
+
+~~~json
+{"command": "deno cache --no-config --lock=deno.lock --node-modules-dir=auto --vendor index.ts",
+ "plugin": "order_lookup", "need_network": true}
+~~~
+
+   它只挂 plugins/<slug> 到 /plugin 并以它为 cwd（工作区不可见），所以 node_modules / vendor / deno.lock 刚好落在插件目录里。
+   need_network 要声明：这条命令自身在下载，平台会给一次确认（deno cache 不是「纯装依赖」，不会自动有网）。
+   --lock=deno.lock 不能省：带 --no-config 时 deno 不会自动建锁文件，而运行期要靠它校验与重装。
+2. npm: 包落 node_modules/，jsr: 与 https: 包落 vendor/，deno.lock 是完整性凭据。三者都留在草稿目录里，但**不算插件内容**：
+   不进发布件、不计入 hash、也不占 bundle 的 200 个文件 / 5MB 上限。
+3. 试运行与正式运行都用 --node-modules-dir=manual --vendor：只从目录解析，不碰网络。
+   报 "Could not find a matching package for 'npm:xxx' in the node_modules directory" 就是依赖没装（或装了之后又改了 import），回第 1 步重装。
+4. 发布件只带 deno.lock，别人安装时平台按锁在执行体里重装（那时联网）。所以锁文件要跟着提交，否则装出来的版本可能和作者验过的不一样——平台只在发布时提醒，不阻断。
+   安装**不会替你生成** deno.lock：要在开发期（第 1 步）生成并随草稿提交。没锁时安装与运行都按代码里的说明符解析，装到哪算哪。
+5. 声明 runtime.resident 的插件在**启用前**会被离线预检一次依赖。缺包直接拒绝启用，并原样回上面那条
+   "Could not find a matching package ..."（常驻是「启用即启动」，不预检的话进程起来就崩、退避、熔断，
+   界面上只会写「插件不可用」）。一次性插件不预检，缺依赖在试运行时就会报出来。
+
+不要用 npm i / deno install 装依赖：它们会执行包的生命周期脚本（postinstall 之类），而这一步只需要「下载」；deno cache 只下载不执行。
 
 ## 清单
 ~~~json
@@ -315,6 +346,9 @@ export default async function (input: { order_no: string }) {
 - 凭证用 host.secret(名称) 取明文，名字逐条声明在 capabilities 里；宿主不再代发任何请求。
 - 风险由能力推导：只读 HTTP = L2；写文件 / 写 HTTP / shell / ws.connect = L3；secret.use 加外部写 = L4。
 - ws.connect 只接受 hosts，写 verbs 或 name 都会解析失败（隧道里宿主看不到方法）。
+- ` + "`im.reply`" + ` 声明「这是 IM 渠道插件」：收到的消息能投进各人固定的渠道会话，
+  并由宿主把答复交回来。它本身不抬风险（出网仍要 http.request / ws.connect），
+  但长连接必须配 runtime.resident；写法见 ` + "`references/im.md`" + `。
 
 ## 测试
 - 空间插件面板的「试运行」会真实执行一次，报错带行号与原因。
@@ -336,7 +370,7 @@ const pluginDevMCPDoc = `# MCP 插件（kind=mcp）
   "capability": "http.request",
   "transport": { "type": "http", "url": "https://mcp.example.com/mcp" },
   "auth": { "in": "header", "name": "Authorization", "secret": "crm_token" },
-  "tools": { "allow": ["customer_*", "lead_create"], "deny": ["customer_delete"] }
+  "tools": { "allow": ["customer_*", "lead_create"], "deny": ["customer_delete"], "writes": true }
 }
 ~~~
 
@@ -373,13 +407,24 @@ static 是默认模式：auth.secret 只写凭证名（如 crm_token），值由
   然后从 user_id / email / job_number 取用户信息。**密钥是应用级的，不能跨应用复用。**
 - 凭证存储没启用（未配 SECRET_KEK）时签发不了令牌：这类插件会明确不可用，不会退回无鉴权调用。
 
+## 远端写：必须声明 tools.writes
+- 远端工具对平台是黑盒：除了 input_schema 没有语义，也没有动词可看（请求由远端 Server 发）。
+  所以**不声明就按只读处理**，风险是 L2（只读有成本）——远端鉴权与只读账号是第一道闸，
+  平台不替它猜。
+- 这些工具会建单 / 改状态 / 删数据时，在清单里写 ` + "`\"tools\": {\"writes\": true}`" + `：
+  风险抬到 L3，并且**每次调用都要人工确认**（与脚本插件的「出网非只读」同一口径）。
+- ` + "`writes`" + ` 只属于 mcp：写在别的 kind 上解析直接失败，不要以为它被静默忽略了。
+- 安装方还能在空间插件面板的「配置」里改审批档位（按声明 / 每次都确认 / 不确认）：
+  改的是「拦不拦」，不改变发布快照里的风险等级，也不影响别的空间。
+
 ## 规则
 - transport.url 默认要求 https。内网 MCP Server 只有 http 时，显式写 transport.allow_http: true 即可，
   权限文案会标成「明文 http」，安装的人看得见代价；本机（localhost / 127.0.0.1 / ::1）用 http 不必声明。
 - allow_http 是「允许」不是「必须」：清单写 https 地址同时声明 allow_http，安装方才能在「配置」里
   把服务地址覆盖成内网 http（反过来不行，发布方没声明就不能靠改地址绕成明文）。
 - tools.allow 必填且非空：默认不信任远端全部工具；支持尾部 * 前缀匹配，deny 优先。
-- MCP 默认按 L3 处理（远端工具可能写数据）；同时用到密钥时按 L4 走系统管理员。
+- MCP 默认按 L2（只读有成本）处理，声明 ` + "`tools.writes`" + ` 才抬到 L3 并逐次确认；
+  同时用到 ` + "`secret.use`" + ` 时按 L4 走系统管理员。
 - 安装后服务地址、鉴权 Header 名、凭证名可按空间覆盖（空间插件面板的「配置」），发布快照不动。
 - 远端暂不可用不会让空间失去其他工具：连接失败只影响这个 MCP。`
 
@@ -575,10 +620,13 @@ const pluginDevAgentDoc = `# 智能体插件（kind=agent）
 - 平台基础规则始终在最前面，智能体只能追加，不能覆盖或删除。
 - 追加正文上限 64KB；写清输出格式比写口号有用。
 
-## 继承
-- extends 指向另一个 agent 插件的 slug：父提示词在前、自己在后拼接，最多 4 层，禁止成环。
-- 父智能体必须已发布；父的 requires 不会自动继承，依赖要写在自己的 requires 里。
-- 留空表示只追加到平台基础规则。
+## 继承（已取消）
+- ` + "`agent.extends`" + ` 是**废弃字段**：写着不报错（兼容存量清单），但运行时不读它、也不会拼父链，
+  发布与试运行时只会提示「已不再生效」。写进新清单等于写了也没有。
+- 取消的原因：散文拼接会把「可以写文件」和「不要写文件」放进同一层互相抵消，结果取决于
+  措辞与顺序；父智能体发版还会在使用方不知情时改变它的行为，排障时只能猜。
+- 要复用别人的工作方式就**复制正文**；要复用能力写 ` + "`agent.requires`" + `（依赖不会自动继承，必须自己写）。
+- 正文只读自己那一份，留空或不写 entry 表示只追加到平台基础规则。
 
 ## 依赖
 - requires 里的插件会在安装智能体时一并安装到同一空间；已全局可用的内置件自动跳过。
@@ -594,7 +642,7 @@ const pluginDevAgentDoc = `# 智能体插件（kind=agent）
   - agent.tools：工具插件目录（含 plugin.json 与入口脚本，kind 必须是 tool）。加载成
     <智能体>__<工具> 的工具，模型在工具列表里直接看到；不进空间插件面板、不进 plugin_search、
     不需要安装记录，停用/卸载智能体即失效。
-- 只看得到自己那份：extends 的父子智能体互不继承；要共享就写 requires 或复制一份。
+- 只看得到自己那份：智能体之间**没有运行时继承**（extends 已废弃）；要共享就写 requires 或复制一份。
 - 上限：skills 最多 12 条路径、单文件 64KB；tools 最多 8 个，每个仍受发布上限约束（200 文件 / 5MB）。
 - 内部工具的清单按草稿写法（不写 version），可以声明 capabilities / secret；凭证仍走平台
   凭证存储，config 只取清单默认值（没有安装级配置入口，要改就改智能体版本）。风险和审批

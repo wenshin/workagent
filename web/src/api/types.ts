@@ -354,6 +354,14 @@ export interface DirsResponse {
   dirs: SpaceDir[];
 }
 
+/**
+ * 文件树的结构版本号：路径集合与各文件修改时间的指纹。
+ * 前端定时拉它，值变了才重新取 dirs / files。
+ */
+export interface TreeRevResponse {
+  rev: string;
+}
+
 /** 右侧面板的渲染方式：text 取正文，image/video/audio/pdf 取原始字节，none 只能下载 */
 export type FilePreviewKind = 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'none';
 
