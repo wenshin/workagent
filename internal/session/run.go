@@ -395,6 +395,8 @@ func (s *Service) execute(
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
 			PluginTry: s.pluginTry,
+			// 常驻进程重启：改完草稿让新代码生效，不用去面板关开一次开关
+			PluginRestart: s.pluginRestart,
 			// 插件调用记录：用户问「刚才那条怎么没发出去」时，模型查得到最近几次的结果
 			PluginLogs: s.pluginLogs,
 			// 空间运行日志：shell 与插件执行各留一条，落在 files/.logs，供事后复核

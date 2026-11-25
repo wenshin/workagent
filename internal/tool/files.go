@@ -93,6 +93,29 @@ func workspaceFilePath(raw string) (string, error) {
 	return rel, nil
 }
 
+// pluginWriteHint 是写插件文件后的补充提示：文件变了不等于进程换了，
+// 常驻进程里跑的还是启动那一刻的模块。不提醒一句，作者就会把「改了没生效」
+// 当成平台故障，然后去怀疑代码。
+func pluginWriteHint(rel string) string {
+	slug := pluginPathSlug(rel)
+	if slug == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n注意：这是插件内容，常驻进程仍在跑旧代码；"+
+		"要立刻生效请调用 plugin_restart（slug=%s）。", slug)
+}
+
+// pluginPathSlug 从 plugins/<slug>/... 取 slug；不在插件目录下返回空。
+//
+// 只认三层及以上的路径：`plugins/x`（目录本身）与 `plugins` 都不是插件文件内容。
+func pluginPathSlug(rel string) string {
+	parts := strings.Split(path.Clean(rel), "/")
+	if len(parts) < 3 || parts[0] != "plugins" {
+		return ""
+	}
+	return parts[1]
+}
+
 // workspaceTextFile 报告路径是否按文本内容处理：常规后缀走白名单，
 // 用户自己的隐藏文件（.env / .gitignore 这类没有常规后缀的配置）直接放行。
 func workspaceTextFile(rel string) bool {
@@ -336,7 +359,7 @@ func fileWrite() Tool {
 					env.Log.Warn("刷新空间索引失败", "space_id", env.SpaceID, "path", rel, "err", err)
 				}
 			}
-			return fmt.Sprintf("已写入 %s（%d 字节，mode=%s）", rel, len(body), mode), nil
+			return fmt.Sprintf("已写入 %s（%d 字节，mode=%s）%s", rel, len(body), mode, pluginWriteHint(rel)), nil
 		},
 	}
 }

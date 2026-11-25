@@ -59,6 +59,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/uninstall", h.uninstall)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/enable", h.enable)
 	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/disable", h.disable)
+	// 重启常驻进程：改完草稿让新代码生效，比「停用再启用」少一次工具列表抖动。
+	mux.HandleFunc("POST /spaces/{id}/plugins/{slug}/restart", h.restart)
 	mux.HandleFunc("GET /spaces/{id}/plugins/{slug}/jwt-key", h.jwtKey)
 	// 会话里的「应用密钥」卡片：按应用名生成或取回，只回给创建者本人。
 	mux.HandleFunc("POST /spaces/{id}/mcp-apps/{app}/key", h.mcpAppKey)
@@ -315,6 +317,20 @@ func (h *Handler) toggle(w http.ResponseWriter, r *http.Request, enabled bool) {
 		}
 	}
 	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// restart 重启常驻进程：常驻进程跑的是启动那一刻的代码，改完草稿必须显式换掉。
+// 权限按空间 manage 校验，和停用一致——重启会打断这个插件正在进行的调用。
+func (h *Handler) restart(w http.ResponseWriter, r *http.Request) {
+	user, _, ok := h.guard(w, r, "manage")
+	if !ok {
+		return
+	}
+	if err := h.mgr.Restart(r.Context(), user.ID, r.PathValue("id"), r.PathValue("slug")); err != nil {
 		h.fail(w, r, err)
 		return
 	}

@@ -301,6 +301,8 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	sessionSvc.SetAgentPlugins(pluginSvc)
 	// 插件试跑：会话里写完草稿直接验配置
 	sessionSvc.SetPluginTry(pluginSvc)
+	// 常驻进程重启：改完草稿在会话里直接换进程，不用去面板关开一次
+	sessionSvc.SetPluginRestart(pluginSvc)
 	// 插件调用记录：同一份 Manager 持有的内存缓冲，会话侧只读
 	sessionSvc.SetPluginLogs(pluginSvc)
 	// 空间运行日志：shell 与插件共用，工具侧通过 Env.SpaceLog 拿到

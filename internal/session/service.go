@@ -149,6 +149,8 @@ type Service struct {
 	shell sandbox.Runner
 	// pluginTry 是插件试跑（plugin_try），为 nil 时该工具不可用
 	pluginTry tool.PluginTry
+	// pluginRestart 是常驻进程重启（plugin_restart），为 nil 时该工具不可用
+	pluginRestart tool.PluginRestarter
 	// pluginLogs 是插件调用记录（plugin_logs），为 nil 时该工具报不可用
 	pluginLogs tool.PluginLogs
 	// spaceLog 是空间运行日志（files/.logs），为 nil 时不写
@@ -217,6 +219,9 @@ func (s *Service) SetAgentPlugins(src AgentPluginSource) { s.agentPlugins = src 
 
 // SetPluginTry 注入插件试跑能力；不注入时 plugin_try 返回「能力未配置」。
 func (s *Service) SetPluginTry(src tool.PluginTry) { s.pluginTry = src }
+
+// SetPluginRestart 注入常驻进程重启能力；不注入时 plugin_restart 返回「能力未配置」。
+func (s *Service) SetPluginRestart(src tool.PluginRestarter) { s.pluginRestart = src }
 
 // SetPluginLogs 注入插件调用记录；不注入时 plugin_logs 返回「能力未配置」。
 func (s *Service) SetPluginLogs(src tool.PluginLogs) { s.pluginLogs = src }

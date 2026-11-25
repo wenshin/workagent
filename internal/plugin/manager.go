@@ -1134,6 +1134,41 @@ func (m *Manager) SetEnabled(ctx context.Context, userID, spaceID, slug string, 
 	return nil
 }
 
+// Restart 重启单个插件的常驻进程，让磁盘上的最新代码生效。
+//
+// 常驻进程里跑的是**启动那一刻**的模块：改草稿、刷索引都不影响已经在跑的
+// 那个进程，所以「文件改了、行为没变」是这个池的固有行为，必须有一个显式的
+// 重启动作。只失效这一个插件——走 Reload 是整空间重载，同空间的长连接插件
+// （IM 机器人）会被一并杀掉重连，还可能触发上游重推，代价远大于一次编辑。
+func (m *Manager) Restart(ctx context.Context, userID, spaceID, slug string) error {
+	if err := m.ensureLoaded(ctx, spaceID); err != nil {
+		return err
+	}
+	m.mu.RLock()
+	_, ok := m.inst[spaceID][slug]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("%w：插件 %s 未在本空间启用，没有可重启的进程", store.ErrNotFound, slug)
+	}
+	// 进程与实例一起丢：入口文件、白名单、常驻声明都可能改过，只换进程会沿用
+	// 旧的 manifest 与沙箱参数，等于「重启了还是旧配置」。
+	m.invalidate(spaceID, slug)
+	m.mu.Lock()
+	// ensureLoaded 的「已加载」判据是整空间，必须整体丢弃才会重读磁盘。
+	delete(m.inst, spaceID)
+	// 借用池可能持有这个插件的工具，内容一变就得整体重建。
+	m.borrow = map[string][]*instance{}
+	m.mu.Unlock()
+	if err := m.ensureLoaded(ctx, spaceID); err != nil {
+		return err
+	}
+	// 同步拉起：调用方（接口 / 工具）要能看到「起没起来」，不能丢给异步预热。
+	// ensureLoaded 里那一路是给服务启动用的，失败只会进日志。
+	m.startResident(ctx, spaceID, slug)
+	m.recordAudit(ctx, userID, "plugin.restart", slug, "restarted", map[string]any{"space": spaceID})
+	return nil
+}
+
 // DisabledSlugs 返回对该空间「已被停用」的插件 slug：本空间停用的安装
 // + 系统空间停用的全局安装（后者对所有空间生效）。
 //

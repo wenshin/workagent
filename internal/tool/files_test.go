@@ -234,3 +234,32 @@ func TestBuiltinManifestsFitPluginLimits(t *testing.T) {
 		}
 	}
 }
+
+// 写插件内容要带一句「常驻进程还是旧代码」：file_write 不会重启进程，
+// 不提醒就等于把「改了没生效」留给用户自己踩。
+func TestPluginWriteHint(t *testing.T) {
+	hint := pluginWriteHint("plugins/dingtalk_bot/index.ts")
+	if !strings.Contains(hint, "plugin_restart") || !strings.Contains(hint, "dingtalk_bot") {
+		t.Fatalf("写插件文件应提示重启并带上 slug: %s", hint)
+	}
+	// 普通工作文件不该带这条噪音
+	if got := pluginWriteHint("notes/a.md"); got != "" {
+		t.Fatalf("非插件文件不该提示重启: %s", got)
+	}
+}
+
+func TestPluginPathSlug(t *testing.T) {
+	cases := map[string]string{
+		"plugins/x/index.ts":       "x",
+		"plugins/x/docs/guide.md":  "x",
+		"plugins/x":                "",
+		"plugins":                  "",
+		"notes/plugins/x/a.ts":     "",
+		"published/tool/x/1.0.0/a": "",
+	}
+	for in, want := range cases {
+		if got := pluginPathSlug(in); got != want {
+			t.Errorf("pluginPathSlug(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}

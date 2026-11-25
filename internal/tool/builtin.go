@@ -41,6 +41,7 @@ func builtinTools() []Tool {
 		webSearch(),
 		shellExec(),
 		pluginTry(),
+		pluginRestart(),
 		secretRequest(),
 		mcpAppKey(),
 	}

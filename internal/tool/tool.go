@@ -32,6 +32,13 @@ type PluginTry interface {
 	DryRunJSON(ctx context.Context, spaceID, slug, userID string, input json.RawMessage) (string, error)
 }
 
+// PluginRestarter 抽象「重启常驻插件进程」，同样避免 tool 包反向依赖 plugin 包。
+//
+// userID 只为审计：重启会打断正在进行的调用，谁按的必须留痕。
+type PluginRestarter interface {
+	Restart(ctx context.Context, userID, spaceID, slug string) error
+}
+
 // PluginCall 是一次插件调用的记账，供 plugin_logs 展示。
 //
 // 它记录的是「平台看到的调用结果」，不是插件 print 的内容：脚本进程的 stdout
@@ -111,6 +118,11 @@ type Env struct {
 	// PluginTry 是插件试跑能力（plugin.Manager.DryRun），为 nil 时 plugin_try 不可用。
 	// 「对话开发插件」如果没有试跑，就只能发布上线后才发现配置错。
 	PluginTry PluginTry
+
+	// PluginRestart 是常驻进程重启能力（plugin.Manager.Restart），为 nil 时
+	// plugin_restart 不可用。常驻进程跑的是启动那一刻的代码，改完草稿只有显式
+	// 重启才会加载新版本。
+	PluginRestart PluginRestarter
 
 	// PluginLogs 是插件调用记录（plugin.Manager 实现），为 nil 时 plugin_logs 不可用。
 	// 只读当前空间：借用插件也按执行落地的空间查，看得到「这次为什么没成」。
