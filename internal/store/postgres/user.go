@@ -120,6 +120,54 @@ limit 1`
 	return d.getUserByID(ctx, id)
 }
 
+// FindUserByProviderUID 按 (provider, provider_uid) 反查用户。
+//
+// 与登录时写入 user_identity 的方向相反：IM 回调只带渠道自己的 id，
+// 需要一个「渠道 id → 平台用户」的查找。不筛 status 以外的东西——停用用户在
+// 这里返回 ErrNotFound，投递侧据此明确回「你不是平台用户」，而不是静默丢弃。
+func (d *DB) FindUserByProviderUID(ctx context.Context, provider, providerUID string) (store.User, error) {
+	const q = `
+select i.user_id::text
+from user_identity i
+join app_user u on u.id = i.user_id
+where i.provider = $1 and i.provider_uid = $2 and u.status = 'active'
+limit 1`
+
+	var id string
+	err := d.pool.QueryRow(ctx, q, provider, providerUID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.User{}, store.ErrNotFound
+	}
+	if err != nil {
+		return store.User{}, err
+	}
+	return d.getUserByID(ctx, id)
+}
+
+// FindUserIDByStaff 按渠道员工 id（钉钉 senderStaffId）反查平台用户。
+//
+// 匹配 employee_id 而不是 provider_uid：后者是 unionId（登录唯一键），
+// IM 消息里带的是通讯录 userid，两个值不同，拿它查必然一条也查不到。
+// 同一个 staffId 理论上唯一，limit 1 只为防脏数据。
+func (d *DB) FindUserIDByStaff(ctx context.Context, provider, staffID string) (string, error) {
+	const q = `
+select i.user_id::text
+from user_identity i
+join app_user u on u.id = i.user_id
+where i.provider = $1 and i.employee_id = $2 and u.status = 'active'
+limit 1`
+
+	var id string
+	err := d.pool.QueryRow(ctx, q, provider, staffID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 func (d *DB) getUserByID(ctx context.Context, id string) (store.User, error) {
 	const q = `
 select u.id::text, coalesce(i.provider, ''), coalesce(i.provider_uid, ''),

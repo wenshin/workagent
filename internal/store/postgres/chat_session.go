@@ -10,18 +10,20 @@ import (
 
 const sessionColumns = `id::text, space_id::text, coalesce(dir, ''), title, title_auto, coalesce(skill_path, ''),
        created_by::text, last_message_at, status, created_at, updated_at,
-       coalesce(agent_id, ''), coalesce(agent_space_id::text, ''), agent_version, agent_prompt`
+       coalesce(agent_id, ''), coalesce(agent_space_id::text, ''), agent_version, agent_prompt,
+       coalesce(channel, '')`
 
 // sessionColumnsWithAlias 是带表别名的版本，列顺序必须与 scanSession 一致。
 const sessionColumnsWithAlias = `s.id::text, s.space_id::text, coalesce(s.dir, ''), s.title, s.title_auto, coalesce(s.skill_path, ''),
        s.created_by::text, s.last_message_at, s.status, s.created_at, s.updated_at,
-       coalesce(s.agent_id, ''), coalesce(s.agent_space_id::text, ''), s.agent_version, s.agent_prompt`
+       coalesce(s.agent_id, ''), coalesce(s.agent_space_id::text, ''), s.agent_version, s.agent_prompt,
+       coalesce(s.channel, '')`
 
 func scanSession(row pgx.Row) (store.Session, error) {
 	var s store.Session
 	if err := row.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
 		&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt,
-		&s.AgentID, &s.AgentSpaceID, &s.AgentVersion, &s.AgentPrompt); err != nil {
+		&s.AgentID, &s.AgentSpaceID, &s.AgentVersion, &s.AgentPrompt, &s.Channel); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Session{}, store.ErrNotFound
 		}
@@ -105,7 +107,7 @@ func collectSessions(rows pgx.Rows) ([]store.Session, error) {
 		var s store.Session
 		if err := rows.Scan(&s.ID, &s.SpaceID, &s.Dir, &s.Title, &s.TitleAuto, &s.SkillPath, &s.CreatedBy,
 			&s.LastMessageAt, &s.Status, &s.CreatedAt, &s.UpdatedAt,
-			&s.AgentID, &s.AgentSpaceID, &s.AgentVersion, &s.AgentPrompt); err != nil {
+			&s.AgentID, &s.AgentSpaceID, &s.AgentVersion, &s.AgentPrompt, &s.Channel); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -122,6 +124,40 @@ where id::text = $1
   and status = 'active'`
 
 	return scanSession(d.pool.QueryRow(ctx, q, id))
+}
+
+// GetOrCreateChannelSession 取「该渠道 + 该用户」的钉死会话，没有就现建一个。
+//
+// 走一条 upsert 而不是「先查再插」：(channel, created_by) 上有部分唯一索引，
+// 两个渠道进程同时投递同一个人时，后到的那条会改走 do nothing，再读到已存在
+// 的那一行。先查再插在并发下会有一个必然失败的插入，投递侧只能重试。
+func (d *DB) GetOrCreateChannelSession(ctx context.Context, channel, spaceID, userID, title string, agentSpaceID, agentID, agentVersion, agentPrompt string) (store.Session, bool, error) {
+	const q = `
+insert into session (space_id, title, title_auto, created_by, channel, agent_space_id, agent_id, agent_version, agent_prompt)
+values ($1::uuid, $2, false, $3::uuid, $4, nullif($5, '')::uuid, nullif($6, ''), $7, $8)
+on conflict (channel, created_by) where channel is not null do nothing
+returning ` + sessionColumns
+
+	sess, err := scanSession(d.pool.QueryRow(ctx, q, spaceID, title, userID, channel, agentSpaceID, agentID, agentVersion, agentPrompt))
+	if err == nil {
+		return sess, true, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return store.Session{}, false, err
+	}
+
+	// 冲突（已存在）或被软删（status 不是 active）时走到这里：回到读取。
+	const sel = `
+select ` + sessionColumns + `
+from session
+where channel = $1 and created_by = $2::uuid
+order by created_at desc
+limit 1`
+	sess, err = scanSession(d.pool.QueryRow(ctx, sel, channel, userID))
+	if err != nil {
+		return store.Session{}, false, err
+	}
+	return sess, false, nil
 }
 
 // RenameSession 修改会话标题。

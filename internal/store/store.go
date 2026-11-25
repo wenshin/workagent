@@ -75,6 +75,16 @@ type SpaceInput struct {
 	IsSystemReserved bool
 }
 
+// IMChannel 是一个外部消息渠道（钉钉 / 企微 / 飞书 ...）。
+//
+// 做成表而不是常量：接入一个新渠道不该改代码发版。真正实现渠道的是插件
+// （docs/插件安全基线.md 的 im.reply 能力），这张表只记「平台认哪些渠道」。
+type IMChannel struct {
+	Channel string
+	Label   string
+	Enabled bool
+}
+
 // Session 是聊天会话，直接归属于某个空间。
 type Session struct {
 	ID      string
@@ -93,7 +103,10 @@ type Session struct {
 	// AgentVersion 是创建时绑定的版本，用于发现配置漂移
 	AgentVersion string
 	// AgentPrompt 是创建时固化的追加提示词，管理员事后改配置不影响已开会话
-	AgentPrompt   string
+	AgentPrompt string
+	// Channel 非空表示这个会话被 IM 渠道钉死（dingtalk / wecom ...），
+	// 由该渠道的消息持续投喂；空是普通会话。渠道会话不改名、不进常规会话流。
+	Channel       string
 	CreatedBy     string
 	LastMessageAt *time.Time
 	Status        string
@@ -296,10 +309,13 @@ type Approval struct {
 	ActionKey string
 	// ArgsHash 是「工具 + 规范化参数」的指纹：续跑时模型重新生成的 tool_call id
 	// 是新的，只有参数能证明「这就是刚才那次调用」。
-	ArgsHash  string
-	Detail    string
-	Reason    string
-	Risk      int
+	ArgsHash string
+	Detail   string
+	Reason   string
+	Risk     int
+	// RiskLabel 是这一次动作的具体标签（网络请求 / 写文件 / 脚本执行…）。
+	// 等级只有四档，标签用来把「都是写入」的几种动作区分开；空串表示没有更具体的说法。
+	RiskLabel string
 	Status    string
 	Scope     string
 	DecidedBy string
@@ -357,6 +373,32 @@ type Store interface {
 	// ListUserSessions 返回用户在可见空间下的全部会话（左侧树一次性取数）。
 	ListUserSessions(ctx context.Context, userID string) ([]Session, error)
 	GetSession(ctx context.Context, id string) (Session, error)
+	// GetOrCreateChannelSession 取「该渠道 + 该用户」的钉死会话，没有就现建一个。
+	//
+	// 渠道会话是外部消息唯一的落地位置：同一个钉钉用户的消息必须进同一个会话，
+	// 否则每来一条消息就多一条时间线，上下文全丢。靠 (channel, created_by) 上的
+	// 唯一索引保证并发安全——两个渠道进程同时投递也只会建出一个。
+	// created 报告这次是不是新建的，调用方据此决定是否要提示「会话已建立」。
+	GetOrCreateChannelSession(ctx context.Context, channel, spaceID, userID, title string, agentSpaceID, agentID, agentVersion, agentPrompt string) (session Session, created bool, err error)
+	// GetIMChannel 取渠道注册信息；不存在返回 ErrNotFound。
+	GetIMChannel(ctx context.Context, channel string) (IMChannel, error)
+	// EnsureIMChannel 幂等注册渠道，已存在时不覆盖 label / enabled。
+	EnsureIMChannel(ctx context.Context, channel, label string) error
+	// FindUserByProviderUID 按身份接入层的 (provider, provider_uid) 反查用户。
+	//
+	// IM 回调里拿到的是渠道自己的 userId（钉钉 staffId），不是平台 user_id；
+	// 映射关系本来就在 user_identity 里（登录时写入），这里只是换个方向查。
+	FindUserByProviderUID(ctx context.Context, provider, providerUID string) (User, error)
+	// FindUserIDByStaff 按「渠道自己的员工 id」反查平台用户，查不到返回空串。
+	//
+	// 为什么不能直接用 provider_uid：那个字段存的是 unionId（钉钉扫码登录的唯一键），
+	// 而 IM 消息里带的是 senderStaffId（通讯录 userid）——两者是钉钉的两个不同
+	// 标识，互相换不来。员工 id 落在 user_identity.employee_id（登录时通讯录补全
+	// 写入），所以渠道投递必须走这一列。
+	//
+	// 查不到返回空串而不是 ErrNotFound：投递要逐条解析一串发送者，
+	// 「这个人没登录过」是正常情况，不该变成一堆错误日志。
+	FindUserIDByStaff(ctx context.Context, provider, staffID string) (string, error)
 	// RenameSession 修改标题；auto 为 true 表示仍允许被首条消息覆盖。
 	RenameSession(ctx context.Context, id, title string, auto bool) error
 	// DeleteSession 软删会话，历史消息保留。
@@ -559,6 +601,9 @@ type Store interface {
 	ListPluginCandidatesBySpace(ctx context.Context, spaceID string) ([]PluginCandidate, error)
 	// MarkPluginCandidatePublished 记录候选已发布到的 plugin；不改本地启用状态。
 	MarkPluginCandidatePublished(ctx context.Context, spaceID, slug, pluginID string) error
+	// UpdatePluginCandidateConfig 覆盖草稿态配置。草稿没有安装记录，配置只能存这里；
+	// 只改配置，不动启用状态与发布关联（改配置不该顺手把插件关掉）。
+	UpdatePluginCandidateConfig(ctx context.Context, spaceID, slug string, cfg json.RawMessage) error
 	DeletePluginCandidate(ctx context.Context, spaceID, slug string) error
 	// ListAllSpaces 返回全部未删除空间，供启动时的存量迁移与默认安装集使用。
 	ListAllSpaces(ctx context.Context) ([]Space, error)
@@ -637,18 +682,24 @@ type Plugin struct {
 // 内容仍以空间文件为准；这里只存市场展示与状态需要的元数据。发布后
 // PluginID 指向全局 plugin，但本地插件仍可继续编辑，hash 变化即「有新版本」。
 type PluginCandidate struct {
-	ID            string
-	SpaceID       string
-	SpaceName     string
-	Slug          string
-	Kind          string
-	Name          string
-	Description   string
-	AuthorID      string
-	AuthorName    string
-	ManifestHash  string
-	Risk          int
-	Capabilities  json.RawMessage
+	ID           string
+	SpaceID      string
+	SpaceName    string
+	Slug         string
+	Kind         string
+	Name         string
+	Description  string
+	AuthorID     string
+	AuthorName   string
+	ManifestHash string
+	Risk         int
+	Capabilities json.RawMessage
+	// Config 是草稿态下的配置值（清单 config 段的填写结果）。
+	//
+	// 草稿没有安装记录，而配置一直只存在 plugin_install 上；启用后的草稿
+	// 是这个空间真正在用的插件，没有这份配置就等于永远只能用清单默认值
+	// （钉钉这类必须有 AppKey 的插件在草稿态直接不可用）。
+	Config        json.RawMessage
 	Status        string
 	PluginID      string
 	PublishedName string

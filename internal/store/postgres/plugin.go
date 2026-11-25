@@ -422,7 +422,7 @@ returning id::text, space_id::text, slug, kind, name, description,
 const candidateSelect = `
 select c.id::text, c.space_id::text, coalesce(s.name, ''), c.slug, c.kind, c.name, c.description,
        coalesce(c.author_id::text, ''), c.author_name, c.manifest_hash, c.risk, c.capabilities,
-       c.status, coalesce(c.plugin_id::text, ''), coalesce(p.name, ''),
+       c.config, c.status, coalesce(c.plugin_id::text, ''), coalesce(p.name, ''),
        coalesce(c.enabled_at, 'epoch'::timestamptz), c.created_at, c.updated_at
 from plugin_candidate c
 left join space s on s.id = c.space_id
@@ -433,7 +433,7 @@ func scanCandidate(row pgx.Row) (store.PluginCandidate, error) {
 	err := row.Scan(
 		&c.ID, &c.SpaceID, &c.SpaceName, &c.Slug, &c.Kind, &c.Name, &c.Description,
 		&c.AuthorID, &c.AuthorName, &c.ManifestHash, &c.Risk, &c.Capabilities,
-		&c.Status, &c.PluginID, &c.PublishedName, &c.EnabledAt, &c.CreatedAt, &c.UpdatedAt,
+		&c.Config, &c.Status, &c.PluginID, &c.PublishedName, &c.EnabledAt, &c.CreatedAt, &c.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.PluginCandidate{}, store.ErrNotFound
@@ -488,6 +488,18 @@ func (d *DB) MarkPluginCandidatePublished(ctx context.Context, spaceID, slug, pl
 		`update plugin_candidate set plugin_id = $3::uuid, updated_at = now()
 		 where space_id = $1::uuid and slug = $2`,
 		spaceID, slug, pluginID)
+	return err
+}
+
+// UpdatePluginCandidateConfig 覆盖草稿态配置：只改配置列，不动启用状态与发布关联。
+func (d *DB) UpdatePluginCandidateConfig(ctx context.Context, spaceID, slug string, cfg json.RawMessage) error {
+	if len(cfg) == 0 {
+		cfg = json.RawMessage(`{}`)
+	}
+	_, err := d.pool.Exec(ctx,
+		`update plugin_candidate set config = $3::jsonb, updated_at = now()
+		 where space_id = $1::uuid and slug = $2`,
+		spaceID, slug, cfg)
 	return err
 }
 

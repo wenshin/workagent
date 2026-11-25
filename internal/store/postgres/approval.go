@@ -11,15 +11,15 @@ import (
 
 const approvalColumns = `
 id, session_id::text, run_id::text, call_id, tool, kind, action_key, args_hash,
-detail, reason, risk, status, scope, coalesce(decided_by::text, ''),
+detail, reason, risk, risk_label, status, scope, coalesce(decided_by::text, ''),
 decided_at, created_at, expire_at`
 
 // CreateApproval 登记一条待确认记录；同 id 已存在时复用（重放幂等）。
 func (d *DB) CreateApproval(ctx context.Context, a store.Approval) (store.Approval, error) {
 	const q = `
 insert into approval (id, session_id, run_id, call_id, tool, kind, action_key, args_hash,
-                      detail, reason, risk, status, scope, expire_at)
-values ($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                      detail, reason, risk, risk_label, status, scope, expire_at)
+values ($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 on conflict (id) do nothing`
 
 	status := a.Status
@@ -32,7 +32,7 @@ on conflict (id) do nothing`
 	}
 	if _, err := d.pool.Exec(ctx, q,
 		a.ID, a.SessionID, a.RunID, a.CallID, a.Tool, a.Kind, a.ActionKey, a.ArgsHash,
-		a.Detail, a.Reason, a.Risk, status, scope, a.ExpireAt,
+		a.Detail, a.Reason, a.Risk, a.RiskLabel, status, scope, a.ExpireAt,
 	); err != nil {
 		return store.Approval{}, err
 	}
@@ -167,7 +167,7 @@ func (d *DB) scanApproval(row interface {
 	var a store.Approval
 	err := row.Scan(
 		&a.ID, &a.SessionID, &a.RunID, &a.CallID, &a.Tool, &a.Kind, &a.ActionKey, &a.ArgsHash,
-		&a.Detail, &a.Reason, &a.Risk, &a.Status, &a.Scope, &a.DecidedBy,
+		&a.Detail, &a.Reason, &a.Risk, &a.RiskLabel, &a.Status, &a.Scope, &a.DecidedBy,
 		&a.DecidedAt, &a.CreatedAt, &a.ExpireAt,
 	)
 	return a, err
