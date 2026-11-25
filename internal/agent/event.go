@@ -53,6 +53,9 @@ type ApprovalState struct {
 	Detail string `json:"detail,omitempty"`
 	Reason string `json:"reason,omitempty"`
 	Risk   int    `json:"risk,omitempty"`
+	// RiskLabel 是这次动作的具体标签（网络请求 / 写文件 / 脚本执行…）。
+	// 与 ToolState.RiskLabel 同源，前端优先显示它，为空时退回等级文案。
+	RiskLabel string `json:"risk_label,omitempty"`
 }
 
 // ApprovalID 由工具调用 ID 派生稳定的审批 ID，跨事件与 checkpoint 保持一致。
@@ -71,6 +74,7 @@ type ToolState struct {
 	Result     string `json:"result,omitempty"`
 	Status     string `json:"status"`
 	Risk       int    `json:"risk,omitempty"`
+	RiskLabel  string `json:"risk_label,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
 }
 
@@ -85,6 +89,9 @@ func (t *ToolState) Payload() map[string]any {
 		"args":    t.Args,
 		"status":  t.Status,
 		"risk":    t.Risk,
+	}
+	if t.RiskLabel != "" {
+		payload["risk_label"] = t.RiskLabel
 	}
 	if t.Result != "" {
 		payload["summary"] = t.Result
@@ -135,6 +142,7 @@ type Step struct {
 	Result     string `json:"result,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Risk       int    `json:"risk,omitempty"`
+	RiskLabel  string `json:"risk_label,omitempty"`
 	DurationMS int64  `json:"duration_ms,omitempty"`
 }
 

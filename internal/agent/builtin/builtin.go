@@ -33,7 +33,6 @@ func init() { agent.Register(Name, New) }
 
 // 单轮对话内的容量上限，避免模型输出把上下文撑爆。
 const (
-	maxToolArgBytes = 8 * 1024
 	// maxToolFeedBytes 是工具结果回填给模型的默认上限；
 	// 读类工具通过 Tool.MaxResultBytes 申请更高额度（见 file_read / plugin_read）。
 	maxToolFeedBytes = 4 * 1024
@@ -251,10 +250,11 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			state := &agent.ToolState{
 				ID:         p.ID,
 				Name:       p.Name,
-				Args:       agent.TruncateText(p.Args, maxToolArgBytes),
+				Args:       agent.ClampToolArgs(p.Args),
 				Result:     agent.TruncateText(r.Content, 8*1024),
 				Status:     r.Status,
 				Risk:       r.Risk,
+				RiskLabel:  r.RiskLabel,
 				DurationMS: r.LatencyMS,
 			}
 			if err := emit(agent.Event{Type: agent.EventToolResult, Tool: state}); err != nil {
@@ -268,6 +268,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Result:     state.Result,
 				Status:     state.Status,
 				Risk:       state.Risk,
+				RiskLabel:  state.RiskLabel,
 				DurationMS: state.DurationMS,
 			})
 			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
@@ -308,6 +309,15 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		// 上下文管理：超预算就折叠较早的工具往返，别等模型报错。
 		// 判据用上一轮真实的 input_tokens，没有就按字数估。
 		messages = a.fitContext(messages, lastInputTokens)
+
+		// 折叠只是把已经涨起来的上下文压回去；要它不再涨，得把接下来的
+		// 「读与筛」挪到子 Agent 里。同一个 run 只提醒一次，续跑也认这条记录。
+		if a.needDispatchHint(in, lastInputTokens, messages) {
+			messages = append(messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: dispatchPressureText(lastInputTokens, a.contextBudget()),
+			})
+		}
 
 		var roundText strings.Builder
 		// 注意用 = 而不是 :=：:= 会在循环里新建一个 messages，
@@ -391,12 +401,14 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			state := &agent.ToolState{
 				ID:     call.ID,
 				Name:   call.Function.Name,
-				Args:   agent.TruncateText(call.Function.Arguments, maxToolArgBytes),
+				Args:   agent.ClampToolArgs(call.Function.Arguments),
 				Status: "running",
 			}
 			if t, ok := tool.Find(tools, call.Function.Name); ok {
 				// running 态与最终回执用同一套计算，否则徽标会在中途跳变
-				state.Risk = t.EffectiveRisk(json.RawMessage(call.Function.Arguments))
+				args := json.RawMessage(call.Function.Arguments)
+				state.Risk = t.EffectiveRisk(args)
+				state.RiskLabel = t.EffectiveRiskLabel(args)
 			}
 			if err := emit(agent.Event{Type: agent.EventToolCall, Tool: state}); err != nil {
 				return res, err
@@ -429,11 +441,13 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 		var wg sync.WaitGroup
 		for i, call := range out.ToolCalls {
 			if reason, blocked := rejected[call.ID]; blocked {
+				args := json.RawMessage(call.Function.Arguments)
 				results[i] = tool.InvokeResult{
-					ToolName: call.Function.Name,
-					Status:   tool.StatusError,
-					Content:  reason,
-					Risk:     riskOf(tools, call.Function.Name, json.RawMessage(call.Function.Arguments)),
+					ToolName:  call.Function.Name,
+					Status:    tool.StatusError,
+					Content:   reason,
+					Risk:      riskOf(tools, call.Function.Name, args),
+					RiskLabel: riskLabelOf(tools, call.Function.Name, args),
 				}
 				continue
 			}
@@ -476,10 +490,11 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 			state := &agent.ToolState{
 				ID:         call.ID,
 				Name:       call.Function.Name,
-				Args:       agent.TruncateText(call.Function.Arguments, maxToolArgBytes),
+				Args:       agent.ClampToolArgs(call.Function.Arguments),
 				Result:     agent.TruncateText(r.Content, 8*1024),
 				Status:     r.Status,
 				Risk:       r.Risk,
+				RiskLabel:  r.RiskLabel,
 				DurationMS: r.LatencyMS,
 			}
 			if err := emit(agent.Event{Type: agent.EventToolResult, Tool: state}); err != nil {
@@ -496,6 +511,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				Result:     state.Result,
 				Status:     state.Status,
 				Risk:       state.Risk,
+				RiskLabel:  state.RiskLabel,
 				DurationMS: state.DurationMS,
 			})
 			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
@@ -705,6 +721,14 @@ func riskOf(tools []tool.Tool, name string, args json.RawMessage) int {
 		return t.EffectiveRisk(args)
 	}
 	return 0
+}
+
+// riskLabelOf 返回这一次调用的动作标签（网络请求 / 写文件 / 脚本执行…）。
+func riskLabelOf(tools []tool.Tool, name string, args json.RawMessage) string {
+	if t, ok := tool.Find(tools, name); ok {
+		return t.EffectiveRiskLabel(args)
+	}
+	return ""
 }
 
 // resultBudget 返回单次工具结果回填给模型的字节上限。

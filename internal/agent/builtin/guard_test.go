@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,67 @@ func TestGuardEmptyResultsCountAsNoGain(t *testing.T) {
 	rec = []callRecord{{Name: "shell_exec", Args: `{"cmd":"x"}`, Status: "error", Output: "boom"}}
 	if hint := g.afterRound(rec); hint == "" {
 		t.Fatal("报错不应算作进展")
+	}
+}
+
+// 同参数 + 完全相同的结果就是「反复相同的命令调用」的确证：
+// 第二次执行完发现结果没变，第三次调用直接拦掉。
+func TestGuardBlocksRepeatedSameOutput(t *testing.T) {
+	g := newProgressGuard(2)
+	args := `{"cmd":"git status"}`
+	step := func(id string) map[string]string {
+		return g.inspect([]pendingCall{{ID: id, Name: "shell_exec", Args: args}})
+	}
+	record := func() {
+		g.afterRound([]callRecord{{Name: "shell_exec", Args: args, Status: "ok", Output: "nothing to commit"}})
+	}
+	if r := step("c1"); len(r) != 0 {
+		t.Fatalf("第 1 次不应拦截: %v", r)
+	}
+	record()
+	if r := step("c2"); len(r) != 0 {
+		t.Fatalf("第 2 次不应拦截（结果相同还没被观察到）: %v", r)
+	}
+	record()
+	r := step("c3")
+	reason, blocked := r["c3"]
+	if !blocked {
+		t.Fatalf("结果与上次完全相同，这一轮应被拦截: %v", r)
+	}
+	if !strings.HasPrefix(reason, DuplicateBlockMarker) || !strings.Contains(reason, "完全相同") {
+		t.Fatalf("拦截文案应说明「结果完全相同」: %q", reason)
+	}
+}
+
+// 结果一直在变的轮询是有效观察（等日志出现关键字、等构建结束），
+// 不能因为「同参数调了很多次」就拦掉。
+func TestGuardAllowsPollingWithChangingOutput(t *testing.T) {
+	g := newProgressGuard(2)
+	args := `{"cmd":"tail -n 20 build.log"}`
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("c%d", i)
+		if r := g.inspect([]pendingCall{{ID: id, Name: "shell_exec", Args: args}}); len(r) != 0 {
+			t.Fatalf("第 %d 轮结果在变，不应拦截: %v", i+1, r)
+		}
+		g.afterRound([]callRecord{{
+			Name: "shell_exec", Args: args, Status: "ok",
+			Output: fmt.Sprintf("round %d", i),
+		}})
+	}
+}
+
+// 拿不到可用回执（报错）时没有「结果是否相同」可比，仍按次数兜底。
+func TestGuardBlocksRepeatedErrors(t *testing.T) {
+	g := newProgressGuard(2)
+	args := `{"cmd":"make"}`
+	for i := 1; i <= 2; i++ {
+		if r := g.inspect([]pendingCall{{ID: fmt.Sprintf("c%d", i), Name: "shell_exec", Args: args}}); len(r) != 0 {
+			t.Fatalf("第 %d 次不应拦截: %v", i, r)
+		}
+		g.afterRound([]callRecord{{Name: "shell_exec", Args: args, Status: "error", Output: "boom"}})
+	}
+	if _, ok := g.inspect([]pendingCall{{ID: "c3", Name: "shell_exec", Args: args}})["c3"]; !ok {
+		t.Fatal("同一命令连续失败 3 次应被拦截")
 	}
 }
 

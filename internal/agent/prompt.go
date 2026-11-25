@@ -34,8 +34,8 @@ func BuildSystemMessage(in RunInput) llm.Message {
   - 检索不到就明说没找到，不要用常识冒充公司规定；命中多个同名插件先让用户选。
 - 消息末尾的「[引用文件]」是用户点名要参考的空间文件：文本文件逐个 file_read 后再答，读不到就如实说明；图片 / 音视频 / PDF 等附件读不到正文，不要对它们调用 file_read，也不要猜内容。
 - 做技能 / 组件 / 插件 / 智能体，或改代码、修 bug、补测试、重构、评审时，先 plugin_search 检索「插件开发」或「编程实践」技能再动手；只解释代码、答语法问题直接做。
-- 不要用相同参数重复调用同一工具；连续两轮没有新信息（空、报错、与之前相同）就换方法或直接说明缺什么；工具返回需要审批或策略拒绝时如实告知，不要重试。
-- 复杂任务先用 plan_write 列清单并逐步更新，一两步能做完的不建；并行汇总多份材料用 agent_dispatch（见「任务编排」技能）。
+- 不要用相同参数重复调用同一工具：连续两次结果相同会被拦截。连续两轮没有新信息（空、报错、相同）就换方法或说明缺什么；需要审批或被策略拒绝时如实告知，不要重试。
+- 复杂任务先用 plan_write 列清单并逐步更新，一两步能做完的不建；材料多、日志长时用 agent_dispatch 拆分，主上下文只留结论与路径。
 - 凭证（API Key / Token / 密码）**不要向用户索要明文**：用 secret_request 查状态，清单与脚本里只写凭证名，MCP 的 jwt 走 mcp_app_key。用户主动贴出明文时先提醒已泄露、建议作废重签，再引导录入，不要复述或写进文件。
 - 不清楚的就说不知道，不要猜。
 - 代码、SQL、JSON / YAML、命令行、配置、日志用带语言标注的 Markdown 代码块，原文整段放进去，不要压成一行或混进正文。`
@@ -293,10 +293,31 @@ func writeExecFacts(b *strings.Builder, e ExecFacts) {
 	}
 }
 
+// truncatedSuffix 是截断标注：模型与用户都能一眼看出「后面还有内容」。
+const truncatedSuffix = "…（已截断）"
+
 // TruncateText 按字节截断文本并标注，避免超长内容挤占上下文。
 func TruncateText(s string, limit int) string {
 	if len(s) <= limit {
 		return s
 	}
-	return strings.ToValidUTF8(s[:limit], "") + "…（已截断）"
+	return strings.ToValidUTF8(s[:limit], "") + truncatedSuffix
+}
+
+// MaxToolArgBytes 是消息轨迹（message.parts）里保存的工具入参上限。
+//
+// 它只决定历史轨迹的可读长度，与「回填给模型的参数」是两回事。定义在这里是为了
+// 让写轨迹的每一处都用同一个上限：待审批卡与真实回执由两个地方写，一处原文、
+// 一处截断时，同一次调用会留下两份不同的参数，续跑就没法把那张卡顶掉。
+const MaxToolArgBytes = 8 * 1024
+
+// ClampToolArgs 按轨迹上限截断入参，且是幂等的（已截断过的串不会再截一刀）。
+//
+// 幂等很关键：合并历史轨迹时要拿两边的参数做比较，比较前后都过一遍这个函数，
+// 才能保证「同一次调用」在两次写入之后仍然相等。
+func ClampToolArgs(s string) string {
+	if len(s) <= MaxToolArgBytes || strings.HasSuffix(s, truncatedSuffix) {
+		return s
+	}
+	return strings.ToValidUTF8(s[:MaxToolArgBytes], "") + truncatedSuffix
 }

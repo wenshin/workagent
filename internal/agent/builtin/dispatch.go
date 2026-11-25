@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/workagent/auto-agent/internal/agent"
+	"github.com/workagent/auto-agent/internal/llm"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/tool"
 )
@@ -42,6 +43,42 @@ func (a *Agent) canDispatch(in agent.RunInput) bool {
 	return in.Depth < a.maxDepth()
 }
 
+// dispatchPressureHint 是「主上下文已经接近窗口」时注入的拆解提醒的固定前缀。
+// 它同时是去重依据：同一次运行（含续跑）只提醒一次，避免每轮重复注入。
+const dispatchPressureHint = "[上下文提醒]"
+
+// needDispatchHint 判断是否该提醒「把剩下的读与筛拆给子 Agent」。
+//
+// 判据与轮内折叠一致：上一轮真实的 input_tokens 达到上下文预算（窗口 60%）。
+// 两件事的分工是：折叠是补救（把已发生的膨胀压回去），派发是源头治理
+// （不让主上下文继续长大）。只折叠不派发，压完还会再涨回去。
+func (a *Agent) needDispatchHint(in agent.RunInput, lastInputTokens int, messages []llm.Message) bool {
+	if lastInputTokens <= 0 || !a.canDispatch(in) {
+		return false
+	}
+	limit := a.contextBudget()
+	if limit <= 0 || lastInputTokens < limit {
+		return false
+	}
+	for _, m := range messages {
+		if strings.HasPrefix(m.Content, dispatchPressureHint) {
+			return false
+		}
+	}
+	return true
+}
+
+// dispatchPressureText 是拆解提醒的正文：说清「现在多大、接下来该怎么做」。
+func dispatchPressureText(inputTokens, limit int) string {
+	return fmt.Sprintf(
+		"%s 主上下文已接近窗口上限（上一轮输入约 %d token，折叠阈值 %d）。\n"+
+			"从现在起不要把更多材料整段读进主上下文：把剩余的检索、多文件读取、长日志筛选取证"+
+			"拆成 agent_dispatch 子任务，任务描述要自包含（子 Agent 看不到本会话历史），"+
+			"只要它回结论、关键片段与产物路径。\n"+
+			"主上下文只保留这些结论；信息已经够的部分直接收尾作答，不要为补齐细节继续扩大读取。",
+		dispatchPressureHint, inputTokens, limit)
+}
+
 // maxDepth 返回允许的最大派发深度；配置缺失时用 2（主 → 子 → 孙）。
 func (a *Agent) maxDepth() int {
 	if a.cfg.AgentMaxDepth > 0 {
@@ -58,7 +95,9 @@ func (a *Agent) dispatchTool(parent agent.RunInput, parentTools []tool.Tool) too
 		Capability: "agent.dispatch",
 		Description: "把一个边界清晰的子任务交给独立的子 Agent 完成，只拿回结论。" +
 			"适合：需要读很多文件/检索大量材料但主流程只需要结论、需要并行推进的多条独立线索、" +
-			"或需要一套不同工具组合的子任务。不适合：一句话就能答的问题、需要与用户来回确认的动作。" +
+			"或需要一套不同工具组合的子任务。主上下文已经装了大量材料（多文件、长日志、成片检索结果）时，" +
+			"必须用它对剩余的读取与筛选做隔离，只把结论与产物路径收回主上下文。" +
+			"不适合：一句话就能答的问题、需要与用户来回确认的动作。" +
 			"子 Agent 看不到当前对话历史，任务描述必须自包含。",
 		Parameters: json.RawMessage(`{
   "type": "object",

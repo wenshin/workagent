@@ -23,9 +23,13 @@ import (
 // 它的判断全部基于可观测的事实（调用指纹、结果摘要），不需要额外一次模型调用，
 // 因此不会把「判断有没有进展」变成又一轮成本。
 
-// maxDuplicateCalls 是「同一工具 + 相同参数」允许执行的次数。
+// maxDuplicateCalls 是「同一工具 + 相同参数」在没有新信息时允许执行的次数。
 // 第 2 次仍放行：模型换一种问法前先重试一次是合理的；第 3 次起拦截——
 // 结果不会变，只会烧上下文和预算。
+//
+// 这是「拿不到结果」时的兜底（报错、空回执）。一旦拿到回执，判据换成
+// 「结果有没有变」：同参数 + 同结果下一次就拦，同参数但结果在变则放行
+// （轮询日志、看队列进度都是合法用法，按次数砍会误伤正在推进的任务）。
 const maxDuplicateCalls = 2
 
 // DuplicateBlockMarker 是拦截重复调用时回填文本的固定前缀。
@@ -49,10 +53,13 @@ type guardDecision struct {
 type progressGuard struct {
 	// stallLimit 是连续多少轮没有任何新信息后判定停滞
 	stallLimit int
-	// calls 是调用指纹 → 已执行次数
+	// calls 是调用指纹 → 连续「没有新信息」的执行次数（拿到新结果就清零）
 	calls map[string]int
 	// outputs 是调用指纹 → 上次成功产出（用于识别「同样的调用、同样的结果」）
 	outputs map[string]string
+	// repeats 是调用指纹 → 连续「结果与上次完全相同」的次数。
+	// 大于 0 表示这个调用已经被证明不会产生新信息：下一次直接拦截。
+	repeats map[string]int
 	// stalled 是连续无新信息的轮数
 	stalled int
 	// blocked 是累计拦截次数，供测试与日志使用
@@ -67,6 +74,7 @@ func newProgressGuard(stallLimit int) *progressGuard {
 		stallLimit: stallLimit,
 		calls:      map[string]int{},
 		outputs:    map[string]string{},
+		repeats:    map[string]int{},
 	}
 }
 
@@ -105,10 +113,22 @@ type pendingCall struct {
 
 // inspect 在拿到模型返回的工具调用后登记指纹，返回被拦截的调用（callID → 原因）。
 // 被拦截的调用不执行，直接把原因回填给模型。
+//
+// 两级判据，先看「结果有没有变」，再看「试了几次」：
+//  1. 同参数已经连续拿到相同结果（repeats > 0）：这次必然还是同一个结果，直接拦；
+//  2. 还没有结果可比（报错、空回执）：按次数兜底，第 3 次起拦。
 func (g *progressGuard) inspect(calls []pendingCall) map[string]string {
 	rejected := map[string]string{}
 	for _, call := range calls {
 		key := callKey(call.Name, call.Args)
+		if n := g.repeats[key]; n > 0 {
+			g.blocked++
+			rejected[call.ID] = fmt.Sprintf(
+				"%s：%s 用相同参数已连续 %d 次得到完全相同的输出，再执行也不会有新信息。"+
+					"请换参数、换工具，或直接根据已有结果作答。",
+				DuplicateBlockMarker, call.Name, n+1)
+			continue
+		}
 		g.calls[key]++
 		if g.calls[key] > maxDuplicateCalls {
 			g.blocked++
@@ -129,6 +149,10 @@ type callRecord struct {
 }
 
 // afterRound 在一轮工具执行完成后更新进展状态，返回应当附加给模型的提醒（可为空）。
+//
+// 这里才拿得到回执，所以「同参数 + 同结果」的判定放在这一侧：
+// 结果变了说明这次重复观察是有意义的（轮询日志、等队列跑完），把次数清零继续放行；
+// 结果一模一样则给这个指纹记一次重复，下一次调用在 inspect 处直接拦掉。
 func (g *progressGuard) afterRound(records []callRecord) string {
 	gain := false
 	for _, r := range records {
@@ -139,8 +163,12 @@ func (g *progressGuard) afterRound(records []callRecord) string {
 		prev, seen := g.outputs[key]
 		if !seen || prev != r.Output {
 			g.outputs[key] = r.Output
+			g.repeats[key] = 0
+			g.calls[key] = 0 // 有新信息：这是有效调用，次数不该累计到拦截
 			gain = true
+			continue
 		}
+		g.repeats[key]++
 	}
 	if gain {
 		g.stalled = 0
@@ -149,7 +177,8 @@ func (g *progressGuard) afterRound(records []callRecord) string {
 	g.stalled++
 	return fmt.Sprintf(
 		"[进度提醒] 上一轮的 %d 次工具调用没有带来任何新信息（结果为空、报错，或与之前完全相同）。"+
-			"不要用同样的方式再试一次：换工具、换参数，或者直接用已有信息给出结论。", len(records))
+			"不要用同样的方式再试一次：换工具、换参数，或者直接用已有信息给出结论。"+
+			"相同参数 + 相同结果的调用再出现会被直接拦截。", len(records))
 }
 
 // blockedCount 返回累计拦截次数。
