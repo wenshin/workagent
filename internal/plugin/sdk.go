@@ -197,8 +197,20 @@ const readBody = async (r: SockReader, headers: Headers): Promise<Uint8Array> =>
   return r.rest();
 };
 
-/** wa 是插件的运行时助手：文件路径与出网客户端。 */
+/** wa 是插件的运行时助手：配置、文件路径与出网客户端。 */
 export const wa = {
+  /**
+   * 取安装方给这个插件填的配置（清单 config 段声明的键，已按默认值补齐）。
+   *
+   * 文档口径一直是 await wa.config()，但这里长期只有 host.config()——
+   * 插件照着文档写 wa.config() 会抛 TypeError，被插件自己的 try/catch 吞掉后
+   * 表现为「配置为空、插件永远未就绪」，而安装页明明填过 AppKey。
+   * 所以两个名字都留：wa.config() 是文档面，host.config() 是 RPC 面。
+   */
+  config(): Promise<Record<string, string>> {
+    return host.config();
+  },
+
   /**
    * 把「相对空间工作区的路径」拼成绝对路径，直接喂给 Deno.readTextFile 等。
    * 前提是清单 fs 段声明过对应目录：空间工作区默认不挂，没声明时连
@@ -318,7 +330,13 @@ if (!entry) {
   console.error("missing plugin entry");
   Deno.exit(2);
 }
-await ready;
+// 这里绝对不能 await ready：ready 是 stdin 读循环（pump）的 promise，只有 stdin
+// 关闭才 resolve。一次性进程（Run / plugin_try）会关，常驻进程永远不会——等它
+// 就等于「常驻插件永远不加载入口」，调用方只能等到超时，现场表现是
+// 「插件执行超时（15000ms）」而 stderr 一片空白。
+// pump 是 host_sdk 的模块副作用，上面那行 import 时已经在跑了，这里只挂个
+// catch 免得读失败变成未处理的 rejection。
+void ready.catch((e) => console.error("host 通道异常:", String(e)));
 const mod = await import(entry);
 await serve(mod.default);
 `
