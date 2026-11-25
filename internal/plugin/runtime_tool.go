@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/workagent/auto-agent/internal/sandbox"
+	"github.com/workagent/auto-agent/internal/spacelog"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/tool"
 )
@@ -47,13 +48,19 @@ type localPathStore interface {
 // 默认一次性：每次调用起一个进程，跑完即退。
 // 只有清单声明 runtime.resident 的插件才进常驻池，按键（空间 + slug + 目录）复用。
 type toolRuntime struct {
-	runner     sandbox.Runner
-	deno       string
+	runner sandbox.Runner
+	// deno 是本机（控制面）的 deno，只给 warmDeps 用：依赖预热是宿主进程动作。
+	deno string
+	// denoBin 是**执行体里**的 deno 可执行文件，插件进程的命令行用它。
+	// 两者不能合并：容器化后控制面与执行体不是同一个文件系统。
+	denoBin    string
 	runtimeDir string
 	secrets    Secrets
 	fs         storage.Storage
 	logger     *slog.Logger
-	pool       *residentPool
+	// spaceLog 是空间运行日志：插件的 wa.log 与宿主记账都落到 files/.logs。
+	spaceLog *spacelog.Logger
+	pool     *residentPool
 	// egress 给每个插件实例一条独立出网通道（SOCKS5 over unix socket）。
 	// 没有声明 http.request 的插件拿不到 socket，也就完全没有出网。
 	egress *egressPool
@@ -84,6 +91,9 @@ type invokeInput struct {
 	OneShot bool
 	// WSHosts 是 ws.connect 声明的域名：非空才注入 HTTPS_PROXY 并放行 CONNECT。
 	WSHosts []string
+	// HostPorts 是平台注入的宿主地址（精确 host:port），让 im.reply 插件
+	// 能回调 /inbox。它不来自清单：宿主在哪是部署事实，插件无从声明。
+	HostPorts []string
 	// 能力清单是审批对象：脚本能调到哪些宿主方法由 plugin.json 决定。
 	Allow   map[string]bool
 	Verbs   map[string]bool
@@ -192,14 +202,14 @@ type rpcReply struct {
 // 草稿代码不能留在池里。
 // OneShot 走一次性执行，用于试运行与不方便持有进程的场景。
 func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
-	if r.deno == "" {
+	if r.denoBin == "" {
 		return "", errors.New("当前环境没有 deno，无法执行脚本插件")
 	}
 	if in.OneShot || r.pool == nil {
 		return r.callOnce(ctx, in, input)
 	}
 	key := residentKey(in.SpaceID, in.Slug, in.Dir)
-	rp, err := r.pool.acquire(key, r, func() (*sandbox.Proc, error) {
+	rp, err := r.pool.acquire(key, r, &in, func() (*sandbox.Proc, error) {
 		return r.startProc(ctx, in, true)
 	})
 	if err != nil {
@@ -223,14 +233,14 @@ func (r *toolRuntime) Call(ctx context.Context, in invokeInput, input json.RawMe
 // 只对声明了 runtime.resident 的工具生效：一次性插件没有「空闲进程」可言，
 // 进程就是调用本身。调用方（安装/启用）失败只记日志，不阻断安装。
 func (r *toolRuntime) Warm(ctx context.Context, in invokeInput) error {
-	if r.deno == "" {
+	if r.denoBin == "" {
 		return errors.New("当前环境没有 deno，无法启动常驻插件")
 	}
 	if r.pool == nil || in.OneShot {
 		return nil
 	}
 	key := residentKey(in.SpaceID, in.Slug, in.Dir)
-	_, err := r.pool.acquire(key, r, func() (*sandbox.Proc, error) {
+	_, err := r.pool.acquire(key, r, &in, func() (*sandbox.Proc, error) {
 		return r.startProc(ctx, in, true)
 	})
 	return err
@@ -256,11 +266,11 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	}).String()
 	bootstrap := path.Join(sandbox.RuntimeDir, "bootstrap.ts")
 
-	// 出网：声明了 http.request 或 ws.connect 才有通道。两张名单都空就没有代理，
-	// 沙箱又保持 --unshare-net，等于完全断网。
+	// 出网：声明了 http.request / ws.connect，或平台注入了宿主地址，才有通道。
+	// 三张名单都空就没有代理，沙箱又保持 --unshare-net，等于完全断网。
 	var proxy string
-	if r.egress != nil && (len(in.NetHosts) > 0 || len(in.WSHosts) > 0) {
-		p, err := r.egress.proxyFor(in.SpaceID, in.Slug, in.NetHosts, in.WSHosts, in.Verbs)
+	if r.egress != nil && (len(in.NetHosts) > 0 || len(in.WSHosts) > 0 || len(in.HostPorts) > 0) {
+		p, err := r.egress.proxyFor(in.SpaceID, in.Slug, in.NetHosts, in.WSHosts, in.HostPorts, in.Verbs)
 		if err != nil {
 			return sandbox.Spec{}, fmt.Errorf("建立出网通道失败: %w", err)
 		}
@@ -283,7 +293,8 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	)
 
 	args := []string{
-		r.deno, "run",
+		// 过线的是命令名，不是宿主绝对路径：bwrap 在执行体里按容器 PATH 解析。
+		r.denoBin, "run",
 		"--quiet", "--no-prompt",
 		// 不让插件自带 deno.json：作者能改自己的配置，等于绕过这里的门控。
 		"--no-config",
@@ -299,10 +310,12 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	} else {
 		args = append(args, "--no-lock")
 	}
-	args = append(args, denoPermissionFlags(mounts, proxy != "", len(in.WSHosts) > 0)...)
+	args = append(args, denoPermissionFlags(mounts, proxy != "")...)
 	args = append(args, bootstrap, entryURL)
 
 	spec := sandbox.Spec{
+		// 插件运行与插件开发都落在租户的插件容器里：常驻、不按空闲回收。
+		Scope:     sandbox.Scope{Space: in.SpaceID, Kind: sandbox.KindPlugin},
 		Cmd:       args,
 		Dir:       sandbox.PluginDir,
 		Mode:      sandbox.ModeWorkspaceWrite,
@@ -319,9 +332,10 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	// 部署里插件就完全出不了网，而这不会在单机上暴露出来。
 	if proxy != "" {
 		spec.Egress = &sandbox.EgressSpec{
-			Hosts:   cleanHosts(in.NetHosts),
-			WSHosts: cleanHosts(in.WSHosts),
-			Verbs:   verbsList(in.Verbs),
+			Hosts:     cleanHosts(in.NetHosts),
+			WSHosts:   cleanHosts(in.WSHosts),
+			Verbs:     verbsList(in.Verbs),
+			HostPorts: cleanHostPorts(in.HostPorts),
 		}
 	}
 	// 进程环境被 --clearenv 清空过，只有这里列出来的变量能进沙箱。
@@ -331,11 +345,16 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 	if in.SpaceMounted {
 		spec.Env = append(spec.Env, "WA_SPACE_DIR="+sandbox.SpaceDir)
 	}
-	// WA_EGRESS_PROXY 由 sandbox 统一注入（指向沙箱内的固定 socket 路径），
-	// 这里只补 Deno 自己认的 HTTPS_PROXY：
-	// wss:// 只能靠 Deno 的代理支持，它读 HTTPS_PROXY，且认 unix:/path 这种写法。
-	// 不声明 ws.connect 就不注入，插件连 new WebSocket 都会直连失败。
-	if proxy != "" && len(in.WSHosts) > 0 {
+	// 只要建了代理就补 Deno 认的 HTTPS_PROXY，不能只在声明 ws.connect 时补。
+	//
+	// 沙箱是 --unshare-net，对 https:// 的 TCP 连接根本没有路由：没给代理，
+	// Deno 只会对着一个不存在的网络重试到超时，现场表现是 wa.fetch 报
+	// 「网络请求超时」而不是「目标不在白名单」。更隐蔽的是配置了声明外域名的
+	// 插件（例如依赖里出现的远程 import）：请求会绕过代理直连失败，
+	// 审计里连一条拒绝记录都不会有——白名单形同虚设，责任也说不清。
+	//
+	// 授权仍然由代理按 Hosts / WSHosts 两张表判定：给的是通道，不是权限。
+	if proxy != "" {
 		spec.Env = append(spec.Env, "HTTPS_PROXY=unix:"+sandbox.EgressProxy)
 	}
 	return spec, nil
@@ -346,7 +365,7 @@ func (r *toolRuntime) procSpec(in invokeInput, resident bool) (sandbox.Spec, err
 // 沙箱挂载决定「路径存不存在」，这里决定「deno 允不允许读」。只做挂载的话，
 // 一个 --allow-read 全开就能读到挂载进来的所有东西；只做权限的话，
 // 挂载层漏掉的路径又会被 deno 放出去。两层都要，才是同一份声明的两个执行点。
-func denoPermissionFlags(mounts []sandbox.Mount, hasProxy, allowWS bool) []string {
+func denoPermissionFlags(mounts []sandbox.Mount, hasProxy bool) []string {
 	var read, write []string
 	for _, m := range mounts {
 		// 可写路径同样要读权限：deno 的两个档位是独立的，
@@ -373,10 +392,9 @@ func denoPermissionFlags(mounts []sandbox.Mount, hasProxy, allowWS bool) []strin
 	}
 	envs := []string{"WA_SPACE_DIR"}
 	if hasProxy {
-		envs = append(envs, "WA_EGRESS_PROXY")
-		if allowWS {
-			envs = append(envs, "HTTPS_PROXY")
-		}
+		// Deno 读 HTTPS_PROXY 时同样受 --allow-env 约束，漏掉它相当于
+		// 注入了变量而运行时看不见：配置上「有代理」，行为上「没有」。
+		envs = append(envs, "WA_EGRESS_PROXY", "HTTPS_PROXY")
 		// 放开 --allow-net 不会变成直连：沙箱是 --unshare-net，
 		// 除了挂进来的 socket 没有第二个出口。
 		flags = append(flags, "--allow-net")
@@ -416,7 +434,7 @@ func (r *toolRuntime) startProc(ctx context.Context, in invokeInput, resident bo
 
 // callOnce 是一次性执行：起进程、跑一次、关闭。
 func (r *toolRuntime) callOnce(ctx context.Context, in invokeInput, input json.RawMessage) (string, error) {
-	if r.deno == "" {
+	if r.denoBin == "" {
 		return "", errors.New("当前环境没有 deno，无法执行脚本插件")
 	}
 	proc, err := r.startProc(ctx, in, false)
@@ -544,6 +562,17 @@ func (r *toolRuntime) hostCall(ctx context.Context, in invokeInput, frame rpcFra
 		}
 		_ = json.Unmarshal(frame.Args, &a)
 		r.logger.Info("插件日志", "plugin", in.Slug, "space", in.SpaceID, "level", a.Level, "message", clipText(a.Message, 500))
+		// 插件主动打的那条也进空间日志：warn / error 往往正是排障的起点，
+		// 只留在控制面 stdout 里，重启就没了。
+		r.spaceLog.Write(callCtx, spacelog.Entry{
+			SpaceID: in.SpaceID,
+			Kind:    "plugin",
+			Tool:    in.Slug,
+			Status:  "log",
+			Level:   a.Level,
+			UserID:  in.UserID,
+			Output:  a.Message,
+		})
 		return map[string]any{"ok": true}, nil
 	default:
 		return nil, fmt.Errorf("宿主不支持 method %q", frame.Method)

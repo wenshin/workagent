@@ -91,7 +91,7 @@ func newResidentPool(max, maxRestarts int, log *slog.Logger) *residentPool {
 //
 // 起进程放在锁外：deno 冷启动约 100ms，占着锁会让别的插件的调用一起排队。
 // 代价是两个并发首次调用可能各起一个进程，后到的那个立刻关掉，不影响正确性。
-func (p *residentPool) acquire(key string, rt *toolRuntime, start func() (*sandbox.Proc, error)) (*residentProc, error) {
+func (p *residentPool) acquire(key string, rt *toolRuntime, base *invokeInput, start func() (*sandbox.Proc, error)) (*residentProc, error) {
 	p.mu.Lock()
 	if rp, ok := p.procs[key]; ok && !rp.dead() {
 		rp.touch()
@@ -129,18 +129,18 @@ func (p *residentPool) acquire(key string, rt *toolRuntime, start func() (*sandb
 		victim.close()
 		p.logger.Info("插件常驻进程达到上限，淘汰最久未用", "key", victim.key, "max", p.max)
 	}
-	return p.spawn(key, rt, start)
+	return p.spawn(key, rt, base, start)
 }
 
 // spawn 起第一个进程并交给守护协程。
-func (p *residentPool) spawn(key string, rt *toolRuntime, start func() (*sandbox.Proc, error)) (*residentProc, error) {
+func (p *residentPool) spawn(key string, rt *toolRuntime, base *invokeInput, start func() (*sandbox.Proc, error)) (*residentProc, error) {
 	proc, err := start()
 	if err != nil {
 		// 起不来也是一次失败：一个启动就崩的插件不能每次调用都重付启动开销。
 		p.noteFailure(key, nil)
 		return nil, err
 	}
-	rp := newresidentProc(key, proc, rt, p.logger)
+	rp := newresidentProc(key, proc, rt, p.logger, base)
 
 	p.mu.Lock()
 	if existing, ok := p.procs[key]; ok && !existing.dead() {
@@ -154,7 +154,7 @@ func (p *residentPool) spawn(key string, rt *toolRuntime, start func() (*sandbox
 		if err != nil {
 			return nil, err
 		}
-		return newresidentProc(key, proc, rt, p.logger), nil
+		return newresidentProc(key, proc, rt, p.logger, base), nil
 	}
 	p.mu.Unlock()
 
@@ -368,9 +368,16 @@ type residentProc struct {
 	wmu sync.Mutex // 串行化对 stdin 的写
 	imu sync.Mutex // 串行化 invoke：一个进程同时只处理一个请求
 
-	mu       sync.Mutex
-	cur      *invokeInput
-	curCtx   context.Context
+	mu     sync.Mutex
+	cur    *invokeInput
+	curCtx context.Context
+	// base 是启动这个进程时的那次调用参数。
+	//
+	// 插件的模块顶层常直接 await wa.config() / host.secret() 去建连接，这时还没有
+	// invoke 帧，cur 是 nil。没有 base 的话宿主会回「没有正在执行的调用」，插件把它
+	// catch 成空配置并缓存在模块级状态里——之后调用多少次都是「未配置」，
+	// 而安装页明明填过（现场表现就是重启后 status 突然变空）。
+	base     *invokeInput
 	rpc      int
 	overflow string
 	lastUsed time.Time
@@ -384,12 +391,13 @@ type residentProc struct {
 	once    sync.Once
 }
 
-func newresidentProc(key string, proc *sandbox.Proc, rt *toolRuntime, log *slog.Logger) *residentProc {
+func newresidentProc(key string, proc *sandbox.Proc, rt *toolRuntime, log *slog.Logger, base *invokeInput) *residentProc {
 	p := &residentProc{
 		key:      key,
 		proc:     proc,
 		rt:       rt,
 		log:      log,
+		base:     base,
 		replies:  make(chan rpcFrame, 1),
 		done:     make(chan struct{}),
 		lastUsed: time.Now(),
@@ -448,6 +456,34 @@ func (p *residentProc) exitErr() error {
 	}
 }
 
+// moduleInitMethod 判断宿主方法能否在「还没有 invoke」的模块加载期调用。
+//
+// 只放行读初始化材料的三类：它们的语义是「这个插件的安装参数」与日志，
+// 与具体哪次调用无关。出网、建隧道这类仍然要求有正在执行的调用——
+// 否则模块顶层一行代码就能绕过 callRPC 的计数与超时。
+func moduleInitMethod(method string) bool {
+	switch method {
+	case MethodConfigGet, MethodSecretGet, MethodLog:
+		return true
+	}
+	return false
+}
+
+// pickHostCallInput 决定一次宿主调用用哪份参数。
+//
+// 正在执行的那次优先；没有 invoke 时（模块加载期）退回启动参数，仅限初始化只读
+// 方法。返回 nil 表示「这次调用没有可用的上下文」，调用方按「没有正在执行的调用」
+// 回错——出网、建隧道不能借预热期绕过调用上下文。
+func pickHostCallInput(method string, cur *invokeInput, curCtx context.Context, base *invokeInput) (*invokeInput, context.Context) {
+	if cur != nil {
+		return cur, curCtx
+	}
+	if moduleInitMethod(method) {
+		return base, context.Background()
+	}
+	return nil, nil
+}
+
 // loop 是唯一的读循环：一次启动，活到进程结束。
 //
 // 与一次性执行的差别只有一处：收到 return 之后不退出，继续读下一帧。
@@ -483,8 +519,7 @@ func (p *residentProc) loop() {
 
 func (p *residentProc) handleCall(frame rpcFrame) {
 	p.mu.Lock()
-	in := p.cur
-	ctx := p.curCtx
+	in, ctx := pickHostCallInput(frame.Method, p.cur, p.curCtx, p.base)
 	limit := 0
 	if in != nil {
 		limit = in.Limits.MaxRPC

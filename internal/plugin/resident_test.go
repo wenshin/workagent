@@ -74,6 +74,36 @@ func invokeInputForTest() invokeInput {
 	return invokeInput{SpaceID: "space-1", Slug: "demo", Dir: "/tmp/demo", Limits: Limits{TimeoutMS: 3000}}
 }
 
+// 模块加载期读配置/凭证必须落到启动参数上：这是「重启后 status 突然未配置」的根因。
+//
+// 预热只起进程、不发 invoke 帧，插件顶层 await wa.config() 时没有调用上下文；
+// 没有这条兜底就会命中「没有正在执行的调用」，插件把空配置缓存进模块级状态，
+// 之后调用多少次都不再重读——而安装页里配置一直是好的。
+func TestPickHostCallInput(t *testing.T) {
+	cur := invokeInputForTest()
+	base := invokeInputForTest()
+	ctx := context.Background()
+
+	if got, gotCtx := pickHostCallInput(MethodHTTP, &cur, ctx, &base); got != &cur || gotCtx != ctx {
+		t.Fatal("有正在执行的调用时必须用它，不能退回启动参数")
+	}
+	for _, m := range []string{MethodConfigGet, MethodSecretGet, MethodLog} {
+		got, gotCtx := pickHostCallInput(m, nil, nil, &base)
+		if got != &base {
+			t.Fatalf("%s 在模块加载期应退回启动参数", m)
+		}
+		if gotCtx == nil {
+			t.Fatalf("%s 需要一个可用的 context", m)
+		}
+	}
+	if got, gotCtx := pickHostCallInput(MethodHTTP, nil, nil, &base); got != nil || gotCtx != nil {
+		t.Fatal("出网在模块加载期必须仍然拒绝，不能借预热期绕过调用上下文")
+	}
+	if got, _ := pickHostCallInput(MethodConfigGet, nil, nil, nil); got != nil {
+		t.Fatal("没有启动参数时不应凭空造上下文")
+	}
+}
+
 // 同一个键必须复用同一个进程：常驻的全部意义在这里。
 func TestResidentReusesProcess(t *testing.T) {
 	pool := newResidentPool(4, 3, slog.Default())
@@ -81,7 +111,7 @@ func TestResidentReusesProcess(t *testing.T) {
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
 
-	p1, err := pool.acquire("s|a|d", rt, start)
+	p1, err := pool.acquire("s|a|d", rt, nil, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -93,7 +123,7 @@ func TestResidentReusesProcess(t *testing.T) {
 		t.Fatalf("第一次应为 1，实际 %q", out1)
 	}
 
-	p2, err := pool.acquire("s|a|d", rt, start)
+	p2, err := pool.acquire("s|a|d", rt, nil, start)
 	if err != nil {
 		t.Fatalf("第二次 acquire: %v", err)
 	}
@@ -119,7 +149,7 @@ func TestResidentSerializesCalls(t *testing.T) {
 	defer pool.CloseAll()
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
-	p, err := pool.acquire("s|a|d", rt, start)
+	p, err := pool.acquire("s|a|d", rt, nil, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -162,7 +192,7 @@ func TestResidentRestartsAfterCrash(t *testing.T) {
 	mark := filepath.Join(t.TempDir(), "started")
 	start := startShellArgs(t, crashOncePlugin, mark)
 
-	p1, err := pool.acquire(key, rt, start)
+	p1, err := pool.acquire(key, rt, nil, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -174,7 +204,7 @@ func TestResidentRestartsAfterCrash(t *testing.T) {
 	var p2 *residentProc
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		rp, err := pool.acquire(key, rt, start)
+		rp, err := pool.acquire(key, rt, nil, start)
 		if err == nil && rp != p1 && !rp.dead() {
 			p2 = rp
 			break
@@ -206,7 +236,7 @@ func TestResidentStopsRestartAfterTooManyCrashes(t *testing.T) {
 	var hit error
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		rp, err := pool.acquire(key, rt, start)
+		rp, err := pool.acquire(key, rt, nil, start)
 		if err != nil {
 			hit = err
 			break
@@ -231,7 +261,7 @@ func TestResidentNoRestartAfterClose(t *testing.T) {
 	defer pool.CloseAll()
 	rt := testRuntime()
 	const key = "s1|k|d"
-	if _, err := pool.acquire(key, rt, startShell(t, counterPlugin)); err != nil {
+	if _, err := pool.acquire(key, rt, nil, startShell(t, counterPlugin)); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	pool.closePrefix("s1|")
@@ -240,7 +270,7 @@ func TestResidentNoRestartAfterClose(t *testing.T) {
 		t.Fatalf("主动关闭后被重启了，池内 %d", pool.size())
 	}
 	// 清掉的是启动闭包：下一次调用按新参数重新拉起
-	if _, err := pool.acquire(key, rt, startShell(t, counterPlugin)); err != nil {
+	if _, err := pool.acquire(key, rt, nil, startShell(t, counterPlugin)); err != nil {
 		t.Fatalf("重新调用应能起新进程: %v", err)
 	}
 	if pool.size() != 1 {
@@ -255,13 +285,13 @@ func TestResidentClosePrefix(t *testing.T) {
 	rt := testRuntime()
 	start := startShell(t, counterPlugin)
 
-	if _, err := pool.acquire("s1|a|d", rt, start); err != nil {
+	if _, err := pool.acquire("s1|a|d", rt, nil, start); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.acquire("s1|b|d", rt, start); err != nil {
+	if _, err := pool.acquire("s1|b|d", rt, nil, start); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.acquire("s2|a|d", rt, start); err != nil {
+	if _, err := pool.acquire("s2|a|d", rt, nil, start); err != nil {
 		t.Fatal(err)
 	}
 	if pool.size() != 3 {
@@ -297,7 +327,7 @@ func TestResidentProcIgnoresTimeout(t *testing.T) {
 	}
 	pool := newResidentPool(2, 3, slog.Default())
 	defer pool.CloseAll()
-	p, err := pool.acquire("s|c|d", testRuntime(), start)
+	p, err := pool.acquire("s|c|d", testRuntime(), nil, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
@@ -362,7 +392,7 @@ func TestResidentRejectsGarbageFrame(t *testing.T) {
 	}
 	pool := newResidentPool(2, 3, slog.Default())
 	defer pool.CloseAll()
-	p, err := pool.acquire("s|e|d", testRuntime(), start)
+	p, err := pool.acquire("s|e|d", testRuntime(), nil, start)
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}

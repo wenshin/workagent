@@ -41,13 +41,65 @@ func (m *Manager) Bootstrap(ctx context.Context) error {
 	}
 
 	// 预热系统空间：全局搜索源（kind=source）是在 ensureLoaded 时注册的，
-	// 不预热就要等某个空间被访问之后才生效。
-	if sysID, sysErr := m.systemSpaceID(ctx); sysErr == nil && sysID != "" {
+	// 不预热就要等某个空间被访问之后才生效。这一份同步做——全局能力不能有窗口期。
+	sysID := ""
+	if id, sysErr := m.systemSpaceID(ctx); sysErr == nil {
+		sysID = id
+	}
+	if sysID != "" {
 		if err := m.ensureLoaded(ctx, sysID); err != nil {
 			m.o.Logger.Warn("预热系统空间失败", "err", err)
 		}
 	}
+
+	// 其余空间的常驻插件在后台拉起：常驻是「运行期常在线」的承诺，有些插件
+	// （如钉钉长连接）必须一直在线，不能等人工打开面板才启动。异步做——启动
+	// 路径不该被 N 个空间的插件冷启动串起来。
+	go m.warmAllSpaces(spaces, sysID)
 	return nil
+}
+
+// warmSpaceTimeout 是启动预热单个空间的上限。
+//
+// 只约束「加载」这一段：常驻进程由 warmSpaceResident 用独立 ctx 拉起，不受这里
+// 影响。给超时是为了一个坏空间（存储挂起、清单解析异常）不拖住后面的空间。
+const warmSpaceTimeout = 30 * time.Second
+
+// warmAllSpaces 依次加载所有空间，把各自的常驻插件拉起来。
+//
+// 串行加载而不是并发：空间多时同时 buildInstance 会一起抢磁盘与数据库连接，
+// 而每个空间末尾的 warmSpaceResident 已经是异步的，进程启动本身不会互相等待。
+// 单个空间失败只记日志，不影响其它空间；已经加载过的空间 ensureLoaded 直接返回。
+func (m *Manager) warmAllSpaces(spaces []store.Space, skipSpaceID string) {
+	total := len(spaces)
+	if skipSpaceID != "" {
+		total-- // 系统空间已由 Bootstrap 同步预热
+	}
+	m.o.Logger.Info("开始预热各空间常驻插件", "spaces", total)
+	started := 0
+	for _, sp := range spaces {
+		if sp.ID == skipSpaceID {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), warmSpaceTimeout)
+		if err := m.ensureLoaded(ctx, sp.ID); err != nil {
+			m.o.Logger.Warn("启动预热常驻插件失败", "space", sp.ID, "err", err)
+		}
+		cancel()
+		started++
+	}
+	// 结束日志带「起了几个常驻进程」：没有这条，预热整段是静默的，
+	// 「插件没自动上线」只能靠翻进程表猜。
+	m.o.Logger.Info("空间常驻插件预热完成",
+		"spaces", started, "resident", m.residentCount())
+}
+
+// residentCount 统计当前池里的常驻进程数（不含被淘汰的）。
+func (m *Manager) residentCount() int {
+	if m.rt == nil || m.rt.pool == nil {
+		return 0
+	}
+	return m.rt.pool.size()
 }
 
 // migrateSpace 一次性迁移：旧技能目录 → plugins/<slug>/，旧只读投影目录删除。
