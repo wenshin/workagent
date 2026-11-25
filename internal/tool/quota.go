@@ -3,10 +3,13 @@ package tool
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/workagent/auto-agent/internal/spacefs"
 )
 
 // 空间磁盘配额，默认 5 GiB。0 表示不限制。
@@ -86,11 +89,31 @@ func spaceUsage(dir string) (int64, error) {
 		return 0, err
 	}
 	use := kib * 1024
+	// 运行日志是平台写的，不该占用户配额：单独量一次扣掉。
+	// 量不到按 0 处理——配额统计失败本来就一律放行，日志更不该成为拦截理由。
+	use -= dirUsage(filepath.Join(dir, "files", spacefs.LogsDir))
 
 	quotaStatMu.Lock()
 	quotaStat[dir] = quotaSample{at: time.Now(), use: use}
 	quotaStatMu.Unlock()
 	return use, nil
+}
+
+// dirUsage 返回单个目录占用的字节数，量不到返回 0。
+func dirUsage(dir string) int64 {
+	out, err := exec.Command("du", "-sk", dir).Output()
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0
+	}
+	kib, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return kib * 1024
 }
 
 func humanBytes(n int64) string {

@@ -37,6 +37,7 @@ func builtinTools() []Tool {
 		wikiSearch(),
 		pluginSearch(),
 		pluginRead(),
+		pluginLogs(),
 		webSearch(),
 		shellExec(),
 		pluginTry(),

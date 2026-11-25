@@ -86,6 +86,29 @@ func (f *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (stri
 	return key, nil
 }
 
+// Append 在文件末尾追加，文件不存在时创建；父目录自动建。
+//
+// 用 O_APPEND 而不是「读出来再 Put」：日志是多实例同时写的场景，
+// 每次整份重写会把另一实例刚写的那几行覆盖掉。
+func (f *FS) Append(ctx context.Context, key string, r io.Reader) (int64, error) {
+	full, err := f.resolve(key)
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return 0, err
+	}
+	out, err := os.OpenFile(full, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	n, copyErr := io.Copy(out, r)
+	if closeErr := out.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	return n, copyErr
+}
+
 // Get 打开文件，不存在返回 storage.ErrNotFound。
 func (f *FS) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	full, err := f.resolve(key)

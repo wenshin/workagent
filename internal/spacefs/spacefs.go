@@ -17,6 +17,9 @@ const (
 	InstallFile = ".install.json"
 	// HistoryDir 是插件改动前的备份目录（files/plugins/.history/）。
 	HistoryDir = ".history"
+	// LogsDir 是空间运行日志目录（files/.logs/）：平台记录插件与 shell 执行，
+	// 按天分文件、历史压缩。暂不对用户与 Agent 开放。
+	LogsDir = ".logs"
 )
 
 // reserved 是平台保留的隐藏项。
@@ -27,6 +30,7 @@ var reserved = map[string]struct{}{
 	MetaFile:    {},
 	InstallFile: {},
 	HistoryDir:  {},
+	LogsDir:     {},
 }
 
 // Hidden 报告名字是否是隐藏项（以 . 开头）。

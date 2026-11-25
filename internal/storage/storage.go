@@ -38,6 +38,15 @@ type Storage interface {
 	SpaceKey(spaceID string) string
 }
 
+// Appender 是 Storage 的可选能力：在已有内容末尾追加。
+//
+// 日志类写入是高频小写入，Put 的「临时文件 + 整份改名」既低效，多实例并发时
+// 还会互相覆盖。不支持追加的实现由调用方自行降级（spacelog 退回读 + 写）。
+type Appender interface {
+	// Append 把 r 写到 key 末尾，文件不存在时创建；返回写入字节数。
+	Append(ctx context.Context, key string, r io.Reader) (int64, error)
+}
+
 // TrashKey 生成回收站 key：trash/{unix_ts}/{space_id}。
 func TrashKey(spaceID string) string {
 	return fmt.Sprintf("trash/%d/%s", time.Now().Unix(), spaceID)
