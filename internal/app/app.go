@@ -123,12 +123,17 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	}
 
 	// 上下文管理：摘要压缩 + 向量检索（§5.7.2 / §5.7.4）
+	// 摘要在后台增量折叠，请求路径只读快照：模型再慢也不挡首 token。
 	memory := ctxmgr.New(st, router, log, ctxmgr.Budget{
-		Window:       cfg.CtxWindow,
-		MaxRunes:     cfg.CtxMaxRunes,
-		TopK:         cfg.CtxTopK,
-		SummaryRunes: cfg.CtxSummaryRunes,
-		MinScore:     0.35,
+		Window:             cfg.CtxWindow,
+		MaxRunes:           cfg.CtxMaxRunes,
+		TopK:               cfg.CtxTopK,
+		SummaryRunes:       cfg.CtxSummaryRunes,
+		MinScore:           0.35,
+		FoldEvery:          cfg.CtxSummaryEvery,
+		SummaryInputTokens: cfg.CtxSummaryInputTokens,
+		FoldTimeout:        cfg.CtxSummaryTimeout,
+		RetrieveTimeout:    cfg.CtxRetrieveTimeout,
 	})
 
 	// 凭证存储（§5.5.2 的 MVP 形态）：信封加密落盘，明文只在用到的那一刻取出

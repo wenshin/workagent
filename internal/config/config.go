@@ -201,6 +201,15 @@ type Config struct {
 	CtxMaxRunes     int
 	CtxSummaryRunes int
 	CtxTopK         int
+	// 滚动摘要按增量折叠（旧摘要 + 新增段），下面是它的节奏与预算：
+	// CtxSummaryEvery 是攒够多少条新增才折一次（折叠落后时原文照带，不丢消息），
+	// CtxSummaryInputTokens 是单次折叠的输入上限（超了分段连续折），
+	// CtxSummaryTimeout 是后台折叠的整体超时，CtxRetrieveTimeout 是请求路径上
+	// 向量检索的等待上限。
+	CtxSummaryEvery       int
+	CtxSummaryInputTokens int
+	CtxSummaryTimeout     time.Duration
+	CtxRetrieveTimeout    time.Duration
 
 	// 凭证加密（§5.5.2 的 MVP 形态）：KEK 只从环境变量读，不进仓库。
 	// 为空时凭证存储不可用，搜索等需要密钥的能力自动降级为「未配置」。
@@ -310,6 +319,8 @@ func Load() (*Config, error) {
 	ctxMaxRunes := 24000
 	ctxSummaryRunes := 600
 	ctxTopK := 4
+	ctxSummaryEvery := 4
+	ctxSummaryInputTokens := 6000
 	for _, item := range []struct {
 		name string
 		dst  *int
@@ -319,6 +330,8 @@ func Load() (*Config, error) {
 		{"CTX_MAX_RUNES", &ctxMaxRunes, 24000},
 		{"CTX_SUMMARY_RUNES", &ctxSummaryRunes, 600},
 		{"CTX_TOP_K", &ctxTopK, 4},
+		{"CTX_SUMMARY_EVERY", &ctxSummaryEvery, 4},
+		{"CTX_SUMMARY_INPUT_TOKENS", &ctxSummaryInputTokens, 6000},
 	} {
 		v := getenv(item.name, "")
 		if v == "" {
@@ -326,6 +339,23 @@ func Load() (*Config, error) {
 		}
 		if _, err := fmt.Sscanf(v, "%d", item.dst); err != nil || *item.dst <= 0 {
 			return nil, fmt.Errorf("%s 必须是正整数", item.name)
+		}
+	}
+
+	// 摘要在后台折叠，超时可以给得比请求宽松；检索在请求路径上，必须短。
+	// 两者一个都不该成为「首 token 很慢」的原因，所以都显式可配。
+	ctxSummaryTimeout := 90 * time.Second
+	if v := getenv("CTX_SUMMARY_TIMEOUT", ""); v != "" {
+		ctxSummaryTimeout, err = time.ParseDuration(v)
+		if err != nil || ctxSummaryTimeout <= 0 {
+			return nil, fmt.Errorf("CTX_SUMMARY_TIMEOUT 不是合法的时长")
+		}
+	}
+	ctxRetrieveTimeout := 5 * time.Second
+	if v := getenv("CTX_RETRIEVE_TIMEOUT", ""); v != "" {
+		ctxRetrieveTimeout, err = time.ParseDuration(v)
+		if err != nil || ctxRetrieveTimeout <= 0 {
+			return nil, fmt.Errorf("CTX_RETRIEVE_TIMEOUT 不是合法的时长")
 		}
 	}
 
@@ -467,10 +497,14 @@ func Load() (*Config, error) {
 		RunIdleTimeout:    idleTimeout,
 		LLMMaxTotalTokens: maxTotalTokens,
 		LLMContextTokens:  contextTokens,
-		CtxWindow:         ctxWindow,
-		CtxMaxRunes:       ctxMaxRunes,
-		CtxSummaryRunes:   ctxSummaryRunes,
-		CtxTopK:           ctxTopK,
+		CtxWindow:             ctxWindow,
+		CtxMaxRunes:           ctxMaxRunes,
+		CtxSummaryRunes:       ctxSummaryRunes,
+		CtxTopK:               ctxTopK,
+		CtxSummaryEvery:       ctxSummaryEvery,
+		CtxSummaryInputTokens: ctxSummaryInputTokens,
+		CtxSummaryTimeout:     ctxSummaryTimeout,
+		CtxRetrieveTimeout:    ctxRetrieveTimeout,
 
 		SecretKEK: getenv("SECRET_KEK", ""),
 

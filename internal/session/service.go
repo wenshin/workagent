@@ -819,7 +819,8 @@ func (s *Service) chat(
 
 	history = append(history, store.Message{Role: "user", Content: text})
 
-	// 上下文三段式组装：摘要 + 按需检索 + 滑动窗口（§5.7.2 / §5.7.4）
+	// 上下文三段式组装：摘要 + 按需检索 + 滑动窗口（§5.7.2 / §5.7.4）。
+	// 摘要只读快照，落后时由 Build 丢给后台折叠——这一句不会被摘要模型挡住。
 	contextMessages, err := s.memory.Build(ctx, ctxmgr.Input{
 		SessionID: sessionID,
 		History:   history,

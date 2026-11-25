@@ -559,6 +559,8 @@ type Store interface {
 
 	// ---- 上下文与记忆（§5.7.2 / §5.7.4）----
 	GetSessionSummary(ctx context.Context, sessionID string) (SessionSummary, bool, error)
+	// SaveSessionSummary 写入滚动摘要。水位单调推进：覆盖范围没有前进时不写入，
+	// 这样并发的旧结果不会把摘要原地往回拨。
 	SaveSessionSummary(ctx context.Context, s SessionSummary) error
 	SaveMessageEmbedding(ctx context.Context, r EmbeddingRecord) error
 	ListMessageEmbeddings(ctx context.Context, sessionID string, limit int) ([]EmbeddingRecord, error)
@@ -619,9 +621,10 @@ type Store interface {
 	GetPluginScan(ctx context.Context, pluginID, version string) (PluginScan, error)
 }
 
-// SessionSummary 是一段历史消息的滚动摘要。
+// SessionSummary 是一段历史消息的滚动摘要（增量折叠出来的最新一份）。
 type SessionSummary struct {
-	SessionID     string
+	SessionID string
+	// UptoMessageID 是覆盖水位：该消息及其之前的消息都已被 Content 概括。
 	UptoMessageID string
 	Content       string
 	MessageCount  int
