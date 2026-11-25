@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/workagent/auto-agent/internal/agent"
@@ -113,4 +114,97 @@ func TestMarshalPartsKeepsUnplacedTools(t *testing.T) {
 	if len(got) != 1 || got[0]["id"] != "c1" {
 		t.Fatalf("应保留未进时间线的工具段，实际 %+v", got)
 	}
+}
+
+// 待审批卡与真实回执是同一个 id：续跑补齐之后只该剩回执那一张。
+//
+// 这就是「审批通过了，卡片还显示待审批」的根因用例：参数超过轨迹上限时，
+// 待审批卡写的是原文、回执写的是截断后的串，按参数比较永远比不上。
+func TestMergePartsDropsParkedCardByCallID(t *testing.T) {
+	long := strings.Repeat("x", agent.MaxToolArgBytes+2048)
+	parked := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_1", Name: "shell_exec",
+		Args: `{"command":"` + long + `"}`, Status: pausedToolStatus,
+	})
+	receipt := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_1", Name: "shell_exec",
+		Args: agent.ClampToolArgs(`{"command":"` + long + `"}`), Status: "ok",
+	})
+
+	got := mergedParts(t, parked, receipt)
+	if len(got) != 1 || got[0]["status"] != "ok" {
+		t.Fatalf("待审批卡应被同一次调用的回执顶掉，实际 %+v", got)
+	}
+}
+
+// 模型重新生成了调用（id 变了）时，按工具名 + 参数认，同样要顶掉。
+func TestMergePartsDropsParkedCardBySignature(t *testing.T) {
+	args := `{"command":"ls -la"}`
+	parked := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_a", Name: "shell_exec", Args: args, Status: pausedToolStatus,
+	})
+	receipt := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_b", Name: "shell_exec", Args: args, Status: "ok",
+	})
+
+	got := mergedParts(t, parked, receipt)
+	if len(got) != 1 || got[0]["status"] != "ok" {
+		t.Fatalf("同名同参数的回执应顶掉待审批卡，实际 %+v", got)
+	}
+}
+
+// 换了一条命令还是待审批（第二次暂停）：这次没拿到回执，卡片必须留着。
+func TestMergePartsKeepsParkedCardWithoutReceipt(t *testing.T) {
+	parked := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_a", Name: "shell_exec",
+		Args: `{"command":"ls"}`, Status: pausedToolStatus,
+	})
+	next := toolParts(t, agent.Step{
+		Type: "tool", ID: "call_b", Name: "shell_exec",
+		Args: `{"command":"cat a.md"}`, Status: pausedToolStatus,
+	})
+
+	got := mergedParts(t, parked, next)
+	if len(got) != 2 {
+		t.Fatalf("没拿到回执的待审批卡不能丢，实际 %+v", got)
+	}
+	if got[0]["id"] != "call_a" || got[1]["status"] != pausedToolStatus {
+		t.Fatalf("顺序或状态不对：%+v", got)
+	}
+}
+
+// 待审批卡落库时就走截断：与回执同一份参数，历史里不会出现两种长度。
+func TestMarshalPartsClampsParkedArgs(t *testing.T) {
+	long := strings.Repeat("x", agent.MaxToolArgBytes+1024)
+	parts := marshalParts(discardLogger(), "s1", agent.Result{
+		Parked: []agent.PendingCall{{ID: "c1", Name: "shell_exec", Args: `{"command":"` + long + `"}`}},
+	})
+	var got []map[string]any
+	if err := json.Unmarshal(parts, &got); err != nil {
+		t.Fatalf("解析 parts 失败: %v", err)
+	}
+	args, _ := got[0]["args"].(string)
+	if len(args) > agent.MaxToolArgBytes+len("…（已截断）")*3 {
+		t.Fatalf("待审批卡的参数应走同一份截断，实际 %d 字节", len(args))
+	}
+}
+
+// toolParts 把一条 step 序列化成 parts 数组的一元素版本。
+func toolParts(t *testing.T, st agent.Step) []byte {
+	t.Helper()
+	data, err := json.Marshal([]agent.Step{st})
+	if err != nil {
+		t.Fatalf("序列化 step 失败: %v", err)
+	}
+	return data
+}
+
+// mergedParts 合并两段 parts 并解析结果。
+func mergedParts(t *testing.T, head, tail []byte) []map[string]any {
+	t.Helper()
+	var got []map[string]any
+	if err := json.Unmarshal(mergeParts(head, tail), &got); err != nil {
+		t.Fatalf("解析合并结果失败: %v", err)
+	}
+	return got
 }

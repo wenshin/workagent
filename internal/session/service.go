@@ -23,6 +23,7 @@ import (
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/space"
 	"github.com/workagent/auto-agent/internal/spacefs"
+	"github.com/workagent/auto-agent/internal/spacelog"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -148,6 +149,10 @@ type Service struct {
 	shell sandbox.Runner
 	// pluginTry 是插件试跑（plugin_try），为 nil 时该工具不可用
 	pluginTry tool.PluginTry
+	// pluginLogs 是插件调用记录（plugin_logs），为 nil 时该工具报不可用
+	pluginLogs tool.PluginLogs
+	// spaceLog 是空间运行日志（files/.logs），为 nil 时不写
+	spaceLog *spacelog.Logger
 	// secrets 是凭证存储（secret_request 用它判断「配过没有」），为 nil 时该工具只报未启用
 	secrets secret.Store
 	// platform 是平台部署事实（租户 / IM 接入），每轮注入系统提示词
@@ -212,6 +217,12 @@ func (s *Service) SetAgentPlugins(src AgentPluginSource) { s.agentPlugins = src 
 
 // SetPluginTry 注入插件试跑能力；不注入时 plugin_try 返回「能力未配置」。
 func (s *Service) SetPluginTry(src tool.PluginTry) { s.pluginTry = src }
+
+// SetPluginLogs 注入插件调用记录；不注入时 plugin_logs 返回「能力未配置」。
+func (s *Service) SetPluginLogs(src tool.PluginLogs) { s.pluginLogs = src }
+
+// SetSpaceLog 注入空间运行日志；不注入时不写，执行链路完全不受影响。
+func (s *Service) SetSpaceLog(l *spacelog.Logger) { s.spaceLog = l }
 
 // SetSecrets 注入凭证存储。
 //

@@ -177,7 +177,7 @@ func (s *Service) execute(
 	// 断开时没必要再为一个没人收的结果起任务，那才是真的浪费。
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
-	live := s.runs.add(run.ID, userID, cancelRun, s.stream, s.log)
+	live := s.runs.add(run.ID, userID, sessionID, cancelRun, s.stream, s.log)
 	// approver 在下面才建好；这里只声明，收尾时用它回查「批了却没动」的待办
 	var approver *runApprover
 	defer func() {
@@ -395,6 +395,10 @@ func (s *Service) execute(
 			Shell: s.shell,
 			// 插件试跑：写完草稿直接在会话里验，不走「发布-安装-发现错」的长链路
 			PluginTry: s.pluginTry,
+			// 插件调用记录：用户问「刚才那条怎么没发出去」时，模型查得到最近几次的结果
+			PluginLogs: s.pluginLogs,
+			// 空间运行日志：shell 与插件执行各留一条，落在 files/.logs，供事后复核
+			SpaceLog: s.spaceLog,
 			// 任务派发：主 Agent 把需要他人确认的事丢出去，自己继续干活（§15.12.4）
 			Tasks: s,
 			// 审批：命中出网写 / 需确认命令时登记待办并把本轮停下，
@@ -686,8 +690,9 @@ func joinParagraph(head, tail string) string {
 
 // mergeParts 按顺序拼接两次执行的 parts。
 //
-// 暂停时留下的待审批卡（status=approval）在同名同参数的调用拿到真实回执后就让位，
-// 否则同一步会既显示「待审批」又显示「成功」。
+// 暂停时留下的待审批卡（status=approval）在同一次调用的真实回执到达后就必须让位，
+// 否则同一步会既显示「待审批」又显示「成功」，而那张卡既没有按钮也没有结论，
+// 刷新历史时还会一直挂在那里。
 func mergeParts(head, tail []byte) []byte {
 	var prev, next []map[string]any
 	if len(head) > 0 {
@@ -702,15 +707,15 @@ func mergeParts(head, tail []byte) []byte {
 	if len(next) == 0 {
 		return head
 	}
-	carried := make(map[string]bool, len(next))
+	carried := make(map[string]bool, 2*len(next))
 	for _, p := range next {
-		if key := partKey(p); key != "" {
+		for _, key := range partKeys(p) {
 			carried[key] = true
 		}
 	}
 	out := make([]map[string]any, 0, len(prev)+len(next))
 	for _, p := range prev {
-		if p["status"] == pausedToolStatus && carried[partKey(p)] {
+		if p["status"] == pausedToolStatus && carriedByAnyPart(p, carried) {
 			continue
 		}
 		out = append(out, p)
@@ -723,15 +728,35 @@ func mergeParts(head, tail []byte) []byte {
 	return data
 }
 
-// partKey 是「同一个工具调用」的判据：续跑时模型会重新生成 call id，
-// 只有工具名加参数能证明这是刚才那一步。
-func partKey(p map[string]any) string {
+// partKeys 返回「同一个工具调用」的全部判据。
+//
+// 优先认 call id：审批是暂停点，那条调用根本没执行过，续跑回放的就是断点里
+// 同一条调用（id 不变），拿 id 比一定对得上。只有模型自己重发了一次才会换 id，
+// 那时再退回按「工具名 + 参数」认——两条都试，是为了两边都不漏。
+//
+// 参数比较必须过同一个截断函数：待审批卡与回执由两处写入，一边原文一边截断时
+// 永远比不上（历史上就是这条导致 8KB 以上的命令留下的待审批卡再也顶不掉）。
+func partKeys(p map[string]any) []string {
 	name, _ := p["name"].(string)
 	if name == "" {
-		return ""
+		return nil
+	}
+	keys := make([]string, 0, 2)
+	if id, _ := p["id"].(string); id != "" {
+		keys = append(keys, "id:"+id)
 	}
 	args, _ := p["args"].(string)
-	return name + "\x00" + args
+	return append(keys, "sig:"+name+"\x00"+agent.ClampToolArgs(args))
+}
+
+// carriedByAnyPart 判断这条待审批卡是不是「已经拿到回执的那一次调用」。
+func carriedByAnyPart(p map[string]any, carried map[string]bool) bool {
+	for _, key := range partKeys(p) {
+		if carried[key] {
+			return true
+		}
+	}
+	return false
 }
 
 // marshalParts 把这一轮的时间线落成 message.parts。
@@ -780,13 +805,16 @@ func marshalParts(log *slog.Logger, sessionID string, res agent.Result) []byte {
 	}
 	// 停在审批上的调用也要留在这一轮里：它们没有回执，状态如实标成待审批。
 	// 不落的话「第一个动作就要确认」的那一轮就是一条空产出，界面看不见。
+	//
+	// 参数与真实回执走同一份截断（agent.ClampToolArgs）：续跑要拿「工具名 + 参数」
+	// 认出这就是刚才那一步，一边原文一边截断时永远比不上，那张待审批卡就再也顶不掉。
 	for _, p := range res.Parked {
 		if placed[p.ID] {
 			continue
 		}
 		placed[p.ID] = true
 		parts = append(parts, agent.Step{
-			Type: "tool", ID: p.ID, Name: p.Name, Args: p.Args,
+			Type: "tool", ID: p.ID, Name: p.Name, Args: agent.ClampToolArgs(p.Args),
 			Status: pausedToolStatus,
 		})
 	}

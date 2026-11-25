@@ -102,6 +102,7 @@ func (a *runApprover) Decide(ctx context.Context, req tool.ApprovalRequest) (too
 		Detail:    req.Detail,
 		Reason:    req.Reason,
 		Risk:      req.Risk,
+		RiskLabel: req.RiskLabel,
 		Status:    store.ApprovalPending,
 		ExpireAt:  time.Now().Add(approvalTTL),
 	})
@@ -115,13 +116,14 @@ func (a *runApprover) Decide(ctx context.Context, req tool.ApprovalRequest) (too
 
 	if a.emit != nil {
 		if err := a.emit(agent.Event{Type: agent.EventApprovalReq, Approval: &agent.ApprovalState{
-			ID:     req.ID,
-			CallID: req.CallID,
-			Tool:   req.Tool,
-			Kind:   req.Kind,
-			Detail: req.Detail,
-			Reason: req.Reason,
-			Risk:   req.Risk,
+			ID:        req.ID,
+			CallID:    req.CallID,
+			Tool:      req.Tool,
+			Kind:      req.Kind,
+			Detail:    req.Detail,
+			Reason:    req.Reason,
+			Risk:      req.Risk,
+			RiskLabel: req.RiskLabel,
 		}}); err != nil {
 			// 事件推不出去，记录不能留在 pending：没有人会看到这条待办
 			a.expire(req.ID)
@@ -133,6 +135,18 @@ func (a *runApprover) Decide(ctx context.Context, req tool.ApprovalRequest) (too
 	a.hub.log.Info("登记待办，本轮暂停",
 		"run_id", a.runID, "approval_id", req.ID, "tool", req.Tool, "kind", req.Kind)
 	return tool.ApprovalDecision{}, tool.ErrApprovalParked
+}
+
+// Granted 实现 tool 包的「查结论」能力：只回答批过没有，不登记待办、不阻塞。
+//
+// 用途只有一个：续跑重放一条已经批过「联网重跑」的命令时，第一次执行就带网，
+// 不再先按无网白跑一遍（那一遍失败，还可能把第二次要做的改动拆坏）。
+func (a *runApprover) Granted(ctx context.Context, req tool.ApprovalRequest) (tool.ApprovalDecision, bool, error) {
+	if a.hub.store == nil {
+		return tool.ApprovalDecision{}, false, nil
+	}
+	d, ok := a.reuse(ctx, req)
+	return d, ok, nil
 }
 
 // reuse 查已经做过、可以直接沿用的结论。
@@ -339,6 +353,8 @@ type ApprovalView struct {
 	Detail string `json:"detail"`
 	Reason string `json:"reason"`
 	Risk   int    `json:"risk"`
+	// RiskLabel 是具体动作标签（网络请求 / 写文件 / 脚本执行…），空串退回等级文案。
+	RiskLabel string `json:"risk_label"`
 }
 
 // PendingApprovals 返回会话里所有还没失效的确认。
@@ -356,13 +372,14 @@ func (s *Service) PendingApprovals(ctx context.Context, userID, sessionID string
 	out := make([]ApprovalView, 0, len(list))
 	for _, a := range list {
 		out = append(out, ApprovalView{
-			ID:     a.ID,
-			CallID: a.CallID,
-			Tool:   a.Tool,
-			Kind:   a.Kind,
-			Detail: a.Detail,
-			Reason: a.Reason,
-			Risk:   a.Risk,
+			ID:        a.ID,
+			CallID:    a.CallID,
+			Tool:      a.Tool,
+			Kind:      a.Kind,
+			Detail:    a.Detail,
+			Reason:    a.Reason,
+			Risk:      a.Risk,
+			RiskLabel: a.RiskLabel,
 		})
 	}
 	return out, nil
