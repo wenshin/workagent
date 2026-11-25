@@ -233,7 +233,10 @@ export function firstOversize(files: File[], maxMb?: number): File | undefined {
 }
 
 /**
- * 能读正文的文本类型，与后端 `previewExts` 同源。
+ * 老版本后端没有 `previewable` / `preview_kind` 字段时的兜底名单。
+ *
+ * 现行后端按排除法判定：除媒体与已知二进制之外一律按文本处理（代码、配置、
+ * Makefile 这类无扩展名文件都算文本），所以这里只保留最常见的几种。
  * 图片 / 音视频 / PDF 能上传、能预览、能作为附件引用，只是模型读不到正文。
  * 隐藏配置没有常规后缀（.env / .gitignore），单独列出来，否则会漏判。
  */

@@ -1,6 +1,7 @@
 package space
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -44,25 +45,42 @@ const (
 	PreviewKindPDF   PreviewKind = "pdf"
 )
 
-// previewExts 是能读取正文（右侧面板展示、Agent 的 file_read 也读得到）的文本类型。
-// 用户自己的隐藏文件（.env / .gitignore 等）没有常规后缀，也按文本处理（见 Readable）。
-// 它只决定「能不能读正文」：上传与引用都接受任意类型，二进制只是读不出正文。
-var previewExts = map[string]bool{
-	".md":   true,
-	".json": true,
-	".txt":  true,
-	".csv":  true,
-	".yaml": true,
-	".yml":  true,
+// binaryExts 是明确不是文本的类型：压缩包、可执行产物、字体、办公文档、数据库文件。
+//
+// 判定走排除法——不在 binaryExts 与 mediaPreviewExts 里的扩展名一律按文本处理，
+// 所以 .ts / .py / .sh / Makefile / Dockerfile 这类代码与配置文件天然可预览，
+// 新增语言不需要改这里的名单。名单只负责「一眼看出是二进制」的类型，
+// 没有扩展名或扩展名不认识的文件由 ReadFile 的 looksBinary 兜底判定。
+var binaryExts = map[string]bool{
+	// 压缩包
+	".zip": true, ".tar": true, ".gz": true, ".tgz": true, ".bz2": true, ".tbz2": true,
+	".xz": true, ".txz": true, ".zst": true, ".7z": true, ".rar": true, ".jar": true,
+	".war": true, ".ear": true, ".apk": true, ".ipa": true, ".dmg": true, ".iso": true,
+	// 可执行产物与字节码
+	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".bin": true, ".o": true,
+	".obj": true, ".a": true, ".lib": true, ".class": true, ".pyc": true, ".pyo": true,
+	".wasm": true, ".node": true, ".msi": true, ".deb": true, ".rpm": true, ".pkg": true,
+	// 字体
+	".ttf": true, ".otf": true, ".woff": true, ".woff2": true, ".eot": true,
+	// 办公文档（二进制容器，正文要交给本地应用）
+	".doc": true, ".docx": true, ".xls": true, ".xlsx": true, ".ppt": true, ".pptx": true,
+	".odt": true, ".ods": true, ".odp": true, ".rtf": true, ".pages": true, ".key": true,
+	".numbers": true,
+	// 数据库与设计稿
+	".sqlite": true, ".sqlite3": true, ".db": true, ".mdb": true, ".psd": true,
+	".ai": true, ".sketch": true, ".fig": true, ".xd": true,
+	// 音视频容器里 raw 端点不处理的补充格式
+	".flv": true, ".wmv": true, ".avi": true, ".mov": true, ".mkv": true, ".m4b": true,
 }
 
 // mediaPreviewExts 是浏览器能原生渲染的类型，值为预览类别与 MIME。
 //
 // MIME 必须是固定白名单，不能用 mime.TypeByExtension：后者依赖系统
 // /etc/mime.types，不同机器上对 .webp / .avif 这类新格式可能返回空串。
-// 这里只收「不会执行脚本」的容器：HTML / XML / JS 一律不在白名单里——raw 端点与平台
-// 同源，返回可执行文档等于把登录态交给文件内容。SVG 允许（<img> 里不执行脚本），
-// 直接打开时由响应头 CSP sandbox 阻断脚本。
+// 这里只收「不会执行脚本」的容器：HTML / XML / JS 不在白名单里——raw 端点与平台
+// 同源，返回可执行文档等于把登录态交给文件内容。它们走文本预览按源码展示
+// （转义后渲染，不执行），只有「按文档内联返回」这条路被堵死。SVG 允许
+// （<img> 里不执行脚本），直接打开时由响应头 CSP sandbox 阻断脚本。
 var mediaPreviewExts = map[string]struct {
 	kind PreviewKind
 	mime string
@@ -220,6 +238,13 @@ func (s *Service) ReadFile(ctx context.Context, userID, spaceID, rawPath string)
 	truncated := len(data) > maxFileBytes
 	if truncated {
 		data = data[:maxFileBytes]
+	}
+
+	// 扩展名不认识的文件在清单里先按文本候选展示（这样新语言不用改名单），
+	// 真读进来才发现是二进制：如实报错，让面板退回下载，而不是把乱码塞进正文
+	// 或交给模型当成文本。
+	if looksBinary(data) {
+		return FileContent{}, ErrFileNotText
 	}
 
 	return FileContent{
@@ -510,25 +535,46 @@ func dirOf(rel string) string {
 }
 
 // Readable 报告文件能否读取正文（file_read 与引用清单的「可读」判定都认它）：
-// 白名单内的文本类型，或用户自己的隐藏文件（.env / .gitignore 这类没有常规后缀的配置）。
+// 除媒体与已知二进制之外的一切文件——文本、代码、配置都没有固定白名单，
+// 用户自己的隐藏文件（.env / .gitignore 这类没有常规后缀的配置）也按文本处理。
 // 它不限制上传与引用：二进制能传、能作为附件引用、能预览下载，只是读不出正文。
 func Readable(name string) bool {
-	if spacefs.UserHidden(path.Base(name)) {
+	base := path.Base(name)
+	if spacefs.UserHidden(base) {
 		return true
 	}
-	return previewExts[strings.ToLower(path.Ext(name))]
+	ext := strings.ToLower(path.Ext(base))
+	if _, ok := mediaPreviewExts[ext]; ok {
+		return false
+	}
+	return !binaryExts[ext]
 }
 
-// previewKind 判定文件的渲染方式：文本白名单优先（隐藏文件也算文本），
-// 其次是浏览器原生渲染的媒体与 PDF，其余只能下载。
+// previewKind 判定文件的渲染方式：媒体与 PDF 优先（raw 端点出原始字节），
+// 已知二进制只能下载，其余一律按文本预览。
 func previewKind(name string) PreviewKind {
-	if Readable(name) {
-		return PreviewKindText
-	}
-	if mt, ok := mediaPreviewExts[strings.ToLower(path.Ext(name))]; ok {
+	ext := strings.ToLower(path.Ext(name))
+	if mt, ok := mediaPreviewExts[ext]; ok {
 		return mt.kind
 	}
-	return PreviewKindNone
+	if binaryExts[ext] {
+		return PreviewKindNone
+	}
+	return PreviewKindText
+}
+
+// maxSniffBytes 是二进制判定的取样窗口，与 net/http 的 DetectContentType 同口径。
+const maxSniffBytes = 8000
+
+// looksBinary 用 NUL 字节判定内容是不是二进制。
+//
+// 只看 NUL 不看 UTF-8 合法性：GBK 这类非 UTF-8 编码的文本仍然是文本，
+// 按非法字节拒绝会把企业里常见的旧编码文档误判成二进制，反而不给预览。
+func looksBinary(data []byte) bool {
+	if len(data) > maxSniffBytes {
+		data = data[:maxSniffBytes]
+	}
+	return bytes.IndexByte(data, 0) >= 0
 }
 
 // normalizeFilePath 校验相对 files/ 的文件路径：禁止越界、平台保留项与不可预览的扩展名。

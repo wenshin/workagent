@@ -161,6 +161,20 @@ export interface LiveRunOptions {
   onSettled?: (info: { sessionId: string; wroteFiles: boolean; aborted: boolean }) => void;
 }
 
+/**
+ * 结算最后一段思考的耗时（本地估算）。
+ *
+ * 思考是「换段才知道结束」的：正文开始或工具调用到达时，这一段才算想完。
+ * 不结算的话标题上永远只有「思考中…」，看不出刚才那一段想了多久。落库后的值
+ * 以后端 `duration_ms` 为准（同一口径：首段增量到换段的墙钟），两者只差几百毫秒。
+ */
+function sealReasoning(items: StreamItem[]): StreamItem[] {
+  const last = items[items.length - 1];
+  if (!last || last.kind !== 'reasoning' || last.duration_ms != null) return items;
+  if (!last.startedAtMs) return items;
+  return [...items.slice(0, -1), { ...last, duration_ms: Date.now() - last.startedAtMs }];
+}
+
 /** 事件 → 视图的唯一映射，首发与续流共用，避免两条链路渲染不一致。 */
 function buildHandlers(
   patch: (fn: (view: LiveRunView) => LiveRunView) => void,
@@ -177,23 +191,29 @@ function buildHandlers(
         if (last && last.kind === 'reasoning') {
           return {
             ...v,
-            items: [...v.items.slice(0, -1), { kind: 'reasoning', text: last.text + delta }],
+            items: [...v.items.slice(0, -1), { ...last, text: last.text + delta }],
           };
         }
-        return { ...v, items: [...v.items, { kind: 'reasoning', text: delta }] };
+        // 新的一段从这一刻起数秒：续流时视图还在内存里，切页回来也不会从头数
+        return {
+          ...v,
+          items: [...v.items, { kind: 'reasoning', text: delta, startedAtMs: Date.now() }],
+        };
       }),
     onText: (delta) =>
       patch((v) => {
-        const last = v.items[v.items.length - 1];
+        const items = sealReasoning(v.items);
+        const last = items[items.length - 1];
         if (last && last.kind === 'text') {
           return {
             ...v,
-            items: [...v.items.slice(0, -1), { kind: 'text', text: last.text + delta }],
+            items: [...items.slice(0, -1), { kind: 'text', text: last.text + delta }],
           };
         }
-        return { ...v, items: [...v.items, { kind: 'text', text: delta }] };
+        return { ...v, items: [...items, { kind: 'text', text: delta }] };
       }),
-    onToolStart: (tool) => patch((v) => ({ ...v, items: [...v.items, { kind: 'tool', tool }] })),
+    onToolStart: (tool) =>
+      patch((v) => ({ ...v, items: [...sealReasoning(v.items), { kind: 'tool', tool }] })),
     // 清单是状态不是步骤：已经有卡片就整块替换，别把每次更新都追加成一张新卡
     onPlan: (plan) =>
       patch((v) => {

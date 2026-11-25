@@ -1,6 +1,6 @@
 import {
-  IconBook,
   IconClose,
+  IconColumnsStroked,
   IconFile,
   IconPaperclip,
   IconSearch,
@@ -19,17 +19,16 @@ import type {
   PlanState,
   SessionTask,
   SpaceFile,
-  SpaceSkill,
   StreamItem,
   ToolCallRecord,
 } from '../api/types';
 import { UPLOAD_HINT, decideApproval, firstOversize } from '../api/client';
 import { useAgents } from '../api/hooks';
 import { markApprovalDecided } from '../api/liveRun';
+import { writtenPaths } from '../lib/changedFiles';
 import MarkdownView from './Markdown';
 import MCPAppKeyCard, { type MCPAppKeyData } from './MCPAppKeyCard';
 import { SessionAgentIcon } from './AgentAvatar';
-import { PluginIcon } from './PluginVisual';
 import SecretRequestCard, { type SecretRequestData } from './SecretRequestCard';
 import TaskPanel, { messageTaskIds, streamTaskIds, useSessionTasks } from './TaskPanel';
 
@@ -134,12 +133,6 @@ interface Props {
   model?: string;
   /** 单文件上传上限（MB），来自服务端配置 UPLOAD_MAX_FILE_MB */
   uploadMaxMb?: number;
-  /** 当前空间 + 系统空间合并后的技能 */
-  skills: SpaceSkill[];
-  /** 选择会话技能，空串表示清除 */
-  onSelectSkill: (path: string) => void;
-  /** 打开选择器前重新取一次：技能可能刚在另一个页面新建/启停过 */
-  onRefreshSkills?: () => void;
   /** 当前空间的文件；引用不限类型（非文本按附件，标签与清单标明读不到正文） */
   spaceFiles: SpaceFile[];
   /** 上传文件到当前空间，返回服务端落盘后的文件（同名会被改名） */
@@ -155,6 +148,10 @@ interface Props {
   onResume?: () => void;
   /** 打开本轮写入的空间文件：清单由工具回执推导，点击跳到右侧预览 */
   onOpenFile?: (path: string) => void;
+  /** 左右分栏是否打开：右侧展示本会话写入过的文件 */
+  splitOpen?: boolean;
+  /** 切换左右分栏 */
+  onToggleSplit?: () => void;
   /**
    * 服务端仍挂着的待确认动作。
    *
@@ -296,14 +293,42 @@ function riskHint(risk: number, label?: string) {
  * 一轮对话里思考可能出现多次（想一段 → 调工具 → 再想一段），每段独立成块，
  * 按时间线穿插在正文与工具卡之间。折叠是刻意的：思考是过程信息，
  * 全部展开会把时间线淹掉；折叠后只看标题就能数出「已经想到第几段」。
+ *
+ * 标题上的耗时与工具卡同一口径（这一段思考的实际消耗）：正在想的那一段按开始
+ * 时刻本地数秒，想完之后用结算值；历史消息直接用落库的 `duration_ms`。
  */
-function ReasoningBlock({ text, live }: { text: string; live?: boolean }) {
+function ReasoningBlock({
+  text,
+  live,
+  durationMs,
+  startedAtMs,
+}: {
+  text: string;
+  live?: boolean;
+  /** 这一段思考的耗时（毫秒）：结束后由后端结算，刷新也不丢 */
+  durationMs?: number;
+  /** 正在思考那一段的起点（epoch ms）：直播时据此继续数秒 */
+  startedAtMs?: number;
+}) {
+  // 还没结算的那一段没有耗时值：本地按起点数秒，数到换段为止。
+  const [liveMs, setLiveMs] = useState(0);
+  useEffect(() => {
+    if (!live || !startedAtMs) return;
+    const tick = () => setLiveMs(Math.max(0, Date.now() - startedAtMs));
+    tick();
+    const timer = window.setInterval(tick, 200);
+    return () => window.clearInterval(timer);
+  }, [live, startedAtMs]);
+  const spent = formatDuration(live && startedAtMs ? liveMs : (durationMs ?? 0));
   return (
     <details className="msg-reasoning">
       <summary className="msg-reasoning-head">
         <span>思考过程</span>
         {live ? <span className="msg-reasoning-live">思考中…</span> : null}
-        <span className="msg-reasoning-size">{text.length} 字</span>
+        <span className="msg-reasoning-size">
+          {text.length} 字
+          {spent ? ` · ${spent}` : ''}
+        </span>
       </summary>
       <div className="msg-reasoning-body">{text}</div>
     </details>
@@ -634,7 +659,7 @@ function ToolRun({
 
 /** 时间线折成渲染块的产物：连续工具调用已并成一块 */
 type TurnBlock =
-  | { kind: 'reasoning'; text: string }
+  | { kind: 'reasoning'; text: string; durationMs?: number; startedAtMs?: number }
   | { kind: 'text'; text: string }
   | { kind: 'tools'; tools: ToolCallRecord[] };
 
@@ -648,7 +673,13 @@ function toBlocks(items: StreamItem[]): TurnBlock[] {
   const blocks: TurnBlock[] = [];
   for (const item of items) {
     if (item.kind === 'reasoning') {
-      blocks.push({ kind: 'reasoning', text: item.text });
+      // 耗时跟着思考段走：历史消息来自 parts.duration_ms，直播时来自本地结算
+      blocks.push({
+        kind: 'reasoning',
+        text: item.text,
+        durationMs: item.duration_ms,
+        startedAtMs: item.startedAtMs,
+      });
       continue;
     }
     if (item.kind === 'text') {
@@ -713,7 +744,10 @@ function toItems(parts?: MessagePart[], byCall?: Map<string, ApprovalInfo>, busy
   return parts.map((p) => {
     if (p.type === 'tool') return { kind: 'tool' as const, tool: toToolRecord(p, byCall, busy) };
     if (p.type === 'plan') return { kind: 'plan' as const, plan: { goal: p.goal, items: p.items } };
-    return { kind: p.type, text: p.text };
+    if (p.type === 'reasoning') {
+      return { kind: 'reasoning' as const, text: p.text, duration_ms: p.duration_ms };
+    }
+    return { kind: 'text' as const, text: p.text };
   });
 }
 
@@ -729,34 +763,6 @@ function lastPlan(items?: StreamItem[] | null): PlanState | null {
     if (item.kind === 'plan') found = item.plan;
   }
   return found;
-}
-
-function parseToolArgs(args: string): Record<string, unknown> | null {
-  try {
-    const value: unknown = JSON.parse(args);
-    return value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
-  } catch {
-    // 流式中参数还没生成完：这一帧先跳过，下一次增量再算
-    return null;
-  }
-}
-
-/**
- * 本轮写入的空间文件，按路径去重、保留首次出现的位置。
- *
- * 只认工具回执：`file_write` 成功才算写过——失败的那次（例如参数超限）不能出现在
- * 「已写入」里；append 分段写同一路径按一次计。wiki_write 落在系统空间，
- * 普通成员打不开，不放进这份可点击的清单。
- */
-function writtenFiles(tools: ToolCallRecord[]): string[] {
-  const out: string[] = [];
-  for (const tool of tools) {
-    if (tool.name !== 'file_write' || tool.status !== 'ok') continue;
-    const args = parseToolArgs(tool.args);
-    const path = typeof args?.path === 'string' ? args.path.trim() : '';
-    if (path && !out.includes(path)) out.push(path);
-  }
-  return out;
 }
 
 /**
@@ -885,7 +891,7 @@ function AssistantBody({
   const allTools = timeline
     ? timeline.flatMap((item) => (item.kind === 'tool' ? [item.tool] : []))
     : tools;
-  const writes = writtenFiles(allTools);
+  const writes = writtenPaths(allTools);
   // 清单排在最前：先看计划再看过程，才读得懂中间的取舍
   const plan = lastPlan(timeline);
   return (
@@ -901,6 +907,8 @@ function AssistantBody({
               <ReasoningBlock
                 key={`reasoning-${index}`}
                 text={block.text}
+                durationMs={block.durationMs}
+                startedAtMs={block.startedAtMs}
                 // 只有最后一段思考才是「正在想」，前面的都已结束
                 live={live && index === blocks.length - 1}
               />
@@ -951,9 +959,6 @@ export default function ChatPanel({
   agentReady,
   model,
   uploadMaxMb,
-  skills,
-  onSelectSkill,
-  onRefreshSkills,
   spaceFiles,
   onUploadFiles,
   onSend,
@@ -962,6 +967,8 @@ export default function ChatPanel({
   resumable,
   onResume,
   onOpenFile,
+  splitOpen,
+  onToggleSplit,
   pendingApprovals = [],
 }: Props) {
   // 智能体清单只在同空间时查：子任务会话的 agent 来自发起方空间，被派发人无权读那份目录，
@@ -979,7 +986,6 @@ export default function ChatPanel({
 
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
-  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
   // 本次要引用的文件（相对空间 files/ 的路径）：发送时随消息一起提交
   const [refs, setRefs] = useState<string[]>([]);
   const [refPickerOpen, setRefPickerOpen] = useState(false);
@@ -1298,12 +1304,6 @@ export default function ChatPanel({
   const resetInputHeight = () => setInputMinHeight(0);
 
   const showEmpty = !loading && messages.length === 0 && !liveView && !pendingUser;
-  const activeSkill = skills.find((s) => s.path === session.skill_path);
-
-  const pickSkill = (path: string) => {
-    onSelectSkill(path);
-    setSkillPickerOpen(false);
-  };
 
   return (
     <div className="chat-panel">
@@ -1323,58 +1323,17 @@ export default function ChatPanel({
           </Text>
         </div>
 
-        <Popover
-          trigger="click"
-          position="bottomRight"
-          visible={skillPickerOpen}
-          onVisibleChange={(v) => {
-            setSkillPickerOpen(v);
-            // 每次打开都以服务端为准：技能可能在插件面板里刚新建、启用或停用
-            if (v) onRefreshSkills?.();
-          }}
-          content={
-            <div className="skill-picker">
-              <div className="skill-picker-head">技能（当前空间与系统空间）</div>
-              {skills.length === 0 ? (
-                <div className="skill-picker-empty">还没有技能，可让 Agent 帮你创建一个</div>
-              ) : (
-                skills.map((s) => (
-                  <button
-                    key={s.path}
-                    type="button"
-                    className={`skill-picker-item${s.path === session.skill_path ? ' is-active' : ''}`}
-                    onClick={() => pickSkill(s.path)}
-                  >
-                    <PluginIcon kind="skill" size="sm" />
-                    <span className="skill-picker-body">
-                      <span className="skill-picker-name">
-                        {s.name}
-                        <span className={`skill-source skill-source-${s.source}`}>
-                          {s.source === 'system' ? '系统' : '当前空间'}
-                        </span>
-                      </span>
-                      {s.description ? <span className="skill-picker-desc">{s.description}</span> : null}
-                    </span>
-                  </button>
-                ))
-              )}
-              {session.skill_path ? (
-                <button type="button" className="skill-picker-clear" onClick={() => pickSkill('')}>
-                  不使用技能
-                </button>
-              ) : null}
-            </div>
-          }
-        >
+        <Tooltip content={splitOpen ? '收起文件分栏' : '分栏查看本会话修改的文件'} position="left">
           <Button
             size="small"
             theme="borderless"
-            icon={<IconBook />}
-            className={`chat-skill-btn${activeSkill ? ' is-active' : ''}`}
-          >
-            {activeSkill ? activeSkill.name : '选择技能'}
-          </Button>
-        </Popover>
+            icon={<IconColumnsStroked />}
+            className={`chat-split-btn${splitOpen ? ' is-active' : ''}`}
+            aria-label={splitOpen ? '收起文件分栏' : '分栏查看本会话修改的文件'}
+            aria-pressed={Boolean(splitOpen)}
+            onClick={onToggleSplit}
+          />
+        </Tooltip>
       </div>
 
       <div className="chat-body" ref={bodyRef} onScroll={handleBodyScroll}>

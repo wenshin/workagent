@@ -185,25 +185,78 @@ func TestPreviewFileKinds(t *testing.T) {
 	}
 }
 
-// 扩展名判定大小写无关，且文本 / 媒体 / 其它三档互斥。
+// 扩展名判定大小写无关，且文本 / 媒体 / 二进制三档互斥。
+// 文本走排除法：代码、配置、无扩展名的构建文件都不需要维护白名单。
 func TestPreviewKind(t *testing.T) {
 	cases := map[string]PreviewKind{
-		"README.md":    PreviewKindText,
-		".env":         PreviewKindText,
-		"photo.PNG":    PreviewKindImage,
-		"logo.svg":     PreviewKindImage,
-		"clip.webm":    PreviewKindVideo,
-		"voice.mp3":    PreviewKindAudio,
-		"manual.pdf":   PreviewKindPDF,
-		"archive.zip":  PreviewKindNone,
-		"page.html":    PreviewKindNone,
-		"script.js":    PreviewKindNone,
-		"no-extension": PreviewKindNone,
+		"README.md":   PreviewKindText,
+		".env":        PreviewKindText,
+		"src/main.ts": PreviewKindText,
+		"main.go":     PreviewKindText,
+		"script.js":   PreviewKindText,
+		"page.html":   PreviewKindText,
+		"Dockerfile":  PreviewKindText,
+		"Makefile":    PreviewKindText,
+		"config.toml": PreviewKindText,
+		"photo.PNG":   PreviewKindImage,
+		"logo.svg":    PreviewKindImage,
+		"clip.webm":   PreviewKindVideo,
+		"voice.mp3":   PreviewKindAudio,
+		"manual.pdf":  PreviewKindPDF,
+		"archive.zip": PreviewKindNone,
+		"tool.exe":    PreviewKindNone,
+		"font.woff2":  PreviewKindNone,
 	}
 	for name, want := range cases {
 		if got := previewKind(name); got != want {
 			t.Fatalf("%s 期望 %q，得到 %q", name, want, got)
 		}
+	}
+}
+
+// 代码与无扩展名配置能读正文；扩展名不认识但内容是二进制的，
+// 读正文时明确报 ErrFileNotText，面板据此退回下载而不是展示乱码。
+func TestReadFileTextAndBinarySniff(t *testing.T) {
+	ctx := context.Background()
+	fs, err := localfs.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("初始化存储失败: %v", err)
+	}
+	svc := &Service{
+		store:   &fakeSpaceStore{space: store.Space{ID: "sp1", Type: "shared"}, perm: "read"},
+		storage: fs,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	base := svc.filesKey("sp1")
+	put := func(rel, body string) {
+		t.Helper()
+		if _, err := fs.Put(ctx, path.Join(base, rel), bytes.NewReader([]byte(body)), int64(len(body))); err != nil {
+			t.Fatalf("预置 %s 失败: %v", rel, err)
+		}
+	}
+	put("src/main.ts", "export const answer: number = 42;\n")
+	put("Makefile", "all:\n\tgo build ./...\n")
+	put("data/blob.dat", "abc\x00def")
+	put("archive.zip", "PK\x03\x04")
+
+	fc, err := svc.ReadFile(ctx, "u1", "sp1", "src/main.ts")
+	if err != nil {
+		t.Fatalf("代码文件应能读正文: %v", err)
+	}
+	if !strings.HasPrefix(fc.Content, "export const answer") || !fc.Previewable || fc.PreviewKind != PreviewKindText {
+		t.Fatalf("代码文件元信息不符: %+v", fc.File)
+	}
+	if _, err := svc.ReadFile(ctx, "u1", "sp1", "Makefile"); err != nil {
+		t.Fatalf("无扩展名的构建文件应能读正文: %v", err)
+	}
+
+	// 扩展名不认识 + 内容含 NUL：不是文本，退回下载
+	if _, err := svc.ReadFile(ctx, "u1", "sp1", "data/blob.dat"); !errors.Is(err, ErrFileNotText) {
+		t.Fatalf("二进制内容应返回 ErrFileNotText，实际: %v", err)
+	}
+	// 已知二进制扩展名在路径校验阶段就被拦住
+	if _, err := svc.ReadFile(ctx, "u1", "sp1", "archive.zip"); !errors.Is(err, ErrFileUnsupported) {
+		t.Fatalf("压缩包应返回 ErrFileUnsupported，实际: %v", err)
 	}
 }
 
@@ -416,7 +469,8 @@ func TestSaveFileAcceptsAnyType(t *testing.T) {
 		{"logo.png", []byte{0x89, 'P', 'N', 'G'}, PreviewKindImage},
 		{"演示.mp4", []byte("mp4"), PreviewKindVideo},
 		{"打包.zip", []byte("PK\x03\x04"), PreviewKindNone},
-		{"README", []byte("no ext"), PreviewKindNone},
+		// 无扩展名的文件按文本候选处理（README / Makefile / Dockerfile 都是这一类）
+		{"README", []byte("no ext"), PreviewKindText},
 		{"说明.md", []byte("# 标题"), PreviewKindText},
 	}
 	for _, c := range cases {

@@ -208,6 +208,13 @@ export interface MessageToolPart {
 export interface MessageTextPart {
   type: 'reasoning' | 'text';
   text: string;
+  /**
+   * 这一段思考的耗时（毫秒）：只有 reasoning 段有值，正文段没有。
+   *
+   * 由后端按「首段思考增量到换段」的墙钟结算，与工具卡的耗时同一口径；
+   * 这次改动之前的老消息没有这个字段，按「不显示耗时」渲染。
+   */
+  duration_ms?: number;
 }
 
 /**
@@ -236,7 +243,14 @@ export type MessagePart = MessageToolPart | MessageTextPart | MessagePlanPart;
  * 流式与落库后的历史消息用同一套形状（历史走 parts），渲染逻辑共用。
  */
 export type StreamItem =
-  | { kind: 'reasoning'; text: string }
+  | {
+      kind: 'reasoning';
+      text: string;
+      /** 这一段思考开始的时刻（epoch ms）：直播时据此继续数秒，切页回来也不从头数 */
+      startedAtMs?: number;
+      /** 这一段思考的耗时：换段时本地结算一次，落库后以后端 duration_ms 为准 */
+      duration_ms?: number;
+    }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; tool: ToolCallRecord }
   /** 任务清单：整份状态，后续更新替换同一条，不追加 */
@@ -354,8 +368,9 @@ export interface SpaceFile {
   size: number;
   mod_time?: string;
   /**
-   * 能否读取正文（md / json 等文本类型）。false 不影响上传与引用：
-   * 图片 / 音视频 / 压缩包能传、能作为附件引用，只是模型读不到正文（见 `isPreviewable`）。
+   * 能否读取正文（除媒体与二进制之外的一切文本，含代码与配置文件）。
+   * false 不影响上传与引用：图片 / 音视频 / 压缩包能传、能作为附件引用，
+   * 只是模型读不到正文（见 `isPreviewable`）。
    * 可选：老版本后端没有这个字段，前端按扩展名兜底。
    */
   previewable?: boolean;

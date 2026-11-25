@@ -52,6 +52,31 @@ func TestMarshalPartsKeepsTimelineOrder(t *testing.T) {
 	}
 }
 
+// 思考耗时随 parts 落库：前端折叠标题读的就是 reasoning 段的 duration_ms，
+// 字段名或省略规则一变，界面上那段耗时就不显示了。
+func TestMarshalPartsKeepsReasoningDuration(t *testing.T) {
+	res := agent.Result{
+		Content: "结论",
+		Steps:   []agent.Step{{Type: "tool", ID: "c1", Name: "fs_list", Status: "ok"}},
+		Timeline: []agent.Segment{
+			{Type: "reasoning", Text: "先看目录", DurationMS: 3200},
+			{Type: "tool", ToolID: "c1"},
+			{Type: "text", Text: "结论"},
+		},
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(marshalParts(discardLogger(), "s1", res), &got); err != nil {
+		t.Fatalf("解析 parts 失败: %v", err)
+	}
+	if got[0]["duration_ms"] != float64(3200) {
+		t.Fatalf("思考段应带耗时 3200ms，实际 %+v", got[0])
+	}
+	// 正文段不写耗时：整轮耗时在 message.duration_ms，这里再写一份就是两个口径
+	if _, ok := got[2]["duration_ms"]; ok {
+		t.Fatalf("正文段不该带耗时，实际 %+v", got[2])
+	}
+}
+
 // 没有工具调用时正文位置是固定的，不写时间线，避免把整段正文复制进 parts。
 func TestMarshalPartsSkipsTimelineWithoutTools(t *testing.T) {
 	res := agent.Result{

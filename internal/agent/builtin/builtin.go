@@ -271,7 +271,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				RiskLabel:  state.RiskLabel,
 				DurationMS: state.DurationMS,
 			})
-			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
+			res.AppendToolSegment(state.ID)
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				ToolCallID: p.ID,
@@ -514,7 +514,7 @@ func (a *Agent) Run(ctx context.Context, in agent.RunInput, emit func(agent.Even
 				RiskLabel:  state.RiskLabel,
 				DurationMS: state.DurationMS,
 			})
-			res.Timeline = append(res.Timeline, agent.Segment{Type: "tool", ToolID: state.ID})
+			res.AppendToolSegment(state.ID)
 
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,

@@ -31,6 +31,8 @@ var (
 	ErrDirTooDeep      = errors.New("目录最多支持 5 层")
 	ErrFileNotFound    = errors.New("文件不存在")
 	ErrFileUnsupported = errors.New("该文件类型不支持预览")
+	// ErrFileNotText：扩展名不像二进制，但内容里含 NUL 字节，按文本读不出可展示的正文
+	ErrFileNotText = errors.New("该文件不是文本，无法按文本预览")
 	ErrFileTooLarge    = errors.New("文件超过单次上传大小上限")
 	// ErrPluginReadOnly：已安装插件的副本整棵只读，删除要走卸载
 	ErrPluginReadOnly = errors.New("已安装插件只能通过卸载删除，不能直接删目录或文件")

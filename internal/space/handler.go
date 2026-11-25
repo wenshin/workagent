@@ -685,6 +685,9 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, ErrFileUnsupported):
 		platform.WriteError(w, r, http.StatusBadRequest, "unsupported_file", err.Error())
+	case errors.Is(err, ErrFileNotText):
+		// 单独一个 code：前端据此把面板退回「下载」，而不是当成读取失败
+		platform.WriteError(w, r, http.StatusBadRequest, "not_text_file", err.Error())
 	case errors.Is(err, ErrFileTooLarge):
 		platform.WriteError(w, r, http.StatusRequestEntityTooLarge, "file_too_large", err.Error())
 	case errors.Is(err, ErrDirExists):

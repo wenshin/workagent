@@ -445,6 +445,10 @@ func (s *Service) execute(
 		},
 	}, emitEvent)
 
+	// 最后一段思考的结束时刻只有这里知道：一轮收尾后不会再有换段事件，
+	// 不在这里结算的话时间线上那段思考的耗时永远是零（刷新后也就没有耗时）。
+	res.CloseTimeline()
+
 	// 落库不跟着请求走：run 已经跑完，客户端在不在都要把结果写进去
 	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancelSave()
@@ -644,6 +648,9 @@ func (s *Service) execute(
 type timelinePart struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+	// DurationMS 是这一段思考的耗时（毫秒），只有 reasoning 段写。
+	// 老消息没有这个字段，前端按「没有耗时」渲染，不补零。
+	DurationMS int64 `json:"duration_ms,omitempty"`
 }
 
 // planPart 是 message.parts 里的任务清单，与前端 MessagePart 对齐。
@@ -797,7 +804,7 @@ func marshalParts(log *slog.Logger, sessionID string, res agent.Result) []byte {
 		if strings.TrimSpace(seg.Text) == "" {
 			continue
 		}
-		parts = append(parts, timelinePart{Type: seg.Type, Text: seg.Text})
+		parts = append(parts, timelinePart{Type: seg.Type, Text: seg.Text, DurationMS: seg.DurationMS})
 	}
 	// 时间线缺失或不完整（第三方实现、续跑补齐）时工具轨迹不能丢
 	for _, st := range res.Steps {

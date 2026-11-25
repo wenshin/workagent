@@ -1,7 +1,16 @@
 import { IconAlertCircle, IconExit, IconPlus } from '@douyinfe/semi-icons';
 import { Avatar, Button, Layout, Modal, Spin, Toast, Tooltip } from '@douyinfe/semi-ui';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api, firstOversize, getActiveRun, getResumable, listPendingApprovals } from '../api/client';
@@ -14,9 +23,7 @@ import {
   useMe,
   useMessages,
   usePluginCatalog,
-  useSetSessionSkill,
   useSessions,
-  useSkills,
   useSpaceDirs,
   useSpaceFiles,
   useSpaces,
@@ -34,6 +41,8 @@ import {
   toApprovalInfo,
 } from '../api/liveRun';
 import type { ChatSession, PluginCategory, Space, SpaceDir, SpaceFile } from '../api/types';
+import { sessionWrittenPaths } from '../lib/changedFiles';
+import ChangedFilesPanel from '../components/ChangedFilesPanel';
 import ChatPanel, { splitReferences, type StreamView } from '../components/ChatPanel';
 import FilePanel from '../components/FilePanel';
 import MCPAppsDialog from '../components/MCPAppsDialog';
@@ -79,7 +88,6 @@ export default function WorkspacePage() {
   // 新建会话统一走弹窗：树右键与空间面板都要能选智能体
   const [newSession, setNewSession] = useState<NewSessionState | null>(null);
   const deleteSession = useDeleteSession();
-  const setSessionSkill = useSetSessionSkill();
   const uploadFiles = useUploadFiles();
   const { data: agentInfo } = useAgentInfo();
 
@@ -187,8 +195,81 @@ export default function WorkspacePage() {
     !(lastMessage?.role === 'user' && splitReferences(lastMessage.content).text === liveRun.pendingUser)
       ? liveRun.pendingUser
       : null;
-  // 技能列表随会话所属空间变化：当前空间 + 系统空间合并，同名当前空间优先
-  const { data: skills = [], refetch: refetchSkills } = useSkills(selectedSession?.space_id);
+  // 左右分栏：左边对话，右边本会话修改过的文件。宽度可拖、双击复位
+  const [splitOpen, setSplitOpen] = useState(false);
+  const [splitPath, setSplitPath] = useState('');
+  const [splitWidth, setSplitWidth] = useState(440);
+  const splitRef = useRef<HTMLDivElement>(null);
+
+  // 切会话时右侧退回清单：上一个会话写过的文件在新会话里通常一个都不在，
+  // 停在预览上只会让人以为「新会话改了这个文件」
+  const splitSessionId = selectedSession?.id ?? '';
+  useEffect(() => {
+    setSplitPath('');
+  }, [splitSessionId]);
+
+  // 分栏清单与每条消息底部的「本轮写入」同源：历史回执 + 当前轮实时工具调用。
+  // 两段分开算：实时帧每来一次都会重算，历史消息不该跟着重新解析一遍参数
+  const historyChanged = useMemo(
+    () => (selectedSession ? sessionWrittenPaths(messages) : []),
+    [selectedSession, messages],
+  );
+  const liveChanged = useMemo(() => sessionWrittenPaths([], stream?.items), [stream?.items]);
+  const changedPaths = useMemo(() => {
+    if (liveChanged.length === 0) return historyChanged;
+    const out = [...historyChanged];
+    for (const path of liveChanged) if (!out.includes(path)) out.push(path);
+    return out;
+  }, [historyChanged, liveChanged]);
+
+  const toggleSplit = () => {
+    setSplitOpen((open) => !open);
+    setSplitPath('');
+  };
+
+  const startSplitResize = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const box = splitRef.current;
+    if (!box) return;
+    const startWidth = splitWidth;
+    const startX = e.clientX;
+    // 左侧至少留 360px：对话被压到几百像素以下就没法读了
+    const clamp = (px: number) =>
+      Math.min(Math.max(px, 320), Math.max(320, Math.round(box.getBoundingClientRect().width) - 360));
+    const onMove = (ev: MouseEvent) => setSplitWidth(clamp(startWidth - (ev.clientX - startX)));
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+  };
+
+  // 分隔条也支持键盘调整：只靠鼠标的布局控件键盘用户完全够不着
+  const resizeSplitByKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 64 : 16;
+    const boxWidth = splitRef.current?.getBoundingClientRect().width ?? 1200;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      setSplitWidth((w) => Math.min(w + step, Math.max(320, Math.round(boxWidth) - 360)));
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      setSplitWidth((w) => Math.max(w - step, 320));
+    }
+  };
+
+  // 写入清单里的文件：分栏开着就在右侧预览，否则整页打开
+  const openSessionFile = (path: string) => {
+    if (!selectedSession) return;
+    if (splitOpen) {
+      setSplitPath(path);
+      return;
+    }
+    setSearchParams({ space: selectedSession.space_id, file: path });
+  };
 
   const spaceSessions = useMemo(
     () => sessions.filter((s) => s.space_id === selectedSpaceId),
@@ -397,6 +478,45 @@ export default function WorkspacePage() {
   const openCategory = (c: PluginCategory) =>
     navigate(c === 'all' ? '/plugins/market' : `/plugins/market/${c}`);
 
+  // 会话面板在整页与分栏两种布局里复用：分栏时它只是左半边
+  const chatView = selectedSession ? (
+    <ChatPanel
+      session={selectedSession}
+      spaceName={selectedSpace?.name}
+      messages={messages}
+      loading={messagesLoading}
+      sending={Boolean(stream)}
+      stream={stream}
+      pendingUser={pendingUser}
+      pendingRefs={stream ? liveRun?.pendingRefs : undefined}
+      agentReady={agentInfo?.ready ?? false}
+      model={agentInfo?.model}
+      uploadMaxMb={agentInfo?.upload_max_file_mb}
+      // 只按空间收窄：引用不限类型（非文本按附件进清单），跨空间路径会被后端跳过，
+      // 所以这里不把其他空间的文件混进来
+      spaceFiles={files.filter((f) => f.space_id === selectedSession.space_id)}
+      onUploadFiles={(list) =>
+        uploadFiles.mutateAsync({
+          spaceId: selectedSession.space_id,
+          files: list,
+          // 会话挂在某个目录下时，材料默认放进这个目录
+          dir: selectedSession.dir,
+        })
+      }
+      onSend={send}
+      onStop={stopGenerating}
+      // 有待办时只留审批卡：「继续」和它抢的是同一份断点，点了也只会再停一次
+      resumable={Boolean(resumeInfo?.resumable) && !stream && approvals.length === 0}
+      onResume={() => void resume()}
+      // 审批即暂停：这一轮已经收尾，卡片要从服务端待办补，刷新后也在
+      pendingApprovals={stream ? [] : approvals}
+      splitOpen={splitOpen}
+      onToggleSplit={toggleSplit}
+      // 写入文件清单里的条目：分栏开着就在右侧预览，否则整页打开展示
+      onOpenFile={openSessionFile}
+    />
+  ) : null;
+
   return (
     <Layout className="app-shell">
       <Layout.Sider className="app-sider" style={{ width: 280 }}>
@@ -546,6 +666,33 @@ export default function WorkspacePage() {
           <div className="plugin-market">
             <PluginCatalogPanel defaultSpaceId={selectedSpaceId} category={pluginCategory} />
           </div>
+        ) : selectedSession && splitOpen ? (
+          // 分栏：左边对话，右边本会话修改过的文件。宽度由分隔条拖出来，落在本地状态里
+          <div className="chat-split" ref={splitRef}>
+            <div className="chat-split-main">{chatView}</div>
+            <div
+              className="chat-split-divider"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖动调整分栏宽度"
+              aria-valuenow={splitWidth}
+              aria-valuemin={320}
+              tabIndex={0}
+              title="拖动调整宽度，双击复位"
+              onMouseDown={startSplitResize}
+              onDoubleClick={() => setSplitWidth(440)}
+              onKeyDown={resizeSplitByKey}
+            />
+            <aside className="chat-split-aside" style={{ width: splitWidth }}>
+              <ChangedFilesPanel
+                space={selectedSpace}
+                files={files.filter((f) => f.space_id === selectedSession.space_id)}
+                paths={changedPaths}
+                selectedPath={splitPath}
+                onSelect={setSplitPath}
+              />
+            </aside>
+          </div>
         ) : selectedFile ? (
           // key 跟着文件走：切文件时媒体加载失败 / 加载中状态必须重置
           <FilePanel
@@ -554,53 +701,7 @@ export default function WorkspacePage() {
             file={selectedFile}
           />
         ) : selectedSession ? (
-          <div className="chat-shell">
-            <ChatPanel
-              session={selectedSession}
-              spaceName={selectedSpace?.name}
-              messages={messages}
-              loading={messagesLoading}
-              sending={Boolean(stream)}
-              stream={stream}
-              pendingUser={pendingUser}
-              pendingRefs={stream ? liveRun?.pendingRefs : undefined}
-              agentReady={agentInfo?.ready ?? false}
-              model={agentInfo?.model}
-              uploadMaxMb={agentInfo?.upload_max_file_mb}
-              skills={skills}
-              onRefreshSkills={() => {
-                void refetchSkills();
-              }}
-              onSelectSkill={(path) => {
-                setSessionSkill.mutate(
-                  { id: selectedSession.id, path },
-                  { onError: (e) => Toast.error(e instanceof Error ? e.message : '技能切换失败') },
-                );
-              }}
-              // 只按空间收窄：引用不限类型（非文本按附件进清单），跨空间路径会被后端跳过，
-              // 所以这里不把其他空间的文件混进来
-              spaceFiles={files.filter((f) => f.space_id === selectedSession.space_id)}
-              onUploadFiles={(list) =>
-                uploadFiles.mutateAsync({
-                  spaceId: selectedSession.space_id,
-                  files: list,
-                  // 会话挂在某个目录下时，材料默认放进这个目录
-                  dir: selectedSession.dir,
-                })
-              }
-              onSend={send}
-              onStop={stopGenerating}
-              // 有待办时只留审批卡：「继续」和它抢的是同一份断点，点了也只会再停一次
-              resumable={Boolean(resumeInfo?.resumable) && !stream && approvals.length === 0}
-              onResume={() => void resume()}
-              // 审批即暂停：这一轮已经收尾，卡片要从服务端待办补，刷新后也在
-              pendingApprovals={stream ? [] : approvals}
-              // 写入文件清单里的条目：切到右侧文件预览，路径落在会话所属空间
-              onOpenFile={(path) =>
-                setSearchParams({ space: selectedSession.space_id, file: path })
-              }
-            />
-          </div>
+          <div className="chat-shell">{chatView}</div>
         ) : (
           <SpacePanel
             space={selectedSpace}

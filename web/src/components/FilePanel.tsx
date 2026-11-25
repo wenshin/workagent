@@ -1,10 +1,19 @@
-import { IconDownload, IconFile, IconImage, IconMusic, IconPdf, IconVideo } from '@douyinfe/semi-icons';
+import {
+  IconChevronLeft,
+  IconDownload,
+  IconFile,
+  IconImage,
+  IconMusic,
+  IconPdf,
+  IconVideo,
+} from '@douyinfe/semi-icons';
 import { Button, Empty, Spin, Toast, Typography } from '@douyinfe/semi-ui';
-import { useState, type ReactNode } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 
-import { downloadSpaceFile, previewKindOf, spaceFileRawUrl } from '../api/client';
+import { ApiError, downloadSpaceFile, previewKindOf, spaceFileRawUrl } from '../api/client';
 import { useFileContent } from '../api/hooks';
 import type { Space, SpaceFile } from '../api/types';
+import { highlightFile } from '../lib/highlight';
 import MarkdownView from './Markdown';
 
 const { Text } = Typography;
@@ -12,6 +21,8 @@ const { Text } = Typography;
 interface Props {
   space?: Space;
   file: SpaceFile;
+  /** 分栏里的形态：头部最左侧给一个返回清单的入口 */
+  onBack?: () => void;
 }
 
 function formatSize(size: number) {
@@ -33,13 +44,13 @@ function prettifyJson(raw: string) {
  * 右侧文件内容面板。
  *
  * 按服务端给的 `preview_kind` 分四种形态，每种都要有加载 / 失败出口：
- * - text：md 渲染富文本、json 格式化，其余按纯文本；
+ * - text：md 渲染富文本；代码按扩展名上色（json 先格式化）；识别不出语言的按纯文本；
  * - image / video / audio：浏览器原生元素，源走 file/raw（支持 Range，视频能拖进度）；
  * - pdf：内嵌浏览器自带阅读器；
  * - none：只给下载按钮，并说明为什么看不到内容。
  * 下载入口始终在头部右上角；媒体解码失败时正文区退回下载，不留白屏。
  */
-export default function FilePanel({ space, file }: Props) {
+export default function FilePanel({ space, file, onBack }: Props) {
   const kind = previewKindOf(file);
   const isText = kind === 'text';
   // 只有文本类型请求正文：file 端点只认文本，其余请求只会 400
@@ -48,7 +59,20 @@ export default function FilePanel({ space, file }: Props) {
   // 媒体解码失败（编码不受支持、文件被删）：退回下载入口，不留空白区域
   const [mediaError, setMediaError] = useState(false);
   const lower = file.name.toLowerCase();
+  const isMarkdown = lower.endsWith('.md') || lower.endsWith('.markdown');
   const rawUrl = space ? spaceFileRawUrl(space.id, file.path) : '';
+
+  // json 先格式化再上色：服务端给的原文可能是压缩成一行的，直接高亮也读不了
+  const source = useMemo(() => {
+    if (kind !== 'text' || !data) return '';
+    return lower.endsWith('.json') ? prettifyJson(data.content) : data.content;
+  }, [kind, data, lower]);
+  const codeHtml = useMemo(
+    () => (isMarkdown || !source ? null : highlightFile(file.name, source)),
+    [isMarkdown, source, file.name],
+  );
+  // 扩展名像文本、内容却是二进制（服务端嗅探到 NUL）：退回下载，不当成读取失败
+  const notText = error instanceof ApiError && error.code === 'not_text_file';
 
   const handleDownload = async () => {
     if (!space) return;
@@ -77,6 +101,17 @@ export default function FilePanel({ space, file }: Props) {
 
   const header = (
     <div className="file-panel-head">
+      {onBack ? (
+        <Button
+          theme="borderless"
+          size="small"
+          icon={<IconChevronLeft />}
+          className="file-panel-back"
+          aria-label="返回文件清单"
+          title="返回文件清单"
+          onClick={onBack}
+        />
+      ) : null}
       <div className="file-panel-title">
         {kindIcon}
         <span className="file-panel-name">{file.name}</span>
@@ -145,6 +180,11 @@ export default function FilePanel({ space, file }: Props) {
     }
 
     if (isError || !data) {
+      if (notText) {
+        return wrap(
+          downloadFallback('该文件不是文本，无法预览', '下载到本机后用本地应用打开'),
+        );
+      }
       return wrap(
         <div className="panel-empty">
           <Empty
@@ -157,11 +197,16 @@ export default function FilePanel({ space, file }: Props) {
 
     return wrap(
       <div className="file-panel-body">
-        {lower.endsWith('.md') ? (
+        {isMarkdown ? (
           <MarkdownView content={data.content} />
+        ) : codeHtml ? (
+          <pre className="file-pre file-code">
+            {/* codeHtml 来自 highlight.js：源码已转义，只含 <span class="hljs-*"> */}
+            <code className="hljs" dangerouslySetInnerHTML={{ __html: codeHtml }} />
+          </pre>
         ) : (
           <pre className="file-pre">
-            <code>{lower.endsWith('.json') ? prettifyJson(data.content) : data.content}</code>
+            <code>{source}</code>
           </pre>
         )}
       </div>,

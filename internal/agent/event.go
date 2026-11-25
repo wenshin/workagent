@@ -114,22 +114,68 @@ type Segment struct {
 	Text string
 	// ToolID 是 tool 段对应的调用 id，指向 Result.Steps 里的同 id 步骤
 	ToolID string
+	// DurationMS 是这一段思考的实际耗时（毫秒），只有 reasoning 段有值。
+	//
+	// 计的是「第一段思考增量到换段」之间的墙钟：等首个 token 的时间不算在内，
+	// 那段属于模型排队而不是思考本身。正文与工具不单独计时——工具耗时在 Step 上，
+	// 整轮耗时在 message.duration_ms，同一段时间记三处只会互相矛盾。
+	DurationMS int64
 }
 
 // AppendSegment 把一段思考 / 正文接到时间线末尾。
 //
 // 增量是一个 token 一个到达的：每次新开一段会让历史回放出现几十个折叠块，
 // 所以同类型连续到达时续写同一段；只有工具调用插进来才真正开始新的一段。
+//
+// 段落「什么时候结束」只有换段那一刻才知道，所以起止时刻记在 Result 上，
+// 换段时结算一次（见 closeSegment）。
 func (r *Result) AppendSegment(typ, text string) {
 	if text == "" {
 		return
 	}
+	now := time.Now()
 	n := len(r.Timeline)
 	if n > 0 && r.Timeline[n-1].Type == typ {
+		// 续写同一段：起点保持第一次到达的那一刻
 		r.Timeline[n-1].Text += text
+		if r.segType == "" {
+			r.segType, r.segStartedAt = typ, now
+		}
 		return
 	}
+	r.closeSegment(now)
 	r.Timeline = append(r.Timeline, Segment{Type: typ, Text: text})
+	r.segType, r.segStartedAt = typ, now
+}
+
+// AppendToolSegment 把一次工具调用插进时间线。
+//
+// 工具段没有正文，只指向 Steps 里的同 id 步骤；它同时是前一段思考的终点，
+// 所以必须先结算再插入，否则那一段的耗时永远停在零。
+func (r *Result) AppendToolSegment(toolID string) {
+	r.closeSegment(time.Now())
+	r.Timeline = append(r.Timeline, Segment{Type: "tool", ToolID: toolID})
+}
+
+// CloseTimeline 结算最后一段的耗时。
+//
+// 一轮结束时没有人再换段，最后一段（常见的是一段收尾思考）得在这里收尾；
+// 会话层拿到 Result 后调用一次即可，第三方的实现同样走这一条路。
+func (r *Result) CloseTimeline() {
+	r.closeSegment(time.Now())
+}
+
+// closeSegment 结算当前这一段，并把计时状态清空。
+func (r *Result) closeSegment(now time.Time) {
+	if r.segType == "" || r.segStartedAt.IsZero() {
+		return
+	}
+	if r.segType == "reasoning" {
+		if n := len(r.Timeline); n > 0 && r.Timeline[n-1].Type == "reasoning" {
+			r.Timeline[n-1].DurationMS = now.Sub(r.segStartedAt).Milliseconds()
+		}
+	}
+	r.segType, r.segStartedAt = "", time.Time{}
 }
 
 // Step 是落库的一条执行轨迹，用于历史消息还原。
@@ -481,6 +527,12 @@ type Result struct {
 	//
 	// 可以不填：没有工具调用时位置是固定的（思考在前、正文在后），会话层不会落它。
 	Timeline []Segment
+	// segType / segStartedAt 是时间线上最后一段的类型与起始时刻，只用于结算思考耗时。
+	//
+	// 段落是「流到换段才知道结束」的：逐 token 累加时没有结束信号，所以时刻留在
+	// Result 上；两段之间插进来的工具调用同样要走 AppendToolSegment 结算。
+	segType      string
+	segStartedAt time.Time
 	// Parked 是停在审批上、还没执行的那几条调用。
 	//
 	// 它不进 Steps：没有回执就不能当成已完成的步骤。但这一轮的消息必须能把它们
