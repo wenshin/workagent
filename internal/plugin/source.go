@@ -84,7 +84,7 @@ func (m *Manager) newSourceProvider(ctx context.Context, spaceID, slug, dir stri
 		d = d.WithMounts(
 			[]sandbox.Mount{{Source: root, Key: dir, Target: sandbox.PluginDir}},
 			path.Join(sandbox.PluginDir, filepath.ToSlash(s.Entry)),
-		)
+		).WithScope(spaceID)
 		return d, nil
 	default:
 		return nil, fmt.Errorf("未知的 source.protocol %q", s.Protocol)
