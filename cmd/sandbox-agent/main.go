@@ -72,7 +72,9 @@ func main() {
 
 	// 出网代理由执行体自己建：控制面的 socket 在另一个容器的 /tmp 里，
 	// 路径传过来没有意义。控制面只把白名单（Spec.Egress）过线。
-	eg := egress.NewRegistry(log)
+	// 执行体建的是给插件用的代理：插件只能说 HTTP 代理语义（absolute-form /
+	// CONNECT），见 egress.NewHTTPRegistry 的说明。
+	eg := egress.NewHTTPRegistry(log)
 	defer eg.Close()
 
 	srv := &http.Server{

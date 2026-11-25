@@ -1,6 +1,12 @@
-# 部署后验：用与线上一致的 Spec 形状打一遍执行体。
+# 部署后验：执行体与探针在同一个容器里，探针走 127.0.0.1。
+#
 # 这不是「能不能起来」的检查，而是「能不能上线」的检查：
 # 能跑、能写自己空间、写不了系统目录、断网、宿主路径不可见、超时生效。
+#
+# 为什么不拆成两个容器：Job 的 Pod 要所有容器都退出才算完成，而执行体是常驻
+# 进程、永远不退出。拆开的结果是 Job 永远 Running，kubectl wait 只能等到超时，
+# 表现为 make sandbox-check 卡住。这里后台起执行体 → 等 /healthz → 跑探针 →
+# 以探针的退出码结束。
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -8,8 +14,15 @@ metadata:
   namespace: workagent
 spec:
   backoffLimit: 0
+  # 兜底：集群异常时不让这一步无限挂着
+  activeDeadlineSeconds: 300
   ttlSecondsAfterFinished: 600
   template:
+    metadata:
+      labels:
+        # NetworkPolicy 按这个标签选执行体：探针要验证「出网档位可达」，
+        # 必须落在同一条 egress 规则里。
+        app.kubernetes.io/name: sandbox-runner
     spec:
       restartPolicy: Never
       containers:
@@ -17,15 +30,50 @@ spec:
           image: workagent/sandbox-runner:dev
           imagePullPolicy: IfNotPresent
           command:
-            - /usr/local/bin/sandbox-probe
-            - -addr=http://sandbox-runner:8323
-            # 相对执行体存储根的 key；目录由执行体自己创建，探针不需要挂载
-            - -space=spaces/probe/files
+            - sh
+            - -c
+            - |
+              set -u
+              # 入口脚本先封私网出站，再 exec 执行体；放后台跑，日志留到失败时打印。
+              /usr/local/bin/wa-entrypoint /usr/local/bin/sandbox-agent >/tmp/agent.log 2>&1 &
+              for _ in $(seq 1 120); do
+                curl -sf -o /dev/null http://127.0.0.1:8323/healthz && break
+                sleep 1
+              done
+              if /usr/local/bin/sandbox-probe -space=spaces/probe/files; then
+                exit 0
+              fi
+              echo "--- 执行体日志 ---" >&2
+              tail -n 50 /tmp/agent.log >&2 || true
+              exit 1
           env:
+            - name: SANDBOX_AGENT_ADDR
+              value: ":8323"
+            # 探针的存储根：emptyDir 就够，验证的是「key 能解析、能写」，
+            # 不是持久化。
+            - name: SANDBOX_AGENT_ROOT
+              value: /var/lib/workagent
+            - name: WA_CACHE_DIR
+              value: /cache
             - name: SANDBOX_RUNNER_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: sandbox-runner-token
                   key: token
-          # 探针只调执行体的 HTTP 接口，自己不需要任何卷：
-          # 工作区由执行体按 key 解析并创建。
+          securityContext:
+            # 与生产执行体同一套：bwrap 需要 SYS_ADMIN / NET_ADMIN，
+            # 默认 seccomp 会拦 unshare。
+            seccompProfile:
+              type: Unconfined
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN"]
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/workagent
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: storage
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}

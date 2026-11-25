@@ -1,0 +1,48 @@
+# 控制面与执行体共享的存储卷。
+#
+# 为什么必须共享：控制面把上传 / 生成的文件写在自己的 STORAGE_ROOT 上，
+# 执行体必须看到同一个目录，否则 file_* / shell 第一次调用就会「找不到文件」。
+# 本地用 hostPath（__WA_STORAGE__ 由 scripts/sandbox-exec.sh 渲染成绝对路径）；
+# 生产换成 RWX 的 NFS / CephFS / EFS，名字保持 workagent-storage 即可，
+# 控制面通过 SANDBOX_STORAGE_PVC 指向它。
+#
+# kind 需要给节点加 extraMounts 才能看到宿主机目录：
+#   kind: Cluster
+#   nodes:
+#     - role: control-plane
+#       extraMounts:
+#         - hostPath: /Users/you/code/auto-agent/data/storage
+#           containerPath: /Users/you/code/auto-agent/data/storage
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: workagent-storage-pv
+  labels:
+    app.kubernetes.io/name: sandbox-executor
+    wa.kind: storage
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: wa-local
+  hostPath:
+    path: __WA_STORAGE__
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workagent-storage
+  namespace: workagent
+  labels:
+    app.kubernetes.io/name: sandbox-executor
+    wa.kind: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: wa-local
+  resources:
+    requests:
+      storage: 100Gi

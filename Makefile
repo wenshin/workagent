@@ -14,6 +14,9 @@ help:
 	@echo "web       构建前端到 web/dist（上传 CDN）"
 	@echo "build     编译 API 到 bin/server"
 	@echo "test      运行单元测试"
+	@echo "sandbox-up    构建执行体镜像并部署命名空间 / 存储 / RBAC"
+	@echo "sandbox-check 部署后验（探针 Job）"
+	@echo "sandbox-down  删除本地执行面"
 	@echo "mock-dc   启动 mock 大数据平台（127.0.0.1:8322，联调数仓类智能体）"
 
 tidy:
@@ -28,11 +31,13 @@ redis-up:
 pg-down:
 	docker compose down
 
-# 服务端执行 agent 一律走远端沙箱（开发 / CI / 生产一致）：先 make sandbox-up 起执行体，
-# 再导出 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN；缺任一项服务会直接启动失败，不退回本机执行。
+# 服务端执行 agent 一律走容器化执行体（开发 / CI / 生产一致）：
+#   SANDBOX_BACKEND 只有 k8s 一档 —— 控制面自己建容器（每空间一个空间容器、
+#   每租户一个插件容器），需要先 make sandbox-up 并配好 kubeconfig / 存储卷。
+# 缺配置时服务直接启动失败，不退回本机执行。
 run:
-	@[ -n "$$SANDBOX_RUNNER_ADDR" ] && [ -n "$$SANDBOX_RUNNER_TOKEN" ] || \
-		echo "提示：需要 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN（见 README 快速开始）"
+	@[ -n "$$SANDBOX_RUNNER_TOKEN" ] || \
+		echo "提示：需要 SANDBOX_RUNNER_TOKEN（见 README 快速开始）"
 	$(GO) run ./cmd/server
 
 build:

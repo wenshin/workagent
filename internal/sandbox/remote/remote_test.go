@@ -22,6 +22,8 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Name() string { return f.name }
 
+func (f *fakeRunner) Executable(name string) string { return name }
+
 func (f *fakeRunner) Run(_ context.Context, spec sandbox.Spec) (sandbox.Result, error) {
 	f.got = spec
 	res := f.res
@@ -54,12 +56,34 @@ type passthroughRunner struct {
 
 func (p *passthroughRunner) Name() string { return p.name }
 
+func (p *passthroughRunner) Executable(name string) string { return name }
+
 func (p *passthroughRunner) Run(context.Context, sandbox.Spec) (sandbox.Result, error) {
 	return sandbox.Result{Sandbox: p.name}, nil
 }
 
 func (p *passthroughRunner) Start(ctx context.Context, spec sandbox.Spec) (*sandbox.Proc, error) {
 	return sandbox.NewLocal().Start(ctx, spec)
+}
+
+// 远端客户端必须回裸命令名：控制面解析出来的绝对路径在执行容器里不存在，
+// 现场症状是 `bwrap: execvp /Users/.../deno: No such file or directory`——
+// 进程起来就退，控制面只读到 EOF，看着像「插件自己崩了」。
+func TestExecutableStaysBareName(t *testing.T) {
+	c, _ := newTestClient(t, &fakeRunner{name: "bwrap"}, "token", t.TempDir())
+	if got := c.Executable("deno"); got != "deno" {
+		t.Fatalf("远端执行体应拿到裸命令名，得到 %q", got)
+	}
+}
+
+// 本地执行体与调用方同一个文件系统，绝对路径才对——不然 PATH 里没有时会静默跑错版本。
+func TestLocalExecutableIsAbsolute(t *testing.T) {
+	if got := sandbox.NewLocal().Executable("sh"); !filepath.IsAbs(got) {
+		t.Fatalf("本地执行体应返回绝对路径，得到 %q", got)
+	}
+	if got := sandbox.NewLocal().Executable("definitely-not-a-command-xyz"); got != "" {
+		t.Fatalf("找不到的命令应返回空串，得到 %q", got)
+	}
 }
 
 // Spec 必须原样穿过协议：Mode / Timeout / FS / Stdin 任何一项丢了，

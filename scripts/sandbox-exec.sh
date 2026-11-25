@@ -2,8 +2,9 @@
 # 执行面（容器化沙箱）本地流程：构建镜像 → 部署执行体 → 跑部署后验。
 #
 # 用法:
+#   scripts/sandbox-exec.sh build   只跨编译 + 构建镜像（生产推 registry 用）
 #   scripts/sandbox-exec.sh up      跨编译 + 构建镜像 + 部署
-#   scripts/sandbox-exec.sh check   跑 sandbox-probe（会重建 Job）
+#   scripts/sandbox-exec.sh check   跑 sandbox-probe（会重建 Job，用 IMAGE 指定镜像）
 #   scripts/sandbox-exec.sh logs    跟踪执行体日志
 #   scripts/sandbox-exec.sh down    删除本地执行面
 #
@@ -58,26 +59,33 @@ up() {
   storage="$(storage_dir)"
   echo "==> 部署执行面（存储根 ${storage}）"
   kubectl apply -f deploy/local/00-namespace.yaml
-  # 执行体的存储根必须与控制面一致：渲染成同一个绝对路径再 apply
-  sed "s|__WA_STORAGE__|${storage}|g" deploy/local/10-runner.yaml | kubectl apply -f -
+  # 控制面与执行体共享的存储卷：控制面的 STORAGE_ROOT 必须指向它，
+  # 否则文件工具在容器里看不到控制面写的文件。
+  sed "s|__WA_STORAGE__|${storage}|g" deploy/local/12-storage.yaml | kubectl apply -f -
+  # 控制面建 Pod 的权限：只有 pods / pvc 的 get/list/create/delete。
+  kubectl apply -f deploy/local/05-rbac.yaml >/dev/null
   # 私网封禁：OrbStack 自带 k8s 没有 CNI，这条会被接受但不生效，
   # 验证它要用 kind + Calico。集群禁用 NetworkPolicy 时也不阻断部署。
   kubectl apply -f deploy/local/15-runner-netpol.yaml >/dev/null 2>&1 \
     || echo "==> 跳过 NetworkPolicy（当前集群不支持）"
-  # 镜像 tag 固定为 dev 且 imagePullPolicy=IfNotPresent：不重启就还是旧二进制，
-  # 「改了代码但行为没变」十次有九次是这个原因。
-  kubectl -n "$NAMESPACE" rollout restart deploy/sandbox-runner >/dev/null
-  kubectl -n "$NAMESPACE" rollout status deploy/sandbox-runner --timeout=180s
-  echo "==> 执行体日志（后端名必须不是 local）"
-  kubectl -n "$NAMESPACE" logs deploy/sandbox-runner --tail=20 || true
+  echo "==> 执行面已就绪（执行体由控制面按空间 / 租户创建）"
+  echo "    部署后验：scripts/sandbox-exec.sh check"
 }
 
 check() {
   kubectl -n "$NAMESPACE" delete job sandbox-probe --ignore-not-found >/dev/null
-  kubectl apply -f deploy/local/20-probe.yaml >/dev/null
+  # 探针 Job 里写的是默认镜像与默认命名空间，生产 / 指定时按 IMAGE、NAMESPACE 渲染。
+  sed -e "s|workagent/sandbox-runner:dev|${IMAGE}|g" \
+    -e "s|namespace: workagent|namespace: ${NAMESPACE}|" \
+    deploy/local/20-probe.yaml | kubectl apply -f - >/dev/null
   echo "==> 等待探针完成"
-  kubectl -n "$NAMESPACE" wait --for=condition=complete job/sandbox-probe --timeout=180s >/dev/null 2>&1 || true
-  kubectl -n "$NAMESPACE" logs job/sandbox-probe
+  if ! kubectl -n "$NAMESPACE" wait --for=condition=complete job/sandbox-probe --timeout=180s >/dev/null 2>&1; then
+    # 超时时只打日志会是空的（Pod 可能 Pending / 镜像拉不下来），先给出现场。
+    echo "==> 探针未在 180s 内完成，当前状态：" >&2
+    kubectl -n "$NAMESPACE" get job sandbox-probe -o wide >&2 || true
+    kubectl -n "$NAMESPACE" get pod -l job-name=sandbox-probe -o wide >&2 || true
+  fi
+  kubectl -n "$NAMESPACE" logs job/sandbox-probe || true
   # 探针失败时 kubectl wait 不会返回非零，必须自己看 Job 状态
   local failed
   failed=$(kubectl -n "$NAMESPACE" get job sandbox-probe -o jsonpath='{.status.failed}')
@@ -88,9 +96,10 @@ check() {
 }
 
 case "${1:-up}" in
+  build) build ;;
   up) up ;;
   check) check ;;
-  logs) kubectl -n "$NAMESPACE" logs -f deploy/sandbox-runner ;;
+  logs) kubectl -n "$NAMESPACE" logs -f job/sandbox-probe ;;
   down) kubectl delete -f deploy/local/ --ignore-not-found ;;
-  *) echo "用法: $0 {up|check|logs|down}" >&2; exit 2 ;;
+  *) echo "用法: $0 {build|up|check|logs|down}" >&2; exit 2 ;;
 esac

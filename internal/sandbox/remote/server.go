@@ -248,7 +248,7 @@ func (s *server) prepareEgress(spec sandbox.Spec) (sandbox.Spec, error) {
 	if s.egress == nil {
 		return spec, errors.New("执行体未启用出网代理，无法满足插件的出网声明")
 	}
-	digest := egress.Digest(spec.Egress.Hosts, spec.Egress.WSHosts, spec.Egress.Verbs)
+	digest := egress.Digest(spec.Egress.Hosts, spec.Egress.WSHosts, spec.Egress.Verbs, spec.Egress.HostPorts)
 	// socket 路径在这台机器上现算：控制面清空了 Proxy（它的 /tmp 与本容器无关），
 	// 沙箱里挂的是固定的 sandbox.EgressProxy，所以两边不需要同一路径。
 	sock, err := egress.SocketPath(digest)
@@ -262,6 +262,7 @@ func (s *server) prepareEgress(spec sandbox.Spec) (sandbox.Spec, error) {
 		Policy:       egress.NewAllowlist(spec.Egress.Hosts),
 		ConnectHosts: spec.Egress.WSHosts,
 		Verbs:        spec.Egress.Verbs,
+		HostPorts:    spec.Egress.HostPorts,
 		Logger:       s.logger,
 		OnEvent: func(ev egress.Event) {
 			if !ev.Allowed {

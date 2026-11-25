@@ -52,12 +52,21 @@ type Deno struct {
 	// scriptInSandbox 非空时用它（沙箱内路径）代替宿主路径执行脚本：
 	// 脚本来自插件目录时，宿主路径既不该进 argv，也不该出现在编译错误里。
 	scriptInSandbox string
+	// scope 是脚本执行体的归属：脚本源属于某个空间的插件，
+	// 落到该空间所在租户的插件容器里。
+	scope sandbox.Scope
 }
 
 // WithMounts 设置脚本进程的挂载表与沙箱内脚本路径（由插件层按空间解析）。
 func (d *Deno) WithMounts(mounts []sandbox.Mount, script string) *Deno {
 	d.mounts = mounts
 	d.scriptInSandbox = script
+	return d
+}
+
+// WithScope 指定脚本执行体的归属（空间 → 租户插件容器）。
+func (d *Deno) WithScope(spaceID string) *Deno {
+	d.scope = sandbox.Scope{Space: spaceID, Kind: sandbox.KindPlugin}
 	return d
 }
 
@@ -214,6 +223,7 @@ func (d *Deno) run(ctx context.Context, in map[string]any, secret string) ([]byt
 		script, dir = d.scriptInSandbox, path.Dir(d.scriptInSandbox)
 	}
 	res, err := d.shell.Run(ctx, sandbox.Spec{
+		Scope: d.scope,
 		Cmd: []string{
 			d.deno, "run",
 			"--quiet", "--no-prompt",

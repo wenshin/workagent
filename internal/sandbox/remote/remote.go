@@ -61,7 +61,7 @@ func New(addr, token string) (*Client, error) {
 	}
 	base := strings.TrimRight(strings.TrimSpace(addr), "/")
 	if base == "" {
-		return nil, errors.New("远端沙箱地址为空（SANDBOX_RUNNER_ADDR）")
+		return nil, errors.New("远端沙箱地址为空（执行体地址未配置）")
 	}
 	if !strings.Contains(base, "://") {
 		base = "http://" + base
@@ -92,6 +92,12 @@ func New(addr, token string) (*Client, error) {
 // Name 返回执行体真实生效的后端名（bwrap / local）。
 // 调用方据此判断「到底有没有隔离」，不要用字面量比较。
 func (c *Client) Name() string { return c.backend }
+
+// Executable 返回裸命令名：真正的解析发生在执行体里，控制面的 PATH 与容器无关。
+//
+// 这条线只传「命令名」，不传宿主绝对路径——容器化部署下控制面可能在 macOS 上，
+// 本机解析出来的 /Users/.../deno 在执行容器里必然不存在。
+func (c *Client) Executable(name string) string { return name }
 
 // Env 返回执行容器自述的运行环境，实现 sandbox.EnvProvider。
 //

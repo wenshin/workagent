@@ -25,7 +25,7 @@ type check struct {
 }
 
 func main() {
-	addr := flag.String("addr", os.Getenv("SANDBOX_RUNNER_ADDR"), "执行体地址")
+	addr := flag.String("addr", "http://127.0.0.1:8323", "执行体地址（与执行体同 Pod 时用默认值）")
 	token := flag.String("token", os.Getenv("SANDBOX_RUNNER_TOKEN"), "执行体令牌")
 	space := flag.String("space", "spaces/probe/files", "探针工作区（相对执行体存储根的 key）")
 	flag.Parse()

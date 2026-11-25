@@ -170,8 +170,34 @@ type Mount struct {
 	Write bool
 }
 
+// Kind 是执行体种类：决定这次调用落到哪一类容器上。
+type Kind string
+
+const (
+	// KindShell 是空间容器：每空间一个，空闲超时销毁。
+	KindShell Kind = "shell"
+	// KindPlugin 是插件容器：每租户一个，常驻；插件运行与插件开发都落在这里。
+	KindPlugin Kind = "plugin"
+)
+
+// Scope 是这次执行归属的租户 / 空间。
+//
+// 容器化执行体（internal/sandbox/k8s）按它解析到具体容器：空间容器按 Space
+// 隔离，插件容器按 Tenant 共享。空值不是「无所谓」——Space 为空时执行体只能
+// 拒绝，否则所有调用会挤进同一个默认容器。
+type Scope struct {
+	// Space 是空间 ID。
+	Space string
+	// Tenant 是租户标识；空表示执行体自行解析（插件容器据此共享）。
+	Tenant string
+	// Kind 决定容器种类，零值按 KindShell 处理。
+	Kind Kind
+}
+
 // Spec 描述一次命令执行。
 type Spec struct {
+	// Scope 是这次执行的归属：执行体按它选容器。
+	Scope Scope
 	// Cmd 是要执行的命令，第一个元素是程序名；不做 shell 解释。
 	Cmd []string
 	// Dir 是沙箱内的工作目录（如 /workspace），默认 WorkspaceDir；
@@ -240,6 +266,10 @@ type EgressSpec struct {
 	WSHosts []string
 	// Verbs 是允许的 HTTP 方法；空表示不限制。
 	Verbs []string
+	// HostPorts 是精确到端口的白名单（"host:port"），只有平台自己注入的
+	// 宿主地址会落在这里：插件需要回调宿主（im.reply 的 inbox），而宿主
+	// 地址是部署事实，清单里既写不出来（hosts 只收域名），也不该由作者写。
+	HostPorts []string
 }
 
 // Result 是一次执行的结果。命令正常退出（含非零退出码）时 error 为 nil，
@@ -259,6 +289,15 @@ type Result struct {
 type Runner interface {
 	// Name 是后端名，调用方用它判断是否真的隔离了。
 	Name() string
+	// Executable 把命令名解析成「执行体所在文件系统」上的可执行路径，
+	// 解析不到返回空串。
+	//
+	// 为什么必须由执行器回答：容器化之后控制面与执行体不是同一个文件系统。
+	// 控制面跑在 macOS 上时 exec.LookPath("deno") 给出 /Users/.../bin/deno，
+	// 这个路径在执行容器里不存在，现象是 `bwrap: execvp ...: No such file or
+	// directory`——进程起来就退，宿主只读到 EOF，看日志像「插件自己崩了」。
+	// 所以过线的只能是命令名，由执行体按容器里的 PATH 解析。
+	Executable(name string) string
 	Run(ctx context.Context, spec Spec) (Result, error)
 	// Start 启动一个长驻进程，暴露 stdin/stdout 供双向协议使用（插件运行时）。
 	// 超时、进程组回收、环境清理与 Run 一致；调用方必须 Close。
@@ -438,6 +477,15 @@ type runner struct {
 }
 
 func (r *runner) Name() string { return r.name }
+
+// Executable 在本机解析：local / bwrap 后端与调用方同一个文件系统，绝对路径才对。
+func (r *runner) Executable(name string) string {
+	p, err := exec.LookPath(name)
+	if err != nil {
+		return ""
+	}
+	return p
+}
 
 func (r *runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	spec, err := spec.normalize()
