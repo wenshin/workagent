@@ -25,7 +25,7 @@
 ## 平台限制
 
 - 空间里能直接写的是 md / json / txt / yaml / ts / js（`file_write`，单文件 256KB，但**单次 content 别超 12KB**：模型单次输出有上限，超了会被截断成半截 JSON）。更长的文件分块写：第一块 `mode=overwrite`（新文件 `create`），其余 `append` 追加到同一路径。`.go` / `.py` / `.sh` 等后缀要用 `shell_exec` 生成，或让用户本地改。
-- `shell_exec` 没有网络：依赖装不上。要跑测试先确认运行时与依赖已经在环境里（`which node`、`ls node_modules`），没有就直说「本环境跑不了」，并给出用户本地可执行的验证命令。
+- `shell_exec` 默认无网：要联网就在参数里声明 `need_network=true`（含脚本 / curl 会先请用户确认）；`pip install` / `npm i` / `apt install` 例外，直接有网。要跑测试先确认运行时与依赖已经在环境里（`which node`、`ls node_modules`），没有就直说「本环境跑不了」，并给出用户本地可执行的验证命令。
 - 单次命令 15s、输出 16KB：测试用 `--filter` / `--grep` 缩小范围，日志用 `| tail -n 40`。
 
 ## 产出格式

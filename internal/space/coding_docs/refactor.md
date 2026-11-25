@@ -20,7 +20,7 @@
 
 ## 平台限制
 
-- `shell_exec` 每次 15s、无网络：重构后的验证要能在本地环境跑；跑不了就说明，并给出用户本地执行的命令。
+- `shell_exec` 每次 15s、默认无网（要联网声明 `need_network=true`）：重构后的验证要能在本地环境跑；跑不了就说明，并给出用户本地执行的命令。
 - 空间文件区可用 `file_write` 直接改 ts / js / md / json / yaml；其它后缀走 `shell_exec`。
 - 大范围重命名用 `shell_exec`（`grep -rl` + `sed`）比手改可靠，但改完要 `grep` 复查有没有漏。
 
