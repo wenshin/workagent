@@ -27,12 +27,13 @@ import (
 	"github.com/workagent/auto-agent/internal/plugin"
 	"github.com/workagent/auto-agent/internal/policy"
 	"github.com/workagent/auto-agent/internal/sandbox"
-	"github.com/workagent/auto-agent/internal/sandbox/remote"
+	"github.com/workagent/auto-agent/internal/sandbox/k8s"
 	"github.com/workagent/auto-agent/internal/search"
 	"github.com/workagent/auto-agent/internal/secret"
 	"github.com/workagent/auto-agent/internal/securityscan"
 	"github.com/workagent/auto-agent/internal/session"
 	"github.com/workagent/auto-agent/internal/space"
+	"github.com/workagent/auto-agent/internal/spacelog"
 	"github.com/workagent/auto-agent/internal/storage"
 	"github.com/workagent/auto-agent/internal/store"
 	"github.com/workagent/auto-agent/internal/tool"
@@ -157,7 +158,7 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	//   remote —— 容器化部署：执行体在租户容器里，控制面只发请求
 	// 两者都要求「探测不到隔离就报错」，且都以后端自己报的名字为准：
 	// 远端执行体降级成 local 时，控制面必须知道，否则审计里会写成 bwrap。
-	shellRunner, err := newShellRunner(cfg, log)
+	shellRunner, err := newShellRunner(cfg, st, log)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +166,14 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	// 搜索注册表先于插件管理器构造：kind=source 的插件在安装/启用时直接注册进来，
 	// 装完即生效，不需要重启服务。
 	searchReg := search.NewRegistry("")
+
+	// 空间运行日志：插件与 shell 的每次执行各留一条，写在空间隐藏目录 files/.logs，
+	// 按天分文件、历史压缩。暂不对用户与 Agent 开放，只作为排障留证。
+	spaceLog := spacelog.New(fs, spacelog.Options{
+		RetainDays:   cfg.SpaceLogRetentionDays,
+		MaxFileBytes: int64(cfg.SpaceLogMaxFileMB) << 20,
+		Logger:       log,
+	})
 
 	// 插件体系（docs/插件体系设计.md）：五类插件共用清单与生命周期。
 	// 脚本插件跑在同一个沙箱里，密钥只经宿主替换，插件进程里没有明文。
@@ -226,6 +235,16 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		Scanner:         scanner,
 		ProcMax:         cfg.PluginProcMax,
 		ProcMaxRestarts: cfg.PluginProcMaxRestarts,
+		// 插件在沙箱里不知道平台在哪，这个值由宿主注入（wa.config().host_base），
+		// 不让使用者填：抄错的唯一表现是投递 401，排查方向还全错。
+		// 用 PluginHostBase 而不是 AppBaseURL：对外地址沙箱里往往不可达
+		// （容器里 127.0.0.1 就是自己），两者必须是两个可分别配置的值。
+		HostBase: cfg.PluginHostBase,
+		// 插件身份密钥：渠道插件没有登录态，回调 /inbox 时带平台签发的令牌，
+		// 宿主用同一份密钥验签，验不过就是 401。
+		TokenSecret: cfg.PluginTokenSecret,
+		// 插件执行留证：与 shell 共用同一个写入端，落在各空间的 files/.logs
+		SpaceLog: spaceLog,
 		// 发布门禁跑插件自带的黄金用例：确定性用例总跑，行为用例用平台预算跑
 		Evals: golden.Runner{Options: golden.Options{
 			MaxRounds:    cfg.LLMMaxRounds,
@@ -282,6 +301,10 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 	sessionSvc.SetAgentPlugins(pluginSvc)
 	// 插件试跑：会话里写完草稿直接验配置
 	sessionSvc.SetPluginTry(pluginSvc)
+	// 插件调用记录：同一份 Manager 持有的内存缓冲，会话侧只读
+	sessionSvc.SetPluginLogs(pluginSvc)
+	// 空间运行日志：shell 与插件共用，工具侧通过 Env.SpaceLog 拿到
+	sessionSvc.SetSpaceLog(spaceLog)
 	// 凭证存储：会话内的 secret_request 只查「配过没有」，值不进模型上下文
 	sessionSvc.SetSecrets(secretStore)
 	// 平台部署事实：租户兜底名来自配置（登录用户的通讯录资料更准），
@@ -301,6 +324,11 @@ func New(cfg *config.Config, st store.Store, fs storage.Storage, log *slog.Logge
 		}
 	}
 	sessionSvc.SetPlatformFacts(platform)
+
+	// IM 渠道桥：渠道插件不持任何人身份，只能把「谁发来的什么」交给宿主，
+	// 由宿主投进那个人固定的渠道会话。反向注入（插件层拿得到会话层能力）是
+	// 单向的：插件层只看到 IMSubmitter 这两个方法，读不到任何会话内容。
+	pluginSvc.SetIM(sessionSvc)
 
 	app := &App{
 		cfg:        cfg,
@@ -438,47 +466,90 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 
 // newShellRunner 按运行形态构造执行面。
 //
-// 两种形态共用同一套「必须真有隔离」的校验：远端执行体在握手时上报自己实际
-// 探测到的后端（bwrap / local），控制面不需要也不可能替它判断。
-//
 // 判定口径是「谁在执行 agent」，不是「这是不是开发环境」：
 //
-//	server —— 只能远端执行体。服务端进程（生产、CI、本机调试一视同仁）执行 agent，
-//	          节点的内核、镜像与安全上下文都不由我们决定，不能假设 bwrap 可用；
-//	          执行体自己报告没有隔离后端时直接启动失败，不存在「容器是唯一边界，
-//	          先跑起来」的降级档，也不存在「本机调试就裸跑」的例外。
+//	server —— 控制面自己建容器（k8s）。服务端进程（生产、CI、本机调试一视同仁）
+//	          执行 agent，节点的内核、镜像与安全上下文都不由我们决定，不能假设
+//	          bwrap 可用；执行体每次握手都校验隔离后端，没有隔离就直接失败，
+//	          不存在「容器是唯一边界，先跑起来」的降级档。
 //	client —— 只能本进程起 bwrap。装在用户机器上的 runtime 必须自带真隔离，
-//	          连远端执行体等于把用户目录交给另一个进程。
-func newShellRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
+//	          连容器等于把用户目录交给另一个进程。
+func newShellRunner(cfg *config.Config, st store.Store, log *slog.Logger) (sandbox.Runner, error) {
 	switch cfg.Role {
 	case config.RoleServer:
-		return newServerRunner(cfg, log)
+		return newServerRunner(cfg, st, log)
 	case config.RoleClient:
 		return newClientRunner(cfg, log)
 	default:
-		return nil, fmt.Errorf("未知运行形态 %q：只能是 server / client（dev 已删除，本机调试同样连远端执行体）", cfg.Role)
+		return nil, fmt.Errorf("未知运行形态 %q：只能是 server / client（dev 已删除，本机调试同样连容器化执行体）", cfg.Role)
 	}
 }
 
-// newServerRunner 只接受远端执行体。
-func newServerRunner(cfg *config.Config, log *slog.Logger) (sandbox.Runner, error) {
-	if !strings.EqualFold(strings.TrimSpace(cfg.SandboxBackend), "remote") {
+// newServerRunner 构造服务端执行面：控制面自己建容器，
+// 每空间一个空间容器（空闲销毁），每租户一个插件容器（常驻）。
+//
+// 只有 k8s 一档：不再保留「连一个现成执行体」的 remote 档——那会让所有空间
+// 共用同一个 /usr（一个空间装包改变另一个空间的环境），而且开发与生产的
+// 隔离形态不一致，测出来的东西不是跑起来的东西。
+func newServerRunner(cfg *config.Config, st store.Store, log *slog.Logger) (sandbox.Runner, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.SandboxBackend)) {
+	case "k8s", "":
+		runner, err := k8s.New(k8s.Config{
+			Namespace:      cfg.SandboxNamespace,
+			Image:          cfg.SandboxImage,
+			Token:          cfg.SandboxRunnerToken,
+			TokenSecret:    cfg.SandboxTokenSecret,
+			TokenKey:       cfg.SandboxTokenKey,
+			Kubeconfig:     cfg.SandboxKubeconfig,
+			StorageClass:   cfg.SandboxStorageClass,
+			StoragePVCName: cfg.SandboxStoragePVC,
+			StoragePVCSize: cfg.SandboxStoragePVCSize,
+			CachePVCSize:   cfg.SandboxCachePVCSize,
+			ShellMemory:    cfg.SandboxShellMemory,
+			PluginMemory:   cfg.SandboxPluginMemory,
+			ShellIdle:      cfg.SandboxShellIdle,
+			ReadyTimeout:   cfg.SandboxReadyTimeout,
+			CacheShared:    cfg.SandboxCacheShared,
+			InitImage:      cfg.SandboxInitImage,
+			TenantOf:       tenantResolver(st),
+			Log:            log,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("k8s 执行面不可用: %w", err)
+		}
+		log.Info("执行面已就绪", "role", config.RoleServer, "transport", runner.Transport(),
+			"namespace", cfg.SandboxNamespace, "image", cfg.SandboxImage)
+		return runner, nil
+
+	default:
 		return nil, fmt.Errorf(
-			"服务端（WA_ROLE=server）只能用远端执行体：SANDBOX_BACKEND 必须为 remote（当前 %q）；"+
-				"本机调试同样如此，先 make sandbox-up 并把 SANDBOX_RUNNER_ADDR / SANDBOX_RUNNER_TOKEN 传进来",
+			"服务端（WA_ROLE=server）只能用容器化执行体：SANDBOX_BACKEND 只能是 k8s（当前 %q）",
 			cfg.SandboxBackend)
 	}
-	client, err := remote.New(cfg.SandboxRunnerAddr, cfg.SandboxRunnerToken)
-	if err != nil {
-		return nil, fmt.Errorf("远端执行体不可用: %w", err)
+}
+
+// tenantResolver 把空间解析成租户（空间的属主所属企业）。
+//
+// 插件容器按租户共享，这个值决定哪些空间共用一个 Pod。解析失败时执行面
+// 退化为「每空间一个插件容器」——多起容器不影响正确性。
+func tenantResolver(st store.Store) func(context.Context, string) (string, error) {
+	if st == nil {
+		return nil
 	}
-	// 执行体报告只有容器、没有 bwrap 时不能启动：服务端没有「降级可接受」的档位，
-	// 那等于把空间隔离寄托在镜像恰好装了 bwrap 上。
-	if err := sandbox.Ensure(client); err != nil {
-		return nil, fmt.Errorf("远端执行体没有可用的隔离后端: %w", err)
+	return func(ctx context.Context, spaceID string) (string, error) {
+		sp, err := st.GetSpace(ctx, spaceID)
+		if err != nil {
+			return "", err
+		}
+		if sp.OwnerID == "" {
+			return "", nil
+		}
+		u, err := st.GetUser(ctx, sp.OwnerID)
+		if err != nil {
+			return "", err
+		}
+		return u.CorpName, nil
 	}
-	log.Info("执行面已就绪", "role", config.RoleServer, "transport", client.Transport(), "backend", client.Name())
-	return client, nil
 }
 
 // newClientRunner 只接受本进程的 bwrap。
