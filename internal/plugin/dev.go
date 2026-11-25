@@ -65,9 +65,11 @@ func (m *Manager) DevExec(ctx context.Context, spaceID, slug, userID, command st
 	// 草稿目录挂到 /workspace：开发会话里的 pwd、报错与装包日志都不该出现
 	// 控制面的存储路径（spaces/<id>/drafts/<slug>）。
 	return m.o.Runner.Run(ctx, sandbox.Spec{
-		Cmd:  []string{"sh", "-c", command},
-		Dir:  sandbox.WorkspaceDir,
-		Mode: mode,
+		// 开发会话跑在租户的插件容器里：装进去的依赖不影响任何空间容器。
+		Scope: sandbox.Scope{Space: spaceID, Kind: sandbox.KindPlugin},
+		Cmd:   []string{"sh", "-c", command},
+		Dir:   sandbox.WorkspaceDir,
+		Mode:  mode,
 		Mounts: []sandbox.Mount{
 			{Source: dir, Key: DraftKey(m.o.Storage, spaceID, slug), Target: sandbox.WorkspaceDir, Write: true},
 			{Source: tool.CacheRoot(), Root: sandbox.RootCache, Target: sandbox.CacheDir, Write: true},

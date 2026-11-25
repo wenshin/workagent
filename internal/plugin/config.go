@@ -3,7 +3,9 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -68,13 +70,17 @@ type ConfigOption struct {
 
 // ConfigField 是一个可编辑项，前端据此渲染表单，不写死字段名。
 type ConfigField struct {
-	Key         string         `json:"key"`
-	Label       string         `json:"label"`
-	Type        string         `json:"type"`
-	Required    bool           `json:"required"`
-	Placeholder string         `json:"placeholder,omitempty"`
-	Help        string         `json:"help,omitempty"`
-	Options     []ConfigOption `json:"options,omitempty"`
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Type        string `json:"type"`
+	Required    bool   `json:"required"`
+	Placeholder string `json:"placeholder,omitempty"`
+	Help        string `json:"help,omitempty"`
+	// Note 是字段下方的事实补充，不随选项变化。审批档位用它列出「这个插件
+	// 被允许访问哪些网站」——用户做的不只是「问几次」的选择，而是「要不要继续
+	// 信任这个插件」的决定，不知道它能连哪里，这个决定就没有依据。
+	Note    string         `json:"note,omitempty"`
+	Options []ConfigOption `json:"options,omitempty"`
 	// Default 是安装方没填过时的生效值（前端可用来提示「留空即 xxx」）。
 	Default string `json:"default,omitempty"`
 }
@@ -107,17 +113,30 @@ func configScope(meta Manifest) string {
 	return ScopeSpace
 }
 
-// approvalField 是审批档位的下拉项。
+// approvalField 是「风险控制」：两档，调用前要不要人工审批。
 //
-// 三档文案都要说清后果：这是安装方对「这个插件要不要拦」的选择，不是风险等级的
-// 另一种写法——等级仍然只用于展示，档位是显式授权。
+// 标题下的说明是这个工具的能力清单——它要访问哪些域名、会不会写文件。用户
+// 打开配置是为了决定「要不要继续让它碰我的东西」，看不到它能连哪儿、能写什么，
+// 这个决定就没有依据；「允许的网站」这种抽象说法等于没说。
+//
+// 「需要用户审批」直接落到 declared（按清单声明拦有风险的调用），不再有单独的
+// always 档：三档并存时用户既要理解「什么算风险」，又要猜这一档到底拦不拦，
+// 最后没人能预期某次调用会不会被打断。always 仍被 ApprovalLevelOf 识别，旧配置
+// 继续按「每次都问」执行——只会更严，界面统一显示成「需要用户审批」。
 func approvalField(help string) ConfigField {
 	return ConfigField{
-		Key: ConfigApprovalPolicy, Label: "审批级别", Type: "select", Help: help,
+		Key: ConfigApprovalPolicy, Label: "风险控制", Type: "select", Help: help,
 		Options: []ConfigOption{
-			{Value: tool.ApprovalDeclared, Label: "按插件声明（默认）", Help: "声明了改数据、或命令命中名单时才确认"},
-			{Value: tool.ApprovalAlways, Label: "每次调用都确认", Help: "不看调用内容，一律先弹确认框"},
-			{Value: tool.ApprovalOff, Label: "都不确认", Help: "直接执行，不再弹确认框"},
+			{
+				Value: tool.ApprovalDeclared,
+				Label: "需要用户审批",
+				Help:  "大模型调用该工具时，需要用户审批。",
+			},
+			{
+				Value: tool.ApprovalOff,
+				Label: "不需要用户审批",
+				Help:  "大模型调用该工具时，不需要用户审批。",
+			},
 		},
 	}
 }
@@ -150,7 +169,8 @@ func platformConfigFields(meta Manifest) []ConfigField {
 	// 哪些命令需要确认只能由使用方按自己的数据来定。
 	if meta.Capability == CapShellExec {
 		return []ConfigField{
-			approvalField("档位对全部命令生效；只有「按插件声明」这一档才看下面的命令名单"),
+			// shell 的站点在命令里，配置页列不出来——说清它的动作形态。
+			approvalField("该工具会在本机执行命令，写本空间的文件。"),
 			{
 				Key: ConfigApprovalCommands, Label: "需确认的命令", Type: "list",
 				Placeholder: "rm, rmdir, dd, truncate, shred, chmod, chown, sudo, su, mount",
@@ -162,7 +182,25 @@ func platformConfigFields(meta Manifest) []ConfigField {
 	// 但能改「要不要拦」；内置工具（file_write / wiki_write 等）的档位由
 	// tool.builtinPolicy 从系统空间那份安装配置读，配置也写在同一处。
 	if meta.Kind == KindTool {
-		return []ConfigField{approvalField("")}
+		// 脚本工具与内置工具的出网动词都来自发布快照（安装方改不了），
+		// 能改的只有「要不要拦」，所以这里说清「按声明」到底拦什么。
+		//
+		// 域名同样来自清单，必须列出来：安装方要判断「这个插件能不能碰我的
+		// 钉钉数据」，唯一的依据就是它会连哪几个站。只写「外部系统」等于没说。
+		hosts, _ := meta.HTTPTargets()
+		// 「能碰什么」按事实写：有域名就列域名，没有的按能力说清是读还是写。
+		// 内置工具（file_read / file_write / wiki_*）没有出网声明，不能套用
+		// 「访问外部网络」，否则用户会以为一个读文件工具会联网。
+		help := "该工具会访问外部网络，写本空间的文件。"
+		switch {
+		case len(hosts) > 0:
+			help = "该工具需要访问 " + strings.Join(hosts, "、") + " 域名，写本空间的文件。"
+		case meta.Capability == CapFSWrite:
+			help = "该工具会写本空间的文件。"
+		case meta.Capability == CapFSRead:
+			help = "该工具会读本空间的文件。"
+		}
+		return []ConfigField{approvalField(help)}
 	}
 	// 智能体只暴露正文覆盖：行为设定是发布方的意图，安装方可以按空间改，
 	// 但只能改这一段追加正文——平台基础规则不在插件里，改不到。
@@ -186,7 +224,8 @@ func platformConfigFields(meta Manifest) []ConfigField {
 	fields := []ConfigField{
 		// 远端工具算不算写由清单 tools.writes 决定，档位覆盖它：
 		// 声明了写入但天天被打扰时，这是安装方的出口。
-		approvalField("远端工具是否算写入由清单 tools.writes 决定；这一档覆盖它"),
+		// MCP 的站点藏在远端：平台只看到「服务地址」这一跳，列不出它代发请求的目标。
+		approvalField("该工具会调用远端服务，写本空间的文件。"),
 		{
 			Key: ConfigURL, Label: "服务地址", Type: "url", Required: true,
 			Placeholder: "https://mcp.example.com/mcp",
@@ -244,8 +283,11 @@ func configValues(meta Manifest, raw json.RawMessage) map[string]string {
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &stored)
 	}
-	// 档位没配过时回显默认档：下拉框空着会让人以为「没设过就是不拦」，
-	// 而实际生效的是「按声明判断」。
+	// 档位没配过时回显默认档：界面空着会让人以为「没设过就是不拦」，
+	// 而实际生效的是「有风险的调用需要审批」。
+	//
+	// 这里回显存储值本身（declared），不归一成 always：保存是整表提交，把
+	// declared 改写成 always 会让「只改了 AppKey」的保存顺带把插件变成每次都问。
 	if hasApprovalField(meta) {
 		values[ConfigApprovalPolicy] = tool.ApprovalDeclared
 	}
@@ -272,37 +314,89 @@ func configValues(meta Manifest, raw json.RawMessage) map[string]string {
 	return values
 }
 
-// ConfigView 返回安装级配置；未安装时返回冲突错误（配置只对安装生效）。
+// ConfigView 返回这份插件在当前空间的配置：已安装读安装记录，未发布读草稿。
 func (m *Manager) ConfigView(ctx context.Context, spaceID, slug string) (ConfigView, error) {
-	in, err := m.installOf(ctx, spaceID, slug)
-	if err != nil {
-		return ConfigView{}, err
-	}
-	meta, err := m.installedManifest(ctx, in)
+	t, err := m.configTargetOf(ctx, spaceID, slug)
 	if err != nil {
 		return ConfigView{}, err
 	}
 	return ConfigView{
-		Slug: slug, Kind: string(meta.Kind),
-		Fields: configFields(meta), Values: configValues(meta, in.Config),
-		Scope: configScope(meta),
+		Slug: slug, Kind: string(t.Meta.Kind),
+		Fields: configFields(t.Meta), Values: configValues(t.Meta, t.Values),
+		Scope: configScope(t.Meta),
 	}, nil
 }
 
-// UpdateConfig 保存安装级配置：只改配置、不动版本，保存后立刻重建运行时。
-func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string, values map[string]string) (ConfigView, error) {
+// configTarget 回答「这份配置该读哪里、写哪里」。
+//
+// 为什么草稿也要有配置：启用的本地草稿就是这个空间真正在用的插件——进检索池、
+// 进工具列表、起常驻进程，和已安装件没有区别。配置却只存在 plugin_install 上，
+// 于是需要参数的插件（钉钉的 AppKey、MCP 的服务地址、审批档位）在草稿态永远
+// 「未就绪」，作者必须先发布、安装，才能填自己插件要用的参数。
+//
+// 不是「两处合并」：同一 slug 的草稿与安装副本互斥，安装记录优先只是兜底顺序。
+type configTarget struct {
+	Meta      Manifest
+	Values    json.RawMessage
+	PluginID  string
+	Version   string
+	Installed bool
+}
+
+func (m *Manager) configTargetOf(ctx context.Context, spaceID, slug string) (configTarget, error) {
 	in, err := m.installOf(ctx, spaceID, slug)
+	if err == nil {
+		meta, merr := m.installedManifest(ctx, in)
+		if merr != nil {
+			return configTarget{}, merr
+		}
+		return configTarget{
+			Meta: meta, Values: in.Config, PluginID: in.PluginID,
+			Version: in.Version, Installed: true,
+		}, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return configTarget{}, err
+	}
+	c, err := m.o.Store.GetPluginCandidate(ctx, spaceID, slug)
+	if err != nil {
+		return configTarget{}, err
+	}
+	meta, err := m.readDraft(ctx, spaceID, slug)
+	if err != nil {
+		return configTarget{}, err
+	}
+	return configTarget{Meta: meta, Values: c.Config}, nil
+}
+
+// storedConfig 是运行时读配置的唯一入口：安装记录优先，草稿兜底。
+//
+// 读不到、或者这条记录没有配置，都返回 nil，调用方按清单默认值处理——
+// 配置解析失败不该让插件直接不可用。
+func (m *Manager) storedConfig(ctx context.Context, spaceID, slug string) json.RawMessage {
+	if in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug); err == nil {
+		return in.Config
+	}
+	c, err := m.o.Store.GetPluginCandidate(ctx, spaceID, slug)
+	if err != nil {
+		return nil
+	}
+	return c.Config
+}
+
+// UpdateConfig 保存配置：只改配置、不动版本与启用状态，保存后立刻重建运行时。
+//
+// 已安装写 plugin_install，未发布的草稿写 plugin_candidate——两者的差别只是
+// 「配置存在哪张表」，对插件来说都是「这个空间给我的参数」。
+func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string, values map[string]string) (ConfigView, error) {
+	t, err := m.configTargetOf(ctx, spaceID, slug)
 	if err != nil {
 		return ConfigView{}, err
 	}
-	meta, err := m.installedManifest(ctx, in)
-	if err != nil {
-		return ConfigView{}, err
-	}
-	if len(configFields(meta)) == 0 {
+	if len(configFields(t.Meta)) == 0 {
 		return ConfigView{}, fmt.Errorf("%w：该插件没有可配置项", ErrConflict)
 	}
-	clean, err := normalizeConfig(meta, values)
+	clean, err := normalizeConfig(t.Meta, values)
 	if err != nil {
 		return ConfigView{}, err
 	}
@@ -310,7 +404,12 @@ func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string
 	if err != nil {
 		return ConfigView{}, err
 	}
-	if err := m.o.Store.UpdatePluginInstallConfig(ctx, spaceID, in.PluginID, raw); err != nil {
+	if t.Installed {
+		err = m.o.Store.UpdatePluginInstallConfig(ctx, spaceID, t.PluginID, raw)
+	} else {
+		err = m.o.Store.UpdatePluginCandidateConfig(ctx, spaceID, slug, raw)
+	}
+	if err != nil {
 		return ConfigView{}, err
 	}
 
@@ -334,17 +433,17 @@ func (m *Manager) UpdateConfig(ctx context.Context, userID, spaceID, slug string
 	for k := range clean {
 		keys = append(keys, k)
 	}
-	m.recordAudit(ctx, userID, "plugin.config", slug, in.Version,
-		map[string]any{"space": spaceID, "fields": keys})
+	m.recordAudit(ctx, userID, "plugin.config", slug, t.Version,
+		map[string]any{"space": spaceID, "fields": keys, "draft": !t.Installed})
 
-	updated, err := m.installOf(ctx, spaceID, slug)
+	updated, err := m.configTargetOf(ctx, spaceID, slug)
 	if err != nil {
 		return ConfigView{}, err
 	}
 	return ConfigView{
-		Slug: slug, Kind: string(meta.Kind),
-		Fields: configFields(meta), Values: configValues(meta, updated.Config),
-		Scope: configScope(meta),
+		Slug: slug, Kind: string(updated.Meta.Kind),
+		Fields: configFields(updated.Meta), Values: configValues(updated.Meta, updated.Values),
+		Scope: configScope(updated.Meta),
 	}, nil
 }
 
@@ -572,15 +671,21 @@ func (m *Manager) effectiveConfig(ctx context.Context, spaceID, slug string, met
 	cfg := meta.ConfigDefaults()
 	// 智能体的「提示词覆盖」是平台字段（不属于清单声明），这里要一并读出来：
 	// 否则内置 base 的覆盖永远读不到，卡片上改了也不生效。
-	if len(meta.Config) == 0 && meta.Kind != KindAgent {
-		return cfg
+	//
+	// 提前返回必须也注入平台事实：清单里一条 config 都没写，不等于脚本
+	// 不需要宿主地址。渠道插件完全可以只声明 im.reply、不做任何可配置项。
+	needStored := len(meta.Config) > 0 || meta.Kind == KindAgent
+	raw := []byte(nil)
+	if needStored {
+		raw = m.storedConfig(ctx, spaceID, slug)
 	}
-	in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug)
-	if err != nil || len(in.Config) == 0 {
+	if len(raw) == 0 {
+		m.injectHostFacts(cfg, spaceID, slug, meta)
 		return cfg
 	}
 	var stored map[string]string
-	if json.Unmarshal(in.Config, &stored) != nil {
+	if json.Unmarshal(raw, &stored) != nil {
+		m.injectHostFacts(cfg, spaceID, slug, meta)
 		return cfg
 	}
 	for _, item := range meta.Config {
@@ -595,7 +700,85 @@ func (m *Manager) effectiveConfig(ctx context.Context, spaceID, slug string, met
 			cfg[ConfigAgentPrompt] = v
 		}
 	}
+	m.injectHostFacts(cfg, spaceID, slug, meta)
 	return cfg
+}
+
+// 平台自己知道的事实，统一在这里注入给脚本，不让使用者填。
+//
+// 目前是两项：宿主地址（插件在沙箱里，不知道平台在哪）与所在空间 id
+// （插件实例本来就挂在某个空间下）。这两个值都写在部署环境里，手抄一遍只会
+// 抄错——而抄错的表现是投递 401，排查方向全是反的。
+const (
+	ConfigHostBase  = "host_base"
+	ConfigHostSpace = "host_space_id"
+	// ConfigHostToken 是宿主签发给这个插件的身份令牌，随 host_base 一起注入。
+	//
+	// 插件没有登录态，也不该有人的身份；它能证明的只有「我是这个空间里的这个
+	// 插件」，所以令牌由 (空间, slug) 派生，宿主用同一份密钥复算校验。作者既
+	// 配不出、也改不了这个值。
+	ConfigHostToken = "host_token"
+)
+
+func (m *Manager) injectHostFacts(cfg map[string]string, spaceID, slug string, meta Manifest) {
+	// 只注入给声明了 im.reply 的渠道插件：普通工具拿到宿主地址只会多一个
+	// 「能调平台接口」的入口，而它并不需要。能力清单是审批对象，注入面跟着走。
+	if !meta.HasCapability(CapIMReply) {
+		return
+	}
+	if m.o.HostBase != "" {
+		// 强制覆盖而不是「没填才补」：使用者填的地址多半是浏览器地址
+		// （127.0.0.1），在沙箱里不可达。部署事实以部署为准。
+		cfg[ConfigHostBase] = strings.TrimRight(m.o.HostBase, "/")
+	}
+	if spaceID != "" {
+		cfg[ConfigHostSpace] = spaceID
+	}
+	if token := m.PluginToken(spaceID, slug); token != "" {
+		cfg[ConfigHostToken] = token
+	}
+}
+
+// platformHostPorts 把宿主地址补进这个插件的出网白名单（精确到端口）。
+//
+// 为什么必须由平台补：插件在沙箱里要回调宿主（im.reply 的 inbox），而宿主
+// 地址是部署事实，作者写不出来——清单的 hosts 只收域名，写 IP 直接解析失败；
+// 就算允许写 IP，按域名放行 127.0.0.1 也等于把本机所有端口交给插件。
+//
+// 注入面跟着能力走，与 injectHostFacts 同一口径：只有声明 im.reply 的插件
+// 拿得到。没有它，白名单里就永远差一个「宿主在哪」的答案。
+func (m *Manager) platformHostPorts(meta Manifest) []string {
+	if !meta.HasCapability(CapIMReply) {
+		return nil
+	}
+	hp, ok := hostPortOf(m.o.HostBase)
+	if !ok {
+		return nil
+	}
+	return []string{hp}
+}
+
+// hostPortOf 从部署地址里取出「精确 host:port」。
+//
+// 端口必须显式算出来：APP_BASE_URL 常常写成 http://host:8321，但也可以省端口，
+// 而代理判定的是真实端口（80/443），不补上就永远对不上。
+func hostPortOf(base string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return "", false
+		}
+	}
+	return net.JoinHostPort(strings.ToLower(u.Hostname()), port), true
 }
 
 // approvalLevelOf 读该空间这份安装的审批档位。
@@ -603,11 +786,7 @@ func (m *Manager) effectiveConfig(ctx context.Context, spaceID, slug string, met
 // 没装、读不到、或旧记录里没有这个键，都按默认档（declared）——档位是安装方的
 // 显式选择，解析不出来时必须退回「按声明判断」，不能悄悄放行。
 func (m *Manager) approvalLevelOf(ctx context.Context, spaceID, slug string) string {
-	in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug)
-	if err != nil {
-		return tool.ApprovalDeclared
-	}
-	return ApprovalLevelOf(in.Config)
+	return ApprovalLevelOf(m.storedConfig(ctx, spaceID, slug))
 }
 
 // applyInstallConfig 把安装级覆盖合并进清单；发布快照本身保持不变。
@@ -615,12 +794,12 @@ func (m *Manager) applyInstallConfig(ctx context.Context, spaceID, slug string, 
 	if meta.Kind != KindMCP {
 		return meta
 	}
-	in, err := m.o.Store.GetPluginInstall(ctx, spaceID, slug)
-	if err != nil || len(in.Config) == 0 {
+	raw := m.storedConfig(ctx, spaceID, slug)
+	if len(raw) == 0 {
 		return meta
 	}
 	var cfg map[string]string
-	if json.Unmarshal(in.Config, &cfg) != nil {
+	if json.Unmarshal(raw, &cfg) != nil {
 		return meta
 	}
 	if v := strings.TrimSpace(cfg[ConfigURL]); v != "" {

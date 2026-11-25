@@ -184,8 +184,23 @@ func TestConfigFieldsIncludeApprovalLevel(t *testing.T) {
 	if len(fields) != 1 || fields[0].Key != ConfigApprovalPolicy || fields[0].Type != "select" {
 		t.Fatalf("脚本工具应有审批档位下拉，实际 %+v", fields)
 	}
-	if len(fields[0].Options) != 3 {
-		t.Fatalf("档位应有三档可选，实际 %+v", fields[0].Options)
+	// 两档：问，或不问。中间档会让用户先猜「什么算风险」，不再提供。
+	if len(fields[0].Options) != 2 {
+		t.Fatalf("档位应有两档可选，实际 %+v", fields[0].Options)
+	}
+	if fields[0].Label != "风险控制" {
+		t.Fatalf("字段名应为「风险控制」，实际 %q", fields[0].Label)
+	}
+	if got := fields[0].Options[0].Label; got != "需要用户审批" {
+		t.Fatalf("第一档应为「需要用户审批」，实际 %q", got)
+	}
+	// 「需要用户审批」直接落 declared（按清单声明拦有风险的调用），
+	// 不再是独立的 always 档。
+	if got := fields[0].Options[0].Value; got != tool.ApprovalDeclared {
+		t.Fatalf("第一档应落到 declared，实际 %q", got)
+	}
+	if got := fields[0].Options[1].Value; got != tool.ApprovalOff {
+		t.Fatalf("第二档应落到 off，实际 %q", got)
 	}
 
 	// 内置工具也能配档位：档位由 tool.builtinPolicy 从系统空间那份安装配置读，
@@ -256,6 +271,8 @@ func TestApprovalLevelOf(t *testing.T) {
 // 档位没配过时下拉框要回显默认档，否则用户以为「没设过就是不拦」。
 func TestConfigValuesShowsDefaultApprovalLevel(t *testing.T) {
 	shell := Manifest{Kind: KindTool, Capability: CapShellExec}
+	// 回显的必须是存储值本身：保存是整表提交，这里若改写成 always，
+	// 「只改了个 AppKey」的保存会顺带把插件变成每次都问。
 	if got := configValues(shell, nil)[ConfigApprovalPolicy]; got != tool.ApprovalDeclared {
 		t.Fatalf("未配置时应回显默认档，实际 %q", got)
 	}
