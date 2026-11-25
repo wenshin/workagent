@@ -2,13 +2,13 @@ package config
 
 import "testing"
 
-// 形态决定默认执行面：服务端连执行体，客户端起本机进程。
+// 形态决定默认执行面：服务端建容器，客户端起本机进程。
 func TestLoadRoleDecidesBackendDefault(t *testing.T) {
 	cases := []struct {
 		role    string
 		backend string
 	}{
-		{RoleServer, "remote"},
+		{RoleServer, "k8s"},
 		{RoleClient, "local"},
 	}
 	for _, tc := range cases {

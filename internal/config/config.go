@@ -25,6 +25,18 @@ type Config struct {
 	AppBaseURL string // 本服务对外地址，用于拼接回调等
 	WebBaseURL string // 前端站点地址，用于登录成功/失败后的跳转
 
+	// PluginHostBase 是「插件在沙箱里回调宿主」用的地址（wa.config().host_base）。
+	//
+	// 与 AppBaseURL 分开是因为两者不是一回事：对外地址要浏览器能解析，沙箱里
+	// 只认执行体所在的网络（集群里是 Service / 宿主网关，127.0.0.1 指向 Pod 自己）。
+	// 留空时回落到 AppBaseURL。
+	PluginHostBase string
+	// PluginTokenSecret 是签发插件身份令牌的密钥（渠道插件回调 /inbox 用）。
+	//
+	// 插件没有、也不该有人的登录态，身份靠平台签发的令牌认。留空时回落到
+	// SandboxTokenSecret——那个值在任何部署里都必须配，且不进前端、不进清单。
+	PluginTokenSecret string
+
 	DatabaseURL string
 
 	// RedisURL 是登录态与会话流缓存的地址。留空时退回进程内存：
@@ -51,6 +63,13 @@ type Config struct {
 	// UploadMaxFileMB 是会话上传单个文件的大小上限（MB），环境变量 UPLOAD_MAX_FILE_MB。
 	// 0 表示沿用默认 100MB（负数启动报错）；单次上传的文件数上限仍是 10 个。
 	UploadMaxFileMB int
+
+	// SpaceLogRetentionDays 是空间运行日志（files/.logs）压缩后的保留天数，
+	// 环境变量 SPACE_LOG_RETENTION_DAYS；0 表示永久保留。
+	SpaceLogRetentionDays int
+	// SpaceLogMaxFileMB 是空间单日日志文件的上限（MB），环境变量 SPACE_LOG_MAX_MB。
+	// 超过后当天不再追加：日志是排障材料，不该长成配额与备份的主要来源。
+	SpaceLogMaxFileMB int
 
 	// 系统管理员工号（逗号分隔）：只有这些用户能看到并编辑「系统空间」。
 	// MVP 用配置文件指定，后续接入组织架构后改为角色表。
@@ -88,20 +107,46 @@ type Config struct {
 	PluginsDefaultInstall []string
 
 	// Role 是运行形态，决定沙箱能且只能用哪一种（docs/本地空间与双端架构.md §5.7）：
-	//   server —— 服务端（含本机调试与 CI）：只能连远端执行体（SANDBOX_BACKEND=remote）。
+	//   server —— 服务端（含本机调试与 CI）：只能建容器化执行体（SANDBOX_BACKEND=k8s）。
 	//   client —— 客户端本地 runtime：只能在本进程起 bwrap。
 	// 两档互斥且必须显式声明：沙箱形态不能取决于「这台机器上恰好装了什么」，
 	// 也不能取决于「这次是不是开发环境」，否则同一份配置换台机器就从隔离变成裸跑。
 	Role string
 
 	// SandboxBackend 选择执行面形态，取值由 Role 决定：
-	//   server —— 只能是 remote（默认）
+	//   server —— 只能是 k8s（控制面自己建容器：每空间一个空间容器、每租户一个插件容器）
 	//   client —— 只能是 local（默认），且必须是 bwrap
 	SandboxBackend string
-	// SandboxRunnerAddr 是远端执行体地址（host:port 或完整 URL）。
-	SandboxRunnerAddr string
-	// SandboxRunnerToken 是远端执行体的鉴权令牌；remote 后端下为空直接启动失败。
+	// SandboxRunnerToken 是控制面调执行体的鉴权令牌；为空直接启动失败。
+	//
+	// 没有「连一个现成执行体」的 remote 档：那会让所有空间共享同一个 /usr
+	// （一个空间装包改变另一个空间的环境），且开发与生产的隔离形态不一致。
 	SandboxRunnerToken string
+
+	// k8s 执行面（SANDBOX_BACKEND=k8s）：控制面自己建按空间 / 租户的 Pod。
+	//
+	// 命名空间里需要先有 SANDBOX_RUNNER_TOKEN 对应的 Secret
+	// （默认 sandbox-runner-token / token），Pod 从它注入同一个令牌。
+	SandboxNamespace    string
+	SandboxImage        string
+	SandboxKubeconfig   string
+	SandboxTokenSecret  string
+	SandboxTokenKey     string
+	SandboxStorageClass string
+	// SandboxStoragePVC / SandboxStoragePVCSize 是控制面与执行体共享的存储卷。
+	SandboxStoragePVC     string
+	SandboxStoragePVCSize string
+	SandboxCachePVCSize   string
+	SandboxShellMemory    string
+	SandboxPluginMemory   string
+	// SandboxShellIdle 是空间容器空闲回收时长。
+	SandboxShellIdle time.Duration
+	// SandboxReadyTimeout 是等容器就绪的上限。
+	SandboxReadyTimeout time.Duration
+	// SandboxCacheShared 为 true 时租户缓存用 RWX PVC 跨 Pod 共享。
+	SandboxCacheShared bool
+	// SandboxInitImage 是准备缓存目录的初始容器镜像。
+	SandboxInitImage string
 
 	// 插件常驻进程池（只装声明了 runtime.resident 的插件，docs/插件安全基线.md §2.5）。
 	// 常驻进程不按空闲回收，只在池满时淘汰最久未用的空闲进程；0 用默认 32。
@@ -143,6 +188,7 @@ type Config struct {
 	RunIdleTimeout time.Duration
 	// LLMMaxTotalTokens 是一次 run 的累计 token 上限（所有轮次相加），
 	// 与 LLMMaxTokens（单次响应）不是一回事：后者限一次输出，前者限累计成本。
+	// 0 = 不限（默认）：长任务按无进展、轮次、工具次数与墙钟收口。
 	LLMMaxTotalTokens int
 	// LLMContextTokens 是模型上下文窗口（token）：输入超过它的 60% 就折叠较早的
 	// 工具往返（见 builtin/compact.go）。0 表示不做轮内压缩。
@@ -181,8 +227,8 @@ func Load() (*Config, error) {
 	default:
 		return nil, fmt.Errorf("WA_ROLE 只能是 server / client，当前 %q（dev 已删除：本机调试同样连远端执行体）", role)
 	}
-	// 服务端没有本机执行面，默认连执行体；客户端默认本机起进程。
-	backendDefault := "remote"
+	// 服务端没有本机执行面，只能建容器；客户端默认本机起进程。
+	backendDefault := "k8s"
 	if role != RoleServer {
 		backendDefault = "local"
 	}
@@ -233,10 +279,13 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// 累计 token 预算：0 表示不限（只靠总时长与工具次数兜底）。
-	// 这是唯一跟成本直接挂钩的预算，长任务按它收口；每轮都会重发完整上下文，
-	// 所以它在轮次上的消耗速度比看起来快。
-	maxTotalTokens := 400000
+	// 累计 token 预算：默认 0 = 不限。
+	//
+	// 不设默认上限是刻意的：长任务与大上下文的成本随「每一轮重发完整上下文」
+	// 自然增长，用一个写死的数字收口，最先砍掉的是「正在推进」的任务。
+	// 真正该兜底的是无进展（进度守卫）、轮次、工具次数与墙钟；要卡成本时
+	// 由部署者显式给一个正整数。
+	maxTotalTokens := 0
 	if v := getenv("LLM_MAX_TOTAL_TOKENS", ""); v != "" {
 		if _, err := fmt.Sscanf(v, "%d", &maxTotalTokens); err != nil || maxTotalTokens < 0 {
 			return nil, fmt.Errorf("LLM_MAX_TOTAL_TOKENS 必须是非负整数（0 表示不限）")
@@ -333,6 +382,8 @@ func Load() (*Config, error) {
 	c := &Config{
 		HTTPAddr:             getenv("HTTP_ADDR", "127.0.0.1:8321"),
 		AppBaseURL:           strings.TrimRight(getenv("APP_BASE_URL", "http://127.0.0.1:8321"), "/"),
+		PluginHostBase:       strings.TrimRight(getenv("PLUGIN_HOST_BASE", ""), "/"),
+		PluginTokenSecret:    getenv("PLUGIN_TOKEN_SECRET", ""),
 		WebBaseURL:           strings.TrimRight(getenv("WEB_BASE_URL", "http://127.0.0.1:5173"), "/"),
 		DatabaseURL:          getenv("DATABASE_URL", ""),
 		IdentityProvider:     getenv("IDENTITY_PROVIDER", "dingtalk"),
@@ -349,6 +400,11 @@ func Load() (*Config, error) {
 		StorageRoot:          getenv("STORAGE_ROOT", "./data/storage"),
 		UploadMaxFileMB:      uploadMaxFileMB,
 		AdminJobs:            splitList(getenv("ADMIN_JOB_NUMBERS", "")),
+
+		// 空间运行日志：默认压缩后留 30 天、单日 2MB。0 天表示永久保留，
+		// 上限为 0 时由 spacelog 用默认值兜底，避免配置写 0 变成「不写日志」。
+		SpaceLogRetentionDays: getenvInt("SPACE_LOG_RETENTION_DAYS", 30),
+		SpaceLogMaxFileMB:     getenvInt("SPACE_LOG_MAX_MB", 2),
 
 		LLMProvider:  getenv("LLM_PROVIDER", "openai"),
 		LLMBaseURL:   strings.TrimRight(getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"), "/"),
@@ -373,8 +429,23 @@ func Load() (*Config, error) {
 		Role: role,
 
 		SandboxBackend:     getenv("SANDBOX_BACKEND", backendDefault),
-		SandboxRunnerAddr:  getenv("SANDBOX_RUNNER_ADDR", ""),
 		SandboxRunnerToken: getenv("SANDBOX_RUNNER_TOKEN", ""),
+
+		SandboxNamespace:      getenv("SANDBOX_NAMESPACE", "workagent"),
+		SandboxImage:          getenv("SANDBOX_IMAGE", "workagent/sandbox-runner:dev"),
+		SandboxKubeconfig:     getenv("SANDBOX_KUBECONFIG", ""),
+		SandboxTokenSecret:    getenv("SANDBOX_TOKEN_SECRET", "sandbox-runner-token"),
+		SandboxTokenKey:       getenv("SANDBOX_TOKEN_KEY", "token"),
+		SandboxStorageClass:   getenv("SANDBOX_STORAGE_CLASS", ""),
+		SandboxStoragePVC:     getenv("SANDBOX_STORAGE_PVC", "workagent-storage"),
+		SandboxStoragePVCSize: getenv("SANDBOX_STORAGE_PVC_SIZE", "100Gi"),
+		SandboxCachePVCSize:   getenv("SANDBOX_CACHE_PVC_SIZE", "20Gi"),
+		SandboxShellMemory:    getenv("SANDBOX_SHELL_MEMORY", "2Gi"),
+		SandboxPluginMemory:   getenv("SANDBOX_PLUGIN_MEMORY", "4Gi"),
+		SandboxShellIdle:      getenvDuration("SANDBOX_SHELL_IDLE", 15*time.Minute),
+		SandboxReadyTimeout:   getenvDuration("SANDBOX_READY_TIMEOUT", 90*time.Second),
+		SandboxCacheShared:    getenvBool("SANDBOX_CACHE_SHARED", false),
+		SandboxInitImage:      getenv("SANDBOX_INIT_IMAGE", "busybox:1.36"),
 
 		PluginProcMax:         getenvInt("PLUGIN_PROC_MAX", 32),
 		PluginProcMaxRestarts: getenvInt("PLUGIN_PROC_MAX_RESTARTS", 5),
@@ -411,6 +482,14 @@ func Load() (*Config, error) {
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL 未配置")
+	}
+	// 回落只在这里做一次，读的地方不必各判一遍：
+	// 插件回调地址默认就是本服务地址；没有专门的插件密钥时用执行体令牌派生。
+	if c.PluginHostBase == "" {
+		c.PluginHostBase = c.AppBaseURL
+	}
+	if c.PluginTokenSecret == "" {
+		c.PluginTokenSecret = c.SandboxTokenSecret
 	}
 	return c, nil
 }
@@ -502,6 +581,34 @@ func getenvInt(key string, def int) int {
 func getenv(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvBool(key string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(getenv(key, "")))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
+}
+
+// getenvDuration 接受 Go duration（15m / 90s）或纯数字（按秒）。
+// 写错时回默认值而不是让服务起不来：容器生命周期参数不该成为启动门禁。
+func getenvDuration(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(getenv(key, ""))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
 	}
 	return def
 }
