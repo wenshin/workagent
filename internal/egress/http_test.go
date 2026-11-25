@@ -59,6 +59,32 @@ func TestHTTPProxyRejectsUnlistedHost(t *testing.T) {
 	}
 }
 
+// 平台地址由部署注入、精确到端口：同一个入口放行它，别的端口仍然拒绝。
+// 它还落在回环 / 私网上，所以不能走「私网一律拒绝」那条拨号路径。
+func TestHTTPProxyAllowsPlatformHostPort(t *testing.T) {
+	sock := shortSockPath(t)
+	srv, err := ListenHTTP(sock, Options{HostPorts: []string{"127.0.0.1:1"}})
+	if err != nil {
+		t.Fatalf("起代理失败: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer srv.Close()
+	go func() { _ = srv.Serve(ctx) }()
+	waitSock(t, sock)
+
+	// 放行的那一条不该是 403：端口 1 没人监听，得到的是转发失败。
+	status := rawRequest(t, sock, "GET http://127.0.0.1:1/x HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+	if strings.Contains(status, "403") {
+		t.Fatalf("精确白名单里的 host:port 不应被拒，实际: %s", status)
+	}
+	// 同一主机别的端口没在名单里，必须在连目标之前就拒掉。
+	status = rawRequest(t, sock, "GET http://127.0.0.1:2/x HTTP/1.1\r\nHost: 127.0.0.1:2\r\n\r\n")
+	if !strings.Contains(status, "403") {
+		t.Fatalf("同主机的其他端口应返回 403，实际: %s", status)
+	}
+}
+
 func waitSock(t *testing.T, sock string) {
 	t.Helper()
 	for i := 0; i < 50; i++ {
@@ -313,5 +339,89 @@ func TestHTTPProxyWebSocketRequiresDecl(t *testing.T) {
 	line := rawRequest(t, sock, "GET http://allowed.example/ws HTTP/1.1\r\nHost: allowed.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
 	if !strings.Contains(line, "403") {
 		t.Fatalf("未声明 ws.connect 应 403，实际: %s", line)
+	}
+}
+
+// 上游先说话：101 之后不等客户端写，上游立刻推帧，客户端必须收到。
+//
+// 现有用例只验「客户端写进去、回显取回来」，那是 client→upstream 方向。
+// 钉钉长连接的 CONNECTED / REGISTERED / ping / CALLBACK 全是**服务端先发**，
+// 这个方向断了用例照样绿，而现场表现是「连接建起来了，但一帧都收不到」——
+// 最容易归因到「钉钉没推」的形态。
+func TestHTTPProxyWebSocketForwardsUpstreamFrames(t *testing.T) {
+	up, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("起上游失败: %v", err)
+	}
+	defer func() { _ = up.Close() }()
+	go func() {
+		c, err := up.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		br := bufio.NewReader(c)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"))
+		// 101 之后立刻推两段，完全不等客户端说话
+		_, _ = c.Write([]byte("FRAME-1"))
+		time.Sleep(50 * time.Millisecond)
+		_, _ = c.Write([]byte("FRAME-2"))
+		time.Sleep(300 * time.Millisecond)
+	}()
+
+	sock := shortSockPath(t)
+	srv, err := ListenHTTP(sock, Options{
+		ConnectHosts: []string{"ws.example"},
+		Dial: func(context.Context, string, int) (net.Conn, error) {
+			return net.Dial("tcp", up.Addr().String())
+		},
+	})
+	if err != nil {
+		t.Fatalf("起代理失败: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer srv.Close()
+	go func() { _ = srv.Serve(ctx) }()
+	waitSock(t, sock)
+
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("连接代理失败: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	req := "GET http://ws.example/echo HTTP/1.1\r\nHost: ws.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	if _, err := c.Write([]byte(req)); err != nil {
+		t.Fatalf("写握手失败: %v", err)
+	}
+	br := bufio.NewReader(c)
+	if line, err := br.ReadString('\n'); err != nil || !strings.Contains(line, "101") {
+		t.Fatalf("握手未通过: %q %v", line, err)
+	}
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("读响应头失败: %v", err)
+		}
+		if l == "\r\n" {
+			break
+		}
+	}
+	buf := make([]byte, 14)
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatalf("上游帧没转发到客户端: %v", err)
+	}
+	if string(buf) != "FRAME-1FRAME-2" {
+		t.Fatalf("上游帧 = %q，期望 FRAME-1FRAME-2", buf)
 	}
 }

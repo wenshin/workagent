@@ -29,17 +29,24 @@ import (
 // 代价是请求头与响应体在插件进程里是明文——它本来就是插件自己发的，
 // 真正需要保密的是 secret:名称，那仍然由宿主在转发前替换。
 type HTTPProxy struct {
-	path     string
-	ln       net.Listener
-	srv      *http.Server
-	policy   Policy
-	connect  *Allowlist
-	dial     func(ctx context.Context, host string, port int) (net.Conn, error)
-	verbs    map[string]bool
-	log      *slog.Logger
-	onEvent  func(Event)
-	client   *http.Client
-	closeOne chan struct{}
+	path    string
+	ln      net.Listener
+	srv     *http.Server
+	policy  Policy
+	connect *Allowlist
+	// hostPorts 是平台自己注入的「精确 host:port」：宿主地址既不能写进清单，
+	// 也不能按域名放行（127.0.0.1 会连带放开本机所有端口）。
+	hostPorts *HostPorts
+	dial      func(ctx context.Context, host string, port int) (net.Conn, error)
+	verbs     map[string]bool
+	log       *slog.Logger
+	onEvent   func(Event)
+	client    *http.Client
+	// platformClient 是给精确白名单目标用的：平台地址本身就是内网 / 回环
+	// （集群里它就是个 10.x 地址），走 dialChecked 会被私网拒绝把自己拒掉。
+	// 它只在 hostPorts 命中时被选中，插件选不了目标。
+	platformClient *http.Client
+	closeOne       chan struct{}
 }
 
 // ListenHTTP 在 path 上起一个 HTTP 代理。
@@ -62,41 +69,48 @@ func newHTTPProxy(ln net.Listener, p string, opt Options) (*HTTPProxy, error) {
 		}
 	}
 	h := &HTTPProxy{
-		path:     p,
-		ln:       ln,
-		policy:   opt.Policy,
-		connect:  connectList(opt.ConnectHosts),
-		dial:     opt.Dial,
-		verbs:    verbs,
-		log:      opt.Logger,
-		onEvent:  opt.OnEvent,
-		closeOne: make(chan struct{}),
+		path:      p,
+		ln:        ln,
+		policy:    opt.Policy,
+		connect:   connectList(opt.ConnectHosts),
+		hostPorts: NewHostPorts(opt.HostPorts),
+		dial:      opt.Dial,
+		verbs:     verbs,
+		log:       opt.Logger,
+		onEvent:   opt.OnEvent,
+		closeOne:  make(chan struct{}),
 	}
-	transport := &http.Transport{
-		// 不走环境代理：这条链路本身就是代理。
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			p, err := parsePort(port)
-			if err != nil {
-				return nil, err
-			}
-			return dialChecked(ctx, host, p)
-		},
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
-		MaxIdleConns:        8,
-		IdleConnTimeout:     30 * time.Second,
-		TLSHandshakeTimeout: DefaultDialTimeout,
+	// 两个客户端只有拨号策略不同：同一份白名单判定在 handle 里先做完，
+	// 这里选哪条只是「允不允许目标是私网」，不改变放行集合。
+	newClient := func(dial func(ctx context.Context, host string, port int) (net.Conn, error)) *http.Client {
+		transport := &http.Transport{
+			// 不走环境代理：这条链路本身就是代理。
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				p, err := parsePort(port)
+				if err != nil {
+					return nil, err
+				}
+				return dial(ctx, host, p)
+			},
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+			MaxIdleConns:        8,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: DefaultDialTimeout,
+		}
+		return &http.Client{
+			Transport: transport,
+			// 不跟随跳转：域名白名单只对第一跳成立，跟随就等于让目标决定去哪。
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Timeout:       60 * time.Second,
+		}
 	}
-	h.client = &http.Client{
-		Transport: transport,
-		// 不跟随跳转：域名白名单只对第一跳成立，跟随就等于让目标决定去哪。
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Timeout:       60 * time.Second,
-	}
+	h.client = newClient(dialChecked)
+	h.platformClient = newClient(dialResolved)
 	h.srv = &http.Server{Handler: http.HandlerFunc(h.handle), ReadHeaderTimeout: 10 * time.Second}
 	return h, nil
 }
@@ -127,6 +141,28 @@ func (h *HTTPProxy) Close() error {
 		_ = os.Remove(h.path)
 	}
 	return err
+}
+
+// allows 是普通 HTTP 请求的放行判定：域名白名单之外，还认平台注入的
+// 精确 host:port（宿主地址）。
+//
+// 两套口径必须分开：宿主地址可能是 127.0.0.1，按域名放行就等于放开本机
+// 所有端口；而它又不能写进清单（清单 hosts 只收域名）。所以平台把这一个
+// 端口单独注进来，插件既不需要声明，也无从伪造。
+func (h *HTTPProxy) allows(host string, port int) bool {
+	if h.policy != nil && h.policy.Allow(host) {
+		return true
+	}
+	return h.hostPorts.Allow(host, port)
+}
+
+// clientFor 按目标选拨号策略：只有精确白名单里的目标（平台地址）可以落在
+// 内网 / 回环网段，其余目标仍由 dialChecked 拒绝私网。
+func (h *HTTPProxy) clientFor(host string, port int) *http.Client {
+	if h.platformClient != nil && h.hostPorts.Allow(host, port) {
+		return h.platformClient
+	}
+	return h.client
 }
 
 func (h *HTTPProxy) handle(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +208,7 @@ func (h *HTTPProxy) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "方法不在清单 verbs 里："+r.Method, http.StatusForbidden)
 		return
 	}
-	if h.policy == nil || !h.policy.Allow(host) {
+	if !h.allows(host, port) {
 		ev.Allowed = false
 		ev.Reason = "not_allowlisted"
 		ev.Duration = time.Since(start)
@@ -190,7 +226,7 @@ func (h *HTTPProxy) handle(w http.ResponseWriter, r *http.Request) {
 		out.Header.Del(k)
 	}
 
-	resp, err := h.client.Do(out)
+	resp, err := h.clientFor(host, port).Do(out)
 	if err != nil {
 		ev.Reason = "dial_failed"
 		ev.Err = err
@@ -503,6 +539,17 @@ func listenUnix(p string) (net.Listener, error) {
 
 // dialChecked 与 SOCKS5 侧同一套判定：解析 → 全部 IP 校验 → 直连校验过的 IP。
 func dialChecked(ctx context.Context, host string, port int) (net.Conn, error) {
+	return dialHost(ctx, host, port, true)
+}
+
+// dialResolved 解析后直连，不拒绝私网。只有一种调用方：精确白名单里的
+// 平台地址——它本身就在内网 / 回环上，按私网拒绝等于把平台自己拒掉。
+// 目标由平台注入，插件只能拿去连那一个 host:port，不能借它扫内网。
+func dialResolved(ctx context.Context, host string, port int) (net.Conn, error) {
+	return dialHost(ctx, host, port, false)
+}
+
+func dialHost(ctx context.Context, host string, port int, checkPrivate bool) (net.Conn, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("端口非法 %d", port)
 	}
@@ -515,9 +562,11 @@ func dialChecked(ctx context.Context, host string, port int) (net.Conn, error) {
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("解析 %s 无结果", host)
 	}
-	for _, ip := range ips {
-		if blockedIP(ip.IP) {
-			return nil, fmt.Errorf("目标 %s 解析到受限地址 %s", host, ip.IP)
+	if checkPrivate {
+		for _, ip := range ips {
+			if blockedIP(ip.IP) {
+				return nil, fmt.Errorf("目标 %s 解析到受限地址 %s", host, ip.IP)
+			}
 		}
 	}
 	var lastErr error

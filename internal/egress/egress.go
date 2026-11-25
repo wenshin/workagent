@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,44 @@ func (a *Allowlist) Allow(host string) bool {
 	return false
 }
 
+// HostPorts 是精确到端口的白名单，与 Allowlist 是两套口径：只放行列出的
+// 「主机 + 端口」组合，不按域名后缀匹配，也不顺带放行同主机的其他端口。
+//
+// 它只服务于一种目标——平台自己的接口地址（APP_BASE_URL）。宿主地址是部署
+// 事实，插件既无从声明也不该声明；而按域名放行 127.0.0.1 等于把本机所有
+// 端口都交给插件，所以这类目标必须精确到端口。
+type HostPorts struct {
+	pairs map[string]bool
+}
+
+// NewHostPorts 规整精确白名单：条目必须是可解析的 host:port。
+func NewHostPorts(list []string) *HostPorts {
+	pairs := make(map[string]bool, len(list))
+	for _, item := range list {
+		host, port, err := net.SplitHostPort(strings.TrimSpace(item))
+		if err != nil || host == "" || port == "" {
+			continue
+		}
+		if _, err := parsePort(port); err != nil {
+			continue
+		}
+		pairs[hostPortKey(host, port)] = true
+	}
+	return &HostPorts{pairs: pairs}
+}
+
+// Allow 判断某个「主机 + 端口」是否在精确白名单内。
+func (h *HostPorts) Allow(host string, port int) bool {
+	if h == nil || port <= 0 {
+		return false
+	}
+	return h.pairs[hostPortKey(host, strconv.Itoa(port))]
+}
+
+func hostPortKey(host, port string) string {
+	return strings.ToLower(strings.Trim(host, ".")) + "|" + port
+}
+
 // Event 是一条出网审计。拒绝也要有记录，否则「没日志」会被当成「没发生」。
 type Event struct {
 	Host     string
@@ -121,6 +160,9 @@ type Options struct {
 	// 隧道里看不见明文，所以授权口径要收得比普通请求更窄：
 	// 只能由清单显式声明，不存在「复用主域名白名单」这种放宽开关。
 	ConnectHosts []string
+	// HostPorts 是精确到端口的白名单（"host:port"）。它的唯一来源是平台
+	// 自己注入的宿主地址，清单里写不出来（清单的 hosts 只收域名）。
+	HostPorts []string
 	// Dial 只在测试里注入，用来把「拨号」换成连本地 echo 服务；
 	// 生产路径永远走 dialChecked（解析后校验全部 IP，私网拒绝）。
 	Dial func(ctx context.Context, host string, port int) (net.Conn, error)

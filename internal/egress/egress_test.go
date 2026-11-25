@@ -50,6 +50,27 @@ func TestEmptyAllowlistDeniesAll(t *testing.T) {
 	}
 }
 
+// 平台地址用精确 host:port 放行：同主机别的端口仍然拒绝，
+// 否则「放行 127.0.0.1」等于把本机所有端口都交出去。
+func TestHostPortsAllowOnlyExactPort(t *testing.T) {
+	hp := NewHostPorts([]string{"127.0.0.1:8321", " .Wa.Example.com:443 ", "bad-entry", "host:notaport", "x:99999"})
+	if !hp.Allow("127.0.0.1", 8321) {
+		t.Fatal("列出的 host:port 应放行")
+	}
+	if hp.Allow("127.0.0.1", 8322) {
+		t.Fatal("同主机的其他端口不该放行")
+	}
+	if hp.Allow("localhost", 8321) {
+		t.Fatal("没列出的主机不该放行")
+	}
+	if !hp.Allow("WA.EXAMPLE.COM", 443) {
+		t.Fatal("主机比较应忽略大小写，首尾空格与点应被规整掉")
+	}
+	if NewHostPorts(nil).Allow("127.0.0.1", 8321) {
+		t.Fatal("空白名单必须全部拒绝")
+	}
+}
+
 func TestBlockedIP(t *testing.T) {
 	blocked := []string{"127.0.0.1", "::1", "::ffff:127.0.0.1", "10.1.2.3", "192.168.1.1",
 		"172.16.0.1", "169.254.169.254", "fe80::1", "0.0.0.0"}

@@ -26,20 +26,44 @@ type Registry struct {
 	mu      sync.Mutex
 	entries map[string]*registryEntry
 	log     *slog.Logger
+	// http 决定这一份注册表建哪种代理。两种都必须存在，因为侧协议不同：
+	//   - 插件：SDK 的 wa.fetch 与 Deno 的 HTTPS_PROXY 都只会说 HTTP 代理
+	//     （absolute-form 请求 / CONNECT 隧道）。Deno 在 unix socket 上做不了
+	//     TLS，所以 TLS 必须由代理这侧完成，SOCKS5 隧道给不了。
+	//   - 原生客户端：curl 之类认 socks5h://，走 SOCKS5。
+	// 以前两处调用（控制面插件池、执行体）都建了 SOCKS5，插件发的是 HTTP，
+	// 现场报错是 `不支持的协议版本 71`（0x47 = 'G'，GET 的首字节）。
+	http bool
 }
 
 type registryEntry struct {
-	server *Server
+	server proxyServer
 	digest string
 	cancel context.CancelFunc
 }
 
-// NewRegistry 构造一个空的代理注册表。
+// proxyServer 是两种代理的公共面：建在哪个 socket、怎么起、怎么关。
+type proxyServer interface {
+	Path() string
+	Serve(ctx context.Context) error
+	Close() error
+}
+
+// NewRegistry 构造一个 SOCKS5 代理注册表（原生客户端用）。
 func NewRegistry(log *slog.Logger) *Registry {
+	return newRegistry(log, false)
+}
+
+// NewHTTPRegistry 构造一个 HTTP 代理注册表：插件出网必须走这一种。
+func NewHTTPRegistry(log *slog.Logger) *Registry {
+	return newRegistry(log, true)
+}
+
+func newRegistry(log *slog.Logger, http bool) *Registry {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Registry{entries: map[string]*registryEntry{}, log: log}
+	return &Registry{entries: map[string]*registryEntry{}, log: log, http: http}
 }
 
 // Ensure 在 path 上确保有一个按 opt 配置的代理，返回实际可用的 socket 路径。
@@ -68,7 +92,13 @@ func (r *Registry) Ensure(path string, opt Options, digest string) (string, erro
 		delete(r.entries, path)
 	}
 
-	srv, err := Listen(path, opt)
+	var srv proxyServer
+	var err error
+	if r.http {
+		srv, err = ListenHTTP(path, opt)
+	} else {
+		srv, err = Listen(path, opt)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -94,9 +124,12 @@ func (r *Registry) Close() {
 }
 
 // Digest 是白名单指纹：排序后哈希，调用顺序不影响判定。
-func Digest(hosts, wsHosts, verbs []string) string {
+//
+// hostPorts 也要进指纹：平台地址变了（换端口 / 换部署）而名单没变时，
+// 旧代理还按旧端口放行，等于名单没改。
+func Digest(hosts, wsHosts, verbs, hostPorts []string) string {
 	h := sha256.New()
-	for _, group := range [][]string{hosts, wsHosts, verbs} {
+	for _, group := range [][]string{hosts, wsHosts, verbs, hostPorts} {
 		list := append([]string{}, group...)
 		sort.Strings(list)
 		for _, s := range list {
